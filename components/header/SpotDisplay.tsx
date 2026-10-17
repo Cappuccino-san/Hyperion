@@ -1,0 +1,147 @@
+"use client";
+
+import React from "react";
+import { getTickerPreset, useDashboardStore } from "@/store/useDashboardStore";
+import { ExpectedMovesBadges } from "./ExpectedMovesBadges";
+import { cn } from "@/lib/utils";
+import { Database, RefreshCw } from "lucide-react";
+
+export function SpotDisplay() {
+  const activeTicker = useDashboardStore((state) => state.activeTicker);
+  const spotPrice = useDashboardStore((state) => state.spotPrice);
+  const previousClose = useDashboardStore((state) => state.previousClose);
+  const impliedVolatility = useDashboardStore((state) => state.impliedVolatility);
+  const { netGex } = useDashboardStore((state) => state.netMetrics);
+  const { zeroGamma } = useDashboardStore((state) => state.gammaLevels);
+  const dataSource = useDashboardStore((state) => state.dataSource);
+  const isLoadingChain = useDashboardStore((state) => state.isLoadingChain);
+  const lastUpdated = useDashboardStore((state) => state.lastUpdated);
+  const fetchOptionsChain = useDashboardStore(
+    (state) => state.fetchOptionsChain
+  );
+
+  const absChange = spotPrice - previousClose;
+  const pctChange = previousClose !== 0 ? (absChange / previousClose) * 100 : 0;
+  const isPositive = absChange >= 0;
+  const isPositiveGamma = spotPrice > zeroGamma && netGex > 0;
+  const preset = getTickerPreset(activeTicker);
+
+  const sourceBadge =
+    dataSource === "TRADIER_LIVE"
+      ? {
+          label: "TRADIER LIVE",
+          className:
+            "bg-emerald-500/15 text-emerald-300 border-emerald-400/40",
+        }
+      : dataSource === "CBOE_MARKET_DATA"
+        ? {
+            label: "CBOE MARKET DATA",
+            className: "bg-cyan-500/15 text-cyan-300 border-cyan-400/40",
+          }
+        : {
+            label: "SIMULATED",
+            className: "bg-amber-500/15 text-amber-300 border-amber-400/40",
+          };
+
+  return (
+    <div className="argon-card rounded-xl p-4 space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        {/* Left: Ticker + Huge Bold Price + Inline Red/Green Delta */}
+        <div className="flex flex-wrap items-baseline gap-3">
+          <span className="text-xl sm:text-2xl font-extrabold tracking-tight text-white">
+            {activeTicker}
+          </span>
+          <span className="font-mono text-2xl sm:text-3xl font-extrabold tracking-tight text-white tabular-nums">
+            ${spotPrice.toLocaleString("en-US", {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 2,
+            })}
+          </span>
+          <span
+            className={cn(
+              "font-mono text-sm font-bold tabular-nums",
+              isPositive ? "text-emerald-400" : "text-rose-400"
+            )}
+          >
+            {isPositive ? "+" : ""}
+            {absChange.toFixed(2)} ({isPositive ? "+" : ""}
+            {pctChange.toFixed(2)}%)
+          </span>
+          <span className="hidden md:inline text-xs font-mono text-slate-500">
+            {preset.name} · IV30 {(impliedVolatility * 100).toFixed(1)}%
+          </span>
+        </div>
+
+        {/* Right: Timestamp + Green LIVE Pill + Regime Pill + Data Source & Refresh */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[11px] font-mono text-slate-400 tabular-nums">
+            {lastUpdated} UTC
+          </span>
+
+          {/* Green LIVE indicator */}
+          <div className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 border border-emerald-400/40 px-2.5 py-0.5">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
+            </span>
+            <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-emerald-300">
+              LIVE
+            </span>
+          </div>
+
+          {/* Purple / Green Gamma Regime Pill */}
+          <div
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-full border px-3 py-0.5 text-[11px] font-mono font-semibold",
+              isPositiveGamma
+                ? "bg-emerald-500/15 border-emerald-400/40 text-emerald-300"
+                : "bg-purple-500/20 border-purple-400/50 text-purple-200"
+            )}
+          >
+            <span
+              className={cn(
+                "h-2 w-2 rounded-full",
+                isPositiveGamma ? "bg-emerald-400" : "bg-purple-400"
+              )}
+            />
+            <span>
+              {isPositiveGamma
+                ? "Positive gamma · expect chop"
+                : "Negative gamma · expect bigger moves"}
+            </span>
+          </div>
+
+          {/* Data Source Indicator Pill */}
+          <div
+            className={cn(
+              "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[10px] font-mono font-bold uppercase",
+              sourceBadge.className
+            )}
+          >
+            <Database className="h-3 w-3 shrink-0" />
+            <span>{sourceBadge.label}</span>
+          </div>
+
+          {/* Manual Refresh Button */}
+          <button
+            type="button"
+            onClick={() => fetchOptionsChain(activeTicker, true)}
+            disabled={isLoadingChain}
+            className="inline-flex items-center gap-1 rounded-full bg-[#0b0d17] hover:bg-[#1c223a] border border-white/15 px-2.5 py-0.5 text-[10px] font-mono font-semibold text-slate-200 transition-colors disabled:opacity-50"
+          >
+            <RefreshCw
+              className={cn(
+                "h-3 w-3 text-[#11cdef]",
+                isLoadingChain && "animate-spin"
+              )}
+            />
+            <span>Refresh</span>
+          </button>
+        </div>
+      </div>
+
+      {/* 4 Color-Coded Expected Move Pills */}
+      <ExpectedMovesBadges />
+    </div>
+  );
+}
