@@ -19,12 +19,12 @@ export function AlertsFeed() {
   }, [alerts]);
 
   return (
-    <div className="bg-[#111422] rounded-2xl border border-white/[0.08] p-4">
-      {/* Card Header */}
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-xs font-mono font-bold uppercase tracking-wider text-white">
+    <div className="argon-card rounded-xl p-4">
+      {/* Header: ALERTS on left, posting to Discord on right */}
+      <div className="flex items-center justify-between border-b border-white/10 pb-2 mb-2">
+        <h4 className="text-[10px] font-mono font-bold uppercase tracking-widest text-slate-400">
           ALERTS
-        </h3>
+        </h4>
         <button
           type="button"
           onClick={() => setSetupModalOpen(true)}
@@ -36,27 +36,35 @@ export function AlertsFeed() {
               <span className="text-emerald-400 font-medium">posting to Discord</span>
             </>
           ) : (
-            <span className="text-argon-muted">posting to Discord (setup)</span>
+            <span className="text-slate-500 font-normal">Discord posting off</span>
           )}
         </button>
       </div>
 
-      {/* Fixed-height scrollable minimalist log */}
+      {/* Events List */}
       <div
         ref={scrollContainerRef}
-        className="max-h-36 overflow-y-auto argon-scrollbar divide-y divide-white/[0.04]"
+        className="max-h-36 overflow-y-auto argon-scrollbar divide-y divide-white/5"
       >
-        {alerts.map((alert) => (
-          <div
-            key={alert.id}
-            className="flex items-baseline gap-3 py-1.5 font-mono text-xs border-b border-white/[0.04] last:border-b-0"
-          >
-            <span className="text-argon-muted tabular-nums shrink-0">
-              {alert.timestamp}
-            </span>
-            <span className="text-argon-text">{alert.message}</span>
+        {alerts.length === 0 ? (
+          <div className="py-2 font-mono text-xs text-slate-500">
+            No events yet — watching for spot crossing zero γ and call/put wall changes.
           </div>
-        ))}
+        ) : (
+          alerts.map((alert) => (
+            <div
+              key={alert.id}
+              className="flex items-baseline gap-3 py-1.5 font-mono text-[11.5px]"
+            >
+              <span className="text-slate-500 tabular-nums shrink-0 text-[11px]">
+                {alert.timestamp}
+              </span>
+              <span className="text-[#cbd5e1] font-medium leading-relaxed">
+                {alert.message}
+              </span>
+            </div>
+          ))
+        )}
       </div>
     </div>
   );

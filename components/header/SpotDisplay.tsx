@@ -6,16 +6,19 @@ import { ExpectedMovesBadges } from "./ExpectedMovesBadges";
 import { cn } from "@/lib/utils";
 import { Database, RefreshCw } from "lucide-react";
 
+const NO_EXT = new Set(["SPX", "^SPX", "NDX", "^NDX", "SPXW", "NDXP"]);
+
 export function SpotDisplay() {
   const activeTicker = useDashboardStore((state) => state.activeTicker);
   const spotPrice = useDashboardStore((state) => state.spotPrice);
   const previousClose = useDashboardStore((state) => state.previousClose);
   const impliedVolatility = useDashboardStore((state) => state.impliedVolatility);
   const { netGex } = useDashboardStore((state) => state.netMetrics);
-  const { zeroGamma } = useDashboardStore((state) => state.gammaLevels);
   const dataSource = useDashboardStore((state) => state.dataSource);
   const isLoadingChain = useDashboardStore((state) => state.isLoadingChain);
   const lastUpdated = useDashboardStore((state) => state.lastUpdated);
+  const bookTimestamp = useDashboardStore((state) => state.bookTimestamp);
+  const extendedQuote = useDashboardStore((state) => state.extendedQuote);
   const fetchOptionsChain = useDashboardStore(
     (state) => state.fetchOptionsChain
   );
@@ -23,8 +26,10 @@ export function SpotDisplay() {
   const absChange = spotPrice - previousClose;
   const pctChange = previousClose !== 0 ? (absChange / previousClose) * 100 : 0;
   const isPositive = absChange >= 0;
-  const isPositiveGamma = spotPrice > zeroGamma && netGex > 0;
+  const isPositiveGamma = netGex >= 0;
   const preset = getTickerPreset(activeTicker);
+  const showExtended =
+    extendedQuote && !NO_EXT.has(activeTicker.toUpperCase());
 
   const sourceBadge =
     dataSource === "TRADIER_LIVE"
@@ -46,36 +51,81 @@ export function SpotDisplay() {
   return (
     <div className="argon-card rounded-xl p-4 space-y-2">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        {/* Left: Ticker + Huge Bold Price + Inline Red/Green Delta */}
-        <div className="flex flex-wrap items-baseline gap-3">
-          <span className="text-xl sm:text-2xl font-extrabold tracking-tight text-white">
-            {activeTicker}
-          </span>
-          <span className="font-mono text-2xl sm:text-3xl font-extrabold tracking-tight text-white tabular-nums">
-            ${spotPrice.toLocaleString("en-US", {
-              minimumFractionDigits: 2,
-              maximumFractionDigits: 2,
-            })}
-          </span>
-          <span
-            className={cn(
-              "font-mono text-sm font-bold tabular-nums",
-              isPositive ? "text-emerald-400" : "text-rose-400"
-            )}
-          >
-            {isPositive ? "+" : ""}
-            {absChange.toFixed(2)} ({isPositive ? "+" : ""}
-            {pctChange.toFixed(2)}%)
-          </span>
-          <span className="hidden md:inline text-xs font-mono text-slate-500">
-            {preset.name} · IV30 {(impliedVolatility * 100).toFixed(1)}%
-          </span>
+        {/* Left: Ticker + Huge Bold Price + Inline Red/Green Delta + Extended Hours Sun/Moon */}
+        <div className="space-y-1">
+          <div className="flex flex-wrap items-baseline gap-3">
+            <span className="text-xl sm:text-2xl font-extrabold tracking-tight text-white">
+              {activeTicker}
+            </span>
+            <span className="font-mono text-2xl sm:text-3xl font-extrabold tracking-tight text-white tabular-nums">
+              ${spotPrice.toLocaleString("en-US", {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2,
+              })}
+            </span>
+            <span
+              className={cn(
+                "font-mono text-sm font-bold tabular-nums",
+                isPositive ? "text-emerald-400" : "text-rose-400"
+              )}
+            >
+              {isPositive ? "+" : ""}
+              {absChange.toFixed(2)} ({isPositive ? "+" : ""}
+              {pctChange.toFixed(2)}%)
+            </span>
+            <span className="hidden md:inline text-xs font-mono text-slate-500">
+              {preset.name} · IV30 {(impliedVolatility * 100).toFixed(1)}%
+            </span>
+          </div>
+
+          {/* Pre-Market (Sun) / After-Hours (Moon) Extended Price Indicator */}
+          {showExtended && (
+            <div className="flex items-center gap-2 text-xs font-mono text-slate-300">
+              {extendedQuote.type === "pre" ? (
+                <svg
+                  className="w-3.5 h-3.5 shrink-0"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#facc15"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                >
+                  <circle cx="12" cy="12" r="4" fill="#facc15" />
+                  <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+                </svg>
+              ) : (
+                <svg
+                  className="w-3.5 h-3.5 shrink-0"
+                  viewBox="0 0 24 24"
+                  fill="#c4b5fd"
+                >
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z" />
+                </svg>
+              )}
+              <b className="text-slate-100 font-bold">
+                ${extendedQuote.price.toFixed(2)}
+              </b>
+              <span
+                className={cn(
+                  "font-semibold",
+                  extendedQuote.change >= 0
+                    ? "text-emerald-400"
+                    : "text-rose-400"
+                )}
+              >
+                {extendedQuote.change >= 0 ? "+" : ""}
+                {extendedQuote.change.toFixed(2)} (
+                {extendedQuote.changePct >= 0 ? "+" : ""}
+                {extendedQuote.changePct.toFixed(2)}%)
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Right: Timestamp + Green LIVE Pill + Regime Pill + Data Source & Refresh */}
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-[11px] font-mono text-slate-400 tabular-nums">
-            {lastUpdated} UTC
+            {bookTimestamp ? `book ${bookTimestamp}` : `${lastUpdated} UTC`}
           </span>
 
           {/* Green LIVE indicator */}
@@ -127,7 +177,7 @@ export function SpotDisplay() {
             type="button"
             onClick={() => fetchOptionsChain(activeTicker, true)}
             disabled={isLoadingChain}
-            className="inline-flex items-center gap-1 rounded-full bg-[#0b0d17] hover:bg-[#1c223a] border border-white/15 px-2.5 py-0.5 text-[10px] font-mono font-semibold text-slate-200 transition-colors disabled:opacity-50"
+            className="inline-flex items-center gap-1 rounded-full bg-[#0b0d17] hover:bg-[#1c223a] border border-white/15 px-2.5 py-0.5 text-[10px] font-mono font-semibold text-slate-200 transition-colors disabled:opacity-50 cursor-pointer"
           >
             <RefreshCw
               className={cn(
@@ -140,7 +190,7 @@ export function SpotDisplay() {
         </div>
       </div>
 
-      {/* 4 Color-Coded Expected Move Pills */}
+      {/* 4 Color-Coded Expected Move Pills (0.85 × ATM Straddle) */}
       <ExpectedMovesBadges />
     </div>
   );

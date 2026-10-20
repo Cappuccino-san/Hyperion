@@ -4,114 +4,125 @@ import React from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { cn } from "@/lib/utils";
 
-const EXPECTED_HORIZONS = [
-  {
-    label: "Daily",
-    days: 1,
-    dateSuffix: " · 10-16",
-    borderClass: "border-slate-300/60 bg-slate-200/5 text-slate-200",
-    tagColor: "text-white",
-  },
-  {
-    label: "Weekly",
-    days: 5,
-    dateSuffix: " · 10-23",
-    borderClass: "border-yellow-400/60 bg-yellow-400/10 text-yellow-100",
-    tagColor: "text-yellow-300",
-  },
-  {
-    label: "Monthly",
-    days: 21,
-    dateSuffix: " · 11-20",
-    borderClass: "border-orange-400/60 bg-orange-400/10 text-orange-100",
-    tagColor: "text-orange-300",
-  },
-  {
-    label: "Annual 2026",
-    days: 252,
-    dateSuffix: "",
-    borderClass: "border-rose-400/60 bg-rose-500/10 text-rose-100",
-    tagColor: "text-rose-300",
-  },
-] as const;
-
 export function ExpectedMovesBadges() {
+  const activeTicker = useDashboardStore((state) => state.activeTicker);
   const spotPrice = useDashboardStore((state) => state.spotPrice);
   const impliedVolatility = useDashboardStore(
     (state) => state.impliedVolatility
   );
   const chainExpirations = useDashboardStore((state) => state.chainExpirations);
+  const expectedMoves = useDashboardStore((state) => state.expectedMoves);
 
-  const dailyDate = chainExpirations[0]?.dateLabel ?? "10-19";
-  const weeklyCol =
-    chainExpirations.find((c) => c.dteDays >= 4 && c.dteDays <= 7) ??
-    chainExpirations[Math.min(4, Math.max(0, chainExpirations.length - 1))];
-  const weeklyDate = weeklyCol?.dateLabel ?? "10-23";
-  const opexCol =
-    chainExpirations.find((c) => c.filterGroup === "OPEX") ??
-    chainExpirations[chainExpirations.length - 1];
-  const monthlyDate = opexCol?.dateLabel ?? "11-20";
+  const dailyDate =
+    expectedMoves?.daily?.exp?.slice(5) ??
+    chainExpirations[0]?.dateLabel ??
+    "10-19";
+  const weekCols = chainExpirations.filter((c) => c.inThisWeek);
+  const weeklyDate =
+    expectedMoves?.weekly?.exp?.slice(5) ??
+    weekCols[weekCols.length - 1]?.dateLabel ??
+    chainExpirations[Math.min(4, Math.max(0, chainExpirations.length - 1))]
+      ?.dateLabel ??
+    "10-23";
+  const monthlyDate =
+    expectedMoves?.monthly?.exp?.slice(5) ??
+    chainExpirations.find((c) => c.filterGroup === "OPEX")?.dateLabel ??
+    "10-30";
 
-  const horizons = [
-    {
-      label: "Daily",
-      days: 1,
-      dateSuffix: ` · ${dailyDate}`,
-      borderClass: "border-slate-300/60 bg-slate-200/5 text-slate-200",
-      tagColor: "text-white",
-    },
-    {
-      label: "Weekly",
-      days: 5,
-      dateSuffix: ` · ${weeklyDate}`,
-      borderClass: "border-yellow-400/60 bg-yellow-400/10 text-yellow-100",
-      tagColor: "text-yellow-300",
-    },
-    {
-      label: "Monthly",
-      days: 21,
-      dateSuffix: ` · ${monthlyDate}`,
-      borderClass: "border-orange-400/60 bg-orange-400/10 text-orange-100",
-      tagColor: "text-orange-300",
-    },
-    {
-      label: "Annual 2026",
-      days: 252,
-      dateSuffix: "",
-      borderClass: "border-rose-400/60 bg-rose-500/10 text-rose-100",
-      tagColor: "text-rose-300",
-    },
-  ];
+  // Fallback 0.85 * ATM straddle approximation when chain hasn't hydrated yet
+  const approxEm = (days: number) =>
+    Number(
+      (
+        0.85 *
+        spotPrice *
+        impliedVolatility *
+        Math.sqrt(days / 252) *
+        Math.sqrt(2 / Math.PI) *
+        2
+      ).toFixed(2)
+    );
+
+  const dailyEm = expectedMoves?.daily?.em ?? approxEm(1);
+  const dailyLow =
+    expectedMoves?.daily?.low ?? Number((spotPrice - dailyEm).toFixed(2));
+  const dailyHigh =
+    expectedMoves?.daily?.high ?? Number((spotPrice + dailyEm).toFixed(2));
+
+  const weeklyEm = expectedMoves?.weekly?.em ?? approxEm(5);
+  const weeklyLow =
+    expectedMoves?.weekly?.low ?? Number((spotPrice - weeklyEm).toFixed(2));
+  const weeklyHigh =
+    expectedMoves?.weekly?.high ?? Number((spotPrice + weeklyEm).toFixed(2));
+
+  const monthlyEm = expectedMoves?.monthly?.em ?? approxEm(21);
+  const monthlyLow =
+    expectedMoves?.monthly?.low ?? Number((spotPrice - monthlyEm).toFixed(2));
+  const monthlyHigh =
+    expectedMoves?.monthly?.high ?? Number((spotPrice + monthlyEm).toFixed(2));
+
+  const isAnnualSupported = ["SPX", "SPXW", "SPY", "QQQ"].includes(
+    activeTicker.toUpperCase()
+  );
+
+  const annualObj = isAnnualSupported
+    ? (expectedMoves?.annual ??
+      (activeTicker === "SPY"
+        ? { exp: "2026", em: 114.18, pct: 16.75, low: 567.74, high: 796.1, fixed: true }
+        : activeTicker === "SPXW" || activeTicker === "SPX"
+          ? { exp: "2026", em: 1141.8, pct: 16.75, low: 5677.4, high: 7961.0, fixed: true }
+          : activeTicker === "QQQ"
+            ? { exp: "2026", em: 108.45, pct: 18.2, low: 487.45, high: 704.35, fixed: true }
+            : null))
+    : null;
 
   return (
     <div className="flex flex-wrap items-center gap-2 pt-2">
-      {horizons.map((item) => {
-        const expectedMove =
-          spotPrice * impliedVolatility * Math.sqrt(item.days / 252);
-        const lower = spotPrice - expectedMove;
-        const upper = spotPrice + expectedMove;
+      {/* Daily (D) - White */}
+      <div className="inline-flex items-center gap-1.5 rounded-full border border-[#ffffff] bg-[#111520] text-slate-200 px-3 py-1 text-[11px] font-mono tabular-nums">
+        <b className="font-bold text-white">Daily</b>
+        <span className="font-semibold">±${dailyEm.toFixed(2)}</span>
+        <span className="opacity-90">
+          ({dailyLow.toFixed(2)}–{dailyHigh.toFixed(2)})
+        </span>
+        <span className="opacity-75">· {dailyDate}</span>
+      </div>
 
-        return (
-          <div
-            key={item.label}
-            className={cn(
-              "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-mono tabular-nums",
-              item.borderClass
-            )}
-          >
-            <span className={cn("font-bold", item.tagColor)}>{item.label}</span>
-            {item.label !== "Annual 2026" && (
-              <span className="font-semibold">±${expectedMove.toFixed(2)}</span>
-            )}
-            <span className="opacity-90">
-              ({lower.toFixed(2)}–{upper.toFixed(2)})
-            </span>
-            {item.dateSuffix && (
-              <span className="opacity-75">{item.dateSuffix}</span>
-            )}
-          </div>
-        );
-      })}
+      {/* Weekly (W) - Yellow */}
+      <div className="inline-flex items-center gap-1.5 rounded-full border border-[#facc15] bg-[#111520] text-slate-200 px-3 py-1 text-[11px] font-mono tabular-nums">
+        <b className="font-bold text-[#facc15]">Weekly</b>
+        <span className="font-semibold">±${weeklyEm.toFixed(2)}</span>
+        <span className="opacity-90">
+          ({weeklyLow.toFixed(2)}–{weeklyHigh.toFixed(2)})
+        </span>
+        <span className="opacity-75">· {weeklyDate}</span>
+      </div>
+
+      {/* Monthly (M) - Orange */}
+      <div className="inline-flex items-center gap-1.5 rounded-full border border-[#fb923c] bg-[#111520] text-slate-200 px-3 py-1 text-[11px] font-mono tabular-nums">
+        <b className="font-bold text-[#fb923c]">Monthly</b>
+        <span className="font-semibold">±${monthlyEm.toFixed(2)}</span>
+        <span className="opacity-90">
+          ({monthlyLow.toFixed(2)}–{monthlyHigh.toFixed(2)})
+        </span>
+        <span className="opacity-75">· {monthlyDate}</span>
+      </div>
+
+      {/* Annual (A) - Red/Coral (for SPY, SPX/SPXW, QQQ) */}
+      {annualObj && (
+        <div
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full border border-[#f87171] bg-[#111520] text-slate-200 px-3 py-1 text-[11px] font-mono tabular-nums"
+          )}
+        >
+          <b className="font-bold text-[#f87171]">Annual {annualObj.exp}</b>
+          {!annualObj.fixed && (
+            <span className="font-semibold">±${annualObj.em.toFixed(2)}</span>
+          )}
+          <span className="opacity-90">
+            ({annualObj.low.toFixed(2)}–{annualObj.high.toFixed(2)})
+          </span>
+        </div>
+      )}
     </div>
   );
 }

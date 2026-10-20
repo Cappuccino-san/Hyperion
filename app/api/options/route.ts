@@ -1,11 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   computeOptionsAnalytics,
+  ExtendedQuoteInfo,
   NormalizedOptionContract,
   OptionsAnalyticsPayload,
   parseOccSymbol,
 } from "@/lib/optionsExposure";
 import { TickerSymbol } from "@/store/useDashboardStore";
+import { recordIntradaySnapshot } from "@/lib/intradayHistory";
 
 export const dynamic = "force-dynamic";
 
@@ -16,6 +18,78 @@ interface CacheEntry {
 
 const memoryCache = new Map<string, CacheEntry>();
 const CACHE_TTL_MS = 10_000;
+
+const NO_EXT_SET = new Set(["SPX", "^SPX", "NDX", "^NDX", "SPXW", "NDXP"]);
+
+async function fetchExtendedQuote(
+  ticker: string,
+  spotPrice: number
+): Promise<ExtendedQuoteInfo | null> {
+  if (NO_EXT_SET.has(ticker.toUpperCase())) return null;
+  try {
+    const nowEt = new Date(
+      new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
+    );
+    const mins = nowEt.getHours() * 60 + nowEt.getMinutes();
+    const wd = nowEt.getDay();
+    // During regular market hours (Mon-Fri 9:30 AM - 4:00 PM ET), no extended quote badge is shown
+    if (wd >= 1 && wd <= 5 && mins >= 570 && mins < 960) {
+      return null;
+    }
+
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
+      ticker
+    )}?range=2d&interval=1m&includePrePost=true`;
+    const res = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; HyperionAnalytics/1.0)",
+      },
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const result = json?.chart?.result?.[0];
+    const meta = result?.meta;
+    if (!meta) return null;
+
+    const sessionType: "pre" | "after" =
+      wd >= 1 && wd <= 5 && mins >= 240 && mins < 570 ? "pre" : "after";
+
+    let extPrice = Number(
+      sessionType === "pre"
+        ? meta.preMarketPrice ?? 0
+        : meta.postMarketPrice ?? 0
+    );
+
+    if (!extPrice || extPrice <= 0) {
+      const closes: (number | null)[] =
+        result?.indicators?.quote?.[0]?.close ?? [];
+      for (let i = closes.length - 1; i >= 0; i--) {
+        const c = closes[i];
+        if (typeof c === "number" && Number.isFinite(c) && c > 0) {
+          extPrice = c;
+          break;
+        }
+      }
+    }
+
+    if (!extPrice || extPrice <= 0 || Math.abs(extPrice - spotPrice) < 0.005) {
+      return null;
+    }
+
+    const change = Number((extPrice - spotPrice).toFixed(2));
+    const changePct = Number(((change / spotPrice) * 100).toFixed(2));
+    return {
+      type: sessionType,
+      price: Number(extPrice.toFixed(2)),
+      change,
+      changePct,
+    };
+  } catch {
+    return null;
+  }
+}
 
 async function fetchTradierOptions(
   ticker: TickerSymbol,
@@ -44,17 +118,19 @@ async function fetchTradierOptions(
   if (!expRes.ok) return null;
   const expJson = await expRes.json();
   const rawDates: string[] = expJson?.expirations?.date ?? [];
-  const nearestDates = rawDates.slice(0, 12);
-  if (nearestDates.length === 0) return null;
+  if (rawDates.length === 0) return null;
 
-  const chainResponses = await Promise.all(
-    nearestDates.map((exp) =>
-      fetch(
-        `https://api.tradier.com/v1/markets/options/chains?symbol=${ticker}&expiration=${exp}&greeks=true`,
-        { headers, cache: "no-store" }
-      ).then((r) => (r.ok ? r.json() : null))
-    )
-  );
+  const [chainResponses, extendedQuote] = await Promise.all([
+    Promise.all(
+      rawDates.map((exp) =>
+        fetch(
+          `https://api.tradier.com/v1/markets/options/chains?symbol=${ticker}&expiration=${exp}&greeks=true`,
+          { headers, cache: "no-store" }
+        ).then((r) => (r.ok ? r.json() : null))
+      )
+    ),
+    fetchExtendedQuote(ticker, spotPrice),
+  ]);
 
   const contracts: NormalizedOptionContract[] = [];
   let ivSum = 0;
@@ -88,6 +164,9 @@ async function fetchTradierOptions(
         gamma: Number(item.greeks?.gamma ?? 0),
         vega: Number(item.greeks?.vega ?? 0),
         percentChange: Number(item.change_percentage ?? 0),
+        bid: Number(item.bid ?? 0),
+        ask: Number(item.ask ?? 0),
+        last: Number(item.last ?? 0),
       });
     }
   }
@@ -103,6 +182,7 @@ async function fetchTradierOptions(
     previousClose,
     impliedVolatility,
     contracts,
+    extendedQuote,
   });
 }
 
@@ -139,19 +219,12 @@ async function fetchCboeOptions(
   const impliedVolatility =
     rawIv30 > 0 ? (rawIv30 > 2 ? rawIv30 / 100 : rawIv30) : 0.18;
 
-  const minStrike = spotPrice * 0.85;
-  const maxStrike = spotPrice * 1.15;
-
   const contracts: NormalizedOptionContract[] = [];
 
   for (const rawOpt of data.options) {
     const occSymbol = String(rawOpt.option ?? "");
     const parsed = parseOccSymbol(occSymbol);
     if (!parsed) continue;
-
-    if (parsed.strike < minStrike || parsed.strike > maxStrike) {
-      continue;
-    }
 
     const openInterest = Number(rawOpt.open_interest ?? 0);
     const volume = Number(rawOpt.volume ?? 0);
@@ -169,10 +242,15 @@ async function fetchCboeOptions(
       gamma: Number(rawOpt.gamma ?? 0),
       vega: Number(rawOpt.vega ?? 0),
       percentChange: Number(rawOpt.percent_change ?? 0),
+      bid: Number(rawOpt.bid ?? 0),
+      ask: Number(rawOpt.ask ?? 0),
+      last: Number(rawOpt.last_trade_price ?? 0),
     });
   }
 
   if (contracts.length === 0) return null;
+
+  const extendedQuote = await fetchExtendedQuote(ticker, spotPrice);
 
   return computeOptionsAnalytics({
     ticker,
@@ -181,7 +259,29 @@ async function fetchCboeOptions(
     previousClose,
     impliedVolatility,
     contracts,
+    extendedQuote,
   });
+}
+
+async function attachIntraday(
+  payload: OptionsAnalyticsPayload
+): Promise<OptionsAnalyticsPayload> {
+  try {
+    const { history, alerts } = await recordIntradaySnapshot({
+      ticker: payload.ticker,
+      spotPrice: payload.spotPrice,
+      callWall: payload.gammaLevels.callWall,
+      putWall: payload.gammaLevels.putWall,
+      zeroGamma: payload.gammaLevels.zeroGamma,
+    });
+    return {
+      ...payload,
+      intradayData: history,
+      alerts,
+    };
+  } catch {
+    return payload;
+  }
 }
 
 export async function GET(request: NextRequest) {
@@ -194,7 +294,8 @@ export async function GET(request: NextRequest) {
   if (!forceRefresh) {
     const cached = memoryCache.get(ticker);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-      return NextResponse.json(cached.payload);
+      const enriched = await attachIntraday(cached.payload);
+      return NextResponse.json(enriched);
     }
   }
 
@@ -208,7 +309,8 @@ export async function GET(request: NextRequest) {
           timestamp: Date.now(),
           payload: tradierPayload,
         });
-        return NextResponse.json(tradierPayload);
+        const enriched = await attachIntraday(tradierPayload);
+        return NextResponse.json(enriched);
       }
     } catch {
       // Fall through to Tier 2 (CBOE Market Data)
@@ -223,7 +325,8 @@ export async function GET(request: NextRequest) {
         timestamp: Date.now(),
         payload: cboePayload,
       });
-      return NextResponse.json(cboePayload);
+      const enriched = await attachIntraday(cboePayload);
+      return NextResponse.json(enriched);
     }
   } catch {
     // Live feed error

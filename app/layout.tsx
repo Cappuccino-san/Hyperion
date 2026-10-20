@@ -17,7 +17,7 @@ const jetbrainsMono = JetBrains_Mono({
 export const metadata: Metadata = {
   title: "Hyperion | Options Gamma & Vanna Positioning Terminal",
   description:
-    "Real-time institutional options analytics, GEX/VEX surface heatmaps, King Node scanner, and Antaeus intraday positioning.",
+    "Real-time institutional options analytics, GEX/VEX surface heatmaps, King Node scanner, and Gaia intraday positioning.",
 };
 
 export default function RootLayout({

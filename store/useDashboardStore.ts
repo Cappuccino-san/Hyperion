@@ -2,11 +2,20 @@ import { create } from "zustand";
 import type {
   ComputedStrikeRow,
   DataSourceType,
+  ExpectedMovesPayload,
   ExpirationColumnSpec,
+  ExtendedQuoteInfo,
   OptionsAnalyticsPayload,
 } from "@/lib/optionsExposure";
 
-export type ActiveView = "Heatmap" | "Quad" | "Antaeus" | "Scanner" | "Charts";
+export type ActiveView =
+  | "Heatmap"
+  | "Quad"
+  | "Gaia"
+  | "Antaeus" // backward-compatible alias
+  | "Scanner"
+  | "Recap"
+  | "Charts";
 export type TickerSymbol = string;
 export type ExposureMetric = "GEX" | "VEX" | "DEX" | "Charm";
 export type ExpirationFilter = "ALL" | "0DTE" | "THIS_WEEK" | "OPEX";
@@ -15,12 +24,17 @@ export type AlertType = "call" | "put" | "zero" | "king";
 export interface NetMetrics {
   netGex: number; // in Billions ($B)
   netVex: number; // in Millions ($M)
+  netDex?: number; // in Millions ($M)
+  netCharm?: number; // in Millions ($M)
 }
 
 export interface GammaLevels {
   putWall: number;   // Strike <= spot with highest put gamma (Pink)
+  putWallGex?: number; // Put-only GEX in $M (negative)
   callWall: number;  // Strike >= spot with highest call gamma (Cyan)
+  callWallGex?: number; // Call-only GEX in $M (positive)
   zeroGamma: number; // Price where total dealer gamma flips sign (closest crossing within ±15%)
+  hasZeroGammaFlip?: boolean;
 }
 
 export interface KingNodeMetrics {
@@ -68,6 +82,7 @@ export interface TickerPreset {
   impliedVolatility: number; // decimal, e.g. 0.218 = 21.8%
   netMetrics: NetMetrics;
   gammaLevels: GammaLevels;
+  gammaLevelsByFilter?: Record<string, GammaLevels>;
   kingPreset: {
     allExpKing: number;
     zeroDteKing: number;
@@ -245,20 +260,26 @@ export const TICKER_PRESETS: Record<string, TickerPreset> = {
   SPY: {
     ticker: "SPY",
     name: "SPDR S&P 500 ETF Trust",
-    spotPrice: 761.64,
+    spotPrice: 767.14,
     previousClose: 771.79,
     impliedVolatility: 0.146,
     netMetrics: { netGex: -4.82, netVex: 642.5 },
-    gammaLevels: { putWall: 755.0, zeroGamma: 768.0, callWall: 770.0 },
+    gammaLevels: { putWall: 765.0, putWallGex: -735.35, zeroGamma: 769.0, callWall: 770.0, callWallGex: 1248.96, hasZeroGammaFlip: true },
+    gammaLevelsByFilter: {
+      ALL: { putWall: 765.0, putWallGex: -735.35, zeroGamma: 769.0, callWall: 770.0, callWallGex: 1248.96, hasZeroGammaFlip: true },
+      THIS_WEEK: { putWall: 765.0, putWallGex: -735.35, zeroGamma: 769.0, callWall: 770.0, callWallGex: 1248.96, hasZeroGammaFlip: true },
+      "0DTE": { putWall: 765.0, putWallGex: -93.22, zeroGamma: 768.5, callWall: 770.0, callWallGex: 366.09, hasZeroGammaFlip: true },
+      OPEX: { putWall: 750.0, putWallGex: -868.77, zeroGamma: 771.0, callWall: 770.0, callWallGex: 584.25, hasZeroGammaFlip: true },
+    },
     kingPreset: {
-      allExpKing: 760.0,
-      zeroDteKing: 760.0,
-      weeklyKing: 765.0,
-      opexKing: 760.0,
-      kingValue: 523.5,
-      secondLargestStrike: 765.0,
-      secondLargestValue: 340.0,
-      totalBoardGamma: 2150.0,
+      allExpKing: 750.0,
+      zeroDteKing: 770.0,
+      weeklyKing: 770.0,
+      opexKing: 750.0,
+      kingValue: 1616.5,
+      secondLargestStrike: 770.0,
+      secondLargestValue: 1495.0,
+      totalBoardGamma: 12500.0,
     },
     strikeStep: 1,
   },
@@ -947,7 +968,10 @@ export function computeFilteredSummaryMetrics(params: {
   strikes: ComputedStrikeRow[];
   allExpNetMetrics: NetMetrics;
   allExpKingNode: KingNodeMetrics;
-}): { netMetrics: NetMetrics; kingNode: KingNodeMetrics } {
+  allExpGammaLevels?: GammaLevels;
+  gammaLevelsByFilter?: Record<string, GammaLevels> | null;
+  spotPrice?: number;
+}): { netMetrics: NetMetrics; kingNode: KingNodeMetrics; gammaLevels: GammaLevels } {
   const {
     expirationFilter,
     preset,
@@ -955,6 +979,8 @@ export function computeFilteredSummaryMetrics(params: {
     strikes,
     allExpNetMetrics,
     allExpKingNode,
+    allExpGammaLevels,
+    gammaLevelsByFilter,
   } = params;
 
   if (expirations.length > 0 && strikes.length > 0) {
@@ -968,11 +994,13 @@ export function computeFilteredSummaryMetrics(params: {
     const zeroDteDate =
       zeroDteColsToUse[0]?.dateLabel ?? allExpKingNode.zeroDteDate ?? "10-19";
 
-    // 2. Determine Week columns: all columns within next 7 calendar days inclusive of today (0 <= dte <= 7)
+    // 2. Determine Week columns using TerraShade's exact inThisWeek (nearest exp through Friday of that week)
     const weekCols = expirations.filter((c) =>
-      c.dteDays !== undefined
-        ? c.dteDays >= 0 && c.dteDays <= 7
-        : c.filterGroup === "0DTE" || c.filterGroup === "THIS_WEEK"
+      c.inThisWeek !== undefined
+        ? c.inThisWeek
+        : c.dteDays !== undefined
+          ? c.dteDays >= 0 && c.dteDays <= 7
+          : c.filterGroup === "0DTE" || c.filterGroup === "THIS_WEEK"
     );
     const weekColsToUse =
       weekCols.length > 0
@@ -1030,6 +1058,7 @@ export function computeFilteredSummaryMetrics(params: {
           weeklyKing: bestWeekStrike,
           weeklyDate,
         },
+        gammaLevels: allExpGammaLevels ?? preset.gammaLevels,
       };
     }
 
@@ -1041,9 +1070,12 @@ export function computeFilteredSummaryMetrics(params: {
     } else if (expirationFilter === "OPEX") {
       matchingCols = expirations.filter((c) => c.filterGroup === "OPEX");
     } else {
-      // Specific date selected from Date ▾ dropdown (e.g. "10-16", "10-23")
+      // Specific date selected from Date ▾ dropdown (e.g. "10-19", "10-23", or ISO date)
       matchingCols = expirations.filter(
-        (c) => c.dateLabel === expirationFilter || c.id === expirationFilter
+        (c) =>
+          c.dateLabel === expirationFilter ||
+          c.id === expirationFilter ||
+          c.isoDate === expirationFilter
       );
     }
 
@@ -1053,6 +1085,8 @@ export function computeFilteredSummaryMetrics(params: {
 
     let sumGexM = 0;
     let sumVexM = 0;
+    let sumDexM = 0;
+    let sumCharmM = 0;
 
     interface StrikeGammaBucket {
       strike: number;
@@ -1065,13 +1099,17 @@ export function computeFilteredSummaryMetrics(params: {
     for (const row of strikes) {
       let rowGexSum = 0;
       let peakColAbs = -1;
-      let peakDateLabel = matchingCols[0]?.dateLabel ?? "10-16";
+      let peakDateLabel = matchingCols[0]?.dateLabel ?? "10-19";
 
       for (const col of matchingCols) {
         const gVal = row.gex[col.id] ?? 0;
         const vVal = row.vex[col.id] ?? 0;
+        const dVal = row.dex?.[col.id] ?? 0;
+        const cVal = row.charm?.[col.id] ?? 0;
         sumGexM += gVal;
         sumVexM += vVal;
+        sumDexM += dVal;
+        sumCharmM += cVal;
         rowGexSum += gVal;
 
         if (Math.abs(gVal) > peakColAbs) {
@@ -1091,7 +1129,7 @@ export function computeFilteredSummaryMetrics(params: {
     const best = rowBuckets[0] ?? {
       strike: allExpKingNode.allExpKing,
       absGamma: allExpKingNode.kingValue,
-      peakDateLabel: matchingCols[0]?.dateLabel ?? "10-16",
+      peakDateLabel: matchingCols[0]?.dateLabel ?? "10-19",
     };
     const second = rowBuckets[1] ?? {
       strike: allExpKingNode.secondLargestStrike,
@@ -1109,20 +1147,102 @@ export function computeFilteredSummaryMetrics(params: {
       Math.max(best.absGamma, totalFilteredGamma)
     );
     const isContested =
-      best.absGamma > 0 &&
-      (best.absGamma - second.absGamma) / best.absGamma <= 0.1;
+      best.absGamma >= 1 && second.absGamma >= best.absGamma * 0.9;
 
     const prefix =
       expirationFilter === "0DTE"
-        ? "0DTE King"
-        : expirationFilter === "OPEX"
-          ? "OPEX King"
-          : "Week King";
+        ? hasZeroDte
+          ? "0DTE King"
+          : "Next exp King"
+        : expirationFilter === "THIS_WEEK"
+          ? "Week King"
+          : expirationFilter === "OPEX"
+            ? "OPEX King"
+            : `${best.peakDateLabel} King`;
+
+    const spot = params.spotPrice ?? preset.spotPrice;
+
+    // Resolve precomputed gamma levels for the active filter if present
+    let filteredGammaLevels: GammaLevels | null = null;
+    const byFilter = gammaLevelsByFilter ?? preset.gammaLevelsByFilter;
+    if (byFilter) {
+      if (expirationFilter === "THIS_WEEK" && byFilter.THIS_WEEK) {
+        filteredGammaLevels = byFilter.THIS_WEEK;
+      } else if (expirationFilter === "0DTE" && byFilter["0DTE"]) {
+        filteredGammaLevels = byFilter["0DTE"];
+      } else if (expirationFilter === "OPEX" && byFilter.OPEX) {
+        filteredGammaLevels = byFilter.OPEX;
+      } else if (byFilter[expirationFilter]) {
+        filteredGammaLevels = byFilter[expirationFilter];
+      }
+    }
+
+    if (!filteredGammaLevels) {
+      let cw = spot;
+      let maxCall = -1;
+      let pw = spot;
+      let maxPut = -1;
+
+      for (const row of strikes) {
+        let callSum = 0;
+        let putSum = 0;
+        for (const col of matchingCols) {
+          callSum += row.callGex?.[col.id] ?? (row.gex[col.id] > 0 ? row.gex[col.id] : 0);
+          putSum += row.putGex?.[col.id] ?? (row.gex[col.id] < 0 ? Math.abs(row.gex[col.id]) : 0);
+        }
+        if (row.strike >= spot && callSum > maxCall) {
+          maxCall = callSum;
+          cw = row.strike;
+        }
+        if (row.strike <= spot && putSum > maxPut) {
+          maxPut = putSum;
+          pw = row.strike;
+        }
+      }
+
+      // Zero gamma interpolation
+      const sortedStrikes = [...strikes].sort((a, b) => a.strike - b.strike);
+      let zg = spot;
+      let minDiff = Infinity;
+      for (let i = 0; i < sortedStrikes.length - 1; i++) {
+        const r1 = sortedStrikes[i];
+        const r2 = sortedStrikes[i + 1];
+        let net1 = 0;
+        let net2 = 0;
+        for (const col of matchingCols) {
+          net1 += r1.gex[col.id] ?? 0;
+          net2 += r2.gex[col.id] ?? 0;
+        }
+        if ((net1 < 0 && net2 >= 0) || (net1 >= 0 && net2 < 0)) {
+          const denom = net2 - net1;
+          const cross =
+            Math.abs(denom) > 1e-12
+              ? r1.strike - net1 * ((r2.strike - r1.strike) / denom)
+              : (r1.strike + r2.strike) / 2;
+          const diff = Math.abs(cross - spot);
+          if (diff < minDiff) {
+            minDiff = diff;
+            zg = Number(cross.toFixed(1));
+          }
+        }
+      }
+
+      filteredGammaLevels = {
+        callWall: cw,
+        callWallGex: Number(Math.max(0, maxCall).toFixed(2)),
+        putWall: pw,
+        putWallGex: Number((-Math.max(0, maxPut)).toFixed(2)),
+        zeroGamma: zg,
+        hasZeroGammaFlip: minDiff < Infinity,
+      };
+    }
 
     return {
       netMetrics: {
         netGex: Number((sumGexM / 1000).toFixed(2)),
         netVex: Number(sumVexM.toFixed(1)),
+        netDex: Number(sumDexM.toFixed(1)),
+        netCharm: Number(sumCharmM.toFixed(1)),
       },
       kingNode: {
         allExpKing: allExpKingNode.allExpKing,
@@ -1140,6 +1260,7 @@ export function computeFilteredSummaryMetrics(params: {
         kingStrength,
         isContested,
       },
+      gammaLevels: filteredGammaLevels,
     };
   }
 
@@ -1150,6 +1271,13 @@ export function computeFilteredSummaryMetrics(params: {
       : expirationFilter === "0DTE"
         ? 0.38
         : 0.68;
+
+  const fallbackLevels =
+    (expirationFilter === "ALL"
+      ? allExpGammaLevels
+      : gammaLevelsByFilter?.[expirationFilter] ??
+        preset.gammaLevelsByFilter?.[expirationFilter]) ??
+    preset.gammaLevels;
 
   return {
     netMetrics: {
@@ -1171,6 +1299,7 @@ export function computeFilteredSummaryMetrics(params: {
         hasZeroDte: allExpKingNode.hasZeroDte,
       }
     ),
+    gammaLevels: fallbackLevels,
   };
 }
 
@@ -1213,13 +1342,18 @@ export interface DashboardState {
   isLoadingChain: boolean;
   toastMessage: string | null;
   lastUpdated: string;
+  bookTimestamp: string | null;
   spotPrice: number;
   previousClose: number;
   impliedVolatility: number;
   strikeStep: number;
+  extendedQuote: ExtendedQuoteInfo | null;
+  expectedMoves: ExpectedMovesPayload | null;
   netMetrics: NetMetrics;
   allExpNetMetrics: NetMetrics;
   gammaLevels: GammaLevels;
+  allExpGammaLevels: GammaLevels;
+  gammaLevelsByFilter: Record<string, GammaLevels> | null;
   kingNode: KingNodeMetrics;
   allExpKingNode: KingNodeMetrics;
   kingByFilter: OptionsAnalyticsPayload["kingByFilter"] | null;
@@ -1258,13 +1392,18 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   isLoadingChain: false,
   toastMessage: null,
   lastUpdated: "19:04 UTC",
+  bookTimestamp: null,
   spotPrice: defaultPreset.spotPrice,
   previousClose: defaultPreset.previousClose,
   impliedVolatility: defaultPreset.impliedVolatility,
   strikeStep: defaultPreset.strikeStep,
+  extendedQuote: null,
+  expectedMoves: null,
   netMetrics: { ...defaultPreset.netMetrics },
   allExpNetMetrics: { ...defaultPreset.netMetrics },
   gammaLevels: { ...defaultPreset.gammaLevels },
+  allExpGammaLevels: { ...defaultPreset.gammaLevels },
+  gammaLevelsByFilter: defaultPreset.gammaLevelsByFilter ?? null,
   kingNode: defaultKing,
   allExpKingNode: defaultKing,
   kingByFilter: null,
@@ -1274,7 +1413,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     metric: "GEX",
     expiration: "ALL",
   },
-  alerts: generateInitialAlerts(defaultPreset),
+  alerts: [],
   intradayData: generateIntradayTrajectory({
     ticker: defaultPreset.ticker,
     spotPrice: defaultPreset.spotPrice,
@@ -1312,6 +1451,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         strikes: [],
         allExpNetMetrics: preset.netMetrics,
         allExpKingNode: baseKing,
+        allExpGammaLevels: preset.gammaLevels,
+        gammaLevelsByFilter: preset.gammaLevelsByFilter ?? null,
+        spotPrice: preset.spotPrice,
       });
 
       return {
@@ -1321,9 +1463,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         previousClose: preset.previousClose,
         impliedVolatility: preset.impliedVolatility,
         strikeStep: preset.strikeStep,
+        extendedQuote: null,
+        expectedMoves: null,
         netMetrics: filtered.netMetrics,
         allExpNetMetrics: { ...preset.netMetrics },
-        gammaLevels: { ...preset.gammaLevels },
+        gammaLevels: filtered.gammaLevels,
+        allExpGammaLevels: { ...preset.gammaLevels },
+        gammaLevelsByFilter: preset.gammaLevelsByFilter ?? null,
         kingNode: filtered.kingNode,
         allExpKingNode: baseKing,
         kingByFilter: null,
@@ -1332,12 +1478,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         gridFilters: {
           ...state.gridFilters,
         },
-        alerts: generateInitialAlerts(preset),
+        alerts: [],
         intradayData: generateIntradayTrajectory({
           ticker: preset.ticker,
           spotPrice: preset.spotPrice,
           previousClose: preset.previousClose,
-          gammaLevels: preset.gammaLevels,
+          gammaLevels: filtered.gammaLevels,
           strikeStep: preset.strikeStep,
         }),
       };
@@ -1388,6 +1534,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       return {
         spotPrice: roundedSpot,
         netMetrics: {
+          ...state.netMetrics,
           netGex: gexDrift,
           netVex: vexDrift,
         },
@@ -1424,6 +1571,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
       return {
         gammaLevels: updatedWalls,
+        allExpGammaLevels: {
+          ...state.allExpGammaLevels,
+          ...walls,
+        },
         intradayData: updatedIntraday,
       };
     });
@@ -1523,12 +1674,16 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         strikes: state.chainStrikes,
         allExpNetMetrics: state.allExpNetMetrics,
         allExpKingNode: state.allExpKingNode,
+        allExpGammaLevels: state.allExpGammaLevels,
+        gammaLevelsByFilter: state.gammaLevelsByFilter,
+        spotPrice: state.spotPrice,
       });
 
       return {
         gridFilters: nextFilters,
         netMetrics: filtered.netMetrics,
         kingNode: filtered.kingNode,
+        gammaLevels: filtered.gammaLevels,
       };
     });
   },
@@ -1549,7 +1704,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         zeroDteDate:
           payload.kingNode.zeroDteDate ??
           payload.kingByFilter?.["0DTE"]?.label?.match(/\(([^)]+)\)/)?.[1] ??
-          "10-16",
+          "10-19",
         hasZeroDte: payload.kingNode.hasZeroDte ?? true,
         weeklyKing:
           payload.kingNode.weeklyKing ??
@@ -1558,7 +1713,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         weeklyDate:
           payload.kingNode.weeklyDate ??
           payload.kingByFilter?.THIS_WEEK?.label?.match(/\(([^)]+)\)/)?.[1] ??
-          "10-16",
+          "10-23",
       };
 
       const filtered = computeFilteredSummaryMetrics({
@@ -1568,6 +1723,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         strikes: payload.strikes,
         allExpNetMetrics: payload.netMetrics,
         allExpKingNode: baseAllExpKingNode,
+        allExpGammaLevels: payload.gammaLevels,
+        gammaLevelsByFilter: payload.gammaLevelsByFilter ?? null,
+        spotPrice: payload.spotPrice,
       });
 
       const isInitialChainHydration = state.chainStrikes.length === 0;
@@ -1579,16 +1737,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         minute: "2-digit",
       });
 
-      if (isInitialChainHydration) {
-        const prevCall =
-          payload.gammaLevels.callWall + payload.strikeStep * 5;
-        nextAlerts.push({
-          id: `${payload.ticker}-sync-cwall-${Date.now()}`,
-          timestamp: formattedTime,
-          type: "call",
-          message: `${payload.ticker} Call wall moved ${prevCall.toFixed(0)} → ${payload.gammaLevels.callWall.toFixed(0)}`,
-        });
-      } else {
+      if (!isInitialChainHydration) {
         if (payload.gammaLevels.callWall !== state.gammaLevels.callWall) {
           nextAlerts.push({
             id: `${payload.ticker}-cwall-${Date.now()}`,
@@ -1605,46 +1754,86 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             message: `${payload.ticker} Put wall moved ${state.gammaLevels.putWall.toFixed(0)} → ${payload.gammaLevels.putWall.toFixed(0)}`,
           });
         }
+        if (
+          (state.spotPrice < state.gammaLevels.zeroGamma &&
+            payload.spotPrice >= payload.gammaLevels.zeroGamma) ||
+          (state.spotPrice >= state.gammaLevels.zeroGamma &&
+            payload.spotPrice < payload.gammaLevels.zeroGamma)
+        ) {
+          const dir =
+            payload.spotPrice >= payload.gammaLevels.zeroGamma
+              ? "above"
+              : "below";
+          nextAlerts.push({
+            id: `${payload.ticker}-zg-${Date.now() + 2}`,
+            timestamp: formattedTime,
+            type: "zero",
+            message: `${payload.ticker} crossed ${dir} zero γ ($${payload.gammaLevels.zeroGamma.toFixed(2)}) — spot $${payload.spotPrice.toFixed(2)}`,
+          });
+        }
       }
 
-      const nextIntraday =
-        isInitialChainHydration ||
-        Math.abs(payload.spotPrice - state.spotPrice) > payload.strikeStep * 10
-          ? generateIntradayTrajectory({
-              ticker: payload.ticker,
-              spotPrice: payload.spotPrice,
-              previousClose: payload.previousClose,
-              gammaLevels: payload.gammaLevels,
-              strikeStep: payload.strikeStep,
-            })
-          : [
-              ...state.intradayData.slice(-59),
-              {
-                time: payload.lastUpdated,
-                spot: payload.spotPrice,
-                callWall: payload.gammaLevels.callWall,
-                putWall: payload.gammaLevels.putWall,
-                zeroGamma: payload.gammaLevels.zeroGamma,
-              },
-            ];
+      const nextIntraday: IntradayPoint[] =
+        payload.intradayData && payload.intradayData.length >= 2
+          ? payload.intradayData.map((d) => ({
+              time: d.time,
+              spot: d.spot,
+              callWall: d.callWall ?? (d as any).cw ?? payload.gammaLevels.callWall,
+              putWall: d.putWall ?? (d as any).pw ?? payload.gammaLevels.putWall,
+              zeroGamma: d.zeroGamma ?? (d as any).zg ?? payload.gammaLevels.zeroGamma,
+            }))
+          : isInitialChainHydration ||
+            Math.abs(payload.spotPrice - state.spotPrice) > payload.strikeStep * 10
+            ? generateIntradayTrajectory({
+                ticker: payload.ticker,
+                spotPrice: payload.spotPrice,
+                previousClose: payload.previousClose,
+                gammaLevels: payload.gammaLevels,
+                strikeStep: payload.strikeStep,
+              })
+            : [
+                ...state.intradayData.slice(-168),
+                {
+                  time: payload.lastUpdated,
+                  spot: payload.spotPrice,
+                  callWall: payload.gammaLevels.callWall,
+                  putWall: payload.gammaLevels.putWall,
+                  zeroGamma: payload.gammaLevels.zeroGamma,
+                },
+              ];
+
+      let resolvedAlerts: AlertItem[] = nextAlerts.slice(-50);
+      if (Array.isArray(payload.alerts) && payload.alerts.length > 0) {
+        resolvedAlerts = payload.alerts.map((a, i) => ({
+          id: a.id || `${payload.ticker}-alert-${i}`,
+          timestamp: a.timestamp || (a as any).time || formattedTime,
+          message: a.message || (a as any).msg || "",
+          type: a.type || "zero",
+        }));
+      }
 
       return {
         dataSource: payload.dataSource,
         isLoadingChain: false,
         lastUpdated: payload.lastUpdated,
+        bookTimestamp: payload.bookTimestamp ?? null,
         spotPrice: payload.spotPrice,
         previousClose: payload.previousClose,
         impliedVolatility: payload.impliedVolatility,
         strikeStep: payload.strikeStep,
+        extendedQuote: payload.extendedQuote ?? null,
+        expectedMoves: payload.expectedMoves ?? null,
         netMetrics: filtered.netMetrics,
         allExpNetMetrics: payload.netMetrics,
-        gammaLevels: payload.gammaLevels,
+        gammaLevels: filtered.gammaLevels,
+        allExpGammaLevels: payload.gammaLevels,
+        gammaLevelsByFilter: payload.gammaLevelsByFilter ?? null,
         kingNode: filtered.kingNode,
         allExpKingNode: baseAllExpKingNode,
         kingByFilter: payload.kingByFilter,
         chainExpirations: payload.expirations,
         chainStrikes: payload.strikes,
-        alerts: nextAlerts.slice(-50),
+        alerts: resolvedAlerts,
         intradayData: nextIntraday,
       };
     });

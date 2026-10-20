@@ -27,6 +27,8 @@ interface StrikeExposureColumn {
   filteredKingConcPct: number;
   bookCenter: number;
   strikeValues: Record<number, number>; // value in Millions ($M)
+  strikeGexValues?: Record<number, number>;
+  strikeVexValues?: Record<number, number>;
   topLevels: { strike: number; valueM: number }[];
 }
 
@@ -113,6 +115,35 @@ function evaluateBucketExposureM(
   if (mode === "GEX") return netGexM;
   if (mode === "VEX") return netVexM;
   return netGexM + netVexM;
+}
+
+interface DivergenceSignal {
+  type: string;
+  p1: number;
+  p2: number;
+  t1: number;
+  t2: number;
+  near?: [string, number][];
+}
+
+interface DivergenceRow {
+  tf: string;
+  name: string;
+  state: string;
+  signal: DivergenceSignal | null;
+  building?: boolean;
+  intraday?: boolean;
+}
+
+interface DivergencePayload {
+  symbol: string;
+  rows: DivergenceRow[];
+  levels: { King: number; "Call wall": number; "Put wall": number };
+}
+
+function divWhen(t: number, intraday?: boolean): string {
+  const d = new Date(t * 1000).toISOString();
+  return intraday ? `${d.slice(5, 10)} ${d.slice(11, 16)}` : d.slice(0, 10);
 }
 
 /**
@@ -230,6 +261,22 @@ function buildLiveAntaeusDataset(
     // 2. Filtered Expiration King & Active Book calculation across activeBuckets
     const strikeTotals =
       expFilter === "ALL" ? allExpStrikeTotals : new Map<number, number>();
+    const strikeGexTotals = new Map<number, number>();
+    const strikeVexTotals = new Map<number, number>();
+
+    const bucketsForDual = expFilter === "ALL" ? optionBuckets : activeBuckets;
+    for (const bucket of bucketsForDual) {
+      const gex = evaluateBucketExposureM(spot, bucket, "GEX");
+      const vex = evaluateBucketExposureM(spot, bucket, "VEX");
+      strikeGexTotals.set(
+        bucket.strike,
+        (strikeGexTotals.get(bucket.strike) ?? 0) + gex
+      );
+      strikeVexTotals.set(
+        bucket.strike,
+        (strikeVexTotals.get(bucket.strike) ?? 0) + vex
+      );
+    }
 
     if (expFilter !== "ALL") {
       for (const bucket of activeBuckets) {
@@ -245,6 +292,8 @@ function buildLiveAntaeusDataset(
     let totalAbsBoardM = 0;
     const rankedFiltered: { strike: number; valueM: number }[] = [];
     const strikeValues: Record<number, number> = {};
+    const strikeGexValues: Record<number, number> = {};
+    const strikeVexValues: Record<number, number> = {};
 
     for (const [strike, valM] of Array.from(strikeTotals.entries())) {
       const rounded = Number(valM.toFixed(2));
@@ -253,6 +302,17 @@ function buildLiveAntaeusDataset(
       rankedFiltered.push({ strike, valueM: rounded });
       if (visibleStrikeSet.has(strike)) {
         strikeValues[strike] = rounded;
+      }
+    }
+
+    for (const [strike, valM] of Array.from(strikeGexTotals.entries())) {
+      if (visibleStrikeSet.has(strike)) {
+        strikeGexValues[strike] = Number(valM.toFixed(2));
+      }
+    }
+    for (const [strike, valM] of Array.from(strikeVexTotals.entries())) {
+      if (visibleStrikeSet.has(strike)) {
+        strikeVexValues[strike] = Number(valM.toFixed(2));
       }
     }
 
@@ -307,6 +367,8 @@ function buildLiveAntaeusDataset(
       filteredKingConcPct,
       bookCenter,
       strikeValues,
+      strikeGexValues,
+      strikeVexValues,
       topLevels,
     };
   });
@@ -361,10 +423,13 @@ function buildLiveAntaeusDataset(
 
 export function AntaeusView() {
   const storeTicker = useDashboardStore((state) => state.activeTicker);
+  const gammaLevels = useDashboardStore((state) => state.gammaLevels);
   const setStoreTicker = useDashboardStore((state) => state.setTicker);
   const fetchOptionsChain = useDashboardStore(
     (state) => state.fetchOptionsChain
   );
+
+  const DIVSYM = useMemo(() => new Set(["SPY", "QQQ", "SPXW", "IWM"]), []);
 
   const [tickerInput, setTickerInput] = useState<string>(storeTicker || "SPY");
   const [loadedTicker, setLoadedTicker] = useState<string>(storeTicker || "SPY");
@@ -385,6 +450,8 @@ export function AntaeusView() {
   const [activeBarIndex, setActiveBarIndex] = useState<number>(0);
   const [hoverBarIndex, setHoverBarIndex] = useState<number | null>(null);
   const [isReplaying, setIsReplaying] = useState<boolean>(false);
+  const [openDivTf, setOpenDivTf] = useState<string | null>(null);
+  const [divPayload, setDivPayload] = useState<DivergencePayload | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -436,6 +503,26 @@ export function AntaeusView() {
     fetchLiveAntaeus(loadedTicker, selectedSessionIso);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const sym = loadedTicker.toUpperCase();
+    if (!DIVSYM.has(sym)) {
+      setDivPayload(null);
+      return;
+    }
+    let active = true;
+    fetch(`/api/divergence?symbol=${encodeURIComponent(sym)}`, { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (active && data && Array.isArray(data.rows)) {
+          setDivPayload(data as DivergencePayload);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [loadedTicker, DIVSYM]);
 
   // Observe chart container width for responsive high-DPI canvas rendering
   useEffect(() => {
@@ -665,15 +752,7 @@ export function AntaeusView() {
       const colKingStrike = isFiltered ? col.filteredKingStrike : col.allExpKingStrike;
 
       for (const strike of dataset.visibleStrikes) {
-        const val = col.strikeValues[strike] ?? 0;
-        const absExposure = Math.abs(val);
-        if (absExposure <= 0.01) continue;
-
         const cy = priceToY(strike);
-        const weight = Math.pow(
-          Math.min(1, absExposure / maxSessionExposure),
-          1.8
-        );
         const isKing = strike === colKingStrike;
 
         if (isKing) {
@@ -690,10 +769,62 @@ export function AntaeusView() {
           ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
           ctx.fill();
           ctx.restore();
+          continue;
+        }
+
+        if (exposureMode === "Combined") {
+          // Dual overlay: render GEX (cyan/purple) and VEX (amber/violet)
+          const gVal = col.strikeGexValues?.[strike] ?? 0;
+          const vVal = col.strikeVexValues?.[strike] ?? 0;
+
+          if (Math.abs(gVal) > 0.01) {
+            const weightG = Math.pow(Math.min(1, Math.abs(gVal) / maxSessionExposure), 1.8);
+            let rx = 1.3;
+            let ry = 1.3;
+            let alpha = 0.22;
+            if (weightG >= 0.25) {
+              const tScale = Math.min(1, (weightG - 0.25) / 0.55);
+              rx = Math.min(colStepX * 0.42, 1.5 + tScale * (3.2 - 1.5));
+              ry = 1.5 + tScale * (2.4 - 1.5);
+              alpha = 0.35 + tScale * (0.85 - 0.35);
+            }
+            ctx.save();
+            ctx.fillStyle = gVal >= 0 ? "#22d3ee" : "#a855f7";
+            ctx.globalAlpha = alpha * 0.82;
+            ctx.beginPath();
+            ctx.ellipse(cx - 1.2, cy, rx, ry, 0, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+          }
+
+          if (Math.abs(vVal) > 0.01) {
+            const weightV = Math.pow(Math.min(1, Math.abs(vVal) / maxSessionExposure), 1.8);
+            let rx = 1.3;
+            let ry = 1.3;
+            let alpha = 0.22;
+            if (weightV >= 0.25) {
+              const tScale = Math.min(1, (weightV - 0.25) / 0.55);
+              rx = Math.min(colStepX * 0.42, 1.5 + tScale * (3.2 - 1.5));
+              ry = 1.5 + tScale * (2.4 - 1.5);
+              alpha = 0.35 + tScale * (0.85 - 0.35);
+            }
+            ctx.save();
+            ctx.fillStyle = vVal >= 0 ? "#f59e0b" : "#8b5cf6";
+            ctx.globalAlpha = alpha * 0.82;
+            ctx.beginPath();
+            ctx.ellipse(cx + 1.2, cy, rx, ry, 0, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+          }
         } else {
-          // Non-linear power curve contrast:
-          // Weak strikes (weight < 0.25) -> tiny dim pinpricks (rx = 1.3, ry = 1.3, alpha = 0.22)
-          // Major strikes -> luminous ovals (up to rx = 3.2, ry = 2.4, alpha = 0.85)
+          const val = col.strikeValues[strike] ?? 0;
+          const absExposure = Math.abs(val);
+          if (absExposure <= 0.01) continue;
+
+          const weight = Math.pow(
+            Math.min(1, absExposure / maxSessionExposure),
+            1.8
+          );
           let rx = 1.3;
           let ry = 1.3;
           let alpha = 0.22;
@@ -825,7 +956,7 @@ export function AntaeusView() {
     }
 
     // Non-Repainting 3-Left / 3-Right Pivot Divergence Lines & Triangles
-    const drawTriangle = (tx: number, ty: number, isBull: boolean) => {
+    const drawTriangle = (tx: number, ty: number, isBull: boolean, isNearLevel: boolean = false) => {
       ctx.fillStyle = isBull ? "#22c55e" : "#ef4444";
       ctx.beginPath();
       if (isBull) {
@@ -839,13 +970,20 @@ export function AntaeusView() {
       }
       ctx.closePath();
       ctx.fill();
+      if (isNearLevel) {
+        ctx.strokeStyle = "#facc15";
+        ctx.lineWidth = 1.4;
+        ctx.stroke();
+      }
     };
 
+    const curKing = dataset.columnsByBar[safeActiveIdx]?.allExpKingStrike ?? 0;
     for (const sig of dataset.pivotSignals5m) {
       if (safeActiveIdx < sig.confirmedAtIndex) continue;
 
       const x2 = barToX(sig.p2Index);
       const y2 = priceToY(sig.p2Price);
+      const isNear = curKing > 0 && Math.abs(sig.p2Price - curKing) / curKing <= 0.0015;
 
       ctx.save();
       if (sig.p1Index >= 0) {
@@ -860,10 +998,10 @@ export function AntaeusView() {
         ctx.lineTo(x2, y2);
         ctx.stroke();
 
-        drawTriangle(x1, y1, sig.type === "BULL");
+        drawTriangle(x1, y1, sig.type === "BULL", false);
       }
 
-      drawTriangle(x2, y2, sig.type === "BULL");
+      drawTriangle(x2, y2, sig.type === "BULL", isNear);
       ctx.restore();
     }
 
@@ -962,6 +1100,43 @@ export function AntaeusView() {
     ctx.beginPath();
     ctx.arc(dividerX, yPriorClose, 3.5, 0, Math.PI * 2);
     ctx.fill();
+
+    // Pin (+GEX, cyan tint) and Fast-move (-GEX, purple tint) shading inside right-side outlook cone
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(dividerX, yPriorClose);
+    ctx.lineTo(outlookRightX, yPlus2);
+    ctx.lineTo(outlookRightX, yMinus2);
+    ctx.closePath();
+    ctx.clip();
+
+    const activeCol = dataset.columnsByBar[safeActiveIdx];
+    if (activeCol) {
+      // Shade Pin zones (+exposure)
+      const posStrikes = dataset.visibleStrikes.filter(
+        (k) =>
+          (activeCol.strikeValues[k] ?? 0) > 0 &&
+          Math.abs(k - dataset.priorClose) <= dataset.sigma2Move
+      );
+      posStrikes.forEach((k) => {
+        const y = priceToY(k);
+        ctx.fillStyle = "rgba(34, 211, 238, 0.22)";
+        ctx.fillRect(dividerX, y - 4, outlookRightX - dividerX, 8);
+      });
+
+      // Shade Fast zones (-exposure)
+      const negStrikes = dataset.visibleStrikes.filter(
+        (k) =>
+          (activeCol.strikeValues[k] ?? 0) < 0 &&
+          Math.abs(k - dataset.priorClose) <= dataset.sigma2Move
+      );
+      negStrikes.forEach((k) => {
+        const y = priceToY(k);
+        ctx.fillStyle = "rgba(232, 121, 249, 0.24)";
+        ctx.fillRect(dividerX, y - 4, outlookRightX - dividerX, 8);
+      });
+    }
+    ctx.restore();
     ctx.restore();
 
     // Path to King Projection (dashed gold curve #eab308, stroke-dasharray: 4 4, anchored to All-exp King)
@@ -1215,7 +1390,7 @@ export function AntaeusView() {
     <div className="space-y-3.5 pb-4">
       {/* 2A. Section Title & Collapsible Guide */}
       <div className="space-y-2.5">
-        <h1 className="text-xl font-bold text-white tracking-tight">Antaeus</h1>
+        <h1 className="text-xl font-bold text-white tracking-tight">Gaia</h1>
 
         <div className="bg-[#101520] border border-[#1e2638] rounded-xl transition-all duration-150">
           <button
@@ -1223,7 +1398,7 @@ export function AntaeusView() {
             onClick={() => setGuideExpanded((prev) => !prev)}
             className="w-full text-left px-4 py-2.5 text-xs font-bold text-[#38bdf8] hover:text-sky-300 flex items-center justify-between cursor-pointer"
           >
-            <span>? How to read Antaeus</span>
+            <span>? How to read Gaia</span>
           </button>
 
           {guideExpanded && (
@@ -1484,6 +1659,11 @@ export function AntaeusView() {
               All-exp King {activeBookCol.allExpKingStrike} ·{" "}
               {formatPct(activeBookCol.allExpKingConcPct)}%
             </span>
+            {(exposureMode === "VEX" || exposureMode === "Combined") && (
+              <span className="bg-amber-500/15 border border-amber-400/80 text-[#fde047] rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
+                VEX King (multi-day) {activeBookCol.allExpKingStrike}
+              </span>
+            )}
             {expFilter !== "ALL" && (
               <span className="bg-[#151b28] border border-slate-500/60 text-white rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
                 {expFilter === "NEXT"
@@ -1634,10 +1814,10 @@ export function AntaeusView() {
             )}
           />
 
-          {/* Layer 4: Multi-Timeframe Divergence HUD Table (top-right of candlestick zone) */}
-          {dataset && (
+          {/* Layer 4: Multi-Timeframe Divergence HUD Table (top-right of candlestick zone, SPY, QQQ, SPXW, IWM only) */}
+          {dataset && DIVSYM.has(loadedTicker.toUpperCase()) && (
             <div
-              className="absolute top-3 z-10 bg-[#0d121c]/95 border border-[#232d42] rounded-md text-[11px] font-mono overflow-hidden shadow-lg pointer-events-none"
+              className="absolute top-3 z-10 bg-[#0d121c]/95 border border-[#232d42] rounded-md text-[11px] font-mono overflow-hidden shadow-lg"
               style={{
                 right: `${Math.round(
                   canvasWidth - (18 + (canvasWidth - 18 - 64) * 0.76) + 10
@@ -1646,34 +1826,78 @@ export function AntaeusView() {
             >
               <table className="border-collapse">
                 <tbody>
-                  {[
-                    { label: "5 min divergence", status: mtfDivergence.tf5m },
-                    { label: "30 min divergence", status: mtfDivergence.tf30m },
-                    { label: "2HR divergence", status: mtfDivergence.tf2h },
-                    { label: "Daily divergence", status: mtfDivergence.tfDaily },
-                    { label: "Weekly divergence", status: mtfDivergence.tfWeekly },
-                  ].map((row, idx) => (
-                    <tr
-                      key={row.label}
-                      className={cn(idx > 0 && "border-t border-[#1e2638]")}
-                    >
-                      <td className="px-2.5 py-1 text-slate-200 border-r border-[#1e2638]">
-                        {row.label}
-                      </td>
-                      <td
-                        className={cn(
-                          "px-2.5 py-1 text-center font-bold",
-                          row.status === "BULL"
-                            ? "text-[#22c55e]"
-                            : row.status === "BEAR"
-                              ? "text-[#ef4444]"
-                              : "text-slate-400"
+                  {(divPayload?.rows && divPayload.rows.length === 5
+                    ? divPayload.rows.map((r) => ({
+                        tf: r.tf,
+                        label:
+                          r.tf === "5"
+                            ? "5 min divergence"
+                            : r.tf === "30"
+                              ? "30 min divergence"
+                              : r.tf === "120"
+                                ? "2HR divergence"
+                                : r.tf === "D"
+                                  ? "Daily divergence"
+                                  : "Weekly divergence",
+                        status: r.state,
+                        detail:
+                          r.state === "NO" || !r.signal
+                            ? "No confirmed divergence in the last 30 bars"
+                            : `${r.signal.type.toUpperCase()} · pivots ${divWhen(r.signal.t1, r.intraday)} (${r.signal.p1}) → ${divWhen(r.signal.t2, r.intraday)} (${r.signal.p2})`,
+                        near:
+                          r.signal?.near && r.signal.near.length > 0
+                            ? r.signal.near.map((n) => `${n[0]} ${n[1]}`).join(", ")
+                            : null,
+                      }))
+                    : [
+                        { tf: "5", label: "5 min divergence", status: mtfDivergence.tf5m, detail: "No confirmed divergence in the last 30 bars", near: null },
+                        { tf: "30", label: "30 min divergence", status: mtfDivergence.tf30m, detail: "No confirmed divergence in the last 30 bars", near: null },
+                        { tf: "120", label: "2HR divergence", status: mtfDivergence.tf2h, detail: "No confirmed divergence in the last 30 bars", near: null },
+                        { tf: "D", label: "Daily divergence", status: mtfDivergence.tfDaily, detail: "No confirmed divergence in the last 30 bars", near: null },
+                        { tf: "W", label: "Weekly divergence", status: mtfDivergence.tfWeekly, detail: "No confirmed divergence in the last 30 bars", near: null },
+                      ]
+                  ).map((row, idx) => {
+                    const isOpen = openDivTf === row.tf;
+                    return (
+                      <React.Fragment key={row.tf}>
+                        <tr
+                          onClick={() => setOpenDivTf(isOpen ? null : row.tf)}
+                          className={cn(
+                            "cursor-pointer hover:bg-white/5 transition-colors",
+                            idx > 0 && "border-t border-[#1e2638]"
+                          )}
+                        >
+                          <td className="px-2.5 py-1 text-slate-200 border-r border-[#1e2638]">
+                            {row.label}
+                          </td>
+                          <td
+                            className={cn(
+                              "px-2.5 py-1 text-center font-bold min-w-[42px]",
+                              row.status === "BULL"
+                                ? "text-[#22c55e]"
+                                : row.status === "BEAR"
+                                  ? "text-[#ef4444]"
+                                  : "text-slate-400"
+                            )}
+                          >
+                            {row.status}
+                          </td>
+                        </tr>
+                        {isOpen && (
+                          <tr className="border-t border-[#1e2638]/50 bg-[#080d17]">
+                            <td colSpan={2} className="px-2.5 py-1 text-[10px] text-slate-400 max-w-[240px]">
+                              <span>{row.detail}</span>
+                              {row.near && (
+                                <span className="text-[#facc15] font-semibold ml-1">
+                                  · near {row.near}
+                                </span>
+                              )}
+                            </td>
+                          </tr>
                         )}
-                      >
-                        {row.status}
-                      </td>
-                    </tr>
-                  ))}
+                      </React.Fragment>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1754,3 +1978,5 @@ export function AntaeusView() {
     </div>
   );
 }
+
+export const GaiaView = AntaeusView;

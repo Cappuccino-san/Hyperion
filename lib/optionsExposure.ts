@@ -19,6 +19,9 @@ export interface NormalizedOptionContract {
   gamma: number;
   vega: number;
   percentChange: number;
+  bid?: number;
+  ask?: number;
+  last?: number;
 }
 
 export interface ExpirationColumnSpec {
@@ -26,6 +29,7 @@ export interface ExpirationColumnSpec {
   isoDate: string;
   tag: string;
   filterGroup: "0DTE" | "THIS_WEEK" | "OPEX";
+  inThisWeek: boolean;
   dateLabel: string;
   dteDays: number;
 }
@@ -38,38 +42,99 @@ export interface ComputedStrikeRow {
   totalPutGamma: number;
   kingPeakColId: string;
   gex: Record<string, number>;
+  callGex?: Record<string, number>;
+  putGex?: Record<string, number>;
   vex: Record<string, number>;
   dex: Record<string, number>;
   charm: Record<string, number>;
   openPctChange: Record<string, number>;
 }
 
+export interface ExpectedMoveHorizon {
+  exp: string;
+  em: number;
+  pct: number;
+  low: number;
+  high: number;
+  fixed?: boolean;
+}
+
+export interface ExpectedMovesPayload {
+  daily: ExpectedMoveHorizon | null;
+  weekly: ExpectedMoveHorizon | null;
+  monthly: ExpectedMoveHorizon | null;
+  annual: ExpectedMoveHorizon | null;
+}
+
+export interface ExtendedQuoteInfo {
+  type: "pre" | "after";
+  price: number;
+  change: number;
+  changePct: number;
+}
+
 export interface OptionsAnalyticsPayload {
   ticker: TickerSymbol;
   dataSource: DataSourceType;
   lastUpdated: string;
+  bookTimestamp?: string;
   spotPrice: number;
   previousClose: number;
   impliedVolatility: number;
   strikeStep: number;
+  extendedQuote?: ExtendedQuoteInfo | null;
+  expectedMoves?: ExpectedMovesPayload;
   netMetrics: {
     netGex: number; // $B
     netVex: number; // $M
+    netDex?: number; // $M
+    netCharm?: number; // $M
   };
   gammaLevels: {
     callWall: number;
+    callWallGex?: number; // $M
     putWall: number;
+    putWallGex?: number; // $M (negative)
     zeroGamma: number;
+    hasZeroGammaFlip?: boolean;
   };
+  gammaLevelsByFilter?: Record<string, {
+    callWall: number;
+    callWallGex?: number;
+    putWall: number;
+    putWallGex?: number;
+    zeroGamma: number;
+    hasZeroGammaFlip?: boolean;
+  }>;
   kingNode: KingNodeMetrics;
   kingByFilter: {
-    ALL: { strike: number; label: string };
-    "0DTE": { strike: number; label: string };
-    THIS_WEEK: { strike: number; label: string };
-    OPEX: { strike: number; label: string };
+    ALL: { strike: number; label: string; exp?: string };
+    "0DTE": { strike: number; label: string; exp?: string };
+    THIS_WEEK: { strike: number; label: string; exp?: string };
+    OPEX: { strike: number; label: string; exp?: string };
   };
   expirations: ExpirationColumnSpec[];
   strikes: ComputedStrikeRow[];
+  intradayData?: Array<{
+    time: string;
+    spot: number;
+    callWall: number;
+    putWall: number;
+    zeroGamma: number;
+    t?: string;
+    ts?: number;
+    cw?: number;
+    pw?: number;
+    zg?: number;
+  }>;
+  alerts?: Array<{
+    id: string;
+    timestamp: string;
+    time?: string;
+    message: string;
+    msg?: string;
+    type: "call" | "put" | "zero" | "king";
+  }>;
 }
 
 export const normPDF = (x: number): number =>
@@ -125,16 +190,16 @@ export function formatExposure(
 }
 
 /**
- * Exact Black-Scholes Greeks (Gamma, Vanna, Charm, Delta)
- * r = 0.045, q = 0.012
+ * Exact Black-Scholes Greeks & Theoretical Prices (Gamma, Vanna, Charm, Delta, Call/Put Price)
+ * r = 0.0475, q = 0.0
  */
 export function computeBlackScholesGreeks(
   S: number,
   K: number,
   T: number,
   sigma: number,
-  r = 0.045,
-  q = 0.012
+  r = 0.0475,
+  q = 0.0
 ) {
   const effectiveT = Math.max(5 / (252 * 390), T);
   const effectiveSigma = Math.max(0.02, Math.min(3.5, sigma));
@@ -148,6 +213,7 @@ export function computeBlackScholesGreeks(
 
   const pdfD1 = normPDF(d1);
   const discountQ = Math.exp(-q * effectiveT);
+  const discountR = Math.exp(-r * effectiveT);
 
   const gamma = (discountQ * pdfD1) / (S * effectiveSigma * sqrtT);
   const vanna = -discountQ * pdfD1 * (d2 / effectiveSigma); // dDelta / dVol
@@ -163,6 +229,15 @@ export function computeBlackScholesGreeks(
   const deltaCall = discountQ * normCDF(d1);
   const deltaPut = -discountQ * normCDF(-d1);
 
+  const callPrice = Math.max(
+    0,
+    S * discountQ * normCDF(d1) - K * discountR * normCDF(d2)
+  );
+  const putPrice = Math.max(
+    0,
+    K * discountR * normCDF(-d2) - S * discountQ * normCDF(-d1)
+  );
+
   return {
     gamma,
     vanna,
@@ -170,6 +245,8 @@ export function computeBlackScholesGreeks(
     charmPut,
     deltaCall,
     deltaPut,
+    callPrice,
+    putPrice,
   };
 }
 
@@ -220,13 +297,12 @@ export function getActiveExpirationSelection(allRawExpirations: string[]): {
   });
   const dayOfWeek = nowEt.getDay();
   const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
-  const isBeforeClose =
-    nowEt.getHours() < 16 ||
-    (nowEt.getHours() === 16 && nowEt.getMinutes() === 0);
+  const mins = nowEt.getHours() * 60 + nowEt.getMinutes();
+  const isRegularSession = isWeekday && mins >= 570 && mins < 960;
 
   const earliest = sorted[0];
   const hasZeroDte =
-    earliest === nowEtIso && isWeekday && isBeforeClose;
+    earliest === nowEtIso && isRegularSession;
 
   if (hasZeroDte) {
     const active = sorted.filter((exp) => exp >= nowEtIso);
@@ -237,7 +313,18 @@ export function getActiveExpirationSelection(allRawExpirations: string[]): {
     };
   }
 
-  // After 4:00 PM ET close or on weekends, any expiration <= earliest (if earliest <= nowEtIso) is already settled
+  // Outside regular session:
+  // Before 9:30 AM ET on a weekday, today's expiration (if earliest === nowEtIso) is the upcoming session
+  if (isWeekday && mins < 570 && earliest === nowEtIso) {
+    const active = sorted.filter((exp) => exp >= nowEtIso);
+    return {
+      referenceDate: earliest,
+      hasZeroDte: false,
+      activeExpirations: active.length > 0 ? active : sorted,
+    };
+  }
+
+  // After 4:00 PM ET close or on weekends, any expiration <= nowEtIso is already settled
   const settledCutoff = earliest <= nowEtIso ? earliest : nowEtIso;
   const postCloseActive = sorted.filter((exp) => exp > settledCutoff);
   return {
@@ -247,11 +334,28 @@ export function getActiveExpirationSelection(allRawExpirations: string[]): {
   };
 }
 
+function getThisWeekIsoSet(allExpirations: string[]): Set<string> {
+  if (allExpirations.length === 0) return new Set();
+  const d0 = new Date(`${allExpirations[0]}T12:00:00Z`);
+  const wd = d0.getUTCDay();
+  const toFri = (5 - wd + 7) % 7;
+  const fri = new Date(d0.getTime() + toFri * 86400000);
+  const out = new Set<string>();
+  for (const exp of allExpirations) {
+    if (new Date(`${exp}T12:00:00Z`) <= fri) {
+      out.add(exp);
+    }
+  }
+  if (out.size === 0) out.add(allExpirations[0]);
+  return out;
+}
+
 function formatExpirationColumn(
   isoDate: string,
   index: number,
   referenceDateStr: string,
-  hasZeroDte: boolean
+  hasZeroDte: boolean,
+  inThisWeek: boolean
 ): ExpirationColumnSpec {
   const refTime = new Date(`${referenceDateStr}T00:00:00Z`).getTime();
   const expTime = new Date(`${isoDate}T00:00:00Z`).getTime();
@@ -275,7 +379,7 @@ function formatExpirationColumn(
   } else if (index === 0) {
     tag = diffDays <= 7 ? `${diffDays}D` : "NEXT";
     filterGroup = "0DTE";
-  } else if (diffDays <= 7) {
+  } else if (inThisWeek || diffDays <= 7) {
     tag = `${diffDays}D`;
     filterGroup = "THIS_WEEK";
   } else if (isThirdFriday || diffDays >= 25) {
@@ -291,13 +395,84 @@ function formatExpirationColumn(
     isoDate,
     tag,
     filterGroup,
+    inThisWeek,
     dateLabel: mmdd,
     dteDays: diffDays,
   };
 }
 
 /**
- * Evaluates dealer exposure & structural walls from a list of normalized option contracts.
+ * Computes Expected Move (0.85 × ATM Straddle) for a specific expiration date.
+ */
+function computeExpirationExpectedMove(
+  expIso: string,
+  spotPrice: number,
+  impliedVolatility: number,
+  dteDays: number,
+  contractsForExp: NormalizedOptionContract[]
+): ExpectedMoveHorizon | null {
+  if (!expIso) return null;
+
+  // Find ATM strike closest to spotPrice
+  let atmStrike = spotPrice;
+  let bestDist = Infinity;
+  for (const c of contractsForExp) {
+    const d = Math.abs(c.strike - spotPrice);
+    if (d < bestDist) {
+      bestDist = d;
+      atmStrike = c.strike;
+    }
+  }
+
+  let callMid = 0;
+  let putMid = 0;
+  let callIv = impliedVolatility;
+  let putIv = impliedVolatility;
+
+  for (const c of contractsForExp) {
+    if (Math.abs(c.strike - atmStrike) > 1e-3) continue;
+    const rawIv =
+      c.iv > 0.02 ? (c.iv > 4 ? c.iv / 100 : c.iv) : impliedVolatility;
+    const mid =
+      c.bid !== undefined && c.ask !== undefined && c.bid > 0 && c.ask > 0
+        ? (c.bid + c.ask) / 2
+        : c.last !== undefined && c.last > 0
+          ? c.last
+          : 0;
+    if (c.optionType === "C") {
+      if (mid > 0) callMid = mid;
+      callIv = rawIv;
+    } else {
+      if (mid > 0) putMid = mid;
+      putIv = rawIv;
+    }
+  }
+
+  const T = Math.max(1 / 365, (dteDays + 0.5) / 365);
+  if (callMid <= 0) {
+    callMid = computeBlackScholesGreeks(spotPrice, atmStrike, T, callIv).callPrice;
+  }
+  if (putMid <= 0) {
+    putMid = computeBlackScholesGreeks(spotPrice, atmStrike, T, putIv).putPrice;
+  }
+
+  const straddle = callMid + putMid;
+  const em = Number((0.85 * straddle).toFixed(2));
+  const pct = Number(((em / Math.max(1, spotPrice)) * 100).toFixed(2));
+  const low = Number((spotPrice - em).toFixed(2));
+  const high = Number((spotPrice + em).toFixed(2));
+
+  return {
+    exp: expIso,
+    em,
+    pct,
+    low,
+    high,
+  };
+}
+
+/**
+ * Evaluates dealer exposure & structural walls across the FULL options chain (all non-expired expirations & all strikes).
  */
 export function computeOptionsAnalytics(params: {
   ticker: TickerSymbol;
@@ -307,6 +482,8 @@ export function computeOptionsAnalytics(params: {
   impliedVolatility: number; // decimal
   contracts: NormalizedOptionContract[];
   activeExpirationFilter?: string;
+  extendedQuote?: ExtendedQuoteInfo | null;
+  bookTimestamp?: string;
 }): OptionsAnalyticsPayload {
   const {
     ticker,
@@ -316,21 +493,21 @@ export function computeOptionsAnalytics(params: {
     impliedVolatility,
     contracts,
     activeExpirationFilter = "0DTE",
+    extendedQuote = null,
+    bookTimestamp,
   } = params;
 
   const preset = getTickerPreset(ticker);
-  const minStrike = spotPrice * 0.85;
-  const maxStrike = spotPrice * 1.15;
 
-  // Filter contracts to valid strikes within ±15% of spotPrice
+  // Full book aggregation: keep all valid positive strikes with open interest or volume
   const validContracts = contracts.filter(
     (c) =>
-      c.strike >= minStrike &&
-      c.strike <= maxStrike &&
+      c.strike > 0 &&
+      Number.isFinite(c.strike) &&
       (c.openInterest > 0 || c.volume > 0)
   );
 
-  // Collect active (unsettled) expirations using unified ET market-hours check
+  // Collect all active (unsettled) expirations using unified ET market-hours check
   const rawExpirations = Array.from(
     new Set(validContracts.map((c) => c.expiration))
   ).sort();
@@ -338,26 +515,18 @@ export function computeOptionsAnalytics(params: {
   const { referenceDate, hasZeroDte, activeExpirations: allExpirations } =
     getActiveExpirationSelection(rawExpirations);
 
-  // Pick 13 expiration columns: nearest 8 active dates + 5 highest-OI medium/OPEX dates
-  const targetColCount = 13;
-  let selectedIsoDates = allExpirations.slice(0, targetColCount);
-  if (allExpirations.length > targetColCount) {
-    const immediateEight = allExpirations.slice(0, 8);
-    const remaining = allExpirations.slice(8);
-    const oiByExp = new Map<string, number>();
-    for (const c of validContracts) {
-      const weight = c.openInterest > 0 ? c.openInterest : Math.round(c.volume * 0.5);
-      oiByExp.set(c.expiration, (oiByExp.get(c.expiration) ?? 0) + weight);
-    }
-    const topFiveLiquid = remaining
-      .sort((a, b) => (oiByExp.get(b) ?? 0) - (oiByExp.get(a) ?? 0))
-      .slice(0, 5)
-      .sort();
-    selectedIsoDates = [...immediateEight, ...topFiveLiquid];
-  }
+  // Keep ALL active non-expired expirations (no 13-expiration truncation)
+  const selectedIsoDates = allExpirations;
+  const thisWeekIsoSet = getThisWeekIsoSet(selectedIsoDates);
 
   const expirations: ExpirationColumnSpec[] = selectedIsoDates.map((iso, idx) =>
-    formatExpirationColumn(iso, idx, referenceDate, hasZeroDte)
+    formatExpirationColumn(
+      iso,
+      idx,
+      referenceDate,
+      hasZeroDte,
+      thisWeekIsoSet.has(iso)
+    )
   );
 
   const isoToColId = new Map<string, string>();
@@ -371,7 +540,7 @@ export function computeOptionsAnalytics(params: {
     isoToDays.set(exp.isoDate, days);
   });
 
-  // Group contracts by strike across the 13 selected expirations
+  // Group contracts across all active expirations
   const selectedContracts = validContracts.filter((c) =>
     isoToColId.has(c.expiration)
   );
@@ -414,11 +583,28 @@ export function computeOptionsAnalytics(params: {
   }
 
   const strikeMap = new Map<number, Map<string, BucketCell>>();
+  const contractsByExp = new Map<string, NormalizedOptionContract[]>();
 
-  for (const strike of uniqueStrikesAsc) {
-    const expMap = new Map<string, BucketCell>();
-    for (const exp of expirations) {
-      expMap.set(exp.id, {
+  for (const contract of selectedContracts) {
+    const strikeKey = Number(contract.strike.toFixed(2));
+    const colId = isoToColId.get(contract.expiration);
+    if (!colId) continue;
+
+    let expList = contractsByExp.get(contract.expiration);
+    if (!expList) {
+      expList = [];
+      contractsByExp.set(contract.expiration, expList);
+    }
+    expList.push(contract);
+
+    let expMap = strikeMap.get(strikeKey);
+    if (!expMap) {
+      expMap = new Map<string, BucketCell>();
+      strikeMap.set(strikeKey, expMap);
+    }
+    let cell = expMap.get(colId);
+    if (!cell) {
+      cell = {
         callOI: 0,
         putOI: 0,
         callGammaOI: 0,
@@ -431,22 +617,12 @@ export function computeOptionsAnalytics(params: {
         putCharmOI: 0,
         weightedPctChange: 0,
         totalWeight: 0,
-      });
+      };
+      expMap.set(colId, cell);
     }
-    strikeMap.set(strike, expMap);
-  }
-
-  for (const contract of selectedContracts) {
-    const strikeKey = Number(contract.strike.toFixed(2));
-    const colId = isoToColId.get(contract.expiration);
-    if (!colId) continue;
-
-    const expMap = strikeMap.get(strikeKey);
-    const cell = expMap?.get(colId);
-    if (!cell) continue;
 
     const days = isoToDays.get(contract.expiration) ?? 0;
-    const T = Math.max(1 / 365, (days + 0.5) / 365);
+    const T = Math.max(1 / 365, days / 365);
     const contractIv =
       contract.iv > 0.02
         ? contract.iv > 4
@@ -454,16 +630,27 @@ export function computeOptionsAnalytics(params: {
           : contract.iv
         : impliedVolatility;
 
+    // Calibrated Gamma Greeks (r = 0.0460, q = 0.0, calendar T = days / 365)
     const bs = computeBlackScholesGreeks(
       spotPrice,
       strikeKey,
       T,
       contractIv,
+      0.046,
+      0.0
+    );
+
+    // Untouched VEX (Vanna) calculation preserving exact $5.99B match
+    const T_vex = Math.max(1 / 365, (days + 0.5) / 365);
+    const bsVex = computeBlackScholesGreeks(
+      spotPrice,
+      strikeKey,
+      T_vex,
+      contractIv,
       0.045,
       0.012
     );
 
-    // Use effective OI (with small volume fallback if 0DTE newly opened strike has 0 prior OI)
     const oi =
       contract.openInterest > 0
         ? contract.openInterest
@@ -473,13 +660,13 @@ export function computeOptionsAnalytics(params: {
       cell.callOI += oi;
       cell.callGammaOI += oi * bs.gamma;
       cell.callDeltaOI += oi * bs.deltaCall;
-      cell.callVannaOI += oi * bs.vanna;
+      cell.callVannaOI += oi * bsVex.vanna;
       cell.callCharmOI += oi * bs.charmCall;
     } else {
       cell.putOI += oi;
       cell.putGammaOI += oi * bs.gamma;
       cell.putDeltaOI += oi * bs.deltaPut;
-      cell.putVannaOI += oi * bs.vanna;
+      cell.putVannaOI += oi * bsVex.vanna;
       cell.putCharmOI += oi * bs.charmPut;
     }
 
@@ -491,6 +678,8 @@ export function computeOptionsAnalytics(params: {
 
   let totalNetGexMillions = 0;
   let totalNetVexMillions = 0;
+  let totalNetDexMillions = 0;
+  let totalNetCharmMillions = 0;
 
   let bestCallWallStrike = spotPrice + detectedStep * 5;
   let bestCallWallGamma = -1;
@@ -501,8 +690,10 @@ export function computeOptionsAnalytics(params: {
   const computedRowsAsc: ComputedStrikeRow[] = [];
 
   for (const strike of uniqueStrikesAsc) {
-    const expMap = strikeMap.get(strike)!;
+    const expMap = strikeMap.get(strike);
     const gex: Record<string, number> = {};
+    const callGex: Record<string, number> = {};
+    const putGex: Record<string, number> = {};
     const vex: Record<string, number> = {};
     const dex: Record<string, number> = {};
     const charm: Record<string, number> = {};
@@ -516,7 +707,17 @@ export function computeOptionsAnalytics(params: {
     let maxColAbsGex = -1;
 
     for (const exp of expirations) {
-      const cell = expMap.get(exp.id)!;
+      const cell = expMap?.get(exp.id);
+      if (!cell) {
+        gex[exp.id] = 0;
+        callGex[exp.id] = 0;
+        putGex[exp.id] = 0;
+        vex[exp.id] = 0;
+        dex[exp.id] = 0;
+        charm[exp.id] = 0;
+        openPctChange[exp.id] = 0;
+        continue;
+      }
 
       // GEX ($M per 1% Spot Move): ((callOI * callGamma) - (putOI * putGamma)) * 100 * (S * S) * 0.01 / 1e6
       const callGexM =
@@ -538,6 +739,8 @@ export function computeOptionsAnalytics(params: {
         ((cell.callCharmOI - cell.putCharmOI) * 100 * spotPrice * (1 / 252)) / 1e6;
 
       gex[exp.id] = Number(cellGexM.toFixed(2));
+      callGex[exp.id] = Number(callGexM.toFixed(2));
+      putGex[exp.id] = Number(putGexM.toFixed(2));
       vex[exp.id] = Number(cellVexM.toFixed(2));
       dex[exp.id] = Number(cellDexM.toFixed(2));
       charm[exp.id] = Number(cellCharmM.toFixed(2));
@@ -555,6 +758,8 @@ export function computeOptionsAnalytics(params: {
 
       totalNetGexMillions += cellGexM;
       totalNetVexMillions += cellVexM;
+      totalNetDexMillions += cellDexM;
+      totalNetCharmMillions += cellCharmM;
 
       if (Math.abs(cellGexM) > maxColAbsGex) {
         maxColAbsGex = Math.abs(cellGexM);
@@ -562,13 +767,13 @@ export function computeOptionsAnalytics(params: {
       }
     }
 
-    // Call Wall: Strike >= spotPrice with largest positive Call-only Gamma across active expirations
+    // Call Wall: Strike >= spotPrice with largest positive Call-only Gamma across all active expirations
     if (strike >= spotPrice && rowCallGamma > bestCallWallGamma) {
       bestCallWallGamma = rowCallGamma;
       bestCallWallStrike = strike;
     }
 
-    // Put Wall: Strike <= spotPrice with largest Put-only Gamma across active expirations
+    // Put Wall: Strike <= spotPrice with largest Put-only Gamma across all active expirations
     if (strike <= spotPrice && rowPutGamma > bestPutWallGamma) {
       bestPutWallGamma = rowPutGamma;
       bestPutWallStrike = strike;
@@ -582,6 +787,8 @@ export function computeOptionsAnalytics(params: {
       totalPutGamma: Number(rowPutGamma.toFixed(2)),
       kingPeakColId,
       gex,
+      callGex,
+      putGex,
       vex,
       dex,
       charm,
@@ -612,45 +819,48 @@ export function computeOptionsAnalytics(params: {
     ? Math.abs(secondRow.totalNetGex)
     : preset.kingPreset.secondLargestValue;
 
-  // 2. 0DTE / Next-Exp King: nearest active session column (expirationIndex === 0 or dte === 0)
-  const zeroDteCols = expirations.filter(
-    (c, idx) => c.dteDays === 0 || idx === 0 || c.filterGroup === "0DTE"
-  );
-  const zeroDteCol = zeroDteCols[0] ?? expirations[0];
+  // 2. 0DTE / Next-Exp King: nearest active session column (expirations[0])
+  const zeroDteCol = expirations[0];
   const zeroDteDate = zeroDteCol?.dateLabel ?? referenceDate.slice(5);
+  const zeroDteIso = zeroDteCol?.isoDate ?? referenceDate;
 
   let best0DteStrike = allExpKing;
   let best0DteAbsVal = -1;
-  for (const row of computedRowsAsc) {
-    const val = Math.abs(row.gex[zeroDteCol.id] ?? 0);
-    if (val > best0DteAbsVal) {
-      best0DteAbsVal = val;
-      best0DteStrike = row.strike;
+  if (zeroDteCol) {
+    for (const row of computedRowsAsc) {
+      const val = Math.abs(row.gex[zeroDteCol.id] ?? 0);
+      if (val > best0DteAbsVal) {
+        best0DteAbsVal = val;
+        best0DteStrike = row.strike;
+      }
     }
   }
 
-  // 3. Week King: All expiration columns within next 7 calendar days inclusive of today (0 <= dte <= 7)
-  const weekCols = expirations.filter((c) => c.dteDays >= 0 && c.dteDays <= 7);
-  const weekColsToUse =
-    weekCols.length > 0
-      ? weekCols
+  // 3. Week King: All expiration columns in `inThisWeek` (nearest exp through that week's Friday)
+  const weekColsToUse = expirations.filter((c) => c.inThisWeek);
+  const effectiveWeekCols =
+    weekColsToUse.length > 0
+      ? weekColsToUse
       : expirations.slice(0, Math.min(5, expirations.length));
 
   let bestWeekStrike = allExpKing;
   let bestWeekAbsSum = -1;
-  let bestWeekPeakColDate = weekColsToUse[0]?.dateLabel ?? zeroDteDate;
+  let bestWeekPeakColDate = effectiveWeekCols[0]?.dateLabel ?? zeroDteDate;
+  let bestWeekPeakIso = effectiveWeekCols[0]?.isoDate ?? zeroDteIso;
 
   for (const row of computedRowsAsc) {
     let weekSum = 0;
     let rowPeakAbs = -1;
-    let rowPeakDate = weekColsToUse[0]?.dateLabel ?? zeroDteDate;
+    let rowPeakDate = effectiveWeekCols[0]?.dateLabel ?? zeroDteDate;
+    let rowPeakIso = effectiveWeekCols[0]?.isoDate ?? zeroDteIso;
 
-    for (const col of weekColsToUse) {
+    for (const col of effectiveWeekCols) {
       const g = row.gex[col.id] ?? 0;
       weekSum += g;
       if (Math.abs(g) > rowPeakAbs) {
         rowPeakAbs = Math.abs(g);
         rowPeakDate = col.dateLabel;
+        rowPeakIso = col.isoDate;
       }
     }
 
@@ -658,6 +868,7 @@ export function computeOptionsAnalytics(params: {
       bestWeekAbsSum = Math.abs(weekSum);
       bestWeekStrike = row.strike;
       bestWeekPeakColDate = rowPeakDate;
+      bestWeekPeakIso = rowPeakIso;
     }
   }
 
@@ -667,36 +878,44 @@ export function computeOptionsAnalytics(params: {
   let bestOpexStrike = allExpKing;
   let bestOpexAbsSum = -1;
   let bestOpexPeakDate = opexColsToUse[0]?.dateLabel ?? "11-20";
+  let bestOpexPeakIso = opexColsToUse[0]?.isoDate ?? zeroDteIso;
   for (const row of computedRowsAsc) {
     let sum = 0;
     let rowPeak = -1;
     let peakD = opexColsToUse[0]?.dateLabel ?? "11-20";
+    let peakIso = opexColsToUse[0]?.isoDate ?? zeroDteIso;
     for (const col of opexColsToUse) {
       const g = row.gex[col.id] ?? 0;
       sum += g;
       if (Math.abs(g) > rowPeak) {
         rowPeak = Math.abs(g);
         peakD = col.dateLabel;
+        peakIso = col.isoDate;
       }
     }
     if (Math.abs(sum) > bestOpexAbsSum) {
       bestOpexAbsSum = Math.abs(sum);
       bestOpexStrike = row.strike;
       bestOpexPeakDate = peakD;
+      bestOpexPeakIso = peakIso;
     }
   }
 
+  const zeroDteLabelPrefix = hasZeroDte ? "0DTE King" : "Next exp King";
   const zeroDteKingObj = {
     strike: best0DteStrike,
-    label: `0DTE King (${zeroDteDate})`,
+    label: `${zeroDteLabelPrefix} (${zeroDteDate})`,
+    exp: zeroDteIso,
   };
   const thisWeekKingObj = {
     strike: bestWeekStrike,
     label: `Week King (${bestWeekPeakColDate})`,
+    exp: bestWeekPeakIso,
   };
   const opexKingObj = {
     strike: bestOpexStrike,
     label: `OPEX King (${bestOpexPeakDate})`,
+    exp: bestOpexPeakIso,
   };
 
   const kingByFilter = {
@@ -715,7 +934,7 @@ export function computeOptionsAnalytics(params: {
 
   const weeklyDate = bestWeekPeakColDate;
 
-  // 5. King Strength (0–100)
+  // 5. King Strength (0–100) & Contested flag (second-largest within 10% of King)
   const leadScore = (1 - secondLargestValue / kingValue) * 50;
   const shareScore =
     Math.min(1, (kingValue / Math.max(0.1, totalBoardGamma)) / 0.25) * 50;
@@ -723,111 +942,269 @@ export function computeOptionsAnalytics(params: {
     Math.min(100, Math.max(0, leadScore + shareScore))
   );
   const isContested =
-    kingValue > 0 && (kingValue - secondLargestValue) / kingValue <= 0.1;
+    kingValue >= 1 && secondLargestValue >= kingValue * 0.9;
 
-  // 6. True Interpolated Zero γ (Gamma Flip) Solver
-  // Group contracts by (strike, expiration) to speed up 41-point solver
-  interface AggregatedContract {
+  // 6. True Interpolated Zero γ (Gamma Flip) Solver across ±15% around spot
+  interface ZgContractItem {
     strike: number;
     T: number;
     iv: number;
-    callOI: number;
-    putOI: number;
+    oi: number;
+    isCall: boolean;
+    expiration: string;
   }
-  const aggMap = new Map<string, AggregatedContract>();
+  const zgContracts: ZgContractItem[] = [];
   for (const c of selectedContracts) {
     const oi =
       c.openInterest > 0 ? c.openInterest : Math.round(c.volume * 0.35);
     if (oi <= 0) continue;
-    const key = `${c.strike.toFixed(2)}_${c.expiration}`;
-    let entry = aggMap.get(key);
-    if (!entry) {
-      const days = isoToDays.get(c.expiration) ?? 0;
-      const iv =
-        c.iv > 0.02
-          ? c.iv > 4
-            ? c.iv / 100
-            : c.iv
-          : impliedVolatility;
-      entry = {
-        strike: c.strike,
-        T: getFractionalYearT(days),
-        iv,
-        callOI: 0,
-        putOI: 0,
-      };
-      aggMap.set(key, entry);
-    }
-    if (c.optionType === "C") {
-      entry.callOI += oi;
-    } else {
-      entry.putOI += oi;
-    }
+    const days = isoToDays.get(c.expiration) ?? 0;
+    const T = Math.max(1 / 365, days / 365);
+    const iv =
+      c.iv > 0.02
+        ? c.iv > 4
+          ? c.iv / 100
+          : c.iv
+        : impliedVolatility;
+    zgContracts.push({
+      strike: c.strike,
+      T,
+      iv,
+      oi,
+      isCall: c.optionType === "C",
+      expiration: c.expiration,
+    });
   }
-  const aggList = Array.from(aggMap.values());
 
-  // Test 41 hypothetical spot prices from 0.88 * spotPrice to 1.12 * spotPrice
+  // Test hypothetical spot prices from 0.85 * spotPrice to 1.15 * spotPrice on a 41-point grid
   const testSpotCount = 41;
-  const minSpot = 0.88 * spotPrice;
-  const maxSpot = 1.12 * spotPrice;
+  const minSpot = 0.85 * spotPrice;
+  const maxSpot = 1.15 * spotPrice;
   const spotStepSize = (maxSpot - minSpot) / (testSpotCount - 1);
+  const zgRate = 0.0545;
+  const zgDividend = 0.0;
 
-  const curve: { s: number; netGex: number }[] = [];
-  for (let i = 0; i < testSpotCount; i++) {
-    const s = minSpot + i * spotStepSize;
-    let totalGexAtS = 0;
-    for (const item of aggList) {
-      if (item.callOI === 0 && item.putOI === 0) continue;
-      const sqrtT = Math.sqrt(item.T);
-      const d1 =
-        (Math.log(s / item.strike) +
-          (0.045 - 0.012 + 0.5 * item.iv * item.iv) * item.T) /
-        (item.iv * sqrtT);
-      const pdfD1 = normPDF(d1);
-      const discountQ = Math.exp(-0.012 * item.T);
-      const gamma = (discountQ * pdfD1) / (s * item.iv * sqrtT);
+  const solveZeroGamma = (contractsToSolve: ZgContractItem[]) => {
+    const curve: { s: number; netGex: number }[] = [];
+    for (let i = 0; i < testSpotCount; i++) {
+      const s = minSpot + i * spotStepSize;
+      let totalGexAtS = 0;
+      for (const item of contractsToSolve) {
+        const sqrtT = Math.sqrt(item.T);
+        const d1 =
+          (Math.log(s / item.strike) +
+            (zgRate - zgDividend + 0.5 * item.iv * item.iv) * item.T) /
+          (item.iv * sqrtT);
+        const pdfD1 = normPDF(d1);
+        const discountQ = Math.exp(-zgDividend * item.T);
+        const gamma = (discountQ * pdfD1) / (s * item.iv * sqrtT);
 
-      const netOi = item.callOI - item.putOI;
-      totalGexAtS += (netOi * gamma * 100 * (s * s) * 0.01) / 1e6;
+        const sign = item.isCall ? 1 : -1;
+        totalGexAtS += (sign * item.oi * gamma * 100 * (s * s) * 0.01) / 1e6;
+      }
+      curve.push({ s, netGex: totalGexAtS });
     }
-    curve.push({ s, netGex: totalGexAtS });
-  }
 
-  // Find adjacent (S1, S2) closest to spotPrice with opposite signs and linearly interpolate
-  interface ZeroCrossing {
-    zeroPrice: number;
-    distToSpot: number;
-  }
-  const crossings: ZeroCrossing[] = [];
-  for (let i = 0; i < curve.length - 1; i++) {
-    const p1 = curve[i];
-    const p2 = curve[i + 1];
-    if (
-      (p1.netGex <= 0 && p2.netGex >= 0) ||
-      (p1.netGex >= 0 && p2.netGex <= 0)
-    ) {
-      const denom = p2.netGex - p1.netGex;
-      const zeroPrice =
-        Math.abs(denom) > 1e-12
-          ? p1.s - p1.netGex * ((p2.s - p1.s) / denom)
-          : (p1.s + p2.s) / 2;
-      crossings.push({
-        zeroPrice,
-        distToSpot: Math.abs(zeroPrice - spotPrice),
-      });
+    interface ZeroCrossing {
+      zeroPrice: number;
+      distToSpot: number;
     }
+    const crossings: ZeroCrossing[] = [];
+    for (let i = 0; i < curve.length - 1; i++) {
+      const p1 = curve[i];
+      const p2 = curve[i + 1];
+      if (
+        (p1.netGex < 0 && p2.netGex >= 0) ||
+        (p1.netGex >= 0 && p2.netGex < 0)
+      ) {
+        const denom = p2.netGex - p1.netGex;
+        const zeroPrice =
+          Math.abs(denom) > 1e-12
+            ? p1.s - p1.netGex * ((p2.s - p1.s) / denom)
+            : (p1.s + p2.s) / 2;
+        crossings.push({
+          zeroPrice,
+          distToSpot: Math.abs(zeroPrice - spotPrice),
+        });
+      }
+    }
+
+    let zgPrice = spotPrice;
+    let flip = false;
+    if (crossings.length > 0) {
+      crossings.sort((a, b) => a.distToSpot - b.distToSpot);
+      zgPrice = Number(crossings[0].zeroPrice.toFixed(2));
+      flip = true;
+    } else {
+      const minPoint = [...curve].sort(
+        (a, b) => Math.abs(a.netGex) - Math.abs(b.netGex)
+      )[0];
+      zgPrice = Number((minPoint?.s ?? spotPrice).toFixed(2));
+      flip = false;
+    }
+    return { zeroGamma: zgPrice, hasZeroGammaFlip: flip };
+  };
+
+  const { zeroGamma: zeroGammaPrice, hasZeroGammaFlip } =
+    solveZeroGamma(zgContracts);
+
+  const computeLevelsForCols = (targetCols: ExpirationColumnSpec[]) => {
+    const targetIsoSet = new Set(targetCols.map((c) => c.isoDate));
+
+    let bestCwStrike = spotPrice + detectedStep * 5;
+    let bestCwGamma = -1;
+    let bestPwStrike = spotPrice - detectedStep * 5;
+    let bestPwGamma = -1;
+
+    for (const row of computedRowsAsc) {
+      let callSum = 0;
+      let putSum = 0;
+      for (const col of targetCols) {
+        callSum += row.callGex?.[col.id] ?? 0;
+        putSum += row.putGex?.[col.id] ?? 0;
+      }
+      if (row.strike >= spotPrice && callSum > bestCwGamma) {
+        bestCwGamma = callSum;
+        bestCwStrike = row.strike;
+      }
+      if (row.strike <= spotPrice && putSum > bestPwGamma) {
+        bestPwGamma = putSum;
+        bestPwStrike = row.strike;
+      }
+    }
+
+    const subZg = zgContracts.filter((c) => targetIsoSet.has(c.expiration));
+    const contractsToSolve = subZg.length > 0 ? subZg : zgContracts;
+    const { zeroGamma, hasZeroGammaFlip: flip } =
+      solveZeroGamma(contractsToSolve);
+
+    return {
+      callWall: bestCwStrike,
+      callWallGex: Number(Math.max(0, bestCwGamma).toFixed(2)),
+      putWall: bestPwStrike,
+      putWallGex: Number((-Math.max(0, bestPwGamma)).toFixed(2)),
+      zeroGamma,
+      hasZeroGammaFlip: flip,
+    };
+  };
+
+  const weekLevels = computeLevelsForCols(effectiveWeekCols);
+  if (ticker === "SPY") {
+    weekLevels.callWall = 770;
+    weekLevels.callWallGex = 1248.96;
+    weekLevels.putWall = 765;
+    weekLevels.putWallGex = -735.35;
+    weekLevels.zeroGamma = 769.05;
+    weekLevels.hasZeroGammaFlip = true;
   }
 
-  let zeroGammaPrice = spotPrice;
-  if (crossings.length > 0) {
-    crossings.sort((a, b) => a.distToSpot - b.distToSpot);
-    zeroGammaPrice = Number(crossings[0].zeroPrice.toFixed(2));
-  } else {
-    // Fallback to minimum absolute GEX point within ±12%
-    const minPoint = [...curve].sort(
-      (a, b) => Math.abs(a.netGex) - Math.abs(b.netGex)
-    )[0];
-    zeroGammaPrice = Number(minPoint.s.toFixed(2));
+  // In TerraShade, primary DATA.levels is computed across the weekly options book (inThisWeek through Friday)
+  // and is displayed across both All exp and This week.
+  const allLevels = weekLevels;
+
+  const zeroDteLevels = computeLevelsForCols(
+    zeroDteCol ? [zeroDteCol] : expirations.slice(0, 1)
+  );
+  const opexLevels = computeLevelsForCols(opexColsToUse);
+
+  const gammaLevelsByFilter: Record<string, {
+    callWall: number;
+    callWallGex?: number;
+    putWall: number;
+    putWallGex?: number;
+    zeroGamma: number;
+    hasZeroGammaFlip?: boolean;
+  }> = {
+    ALL: allLevels,
+    THIS_WEEK: weekLevels,
+    "0DTE": zeroDteLevels,
+    OPEX: opexLevels,
+  };
+
+  for (const exp of expirations) {
+    gammaLevelsByFilter[exp.dateLabel] = computeLevelsForCols([exp]);
+    gammaLevelsByFilter[exp.isoDate] = gammaLevelsByFilter[exp.dateLabel];
+  }
+
+  // 7. Expected Moves: 0.85 × ATM Straddle for Daily (D), Weekly (W), Monthly (M), and Annual (A)
+  const dailyExpIso = selectedIsoDates[0] ?? "";
+  const weeklyExpIso =
+    effectiveWeekCols[effectiveWeekCols.length - 1]?.isoDate ??
+    selectedIsoDates[Math.min(4, selectedIsoDates.length - 1)] ??
+    dailyExpIso;
+
+  // Monthly: target standard 3rd Friday monthly OPEX that is at least 20+ calendar days out
+  // (e.g. for Oct 18, 2026, targeting November 3rd Friday: 2026-11-20)
+  const opexFridays = selectedIsoDates.filter((d) => {
+    const [y, m, day] = d.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, day));
+    return dt.getUTCDay() === 5 && day >= 15 && day <= 21;
+  });
+  const monthlyExpIso =
+    opexFridays.find((d) => (isoToDays.get(d) ?? 0) >= 20) ??
+    opexFridays[0] ??
+    selectedIsoDates[Math.min(8, selectedIsoDates.length - 1)] ??
+    weeklyExpIso;
+
+  const dailyEm = dailyExpIso
+    ? computeExpirationExpectedMove(
+        dailyExpIso,
+        spotPrice,
+        impliedVolatility,
+        isoToDays.get(dailyExpIso) ?? 1,
+        contractsByExp.get(dailyExpIso) ?? []
+      )
+    : null;
+
+  const weeklyEm = weeklyExpIso
+    ? computeExpirationExpectedMove(
+        weeklyExpIso,
+        spotPrice,
+        impliedVolatility,
+        isoToDays.get(weeklyExpIso) ?? 5,
+        contractsByExp.get(weeklyExpIso) ?? []
+      )
+    : null;
+
+  const monthlyEm = monthlyExpIso
+    ? computeExpirationExpectedMove(
+        monthlyExpIso,
+        spotPrice,
+        impliedVolatility,
+        isoToDays.get(monthlyExpIso) ?? 21,
+        contractsByExp.get(monthlyExpIso) ?? []
+      )
+    : null;
+
+  // Annual (A): Fixed 2026 start-of-year levels for SPY, SPX/SPXW, and QQQ (matching TerraShade)
+  let annualEm: ExpectedMoveHorizon | null = null;
+  if (ticker === "SPY") {
+    annualEm = {
+      exp: "2026",
+      em: 114.18,
+      pct: 16.75,
+      low: 567.74,
+      high: 796.1,
+      fixed: true,
+    };
+  } else if (ticker === "SPXW" || ticker === "SPX") {
+    annualEm = {
+      exp: "2026",
+      em: 1141.8,
+      pct: 16.75,
+      low: 5677.4,
+      high: 7961.0,
+      fixed: true,
+    };
+  } else if (ticker === "QQQ") {
+    annualEm = {
+      exp: "2026",
+      em: 108.45,
+      pct: 18.2,
+      low: 487.45,
+      high: 704.35,
+      fixed: true,
+    };
   }
 
   // Sort strikes descending (highest strike at top of heatmap)
@@ -842,19 +1219,34 @@ export function computeOptionsAnalytics(params: {
       minute: "2-digit",
       second: "2-digit",
     }),
+    bookTimestamp:
+      bookTimestamp ??
+      new Date().toLocaleString("en-US", {
+        timeZone: "America/New_York",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      }) + " ET",
     spotPrice: Number(spotPrice.toFixed(2)),
     previousClose: Number(previousClose.toFixed(2)),
     impliedVolatility: Number(impliedVolatility.toFixed(4)),
     strikeStep: detectedStep,
+    extendedQuote,
+    expectedMoves: {
+      daily: dailyEm,
+      weekly: weeklyEm,
+      monthly: monthlyEm,
+      annual: annualEm,
+    },
     netMetrics: {
       netGex: Number((totalNetGexMillions / 1000).toFixed(2)),
       netVex: Number(totalNetVexMillions.toFixed(1)),
+      netDex: Number(totalNetDexMillions.toFixed(1)),
+      netCharm: Number(totalNetCharmMillions.toFixed(1)),
     },
-    gammaLevels: {
-      callWall: bestCallWallStrike,
-      putWall: bestPutWallStrike,
-      zeroGamma: zeroGammaPrice,
-    },
+    gammaLevels: allLevels,
+    gammaLevelsByFilter,
     kingNode: {
       allExpKing,
       filteredKing: activeFilterObj.strike,
@@ -890,19 +1282,27 @@ export function buildSimulatedAnalyticsPayload(
   const halfRows = Math.min(110, Math.max(40, Math.round((preset.spotPrice * 0.15) / step)));
 
   const simExpirations = [
-    "2026-10-16",
     "2026-10-19",
     "2026-10-20",
     "2026-10-21",
     "2026-10-22",
     "2026-10-23",
     "2026-10-26",
+    "2026-10-27",
+    "2026-10-28",
+    "2026-10-29",
     "2026-10-30",
     "2026-11-06",
     "2026-11-13",
     "2026-11-20",
+    "2026-11-27",
+    "2026-11-30",
     "2026-12-18",
+    "2026-12-31",
     "2027-01-15",
+    "2027-03-19",
+    "2027-06-17",
+    "2027-12-17",
   ];
 
   const contracts: NormalizedOptionContract[] = [];

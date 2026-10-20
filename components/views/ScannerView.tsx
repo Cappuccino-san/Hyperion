@@ -1,332 +1,311 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
-import {
-  buildKingNodeMetrics,
-  getTickerPreset,
-  useDashboardStore,
-} from "@/store/useDashboardStore";
+import React, { useEffect, useState } from "react";
+import { useDashboardStore } from "@/store/useDashboardStore";
 import { cn } from "@/lib/utils";
 
-const SCANNER_TICKERS = [
-  "IBIT",
-  "SMCI",
-  "AAPL",
-  "NDX",
-  "ARM",
-  "NVDA",
-  "TSLA",
-  "QQQ",
-  "SPY",
-  "SMH",
-] as const;
-
-interface ScannerEntry {
-  ticker: string;
-  spot: number;
-  kingStrike: number;
-  kingStrength: number;
-  pullScore: number;
-  kingMoved: boolean;
-  timestamp: string;
-  distPct: number;
-  distPts: number;
-  vsDailyEm: number;
-  isPositiveGamma: boolean;
+interface ScannerRow {
+  t: string;
+  px: number;
+  king: number;
+  pts: number;
+  pct: number;
+  xem: number;
+  neg: boolean;
+  str: number;
+  share: number;
+  base: number;
+  score: number;
+  rr: number;
+  book?: string;
+  contested?: boolean;
+  moved?: boolean;
 }
+
+interface ScanSlot {
+  slot: string;
+  day: string;
+  at: string;
+  secs: number;
+  credits: number;
+  rows: ScannerRow[];
+}
+
+interface ScannerData {
+  scans?: ScanSlot[];
+  slots?: string[];
+  running?: string | null;
+}
+
+const f2 = (v: number, d = 2) =>
+  Number(v).toLocaleString("en-US", {
+    minimumFractionDigits: d,
+    maximumFractionDigits: d,
+  });
+
+const sg = (v: number) =>
+  (v >= 0 ? "+" : "") + f2(v, v !== 0 && Math.abs(v) < 10 ? 2 : 1);
+
+const col = (s: number) =>
+  s >= 80 ? "#facc15" : s >= 60 ? "#22d3ee" : "#94a3b8";
+
+const hm = (k: string) => {
+  const [h, m] = k.split(":").map(Number);
+  return (h % 12 || 12) + ":" + String(m).padStart(2, "0") + (h < 12 ? " AM" : " PM");
+};
+
+const dayLab = (d: string) => {
+  try {
+    return new Date(d + "T12:00:00Z").toLocaleDateString("en-US", {
+      timeZone: "UTC",
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+    });
+  } catch {
+    return d;
+  }
+};
+
+const kind = (k: string) => (k === "15:50" ? "closing scan" : "open scan");
+
+const whenLabel = (r?: ScanSlot) => {
+  if (!r) return "";
+  let t = hm(r.slot) + " ET " + kind(r.slot) + " · " + dayLab(r.day);
+  if (r.secs) {
+    t += " · " + (r.secs < 90 ? Math.round(r.secs) + "s" : Math.round(r.secs / 60) + " min");
+  }
+  return t;
+};
 
 export function ScannerView() {
   const setTicker = useDashboardStore((state) => state.setTicker);
   const setActiveView = useDashboardStore((state) => state.setActiveView);
-  const [scanSession, setScanSession] = useState<"9:35 open" | "3:50 close">(
-    "9:35 open"
-  );
 
-  const rankedItems = useMemo<ScannerEntry[]>(() => {
-    const list: ScannerEntry[] = SCANNER_TICKERS.map((sym, idx) => {
-      const preset = getTickerPreset(sym);
-      const kingMetrics = buildKingNodeMetrics(preset, "ALL");
+  const [data, setData] = useState<ScannerData | null>(null);
+  const [curSlot, setCurSlot] = useState<string>("15:50");
+  const [isLoading, setIsLoading] = useState<boolean>(true);
 
-      // Slight deterministic score adjustment between 9:35 open and 3:50 close scan
-      const sessionDelta =
-        scanSession === "3:50 close" ? ((idx % 3) - 1) * 4 : 0;
-      const strength = Math.min(
-        96,
-        Math.max(42, kingMetrics.kingStrength + sessionDelta)
-      );
+  useEffect(() => {
+    let active = true;
+    const fetchScanner = async () => {
+      try {
+        const res = await fetch("/api/scanner", { cache: "no-store" });
+        if (!res.ok) return;
+        const j: ScannerData = await res.json();
+        if (active) {
+          setData(j);
+          const slots = (j.scans || []).map((s) => s.slot);
+          if (slots.length > 0 && !slots.includes(curSlot)) {
+            setCurSlot(slots[slots.length - 1]);
+          }
+          setIsLoading(false);
+        }
+      } catch {
+        if (active) setIsLoading(false);
+      }
+    };
 
-      const spot = preset.spotPrice;
-      const kingStrike = kingMetrics.allExpKing;
-      const distPts = kingStrike - spot;
-      const distPct = spot > 0 ? (distPts / spot) * 100 : 0;
+    fetchScanner();
+    const interval = setInterval(fetchScanner, 60000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [curSlot]);
 
-      const dailyEm =
-        spot * preset.impliedVolatility * Math.sqrt(1 / 252);
-      const vsDailyEm =
-        dailyEm > 0 ? Math.abs(distPts) / dailyEm : 0;
+  const activeScan = (data?.scans || []).find((s) => s.slot === curSlot) ?? data?.scans?.[0];
+  const slots = (data?.scans || []).map((s) => s.slot);
 
-      // Scanner Pull Score (0–100):
-      // Combine kingStrength * 0.6 + Math.max(0, 1 - Math.abs(spotPrice - kingStrike) / (1.5 * dailyExpectedMove)) * 40
-      const pullScore = Math.round(
-        strength * 0.6 +
-        Math.max(
-          0,
-          1 - Math.abs(spot - kingStrike) / (1.5 * Math.max(0.01, dailyEm))
-        ) * 40
-      );
-
-      const isPositiveGamma =
-        spot > preset.gammaLevels.zeroGamma && preset.netMetrics.netGex > 0;
-
-      const kingMoved = sym === "SMCI" || sym === "NVDA" || sym === "TSLA";
-
-      return {
-        ticker: sym,
-        spot,
-        kingStrike,
-        kingStrength: strength,
-        pullScore,
-        kingMoved,
-        timestamp:
-          scanSession === "9:35 open"
-            ? "Oct 16, 1:04 PM ET"
-            : "Oct 16, 3:50 PM ET",
-        distPct,
-        distPts,
-        vsDailyEm,
-        isPositiveGamma,
-      };
-    });
-
-    return list.sort((a, b) => b.pullScore - a.pullScore);
-  }, [scanSession]);
+  const handleCardClick = (ticker: string) => {
+    setTicker(ticker);
+    setActiveView("Heatmap");
+  };
 
   return (
-    <div className="space-y-4">
-      {/* Scanner Header Card */}
-      <div className="argon-card rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-lg font-extrabold text-white tracking-tight">
-            King Node Scanner
-          </h1>
-          <p className="text-xs font-mono text-slate-400">
-            {scanSession === "9:35 open"
-              ? "9:35 AM ET open scan · Fri, Oct 16"
-              : "3:50 PM ET close scan · Fri, Oct 16"}
-          </p>
-          <p className="mt-1 text-[11px] font-mono text-[#11cdef]">
-            Tap a ticker to open its heatmap
-          </p>
+    <div className="max-w-[760px] w-full mx-auto space-y-3 font-sans">
+      {/* Top Header */}
+      <div>
+        <h1 className="text-xl font-extrabold text-white tracking-tight">
+          King Node Scanner
+        </h1>
+        <div className="text-xs text-slate-400 mt-0.5">
+          {isLoading
+            ? "Loading scanner…"
+            : whenLabel(activeScan) || "Open scan at 9:35 AM ET. Closing scan is ready by 3:50 PM ET."}
         </div>
+      </div>
 
-        {/* Scan Session Toggle: [9:35 open | 3:50 close] */}
-        <div className="inline-flex items-center rounded-full bg-[#0b0d17] p-1 border border-white/10">
-          {(["9:35 open", "3:50 close"] as const).map((mode) => {
-            const active = scanSession === mode;
+      {/* Segmented Slot Toggle (.seg) */}
+      {slots.length > 0 && (
+        <div className="inline-flex bg-[#111827]/70 border border-slate-700/50 rounded-xl p-1 gap-1">
+          {slots.map((k) => {
+            const isActive = k === curSlot;
             return (
               <button
-                key={mode}
+                key={k}
                 type="button"
-                onClick={() => setScanSession(mode)}
+                onClick={() => setCurSlot(k)}
                 className={cn(
-                  "px-3.5 py-1 rounded-full text-xs font-mono font-bold transition-all",
-                  active
-                    ? "bg-[#1c223a] border border-[#5e72e4] text-white shadow-[0_0_10px_rgba(94,114,228,0.5)]"
+                  "px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer",
+                  isActive
+                    ? "bg-gradient-to-r from-cyan-400 to-purple-500 text-slate-950 shadow-md font-extrabold"
                     : "text-slate-400 hover:text-white"
                 )}
               >
-                {mode}
+                {k === "15:50" ? "3:50 close" : "9:35 open"}
               </button>
             );
           })}
         </div>
+      )}
+
+      {/* Hint */}
+      <div className="text-[11px] text-slate-500 font-mono">
+        Tap a ticker to open its heatmap
       </div>
 
-      {/* Ranked List of Ticker Cards */}
-      <div className="space-y-3">
-        {rankedItems.map((item, idx) => {
-          const rank = idx + 1;
-          const isPositiveDist = item.distPts >= 0;
+      {/* Cards List */}
+      <div className="space-y-2">
+        {!activeScan || !activeScan.rows.length ? (
+          <div className="bg-[#111827]/60 border border-slate-800 rounded-xl p-8 text-center text-xs text-slate-400">
+            No scan yet. The open scan runs at 9:35 AM ET. The closing scan is ready by 3:50 PM ET.
+          </div>
+        ) : (
+          activeScan.rows.map((x, i) => {
+            const c = col(x.score);
+            const k = x.king;
+            const flag = x.contested ? " · contested" : "";
 
-          return (
-            <button
-              key={item.ticker}
-              type="button"
-              onClick={() => {
-                setTicker(item.ticker);
-                setActiveView("Heatmap");
-              }}
-              className="w-full text-left argon-card rounded-xl p-4 hover:border-[#5e72e4]/60 hover:bg-[#15192b] transition-all space-y-3 group"
-            >
-              {/* Top Row: Rank (#1), Ticker (IBIT), Spot ($46.25), and Top-Right Rounded Score Pill */}
-              <div className="flex items-center justify-between">
-                <div className="flex items-baseline gap-2.5">
-                  <span className="font-mono text-sm font-bold text-slate-400">
-                    #{rank}
+            return (
+              <button
+                key={x.t}
+                type="button"
+                onClick={() => handleCardClick(x.t)}
+                className="w-full text-left block bg-[#111827]/65 hover:border-cyan-400/50 border border-slate-800/80 rounded-2xl p-3 transition-colors cursor-pointer group"
+              >
+                {/* Top Row: Rank, Ticker, Price, Score */}
+                <div className="flex items-center gap-2">
+                  <span className="text-slate-500 font-bold text-xs w-6">
+                    #{i + 1}
                   </span>
-                  <span className="text-lg font-extrabold text-white group-hover:text-[#11cdef] transition-colors">
-                    {item.ticker}
+                  <b className="text-base font-extrabold text-white group-hover:text-cyan-400 transition-colors">
+                    {x.t}
+                  </b>
+                  <span className="text-slate-400 text-xs font-mono tabular-nums">
+                    ${f2(x.px)}
                   </span>
-                  <span className="font-mono text-base font-bold text-slate-200 tabular-nums">
-                    ${item.spot.toFixed(2)}
-                  </span>
-                </div>
-
-                <span
-                  title={`Pull Score ${item.pullScore}/100 · King Strength ${item.kingStrength}`}
-                  className="inline-flex items-center justify-center rounded-full bg-amber-400/20 border border-amber-300/60 px-3 py-0.5 font-mono text-sm font-extrabold text-yellow-300 shadow-[0_0_12px_rgba(250,204,21,0.3)]"
-                >
-                  {item.pullScore}
-                </span>
-              </div>
-
-              {/* 3-Column Metrics Grid: KING | DISTANCE | VS EM */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 rounded-lg bg-[#0b0d17]/90 border border-white/10 p-3 font-mono">
-                {/* Col 1: KING */}
-                <div>
-                  <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                    KING
-                  </div>
-                  <div className="mt-0.5 flex items-center gap-2">
-                    <span className="text-base font-extrabold text-yellow-400 tabular-nums">
-                      {item.kingStrike.toFixed(0)}
-                    </span>
-                    {item.kingMoved && (
-                      <span className="rounded bg-amber-500/20 border border-amber-400/50 px-1.5 py-0.2 text-[9px] font-bold text-amber-300">
-                        King moved
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-[10px] text-slate-500">
-                    {item.timestamp}
-                  </div>
-                </div>
-
-                {/* Col 2: DISTANCE */}
-                <div>
-                  <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                    DISTANCE
-                  </div>
-                  <div
-                    className={cn(
-                      "mt-0.5 text-sm font-bold tabular-nums",
-                      isPositiveDist ? "text-emerald-300" : "text-rose-300"
-                    )}
+                  <div className="flex-1" />
+                  <span
+                    style={{
+                      color: c,
+                      borderColor: `${c}55`,
+                      backgroundColor: `${c}1a`,
+                    }}
+                    className="border rounded-full px-2.5 py-0.5 text-xs font-extrabold font-mono"
                   >
-                    {isPositiveDist ? "+" : ""}
-                    {item.distPct.toFixed(1)}% · {isPositiveDist ? "+" : ""}
-                    {item.distPts.toFixed(2)} pts
+                    {x.score}
+                  </span>
+                </div>
+
+                {/* 3-Column Metrics Grid */}
+                <div className="grid grid-cols-[0.7fr_1.3fr_1fr] gap-1.5 my-2 text-xs font-mono">
+                  {/* Col 1: King */}
+                  <div>
+                    <small className="block text-[10px] text-slate-500 uppercase tracking-wider font-semibold">
+                      King
+                    </small>
+                    <span className="text-[#facc15] font-extrabold text-[13px] drop-shadow-[0_0_8px_rgba(250,204,21,0.5)]">
+                      {k % 1 !== 0 ? f2(k, 1) : k}
+                      {flag}
+                    </span>
+                    {x.book && (
+                      <small className="block text-[9.5px] text-slate-500 lowercase mt-0.5">
+                        {x.book}
+                      </small>
+                    )}
+                    {x.moved && (
+                      <small className="block text-[9.5px] text-slate-400 font-semibold">
+                        King moved
+                      </small>
+                    )}
                   </div>
-                  <div className="text-[10px] text-slate-500">
-                    From current spot
+
+                  {/* Col 2: Distance */}
+                  <div>
+                    <small className="block text-[10px] text-slate-500 uppercase tracking-wider font-semibold">
+                      Distance
+                    </small>
+                    <span className="text-slate-200 tabular-nums">
+                      {sg(x.pct).replace(/(\.\d)\d$/, "$1")}% · {sg(x.pts)} pts
+                    </span>
+                  </div>
+
+                  {/* Col 3: vs EM */}
+                  <div>
+                    <small className="block text-[10px] text-slate-500 uppercase tracking-wider font-semibold">
+                      vs EM
+                    </small>
+                    <span className="text-slate-200 tabular-nums">
+                      {x.xem != null ? `${f2(x.xem, 1)}× daily EM` : "–"}
+                    </span>
                   </div>
                 </div>
 
-                {/* Col 3: VS EM */}
-                <div>
-                  <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                    VS EM
-                  </div>
-                  <div className="mt-0.5 text-sm font-bold text-white tabular-nums">
-                    {item.vsDailyEm.toFixed(1)}× daily EM
-                  </div>
-                  <div className="text-[10px] text-slate-500">
-                    {item.vsDailyEm <= 1.0
-                      ? "Inside 1D expected move"
-                      : "Outside 1D expected move"}
-                  </div>
-                </div>
-              </div>
-
-                  {/* Bottom Row: Regime Pill + King Strength Label + Gold Progress Bar */}
-              <div className="flex flex-wrap items-center gap-3 pt-0.5">
-                <span
-                  className={cn(
-                    "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[10px] font-mono font-bold",
-                    item.isPositiveGamma
-                      ? "bg-teal-500/15 border-teal-400/40 text-teal-300"
-                      : "bg-purple-500/20 border-purple-400/50 text-purple-300"
-                  )}
-                >
+                {/* Bottom Row: Regime, Strength Label, Progress Bar */}
+                <div className="flex items-center gap-2 pt-1 border-t border-slate-800/40 font-mono">
                   <span
                     className={cn(
-                      "h-1.5 w-1.5 rounded-full",
-                      item.isPositiveGamma ? "bg-teal-400" : "bg-purple-400"
+                      "text-[10px] font-bold px-2 py-0.5 rounded-full whitespace-nowrap",
+                      x.neg
+                        ? "text-[#c084fc] bg-purple-500/15"
+                        : "text-[#22d3ee] bg-cyan-500/12"
                     )}
-                  />
-                  {item.isPositiveGamma ? "Positive γ" : "Negative γ"}
-                </span>
-
-                <span className="text-[11px] font-mono text-slate-400">
-                  King strength
-                </span>
-
-                <div className="flex-1 h-2 rounded-full bg-[#0b0d17] border border-white/10 overflow-hidden">
-                  <div
-                    style={{ width: `${item.kingStrength}%` }}
-                    className="h-full rounded-full bg-yellow-400 shadow-[0_0_10px_rgba(250,204,21,0.8)] transition-all duration-300"
-                  />
+                  >
+                    {x.neg ? "Negative" : "Positive"} γ
+                  </span>
+                  <span className="text-slate-500 text-[10px] whitespace-nowrap">
+                    King strength
+                  </span>
+                  <div className="flex-1 h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                    <div
+                      style={{ width: `${Math.max(3, x.str)}%` }}
+                      className="h-full rounded-full bg-gradient-to-r from-[#fdca26] to-[#facc15]"
+                    />
+                  </div>
                 </div>
-              </div>
-            </button>
-          );
-        })}
+              </button>
+            );
+          })
+        )}
       </div>
 
-      {/* Official Hyperion Scanner Glossary & Explainer Footer */}
-      <div className="argon-card rounded-xl p-5 space-y-3 text-xs leading-relaxed text-slate-300 border border-white/10">
-        <div className="space-y-2">
-          <p>
-            <strong className="font-bold text-white">King</strong> – the
-            all-expirations King, the strike with the largest total gamma. It
-            tends to pull price toward it.{" "}
-            <strong className="font-bold text-amber-300">contested</strong>{" "}
-            means the next strike is within about 10%.
-          </p>
-          <p>
-            <strong className="font-bold text-white">Book</strong> – when that
-            row&apos;s book was taken.
-          </p>
-          <p>
-            <strong className="font-bold text-white">King moved</strong> – a
-            newer book changed the all-expirations King, so the row was rescored
-            or flagged.
-          </p>
-          <p>
-            <strong className="font-bold text-white">Distance</strong> – how far
-            the King is from the price now.
-          </p>
-          <p>
-            <strong className="font-bold text-white">vs EM</strong> – that
-            distance compared with today&apos;s expected move.
-          </p>
-          <p>
-            <strong className="font-bold text-white">Gamma regime</strong> –
-            Negative γ means bigger moves; Positive γ means calmer, pinned
-            trading.
-          </p>
-          <p>
-            <strong className="font-bold text-white">King strength</strong> –
-            how much the King stands out from the next-biggest strike.
-          </p>
-          <p>
-            <strong className="font-bold text-white">Pull score</strong> – a
-            0–100 ranking of how strong the pull to the King looks. It&apos;s a
-            ranking, not a prediction.
-          </p>
+      {/* Footer Glossary (.leg) */}
+      <div className="text-xs text-slate-400 bg-[#111827]/50 border border-slate-800 rounded-xl p-3 leading-relaxed space-y-1.5 font-sans">
+        <div>
+          <b className="text-white">King</b> – the all-expirations King, the strike with the largest total gamma. It tends to pull price toward it.{" "}
+          <b className="text-white">contested</b> means the next strike is within about 10%.
         </div>
-
-        {/* Standard Footer Links & Disclaimer */}
-        <div className="border-t border-white/10 pt-3 mt-3 space-y-1.5 text-[11px] font-mono text-slate-400">
-          <div className="flex items-center gap-2">
-            <span className="font-semibold text-slate-300">
-              Hyperion Quant Options &amp; Gamma Intelligence
-            </span>
-          </div>
-          <p className="italic text-slate-500">
-            For educational and informational purposes only. Not financial
-            advice. Data may be delayed or inaccurate; trade at your own risk.
-          </p>
+        <div>
+          <b className="text-white">Book</b> – when that row&apos;s book was taken.
+        </div>
+        <div>
+          <b className="text-white">King moved</b> – a newer book changed the all-expirations King, so the row was rescored or flagged.
+        </div>
+        <div>
+          <b className="text-white">Distance</b> – how far the King is from the price now.
+        </div>
+        <div>
+          <b className="text-white">vs EM</b> – that distance compared with today&apos;s expected move.
+        </div>
+        <div>
+          <b className="text-white">Gamma regime</b> – Negative γ means bigger moves; Positive γ means calmer, pinned trading.
+        </div>
+        <div>
+          <b className="text-white">King strength</b> – how much the King stands out from the next-biggest strike.
+        </div>
+        <div>
+          <b className="text-white">Pull score</b> – a 0–100 ranking of how strong the pull to the King looks. It&apos;s a ranking, not a prediction.
         </div>
       </div>
     </div>

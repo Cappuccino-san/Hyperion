@@ -12,6 +12,7 @@ import { QuadView } from "@/components/views/QuadView";
 import { AntaeusView } from "@/components/views/AntaeusView";
 import { ChartsView } from "@/components/views/ChartsView";
 import { ScannerView } from "@/components/views/ScannerView";
+import { RecapView } from "@/components/views/RecapView";
 import { useDashboardStore } from "@/store/useDashboardStore";
 
 export default function DashboardPage() {
@@ -66,11 +67,12 @@ export default function DashboardPage() {
 
         {activeView === "Quad" && <QuadView />}
 
-        {activeView === "Antaeus" && <AntaeusView />}
+        {(activeView === "Gaia" || activeView === "Antaeus") && <AntaeusView />}
 
         {activeView === "Charts" && <ChartsView />}
 
         {activeView === "Scanner" && <ScannerView />}
+        {activeView === "Recap" && <RecapView />}
       </main>
 
       {/* Footer Links & Disclaimer */}

@@ -2,30 +2,58 @@
 
 import React from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
+import { formatExposure } from "@/lib/optionsExposure";
 
-export function GammaProgressBar() {
+interface GammaProgressBarProps {
+  kingPhrase?: string;
+}
+
+export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
   const spotPrice = useDashboardStore((state) => state.spotPrice);
-  const { putWall, callWall, zeroGamma } = useDashboardStore(
-    (state) => state.gammaLevels
-  );
+  const {
+    putWall,
+    putWallGex,
+    callWall,
+    callWallGex,
+    zeroGamma,
+    hasZeroGammaFlip = true,
+  } = useDashboardStore((state) => state.gammaLevels);
   const kingNode = useDashboardStore((state) => state.kingNode);
+  const allExpKingNode = useDashboardStore((state) => state.allExpKingNode);
 
   const lowBound = Math.min(putWall, callWall);
   const highBound = Math.max(putWall, callWall);
   const span = Math.max(0.01, highBound - lowBound);
 
-  const percentage = Math.min(
-    100,
-    Math.max(0, ((spotPrice - lowBound) / span) * 100)
-  );
+  const rawPct = ((spotPrice - lowBound) / span) * 100;
+  const percentage = Math.min(100, Math.max(0, rawPct));
   const zeroGammaPct = Math.min(
     100,
     Math.max(0, ((zeroGamma - lowBound) / span) * 100)
   );
+  const showZgTick =
+    hasZeroGammaFlip && zeroGamma >= lowBound && zeroGamma <= highBound;
+  const activeKingStrike = kingNode.filteredKing ?? kingNode.allExpKing;
   const kingPct = Math.min(
     100,
-    Math.max(0, ((kingNode.allExpKing - lowBound) / span) * 100)
+    Math.max(0, ((activeKingStrike - lowBound) / span) * 100)
   );
+  const showKingMarker =
+    activeKingStrike >= lowBound && activeKingStrike <= highBound;
+
+  const positionMessage =
+    spotPrice > highBound
+      ? `spot $${(spotPrice - highBound).toFixed(2)} above the upper wall`
+      : spotPrice < lowBound
+        ? `spot $${(lowBound - spotPrice).toFixed(2)} below the lower wall`
+        : `${Math.round(percentage)}% of the way from put wall to call wall`;
+
+  const isContested = kingNode.isContested || allExpKingNode?.isContested;
+  const displayKingPhrase =
+    kingPhrase ??
+    `All-exp King ${kingNode.allExpKing.toFixed(0)}${
+      isContested ? " · contested" : ""
+    }`;
 
   return (
     <div className="argon-card rounded-xl p-4 space-y-4">
@@ -36,11 +64,13 @@ export function GammaProgressBar() {
           <div className="text-[10px] font-mono font-bold uppercase tracking-widest text-slate-400">
             CALL WALL
           </div>
-          <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#11cdef] tabular-nums">
-            ${callWall.toFixed(callWall % 1 !== 0 ? 2 : 0)}
+          <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#22d3ee] tabular-nums">
+            {callWall.toFixed(callWall % 1 !== 0 ? 2 : 0)}
           </div>
-          <div className="text-[10px] font-mono text-slate-500">
-            Highest +γ ≥ Spot
+          <div className="text-[11px] font-mono text-slate-400">
+            {callWallGex !== undefined && callWallGex !== 0
+              ? formatExposure(callWallGex, { showPlus: false })
+              : "Highest +γ ≥ Spot"}
           </div>
         </div>
 
@@ -49,11 +79,13 @@ export function GammaProgressBar() {
           <div className="text-[10px] font-mono font-bold uppercase tracking-widest text-slate-400">
             PUT WALL
           </div>
-          <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#f5365c] tabular-nums">
-            ${putWall.toFixed(putWall % 1 !== 0 ? 2 : 0)}
+          <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#e879f9] tabular-nums">
+            {putWall.toFixed(putWall % 1 !== 0 ? 2 : 0)}
           </div>
-          <div className="text-[10px] font-mono text-slate-500">
-            Highest -γ ≤ Spot
+          <div className="text-[11px] font-mono text-slate-400">
+            {putWallGex !== undefined && putWallGex !== 0
+              ? formatExposure(putWallGex)
+              : "Highest -γ ≤ Spot"}
           </div>
         </div>
 
@@ -63,23 +95,29 @@ export function GammaProgressBar() {
             ZERO Γ
           </div>
           <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-white tabular-nums">
-            ${zeroGamma.toFixed(2)}
+            {hasZeroGammaFlip ? zeroGamma.toFixed(1) : "—"}
           </div>
-          <div className="text-[10px] font-mono text-slate-500">
-            {spotPrice >= zeroGamma ? "Spot above flip" : "Spot below flip"}
+          <div className="text-[11px] font-mono text-slate-400">
+            {hasZeroGammaFlip
+              ? spotPrice >= zeroGamma
+                ? "spot above"
+                : "spot below"
+              : "no flip"}
           </div>
         </div>
       </div>
 
-      {/* All-exp King Purple-to-Teal Progress Slider */}
-      <div className="space-y-2 pt-1">
-        <div className="flex items-center justify-between text-[11px] font-mono">
-          <span className="text-amber-300 font-bold">
-            ★ All-exp King ${kingNode.allExpKing.toFixed(0)}
+      {/* Full-Width King Row + Wall-to-Wall Corridor Slider */}
+      <div className="space-y-2 pt-0.5">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono">
+          <span className="text-[#facc15] font-bold">
+            ★ {displayKingPhrase}
           </span>
-          <span className="text-slate-400">
-            Zero γ marker: ${zeroGamma.toFixed(2)}
-          </span>
+          {hasZeroGammaFlip && (
+            <span className="text-slate-400">
+              Zero γ: {zeroGamma.toFixed(1)}
+            </span>
+          )}
         </div>
 
         <div className="relative pt-6 pb-2">
@@ -94,44 +132,46 @@ export function GammaProgressBar() {
           </div>
 
           {/* Purple-to-Teal Gradient Track */}
-          <div className="relative h-3 w-full rounded-full bg-gradient-to-r from-[#6b21a8] via-[#5e72e4] to-[#14b8a6] shadow-inner">
-            {/* Zero Gamma Vertical Marker */}
-            <div
-              className="absolute -top-1.5 -bottom-1.5 w-0.5 bg-white/80 z-10"
-              style={{ left: `${zeroGammaPct}%` }}
-              title={`Zero γ: $${zeroGamma.toFixed(2)}`}
-            />
+          <div className="relative h-3 w-full rounded-full bg-gradient-to-r from-[#581c87] via-[#1e293b] to-[#115e59] border border-[#243044] shadow-inner">
+            {/* Zero Gamma Vertical Tick Mark (div.zg) */}
+            {showZgTick && (
+              <div
+                className="absolute -top-1 -bottom-1 w-0.5 bg-white/85 z-10"
+                style={{ left: `${zeroGammaPct}%` }}
+                title={`Zero γ ${zeroGamma.toFixed(1)}`}
+              />
+            )}
 
             {/* King Node Gold Marker */}
-            <div
-              className="absolute -top-1.5 -bottom-1.5 w-1 rounded-full bg-amber-300 shadow-[0_0_10px_rgba(251,191,36,0.95)] z-10"
-              style={{ left: `${kingPct}%` }}
-              title={`All-exp King: $${kingNode.allExpKing.toFixed(0)}`}
-            />
+            {showKingMarker && (
+              <div
+                className="absolute -top-1 -bottom-1 w-1 rounded-full bg-[#facc15] shadow-[0_0_10px_rgba(250,204,21,0.95)] z-10"
+                style={{ left: `${kingPct}%` }}
+                title={`King: $${activeKingStrike.toFixed(0)}`}
+              />
+            )}
 
             {/* Glowing White/Indigo Circular Thumb */}
             <div
-              className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 h-5 w-5 rounded-full bg-white border-[3px] border-[#5e72e4] shadow-[0_0_14px_3px_rgba(94,114,228,0.95)] transition-all duration-300 z-20"
+              className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 h-4 w-4 rounded-full bg-white border-2 border-[#6366f1] shadow-[0_0_10px_rgba(99,102,241,0.9)] transition-all duration-300 z-20"
               style={{ left: `${percentage}%` }}
             />
           </div>
         </div>
 
-        {/* Footer: Put wall X | Y% of the way from put wall to call wall | Call wall Z */}
+        {/* Footer: Put wall X | positionMessage | Call wall Z */}
         <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-slate-400 pt-1">
           <span>
             Put wall{" "}
-            <strong className="text-[#f5365c]">
-              ${putWall.toFixed(putWall % 1 !== 0 ? 2 : 0)}
+            <strong className="text-[#e879f9]">
+              {putWall.toFixed(putWall % 1 !== 0 ? 2 : 0)}
             </strong>
           </span>
-          <span className="text-slate-300">
-            {percentage.toFixed(0)}% of the way from put wall to call wall
-          </span>
+          <span className="text-slate-300">{positionMessage}</span>
           <span>
             Call wall{" "}
-            <strong className="text-[#11cdef]">
-              ${callWall.toFixed(callWall % 1 !== 0 ? 2 : 0)}
+            <strong className="text-[#22d3ee]">
+              {callWall.toFixed(callWall % 1 !== 0 ? 2 : 0)}
             </strong>
           </span>
         </div>

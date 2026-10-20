@@ -469,6 +469,9 @@ async function fetchLiveOptionsBuckets(
     iv: number;
     gamma: number;
     delta: number;
+    bid: number;
+    ask: number;
+    lastPrice: number;
   }
 
   const hasChainOpenInterest = data.options.some(
@@ -492,6 +495,9 @@ async function fetchLiveOptionsBuckets(
       rawIv > 0.02 ? (rawIv > 4 ? rawIv / 100 : rawIv) : iv30Decimal;
     const gamma = Number(rawOpt.gamma ?? 0);
     const delta = Number(rawOpt.delta ?? 0);
+    const bid = Number(rawOpt.bid ?? 0);
+    const ask = Number(rawOpt.ask ?? 0);
+    const lastPrice = Number(rawOpt.last_trade_price ?? rawOpt.last ?? 0);
 
     allValidRaw.push({
       expiration: parsed.expiration,
@@ -502,6 +508,9 @@ async function fetchLiveOptionsBuckets(
       iv,
       gamma: Number.isFinite(gamma) && gamma > 0 ? gamma : 0,
       delta: Number.isFinite(delta) ? delta : 0,
+      bid: Number.isFinite(bid) && bid > 0 ? bid : 0,
+      ask: Number.isFinite(ask) && ask > 0 ? ask : 0,
+      lastPrice: Number.isFinite(lastPrice) && lastPrice > 0 ? lastPrice : 0,
     });
   }
 
@@ -539,7 +548,7 @@ async function fetchLiveOptionsBuckets(
     .toISOString()
     .slice(0, 10);
 
-  // Compute expected-move 1σ and 2σ cone from ATM IV on the nearest active expiration
+  // Compute expected-move 1σ and 2σ cone from 0.85 × ATM Straddle or ATM IV on the nearest active expiration
   const midRefPrice = liveSpot * 0.65 + priorClose * 0.35;
   const atmContracts = parsedOptions.filter(
     (o) =>
@@ -552,9 +561,39 @@ async function fetchLiveOptionsBuckets(
       ? atmContracts.reduce((sum, o) => sum + o.iv, 0) / atmContracts.length
       : iv30Decimal;
 
-  const sigma1Move = Number(
-    (priorClose * atmIv * Math.sqrt(1 / 252)).toFixed(2)
+  // Exact TerraShade Expected Move: 0.85 × (ATM Call Mid + ATM Put Mid)
+  const atmCall = parsedOptions.find(
+    (o) =>
+      o.expiration === nextExpIso &&
+      o.optionType === "C" &&
+      Math.abs(o.strike - liveSpot) / liveSpot <= 0.015
   );
+  const atmPut = parsedOptions.find(
+    (o) =>
+      o.expiration === nextExpIso &&
+      o.optionType === "P" &&
+      Math.abs(o.strike - liveSpot) / liveSpot <= 0.015
+  );
+
+  let calculatedMove = 0;
+  if (atmCall && atmPut) {
+    const cMid =
+      atmCall.bid > 0 && atmCall.ask > 0
+        ? (atmCall.bid + atmCall.ask) / 2
+        : atmCall.lastPrice;
+    const pMid =
+      atmPut.bid > 0 && atmPut.ask > 0
+        ? (atmPut.bid + atmPut.ask) / 2
+        : atmPut.lastPrice;
+    if (cMid > 0 && pMid > 0) {
+      calculatedMove = Number((0.85 * (cMid + pMid)).toFixed(2));
+    }
+  }
+
+  const sigma1Move =
+    calculatedMove > 0
+      ? calculatedMove
+      : Number((priorClose * atmIv * Math.sqrt(1 / 252)).toFixed(2));
   const sigma2Move = Number((sigma1Move * 2).toFixed(2));
 
   // Determine strike step near spot
