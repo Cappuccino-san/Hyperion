@@ -15,7 +15,7 @@
 ### 2. Quad View
 - **Simultaneous 4-Index Positioning (`SPY`, `QQQ`, `SPXW`, `IWM`):** Side-by-side strike ladders with independent metric (`GEX`, `VEX`, `DEX`, `Charm`) and horizon (`All exp`, `0DTE`, `This week`) controls to monitor cross-asset dealer alignment.
 
-### 3. Antaeus — Intraday 5m Gamma Matrix & MTF Divergence Engine
+### 3. Gaia — Intraday 5m Gamma Matrix & MTF Divergence Engine
 - **Live CBOE Contract Aggregation:** Computes strike-by-strike dollar gamma exposure across all active expirations:
   $$\text{GEX}_K = \frac{(\text{Call OI} \cdot \Gamma_{\text{call}} - \text{Put OI} \cdot \Gamma_{\text{put}}) \times 100 \times S^2 \times 0.01}{10^6}$$
 - **Dual King Tracking (`All-exp King` + `Filtered King`):** Simultaneously tracks the global **All-exp King** (`solid gold line` + `Path to King` trajectory in the `outlook` zone) and the active **Filtered King** (`0DTE`, `Next exp`, `This week`, or `Date` with a dashed `#38bdf8` reference line and glowing gold bubble row).
@@ -83,7 +83,7 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 ```text
 ├── app/
 │   ├── api/
-│   │   ├── antaeus/route.ts       # Live CBOE + 5m/15m/1h/4h/1D Antaeus positioning engine
+│   │   ├── gaia/route.ts          # Live CBOE + 5m/15m/1h/4h/1D Gaia positioning engine
 │   │   ├── discord/route.ts       # Hyperion Terminal Discord webhook dispatcher
 │   │   └── options/route.ts       # Tradier & CBOE option chain ingestion route
 │   ├── globals.css                # Obsidian theme tokens & custom scrollbars
@@ -95,7 +95,7 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 │   ├── intraday/                  # IntradayChart & real-time AlertsFeed
 │   ├── metrics/                   # MetricsRow summary cards & GammaProgressBar
 │   ├── modals/                    # GuideModal, CheatCodesModal & SetupModal
-│   └── views/                     # AntaeusView, QuadView, ScannerView, ChartsView
+│   └── views/                     # GaiaView (AntaeusView), QuadView, ScannerView, RecapView, ChartsView
 ├── lib/
 │   ├── optionsExposure.ts         # Black-Scholes Greeks & GEX/VEX/DEX/Charm engine
 │   └── utils.ts                   # Classname & formatting utilities

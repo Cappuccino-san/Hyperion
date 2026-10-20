@@ -7,7 +7,7 @@ import { CheatCodesModal } from "@/components/modals/CheatCodesModal";
 import { SetupModal } from "@/components/modals/SetupModal";
 import { cn } from "@/lib/utils";
 
-const VIEW_TABS: ActiveView[] = ["Heatmap", "Quad", "Antaeus", "Scanner"];
+const VIEW_TABS: ActiveView[] = ["Heatmap", "Quad", "Gaia", "Scanner"];
 
 const HOLIDAYS_2026 = new Set([
   "2026-01-01",
