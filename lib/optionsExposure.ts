@@ -3,6 +3,7 @@ import {
   getTickerPreset,
   KingNodeMetrics,
   TickerSymbol,
+  GammaLevels,
 } from "@/store/useDashboardStore";
 
 export type DataSourceType = "TRADIER_LIVE" | "CBOE_MARKET_DATA" | "SIMULATED";
@@ -484,6 +485,7 @@ export function computeOptionsAnalytics(params: {
   activeExpirationFilter?: string;
   extendedQuote?: ExtendedQuoteInfo | null;
   bookTimestamp?: string;
+  officialLevels?: GammaLevels | null;
 }): OptionsAnalyticsPayload {
   const {
     ticker,
@@ -981,8 +983,8 @@ export function computeOptionsAnalytics(params: {
   const minSpot = 0.85 * spotPrice;
   const maxSpot = 1.15 * spotPrice;
   const spotStepSize = (maxSpot - minSpot) / (testSpotCount - 1);
-  const zgRate = 0.0545;
-  const zgDividend = 0.0;
+  const zgRate = 0.045;
+  const zgDividend = 0.012;
 
   const solveZeroGamma = (contractsToSolve: ZgContractItem[]) => {
     const curve: { s: number; netGex: number }[] = [];
@@ -1088,19 +1090,13 @@ export function computeOptionsAnalytics(params: {
     };
   };
 
-  const weekLevels = computeLevelsForCols(effectiveWeekCols);
-  if (ticker === "SPY") {
-    weekLevels.callWall = 770;
-    weekLevels.callWallGex = 1248.96;
-    weekLevels.putWall = 765;
-    weekLevels.putWallGex = -735.35;
-    weekLevels.zeroGamma = 769.05;
-    weekLevels.hasZeroGammaFlip = true;
-  }
+  // In TerraShade, primary DATA.levels is computed across all active expirations (All exp)
+  const allLevels =
+    params.officialLevels && params.officialLevels.callWall > 0
+      ? params.officialLevels
+      : computeLevelsForCols(expirations);
 
-  // In TerraShade, primary DATA.levels is computed across the weekly options book (inThisWeek through Friday)
-  // and is displayed across both All exp and This week.
-  const allLevels = weekLevels;
+  const weekLevels = computeLevelsForCols(effectiveWeekCols);
 
   const zeroDteLevels = computeLevelsForCols(
     zeroDteCol ? [zeroDteCol] : expirations.slice(0, 1)
@@ -1267,96 +1263,4 @@ export function computeOptionsAnalytics(params: {
     expirations,
     strikes: strikesDesc,
   };
-}
-
-/**
- * Tier 3: Deterministic Fallback generator when offline or rate-limited
- */
-export function buildSimulatedAnalyticsPayload(
-  ticker: TickerSymbol,
-  activeExpirationFilter = "0DTE"
-): OptionsAnalyticsPayload {
-  const preset = getTickerPreset(ticker);
-  const step = preset.strikeStep;
-  const centerStrike = Math.round(preset.spotPrice / step) * step;
-  const halfRows = Math.min(110, Math.max(40, Math.round((preset.spotPrice * 0.15) / step)));
-
-  const simExpirations = [
-    "2026-10-19",
-    "2026-10-20",
-    "2026-10-21",
-    "2026-10-22",
-    "2026-10-23",
-    "2026-10-26",
-    "2026-10-27",
-    "2026-10-28",
-    "2026-10-29",
-    "2026-10-30",
-    "2026-11-06",
-    "2026-11-13",
-    "2026-11-20",
-    "2026-11-27",
-    "2026-11-30",
-    "2026-12-18",
-    "2026-12-31",
-    "2027-01-15",
-    "2027-03-19",
-    "2027-06-17",
-    "2027-12-17",
-  ];
-
-  const contracts: NormalizedOptionContract[] = [];
-  for (let i = -halfRows; i <= halfRows; i++) {
-    const strike = centerStrike + i * step;
-    if (strike <= 0) continue;
-
-    simExpirations.forEach((exp, expIdx) => {
-      const distCall = Math.abs(strike - preset.gammaLevels.callWall) / (step * 8);
-      const distPut = Math.abs(strike - preset.gammaLevels.putWall) / (step * 8);
-      const callBell = Math.exp(-distCall * distCall);
-      const putBell = Math.exp(-distPut * distPut);
-      const dteScale = expIdx === 0 ? 1.4 : expIdx === 4 ? 1.7 : 0.9;
-
-      const callOI = Math.round((800 + callBell * 18000) * dteScale);
-      const putOI = Math.round((800 + putBell * 17000) * dteScale);
-
-      contracts.push({
-        symbol: `${ticker}_${exp}_C_${strike}`,
-        expiration: exp,
-        optionType: "C",
-        strike,
-        openInterest: callOI,
-        volume: Math.round(callOI * 0.4),
-        iv: preset.impliedVolatility,
-        delta: 0,
-        gamma: 0,
-        vega: 0,
-        percentChange: Math.round((callBell - 0.3) * 28),
-      });
-
-      contracts.push({
-        symbol: `${ticker}_${exp}_P_${strike}`,
-        expiration: exp,
-        optionType: "P",
-        strike,
-        openInterest: putOI,
-        volume: Math.round(putOI * 0.4),
-        iv: preset.impliedVolatility,
-        delta: 0,
-        gamma: 0,
-        vega: 0,
-        percentChange: Math.round((putBell - 0.3) * 24),
-      });
-    });
-  }
-
-  return computeOptionsAnalytics({
-    ticker,
-    dataSource: "SIMULATED",
-    spotPrice: preset.spotPrice,
-    previousClose: preset.previousClose,
-    impliedVolatility: preset.impliedVolatility,
-    contracts,
-    activeExpirationFilter,
-  });
 }

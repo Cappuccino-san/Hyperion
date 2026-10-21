@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { useDashboardStore } from "@/store/useDashboardStore";
+import { getFridayEtShort, getTodayEtShort, useDashboardStore } from "@/store/useDashboardStore";
 import { GammaProgressBar } from "./GammaProgressBar";
 import { formatExposure } from "@/lib/optionsExposure";
 import { cn } from "@/lib/utils";
@@ -50,11 +50,11 @@ export function MetricsRow() {
   const allExpKing = kingNode.allExpKing ?? allExpKingNode?.allExpKing ?? 760;
   const weeklyKing = kingNode.weeklyKing ?? allExpKingNode?.weeklyKing ?? 765;
   const weeklyDate =
-    kingNode.weeklyDate ?? allExpKingNode?.weeklyDate ?? "10-23";
+    kingNode.weeklyDate ?? allExpKingNode?.weeklyDate ?? getFridayEtShort();
   const zeroDteKing =
     kingNode.zeroDteKing ?? allExpKingNode?.zeroDteKing ?? 760;
   const zeroDteDate =
-    kingNode.zeroDteDate ?? allExpKingNode?.zeroDteDate ?? "10-19";
+    kingNode.zeroDteDate ?? allExpKingNode?.zeroDteDate ?? getTodayEtShort();
 
   const firstTierLabel = hasZeroDte ? "0DTE King" : "Next exp King";
   const isContested = kingNode.isContested || allExpKingNode?.isContested;

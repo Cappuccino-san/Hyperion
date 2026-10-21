@@ -30,12 +30,12 @@ export interface ExpirationColMeta {
 }
 
 export const FALLBACK_EXPIRATION_COLUMNS: ExpirationColMeta[] = [
-  { id: "exp_0", isoDate: "2026-10-19", tag: "0DTE", filterGroup: "0DTE", inThisWeek: true, dateLabel: "10-19", dteWeight: 1.45 },
-  { id: "exp_1", isoDate: "2026-10-20", tag: "1D", filterGroup: "THIS_WEEK", inThisWeek: true, dateLabel: "10-20", dteWeight: 0.95 },
-  { id: "exp_2", isoDate: "2026-10-21", tag: "2D", filterGroup: "THIS_WEEK", inThisWeek: true, dateLabel: "10-21", dteWeight: 0.82 },
-  { id: "exp_3", isoDate: "2026-10-22", tag: "3D", filterGroup: "THIS_WEEK", inThisWeek: true, dateLabel: "10-22", dteWeight: 0.78 },
-  { id: "exp_4", isoDate: "2026-10-23", tag: "4D", filterGroup: "THIS_WEEK", inThisWeek: true, dateLabel: "10-23", dteWeight: 1.15 },
-  { id: "exp_5", isoDate: "2026-10-26", tag: "7D", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "10-26", dteWeight: 0.74 },
+  { id: "exp_0", isoDate: "2026-10-21", tag: "0DTE", filterGroup: "0DTE", inThisWeek: true, dateLabel: "10-21", dteWeight: 1.45 },
+  { id: "exp_1", isoDate: "2026-10-22", tag: "1D", filterGroup: "THIS_WEEK", inThisWeek: true, dateLabel: "10-22", dteWeight: 0.95 },
+  { id: "exp_2", isoDate: "2026-10-23", tag: "2D", filterGroup: "THIS_WEEK", inThisWeek: true, dateLabel: "10-23", dteWeight: 1.15 },
+  { id: "exp_3", isoDate: "2026-10-26", tag: "5D", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "10-26", dteWeight: 0.78 },
+  { id: "exp_4", isoDate: "2026-10-27", tag: "6D", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "10-27", dteWeight: 0.74 },
+  { id: "exp_5", isoDate: "2026-10-28", tag: "7D", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "10-28", dteWeight: 0.74 },
   { id: "exp_6", isoDate: "2026-10-30", tag: "WKLY", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "10-30", dteWeight: 1.1 },
   { id: "exp_7", isoDate: "2026-11-06", tag: "WKLY", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "11-06", dteWeight: 0.85 },
   { id: "exp_8", isoDate: "2026-11-13", tag: "WKLY", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "11-13", dteWeight: 0.75 },

@@ -12,6 +12,7 @@ export type ActiveView =
   | "Heatmap"
   | "Quad"
   | "Gaia"
+  | "Atlas"
   | "Antaeus" // backward-compatible alias
   | "Scanner"
   | "Recap"
@@ -107,6 +108,35 @@ export function calculateKingStrength(
   return Math.round(Math.min(100, Math.max(0, leadScore + shareScore)));
 }
 
+export function getTodayEtShort(): string {
+  try {
+    const d = new Date(
+      new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
+    );
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${m}-${day}`;
+  } catch {
+    return "10-21";
+  }
+}
+
+export function getFridayEtShort(): string {
+  try {
+    const d = new Date(
+      new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
+    );
+    const dayOfWeek = d.getDay();
+    const diff = (5 - dayOfWeek + 7) % 7;
+    const friday = new Date(d.getTime() + diff * 86400 * 1000);
+    const m = String(friday.getMonth() + 1).padStart(2, "0");
+    const day = String(friday.getDate()).padStart(2, "0");
+    return `${m}-${day}`;
+  } catch {
+    return "10-23";
+  }
+}
+
 export function buildKingNodeMetrics(
   preset: TickerPreset,
   expirationFilter: string,
@@ -127,8 +157,8 @@ export function buildKingNodeMetrics(
 
   const zeroDteKing = overrideZeroDteKing ?? preset.kingPreset.zeroDteKing;
   const weeklyKing = overrideWeeklyKing ?? preset.kingPreset.weeklyKing;
-  const zeroDteDate = overrideDates?.zeroDteDate ?? "10-16";
-  const weeklyDate = overrideDates?.weeklyDate ?? "10-16";
+  const zeroDteDate = overrideDates?.zeroDteDate ?? getTodayEtShort();
+  const weeklyDate = overrideDates?.weeklyDate ?? getFridayEtShort();
   const hasZeroDte = overrideDates?.hasZeroDte ?? true;
 
   let filteredKing = zeroDteKing;
@@ -174,112 +204,54 @@ export function buildKingNodeMetrics(
   };
 }
 
-export const ROW1_TICKERS: string[] = [
-  "SPY",
-  "QQQ",
-  "SPX",
-  "SPXW",
-  "IWM",
-  "NDX",
-  "NDXP",
-  "DIA",
-  "META",
-  "COIN",
-  "PLTR",
-  "GME",
+export const WATCH_LIST: string[] = [
+  "SPY", "QQQ", "SPXW", "IWM", "NDXP", "DIA", "SMH", "TLT", "GLD", "SLV",
+  "XLE", "TQQQ", "SOXL", "IBIT", "NVDA", "AAPL", "TSLA", "MSFT", "AMZN", "META",
+  "GOOGL", "AVGO", "NFLX", "ORCL", "AMD", "MU", "INTC", "TSM", "ARM", "PLTR",
+  "COIN", "MSTR", "HOOD", "SOFI", "SMCI", "CRWD", "UBER", "SHOP", "RBLX", "JPM",
+  "BAC", "WMT", "COST", "XOM", "BA", "LLY", "GME", "RIVN", "MARA", "BABA", "SPCX",
 ];
 
-export const ROW2_TICKERS: string[] = [
-  "SMH",
-  "TLT",
-  "GLD",
-  "SLV",
-  "XLE",
-  "TQQQ",
-  "SOXL",
-  "IBIT",
-  "NVDA",
-  "AAPL",
-  "TSLA",
-  "MSFT",
-  "AMZN",
-];
+export const WATCH_LEAD: string[] = ["SPY", "QQQ", "SPXW", "IWM", "NDXP", "DIA"];
+export const WATCH_REST: string[] = WATCH_LIST.filter((t) => !WATCH_LEAD.includes(t));
 
-export const ROW3_TICKERS: string[] = [
-  "GOOGL",
-  "AVGO",
-  "NFLX",
-  "ORCL",
-  "AMD",
-  "MU",
-  "INTC",
-  "TSM",
-  "ARM",
-  "MSTR",
-  "HOOD",
-  "SOFI",
-];
+export const ROW1_TICKERS: string[] = WATCH_LEAD;
 
-export const ROW4_TICKERS: string[] = [
-  "SMCI",
-  "CRWD",
-  "UBER",
-  "SHOP",
-  "RBLX",
-  "JPM",
-  "BAC",
-  "WMT",
-  "COST",
-  "XOM",
-  "BA",
-  "LLY",
-  "RIVN",
-];
+export const ROW2_TICKERS: string[] = WATCH_REST;
 
-export const ROW5_TICKERS: string[] = ["MARA", "BABA", "SPCX"];
+export const ROW3_TICKERS: string[] = [];
+export const ROW4_TICKERS: string[] = [];
 
-export const TICKER_PILL_ROWS: string[][] = [
-  ROW1_TICKERS,
-  ROW2_TICKERS,
-  ROW3_TICKERS,
-  ROW4_TICKERS,
-  ROW5_TICKERS,
-];
+export const ROW5_TICKERS: string[] = [];
 
-export const SUPPORTED_TICKERS: string[] = Array.from(
-  new Set([
-    ...ROW1_TICKERS,
-    ...ROW2_TICKERS,
-    ...ROW3_TICKERS,
-    ...ROW4_TICKERS,
-    ...ROW5_TICKERS,
-  ])
-);
+export const TICKER_PILL_ROWS: string[][] = [WATCH_LEAD, WATCH_REST];
+
+export const SUPPORTED_TICKERS: string[] = WATCH_LIST;
 
 export const TICKER_PRESETS: Record<string, TickerPreset> = {
   SPY: {
     ticker: "SPY",
     name: "SPDR S&P 500 ETF Trust",
-    spotPrice: 767.14,
-    previousClose: 771.79,
+    spotPrice: 774.25,
+    previousClose: 769.05,
     impliedVolatility: 0.146,
-    netMetrics: { netGex: -4.82, netVex: 642.5 },
-    gammaLevels: { putWall: 765.0, putWallGex: -735.35, zeroGamma: 769.0, callWall: 770.0, callWallGex: 1248.96, hasZeroGammaFlip: true },
+    netMetrics: { netGex: 1.66, netVex: 7220.0 },
+    gammaLevels: { putWall: 760.0, putWallGex: -2074.07, zeroGamma: 772.9, callWall: 780.0, callWallGex: 1987.75, hasZeroGammaFlip: true },
     gammaLevelsByFilter: {
-      ALL: { putWall: 765.0, putWallGex: -735.35, zeroGamma: 769.0, callWall: 770.0, callWallGex: 1248.96, hasZeroGammaFlip: true },
-      THIS_WEEK: { putWall: 765.0, putWallGex: -735.35, zeroGamma: 769.0, callWall: 770.0, callWallGex: 1248.96, hasZeroGammaFlip: true },
-      "0DTE": { putWall: 765.0, putWallGex: -93.22, zeroGamma: 768.5, callWall: 770.0, callWallGex: 366.09, hasZeroGammaFlip: true },
-      OPEX: { putWall: 750.0, putWallGex: -868.77, zeroGamma: 771.0, callWall: 770.0, callWallGex: 584.25, hasZeroGammaFlip: true },
+      ALL: { putWall: 760.0, putWallGex: -2074.07, zeroGamma: 772.9, callWall: 780.0, callWallGex: 1987.75, hasZeroGammaFlip: true },
+      THIS_WEEK: { putWall: 769.0, putWallGex: -755.4, zeroGamma: 773.32, callWall: 780.0, callWallGex: 504.51, hasZeroGammaFlip: true },
+      "0DTE": { putWall: 770.0, putWallGex: -134.44, zeroGamma: 765.81, callWall: 775.0, callWallGex: 269.8, hasZeroGammaFlip: true },
+      OPEX: { putWall: 750.0, putWallGex: -735.05, zeroGamma: 771.65, callWall: 800.0, callWallGex: 1014.25, hasZeroGammaFlip: true },
     },
     kingPreset: {
-      allExpKing: 750.0,
-      zeroDteKing: 770.0,
-      weeklyKing: 770.0,
-      opexKing: 750.0,
-      kingValue: 1616.5,
-      secondLargestStrike: 770.0,
-      secondLargestValue: 1495.0,
-      totalBoardGamma: 12500.0,
+      allExpKing: 760.0,
+      zeroDteKing: 773.0,
+      weeklyKing: 780.0,
+      opexKing: 800.0,
+      kingValue: 1780.0,
+      secondLargestStrike: 780.0,
+      secondLargestValue: 1590.0,
+      totalBoardGamma: 30348.0,
     },
     strikeStep: 1,
   },
@@ -992,7 +964,7 @@ export function computeFilteredSummaryMetrics(params: {
     const zeroDteColsToUse =
       zeroDteCols.length > 0 ? zeroDteCols : expirations.slice(0, 1);
     const zeroDteDate =
-      zeroDteColsToUse[0]?.dateLabel ?? allExpKingNode.zeroDteDate ?? "10-19";
+      zeroDteColsToUse[0]?.dateLabel ?? allExpKingNode.zeroDteDate ?? getTodayEtShort();
 
     // 2. Determine Week columns using TerraShade's exact inThisWeek (nearest exp through Friday of that week)
     const weekCols = expirations.filter((c) =>
@@ -1099,7 +1071,7 @@ export function computeFilteredSummaryMetrics(params: {
     for (const row of strikes) {
       let rowGexSum = 0;
       let peakColAbs = -1;
-      let peakDateLabel = matchingCols[0]?.dateLabel ?? "10-19";
+      let peakDateLabel = matchingCols[0]?.dateLabel ?? getTodayEtShort();
 
       for (const col of matchingCols) {
         const gVal = row.gex[col.id] ?? 0;
@@ -1129,7 +1101,7 @@ export function computeFilteredSummaryMetrics(params: {
     const best = rowBuckets[0] ?? {
       strike: allExpKingNode.allExpKing,
       absGamma: allExpKingNode.kingValue,
-      peakDateLabel: matchingCols[0]?.dateLabel ?? "10-19",
+      peakDateLabel: matchingCols[0]?.dateLabel ?? getTodayEtShort(),
     };
     const second = rowBuckets[1] ?? {
       strike: allExpKingNode.secondLargestStrike,
@@ -1364,7 +1336,9 @@ export interface DashboardState {
   intradayData: IntradayPoint[];
   discordConfig: DiscordConfig;
   isSetupModalOpen: boolean;
+  gaiaMode: "classic" | "atlas";
   setActiveView: (view: ActiveView) => void;
+  setGaiaMode: (mode: "classic" | "atlas") => void;
   setToastMessage: (msg: string | null) => void;
   setTicker: (ticker: string) => void;
   updateSpot: (newSpot: number, timeLabel?: string) => void;
@@ -1388,8 +1362,8 @@ const defaultKing = buildKingNodeMetrics(defaultPreset, "0DTE");
 export const useDashboardStore = create<DashboardState>((set, get) => ({
   activeView: "Heatmap",
   activeTicker: defaultPreset.ticker,
-  dataSource: "SIMULATED",
-  isLoadingChain: false,
+  dataSource: "CBOE_MARKET_DATA",
+  isLoadingChain: true,
   toastMessage: null,
   lastUpdated: "19:04 UTC",
   bookTimestamp: null,
@@ -1423,8 +1397,16 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   }),
   discordConfig: getInitialDiscordConfig(),
   isSetupModalOpen: false,
+  gaiaMode: "classic",
 
-  setActiveView: (view) => set({ activeView: view }),
+  setActiveView: (view) => {
+    if (view === "Atlas") {
+      set({ activeView: "Gaia" });
+    } else {
+      set({ activeView: view });
+    }
+  },
+  setGaiaMode: (mode) => set({ gaiaMode: mode }),
   setSetupModalOpen: (open) => set({ isSetupModalOpen: open }),
   updateDiscordConfig: (cfg) => {
     set((state) => {
@@ -1704,7 +1686,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         zeroDteDate:
           payload.kingNode.zeroDteDate ??
           payload.kingByFilter?.["0DTE"]?.label?.match(/\(([^)]+)\)/)?.[1] ??
-          "10-19",
+          getTodayEtShort(),
         hasZeroDte: payload.kingNode.hasZeroDte ?? true,
         weeklyKing:
           payload.kingNode.weeklyKing ??
@@ -1713,7 +1695,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         weeklyDate:
           payload.kingNode.weeklyDate ??
           payload.kingByFilter?.THIS_WEEK?.label?.match(/\(([^)]+)\)/)?.[1] ??
-          "10-23",
+          getFridayEtShort(),
       };
 
       const filtered = computeFilteredSummaryMetrics({
@@ -1849,11 +1831,15 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       );
       if (!res.ok) {
         set({
-          isLoadingChain: false,
           ...(showToastOnError
-            ? { toastMessage: `Live options feed unavailable for ${targetTicker}` }
+            ? { toastMessage: `Connecting to live options feed for ${targetTicker}...` }
             : {}),
         });
+        setTimeout(() => {
+          if (get().activeTicker === targetTicker) {
+            get().fetchOptionsChain(targetTicker, true, false);
+          }
+        }, 1500);
         return;
       }
       const payload: OptionsAnalyticsPayload = await res.json();
@@ -1863,11 +1849,15 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       }
     } catch {
       set({
-        isLoadingChain: false,
         ...(showToastOnError
-          ? { toastMessage: `Live options feed unavailable for ${targetTicker}` }
+          ? { toastMessage: `Connecting to live options feed for ${targetTicker}...` }
           : {}),
       });
+      setTimeout(() => {
+        if (get().activeTicker === targetTicker) {
+          get().fetchOptionsChain(targetTicker, true, false);
+        }
+      }, 1500);
     }
   },
 }));

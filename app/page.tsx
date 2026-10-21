@@ -9,7 +9,7 @@ import { IntradayChart } from "@/components/intraday/IntradayChart";
 import { AlertsFeed } from "@/components/intraday/AlertsFeed";
 import { HeatmapTable } from "@/components/heatmap/HeatmapTable";
 import { QuadView } from "@/components/views/QuadView";
-import { AntaeusView } from "@/components/views/AntaeusView";
+import { GaiaView } from "@/components/views/GaiaView";
 import { ChartsView } from "@/components/views/ChartsView";
 import { ScannerView } from "@/components/views/ScannerView";
 import { RecapView } from "@/components/views/RecapView";
@@ -67,7 +67,9 @@ export default function DashboardPage() {
 
         {activeView === "Quad" && <QuadView />}
 
-        {(activeView === "Gaia" || activeView === "Antaeus") && <AntaeusView />}
+        {(activeView === "Gaia" || activeView === "Antaeus" || activeView === "Atlas") && (
+          <GaiaView />
+        )}
 
         {activeView === "Charts" && <ChartsView />}
 
@@ -94,6 +96,24 @@ export default function DashboardPage() {
               className="hover:text-white transition-colors"
             >
               Index Cheat Codes
+            </a>
+            <a href="/" className="hover:text-white transition-colors">
+              Heatmap
+            </a>
+            <a href="/quad" className="hover:text-white transition-colors">
+              Quad
+            </a>
+            <a href="/gaia" className="hover:text-white transition-colors">
+              Gaia
+            </a>
+            <a href="/scanner" className="hover:text-white transition-colors">
+              Scanner
+            </a>
+            <a href="/recap" className="hover:text-white transition-colors">
+              Recap
+            </a>
+            <a href="/guide" className="hover:text-white transition-colors">
+              Guide
             </a>
             <button
               type="button"

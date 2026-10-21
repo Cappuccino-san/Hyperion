@@ -27,11 +27,26 @@ export default function QuadPage() {
             <a href="https://whop.com/index-cheat-codes/affiliates" target="_blank" rel="noreferrer" className="hover:text-white transition-colors">
               Index Cheat Codes
             </a>
-            <a href="/guide" className="hover:text-white transition-colors">
-              Guide
+            <a href="/" className="hover:text-white transition-colors">
+              Heatmap
+            </a>
+            <a href="/quad" className="hover:text-white transition-colors">
+              Quad
+            </a>
+            <a href="/gaia" className="hover:text-white transition-colors">
+              Gaia
+            </a>
+            <a href="/atlas" className="hover:text-white transition-colors">
+              Atlas
+            </a>
+            <a href="/scanner" className="hover:text-white transition-colors">
+              Scanner
             </a>
             <a href="/recap" className="hover:text-white transition-colors">
               Recap
+            </a>
+            <a href="/guide" className="hover:text-white transition-colors">
+              Guide
             </a>
           </div>
           <div className="text-center sm:text-right text-slate-500">

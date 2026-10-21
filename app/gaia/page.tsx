@@ -2,7 +2,7 @@
 
 import React, { useEffect } from "react";
 import { TopNavBar } from "@/components/header/TopNavBar";
-import { GaiaView } from "@/components/views/AntaeusView";
+import { GaiaView } from "@/components/views/GaiaView";
 import { useDashboardStore } from "@/store/useDashboardStore";
 
 export default function GaiaPage() {

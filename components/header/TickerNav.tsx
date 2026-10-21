@@ -2,12 +2,9 @@
 
 import React, { useEffect, useState } from "react";
 import {
-  ROW1_TICKERS,
-  ROW2_TICKERS,
-  ROW3_TICKERS,
-  ROW4_TICKERS,
-  ROW5_TICKERS,
   SUPPORTED_TICKERS,
+  WATCH_LEAD,
+  WATCH_REST,
   useDashboardStore,
 } from "@/store/useDashboardStore";
 import { cn } from "@/lib/utils";
@@ -40,7 +37,7 @@ export function TickerNav() {
 
     // Validate ticker syntax; if invalid format, fallback gracefully with toast warning
     if (!/^[A-Z0-9._-]{1,10}$/.test(cleaned)) {
-      setToastMessage("Ticker chain unavailable, using simulation");
+      setToastMessage(`Invalid ticker format: "${cleaned}"`);
       return;
     }
 
@@ -121,9 +118,9 @@ export function TickerNav() {
         </button>
       </form>
 
-      {/* Row 1 Pills: SPY, QQQ, SPX, SPXW, IWM, NDX, NDXP, DIA (+ active custom ticker badge if loaded) */}
+      {/* Row 1 Pills: Lead Watch Tickers (SPY, QQQ, SPXW, IWM, NDXP, DIA) + Custom active pill */}
       <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-        {ROW1_TICKERS.map((ticker) => {
+        {WATCH_LEAD.map((ticker) => {
           const isActive = activeTicker === ticker;
           return (
             <button
@@ -147,19 +144,15 @@ export function TickerNav() {
             <Sparkles className="h-3 w-3 text-[#11cdef]" />
             <span>{activeTicker}</span>
             <span className="text-[9px] font-normal text-cyan-200/90">
-              {dataSource === "CBOE_MARKET_DATA"
-                ? "CBOE"
-                : dataSource === "TRADIER_LIVE"
-                  ? "LIVE"
-                  : "SIM"}
+              {dataSource === "TRADIER_LIVE" ? "TRADIER" : "LIVE"}
             </span>
           </div>
         )}
       </div>
 
-      {/* Row 2 Pills: SMH, TLT, GLD, SLV, XLE, TQQQ, SOXL, IBIT, NVDA, AAPL, TSLA, MSFT, AMZN, META */}
-      <div className="flex flex-wrap items-center gap-1.5">
-        {ROW2_TICKERS.map((ticker) => {
+      {/* Row 2 Pills: All Remaining Watch Tickers (45 tickers matching TerraShade) */}
+      <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+        {WATCH_REST.map((ticker) => {
           const isActive = activeTicker === ticker;
           return (
             <button
@@ -167,73 +160,7 @@ export function TickerNav() {
               type="button"
               onClick={() => handlePresetTickerClick(ticker)}
               className={cn(
-                "px-2.5 py-0.5 rounded-full text-[11px] font-mono font-semibold tracking-wide transition-all border",
-                isActive
-                  ? "bg-argon-primary text-white border-[#11cdef] shadow-[0_0_12px_rgba(94,114,228,0.65)]"
-                  : "bg-[#0b0d17]/80 text-slate-400 border-white/10 hover:text-white hover:border-[#5e72e4]/50"
-              )}
-            >
-              {ticker}
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Row 3 Pills: GOOGL, AVGO, NFLX, ORCL, AMD, MU, INTC, TSM, ARM, PLTR, COIN, MSTR, HOOD, SOFI */}
-      <div className="flex flex-wrap items-center gap-1.5">
-        {ROW3_TICKERS.map((ticker) => {
-          const isActive = activeTicker === ticker;
-          return (
-            <button
-              key={ticker}
-              type="button"
-              onClick={() => handlePresetTickerClick(ticker)}
-              className={cn(
-                "px-2.5 py-0.5 rounded-full text-[11px] font-mono font-semibold tracking-wide transition-all border",
-                isActive
-                  ? "bg-argon-primary text-white border-[#11cdef] shadow-[0_0_12px_rgba(94,114,228,0.65)]"
-                  : "bg-[#0b0d17]/80 text-slate-400 border-white/10 hover:text-white hover:border-[#5e72e4]/50"
-              )}
-            >
-              {ticker}
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Row 4 Pills: SMCI, CRWD, UBER, SHOP, RBLX, JPM, BAC, WMT, COST, XOM, BA, LLY, GME, RIVN */}
-      <div className="flex flex-wrap items-center gap-1.5">
-        {ROW4_TICKERS.map((ticker) => {
-          const isActive = activeTicker === ticker;
-          return (
-            <button
-              key={ticker}
-              type="button"
-              onClick={() => handlePresetTickerClick(ticker)}
-              className={cn(
-                "px-2.5 py-0.5 rounded-full text-[11px] font-mono font-semibold tracking-wide transition-all border",
-                isActive
-                  ? "bg-argon-primary text-white border-[#11cdef] shadow-[0_0_12px_rgba(94,114,228,0.65)]"
-                  : "bg-[#0b0d17]/80 text-slate-400 border-white/10 hover:text-white hover:border-[#5e72e4]/50"
-              )}
-            >
-              {ticker}
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Row 5 Pills: MARA, BABA, SPCX */}
-      <div className="flex flex-wrap items-center gap-1.5">
-        {ROW5_TICKERS.map((ticker) => {
-          const isActive = activeTicker === ticker;
-          return (
-            <button
-              key={ticker}
-              type="button"
-              onClick={() => handlePresetTickerClick(ticker)}
-              className={cn(
-                "px-2.5 py-0.5 rounded-full text-[11px] font-mono font-semibold tracking-wide transition-all border",
+                "px-2.5 py-0.5 rounded-full text-[11px] font-mono font-semibold tracking-wide transition-all border shrink-0",
                 isActive
                   ? "bg-argon-primary text-white border-[#11cdef] shadow-[0_0_12px_rgba(94,114,228,0.65)]"
                   : "bg-[#0b0d17]/80 text-slate-400 border-white/10 hover:text-white hover:border-[#5e72e4]/50"

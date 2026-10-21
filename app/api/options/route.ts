@@ -197,15 +197,37 @@ async function fetchCboeOptions(
         : ticker;
   const url = `https://cdn.cboe.com/api/global/delayed_quotes/options/${cboeSymbol}.json`;
 
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "Mozilla/5.0 (compatible; HyperionAnalytics/1.0)",
-    },
-    cache: "no-store",
-  });
+  const fetchWithTimeout = async (attempt = 1): Promise<Response | null> => {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      const res = await fetch(url, {
+        signal: controller.signal,
+        headers: {
+          Accept: "application/json",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        },
+        cache: "no-store",
+      });
+      clearTimeout(timeout);
+      if (res.ok) return res;
+      if (attempt === 1) {
+        await new Promise((r) => setTimeout(r, 300));
+        return fetchWithTimeout(2);
+      }
+      return null;
+    } catch {
+      if (attempt === 1) {
+        await new Promise((r) => setTimeout(r, 300));
+        return fetchWithTimeout(2);
+      }
+      return null;
+    }
+  };
 
-  if (!response.ok) return null;
+  const response = await fetchWithTimeout();
+  if (!response) return null;
 
   const json = await response.json();
   const data = json?.data;
@@ -267,15 +289,33 @@ async function attachIntraday(
   payload: OptionsAnalyticsPayload
 ): Promise<OptionsAnalyticsPayload> {
   try {
-    const { history, alerts } = await recordIntradaySnapshot({
+    const { history, alerts, officialLevels } = await recordIntradaySnapshot({
       ticker: payload.ticker,
       spotPrice: payload.spotPrice,
       callWall: payload.gammaLevels.callWall,
       putWall: payload.gammaLevels.putWall,
       zeroGamma: payload.gammaLevels.zeroGamma,
     });
+
+    let gammaLevels = payload.gammaLevels;
+    let gammaLevelsByFilter = payload.gammaLevelsByFilter;
+    if (officialLevels && officialLevels.callWall > 0) {
+      gammaLevels = {
+        ...payload.gammaLevels,
+        ...officialLevels,
+      };
+      if (gammaLevelsByFilter) {
+        gammaLevelsByFilter = {
+          ...gammaLevelsByFilter,
+          ALL: gammaLevels,
+        };
+      }
+    }
+
     return {
       ...payload,
+      gammaLevels,
+      gammaLevelsByFilter,
       intradayData: history,
       alerts,
     };

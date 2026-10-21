@@ -1,0 +1,2653 @@
+"use client";
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useDashboardStore } from "@/store/useDashboardStore";
+import { normPDF } from "@/lib/optionsExposure";
+import type {
+  GaiaExpirationInfo,
+  GaiaIntradayCandle,
+  GaiaLivePayload,
+  GaiaMtfRow,
+  GaiaPivotSignal,
+  GaiaSessionOption,
+  GaiaStrikeExpBucket,
+} from "@/app/api/gaia/route";
+import { cn } from "@/lib/utils";
+
+type ExposureMode = "GEX" | "VEX" | "Combined";
+type ExpFilterMode = "ALL" | "NEXT" | "WEEK" | string; // string for specific MM-DD date
+
+interface StrikeExposureColumn {
+  netGexB: number; // in Billions ($B)
+  kingStrike: number;
+  kingConcPct: number;
+  allExpKingStrike: number;
+  allExpKingConcPct: number;
+  filteredKingStrike: number;
+  filteredKingConcPct: number;
+  bookCenter: number;
+  strikeValues: Record<number, number>; // value in Millions ($M)
+  strikeGexValues?: Record<number, number>;
+  strikeVexValues?: Record<number, number>;
+  topLevels: { strike: number; valueM: number }[];
+}
+
+interface ComputedGaiaViewData {
+  ticker: string;
+  sessionDate: string;
+  bookLabel: string;
+  priorClose: number;
+  sigma1Move: number;
+  sigma2Move: number;
+  yMin: number;
+  yMax: number;
+  yAxisTicks: number[];
+  visibleStrikes: number[];
+  candles: GaiaIntradayCandle[];
+  columnsByBar: StrikeExposureColumn[];
+  pivotSignals5m: GaiaPivotSignal[];
+  mtfByBar: GaiaMtfRow[];
+}
+
+function formatBookLevelValue(valueM: number): string {
+  const absM = Math.abs(valueM);
+  const sign = valueM < 0 ? "-" : "+";
+  if (absM >= 1000) {
+    return `${sign}${(absM / 1000).toFixed(2)}B`;
+  }
+  return `${sign}${absM.toFixed(2)}M`;
+}
+
+function formatPct(pct: number): string {
+  return `${Number(pct.toFixed(1))}`;
+}
+
+function computeNicePriceTicks(
+  min: number,
+  max: number,
+  targetCount = 5
+): number[] {
+  const span = max - min;
+  if (span <= 0) return [min];
+  const rawStep = span / (targetCount - 1);
+  const magnitude = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  const normalized = rawStep / magnitude;
+  let niceStepNorm = 1;
+  if (normalized > 1.2 && normalized <= 2.2) niceStepNorm = 2;
+  else if (normalized > 2.2 && normalized <= 3.8) niceStepNorm = 2.5;
+  else if (normalized > 3.8 && normalized <= 7.0) niceStepNorm = 5;
+  else if (normalized > 7.0) niceStepNorm = 10;
+  const niceStep = niceStepNorm * magnitude;
+
+  const firstTick = Math.ceil((min - 0.0001) / niceStep) * niceStep;
+  const ticks: number[] = [];
+  for (let t = firstTick; t <= max + niceStep * 0.001; t += niceStep) {
+    ticks.push(Number(t.toFixed(2)));
+  }
+  if (ticks.length >= 3) return ticks;
+  const step = span / 4;
+  return [0, 1, 2, 3, 4]
+    .map((i) => Number((max - i * step).toFixed(2)))
+    .reverse();
+}
+
+function evaluateBucketExposureM(
+  spot: number,
+  bucket: GaiaStrikeExpBucket,
+  mode: ExposureMode
+): number {
+  const T = Math.max(1 / 365, (bucket.dteDays + 0.5) / 365);
+  const sqrtT = Math.sqrt(T);
+  const discountQ = Math.exp(-0.012 * T);
+
+  let callGexM = 0;
+  let callVexM = 0;
+  if (bucket.callOI > 0) {
+    const iv = Math.max(0.02, Math.min(3.5, bucket.callIv));
+    const d1 =
+      (Math.log(Math.max(1e-4, spot / bucket.strike)) +
+        (0.045 - 0.012 + 0.5 * iv * iv) * T) /
+      (iv * sqrtT);
+    const d2 = d1 - iv * sqrtT;
+    const pdf = normPDF(d1);
+    const bsGamma = (discountQ * pdf) / (spot * iv * sqrtT);
+    const gamma =
+      bucket.callGamma && bucket.callGamma > 0 ? bucket.callGamma : bsGamma;
+    const vanna = -discountQ * pdf * (d2 / iv);
+
+    callGexM = (bucket.callOI * gamma * 100 * (spot * spot) * 0.01) / 1e6;
+    callVexM = (bucket.callOI * vanna * 100 * spot * 0.01) / 1e6;
+  }
+
+  let putGexM = 0;
+  let putVexM = 0;
+  if (bucket.putOI > 0) {
+    const iv = Math.max(0.02, Math.min(3.5, bucket.putIv));
+    const d1 =
+      (Math.log(Math.max(1e-4, spot / bucket.strike)) +
+        (0.045 - 0.012 + 0.5 * iv * iv) * T) /
+      (iv * sqrtT);
+    const d2 = d1 - iv * sqrtT;
+    const pdf = normPDF(d1);
+    const bsGamma = (discountQ * pdf) / (spot * iv * sqrtT);
+    const gamma =
+      bucket.putGamma && bucket.putGamma > 0 ? bucket.putGamma : bsGamma;
+    const vanna = -discountQ * pdf * (d2 / iv);
+
+    putGexM = (bucket.putOI * gamma * 100 * (spot * spot) * 0.01) / 1e6;
+    putVexM = (bucket.putOI * vanna * 100 * spot * 0.01) / 1e6;
+  }
+
+  const netGexM = callGexM - putGexM;
+  const netVexM = callVexM - putVexM;
+
+  if (mode === "GEX") return netGexM;
+  if (mode === "VEX") return netVexM;
+  return netGexM + netVexM;
+}
+
+interface DivergenceSignal {
+  type: string;
+  p1: number;
+  p2: number;
+  t1: number;
+  t2: number;
+  near?: [string, number][];
+}
+
+interface DivergenceRow {
+  tf: string;
+  name: string;
+  state: string;
+  signal: DivergenceSignal | null;
+  building?: boolean;
+  intraday?: boolean;
+}
+
+interface DivergencePayload {
+  symbol: string;
+  rows: DivergenceRow[];
+  levels: { King: number; "Call wall": number; "Put wall": number };
+}
+
+function divWhen(t: number, intraday?: boolean): string {
+  const d = new Date(t * 1000).toISOString();
+  return intraday ? `${d.slice(5, 10)} ${d.slice(11, 16)}` : d.slice(0, 10);
+}
+
+/**
+ * Computes the complete Gaia chart view dataset strictly from the live API payload.
+ */
+function buildLiveGaiaDataset(
+  payload: GaiaLivePayload,
+  exposureMode: ExposureMode,
+  expFilter: ExpFilterMode
+): ComputedGaiaViewData {
+  const {
+    ticker,
+    sessionDate,
+    bookLabel,
+    priorClose,
+    sigma1Move,
+    sigma2Move,
+    candles,
+    pivotSignals5m,
+    mtfByBar,
+    expirations,
+    optionBuckets,
+  } = payload;
+
+  // Filter live option buckets by the selected expiration filter
+  const nextExpIso = expirations[0]?.isoDate ?? "";
+  const weekIsoSet = new Set(
+    expirations.filter((e) => e.isThisWeek).map((e) => e.isoDate)
+  );
+
+  const filteredBuckets = optionBuckets.filter((b) => {
+    if (expFilter === "ALL") return true;
+    if (expFilter === "NEXT") return b.expiration === nextExpIso;
+    if (expFilter === "WEEK") {
+      return weekIsoSet.size > 0
+        ? weekIsoSet.has(b.expiration)
+        : b.expiration === nextExpIso;
+    }
+    return b.dateLabel === expFilter || b.expiration === expFilter;
+  });
+
+  const activeBuckets =
+    filteredBuckets.length > 0 ? filteredBuckets : optionBuckets;
+
+  // Compute y-domain bounds from live session candles and ±2σ Expected-Move Cone
+  const candleHighs = candles.map((c) => c.high);
+  const candleLows = candles.map((c) => c.low);
+  const maValues = candles.map((c) => c.sma5d);
+
+  const minChartRef = Math.min(
+    ...candleLows,
+    priorClose - sigma2Move
+  );
+  const maxChartRef = Math.max(
+    ...candleHighs,
+    ...maValues,
+    priorClose + sigma2Move
+  );
+
+  // Extract all live option strikes within the visible vertical price window
+  const allUniqueStrikesDesc = Array.from(
+    new Set(optionBuckets.map((b) => b.strike))
+  ).sort((a, b) => b - a);
+
+  const inWindowStrikes = allUniqueStrikesDesc.filter(
+    (s) => s >= minChartRef - sigma1Move * 0.35 && s <= maxChartRef + sigma1Move * 0.35
+  );
+
+  const baseVisibleStrikes =
+    inWindowStrikes.length >= 5
+      ? inWindowStrikes
+      : allUniqueStrikesDesc.slice(0, 25);
+
+  const visibleStrikeSet = new Set(baseVisibleStrikes);
+
+  const isLatestSession =
+    payload.sessions.length === 0 ||
+    sessionDate === payload.sessions[0].isoDate;
+
+  // Evaluate Black-Scholes exposure across both all-expiration buckets and active filtered buckets at each 5m bar
+  const columnsByBar: StrikeExposureColumn[] = candles.map((candle, idx) => {
+    const spot =
+      isLatestSession && idx === candles.length - 1
+        ? payload.spotPrice
+        : candle.close;
+
+    // 1. Global All-Expiration King calculation across all optionBuckets
+    const allExpStrikeTotals = new Map<number, number>();
+    for (const bucket of optionBuckets) {
+      const valM = evaluateBucketExposureM(spot, bucket, exposureMode);
+      allExpStrikeTotals.set(
+        bucket.strike,
+        (allExpStrikeTotals.get(bucket.strike) ?? 0) + valM
+      );
+    }
+
+    let totalAllExpAbsBoardM = 0;
+    const rankedAllExp: { strike: number; valueM: number }[] = [];
+    for (const [strike, valM] of Array.from(allExpStrikeTotals.entries())) {
+      const rounded = Number(valM.toFixed(2));
+      totalAllExpAbsBoardM += Math.abs(valM);
+      rankedAllExp.push({ strike, valueM: rounded });
+    }
+    rankedAllExp.sort((a, b) => Math.abs(b.valueM) - Math.abs(a.valueM));
+    const allExpKingStrike =
+      rankedAllExp[0]?.strike ??
+      baseVisibleStrikes[baseVisibleStrikes.length - 1] ??
+      Math.round(spot);
+    const allExpKingAbsM = Math.abs(rankedAllExp[0]?.valueM ?? 0);
+    const allExpKingConcPct =
+      totalAllExpAbsBoardM > 0
+        ? Number(((allExpKingAbsM / totalAllExpAbsBoardM) * 100).toFixed(1))
+        : 0;
+
+    // 2. Filtered Expiration King & Active Book calculation across activeBuckets
+    const strikeTotals =
+      expFilter === "ALL" ? allExpStrikeTotals : new Map<number, number>();
+    const strikeGexTotals = new Map<number, number>();
+    const strikeVexTotals = new Map<number, number>();
+
+    const bucketsForDual = expFilter === "ALL" ? optionBuckets : activeBuckets;
+    for (const bucket of bucketsForDual) {
+      const gex = evaluateBucketExposureM(spot, bucket, "GEX");
+      const vex = evaluateBucketExposureM(spot, bucket, "VEX");
+      strikeGexTotals.set(
+        bucket.strike,
+        (strikeGexTotals.get(bucket.strike) ?? 0) + gex
+      );
+      strikeVexTotals.set(
+        bucket.strike,
+        (strikeVexTotals.get(bucket.strike) ?? 0) + vex
+      );
+    }
+
+    if (expFilter !== "ALL") {
+      for (const bucket of activeBuckets) {
+        const valM = evaluateBucketExposureM(spot, bucket, exposureMode);
+        strikeTotals.set(
+          bucket.strike,
+          (strikeTotals.get(bucket.strike) ?? 0) + valM
+        );
+      }
+    }
+
+    let totalNetM = 0;
+    let totalAbsBoardM = 0;
+    const rankedFiltered: { strike: number; valueM: number }[] = [];
+    const strikeValues: Record<number, number> = {};
+    const strikeGexValues: Record<number, number> = {};
+    const strikeVexValues: Record<number, number> = {};
+
+    for (const [strike, valM] of Array.from(strikeTotals.entries())) {
+      const rounded = Number(valM.toFixed(2));
+      totalNetM += valM;
+      totalAbsBoardM += Math.abs(valM);
+      rankedFiltered.push({ strike, valueM: rounded });
+      if (visibleStrikeSet.has(strike)) {
+        strikeValues[strike] = rounded;
+      }
+    }
+
+    for (const [strike, valM] of Array.from(strikeGexTotals.entries())) {
+      if (visibleStrikeSet.has(strike)) {
+        strikeGexValues[strike] = Number(valM.toFixed(2));
+      }
+    }
+    for (const [strike, valM] of Array.from(strikeVexTotals.entries())) {
+      if (visibleStrikeSet.has(strike)) {
+        strikeVexValues[strike] = Number(valM.toFixed(2));
+      }
+    }
+
+    rankedFiltered.sort((a, b) => Math.abs(b.valueM) - Math.abs(a.valueM));
+    const topLevels = rankedFiltered.slice(0, 3);
+    const filteredKingStrike =
+      topLevels[0]?.strike ??
+      baseVisibleStrikes[baseVisibleStrikes.length - 1] ??
+      Math.round(spot);
+    const filteredKingAbsM = Math.abs(topLevels[0]?.valueM ?? 0);
+    const filteredKingConcPct =
+      totalAbsBoardM > 0
+        ? Number(((filteredKingAbsM / totalAbsBoardM) * 100).toFixed(1))
+        : 0;
+
+    const kingStrike =
+      expFilter === "ALL" ? allExpKingStrike : filteredKingStrike;
+    const kingConcPct =
+      expFilter === "ALL" ? allExpKingConcPct : filteredKingConcPct;
+
+    // Ensure both King strikes are included in strikeValues & visibleStrikeSet
+    if (topLevels[0] && strikeValues[filteredKingStrike] === undefined) {
+      strikeValues[filteredKingStrike] = topLevels[0].valueM;
+      visibleStrikeSet.add(filteredKingStrike);
+    }
+    if (rankedAllExp[0] && strikeValues[allExpKingStrike] === undefined) {
+      const allKingInFiltered = strikeTotals.get(allExpKingStrike) ?? 0;
+      strikeValues[allExpKingStrike] = Number(allKingInFiltered.toFixed(2));
+      visibleStrikeSet.add(allExpKingStrike);
+    }
+
+    // Exposure-weighted Book Center across visible strikes
+    let weightedStrikeSum = 0;
+    let absWeightTotal = 0;
+    for (const s of Array.from(visibleStrikeSet)) {
+      const absExp = Math.abs(strikeValues[s] ?? 0);
+      weightedStrikeSum += s * absExp;
+      absWeightTotal += absExp;
+    }
+    const bookCenter =
+      absWeightTotal > 0
+        ? Number((weightedStrikeSum / absWeightTotal).toFixed(2))
+        : Number(spot.toFixed(2));
+
+    return {
+      netGexB: Number((totalNetM / 1000).toFixed(2)),
+      kingStrike,
+      kingConcPct,
+      allExpKingStrike,
+      allExpKingConcPct,
+      filteredKingStrike,
+      filteredKingConcPct,
+      bookCenter,
+      strikeValues,
+      strikeGexValues,
+      strikeVexValues,
+      topLevels,
+    };
+  });
+
+  const visibleStrikes = Array.from(visibleStrikeSet).sort((a, b) => b - a);
+
+  // Include visible strikes, candles, both King strikes, and full ±2σ Expected-Move Cone bounds + padding
+  const lastCol = columnsByBar[columnsByBar.length - 1];
+  const allExpKingFinal = lastCol?.allExpKingStrike ?? priorClose;
+  const filteredKingFinal = lastCol?.filteredKingStrike ?? priorClose;
+  const allDomainPrices = [
+    ...visibleStrikes,
+    ...candleHighs,
+    ...candleLows,
+    ...maValues,
+    priorClose - sigma2Move,
+    priorClose + sigma2Move,
+    allExpKingFinal,
+    filteredKingFinal,
+  ];
+  const minPrice = Math.min(...allDomainPrices);
+  const maxPrice = Math.max(...allDomainPrices);
+  const padPts = Math.max(1.5, (maxPrice - minPrice) * 0.06);
+  const yMin = Number((minPrice - padPts).toFixed(2));
+  const yMax = Number((maxPrice + padPts).toFixed(2));
+
+  // 5 evenly spaced right-axis price ticks across the visible domain
+  const tickTop = maxPrice - padPts * 0.55;
+  const tickBot = minPrice + padPts * 0.95;
+  const tickStep = (tickTop - tickBot) / 4;
+  const yAxisTicks = [0, 1, 2, 3, 4].map((idx) =>
+    Number((tickTop - idx * tickStep).toFixed(2))
+  );
+
+  return {
+    ticker,
+    sessionDate,
+    bookLabel,
+    priorClose,
+    sigma1Move,
+    sigma2Move,
+    yMin,
+    yMax,
+    yAxisTicks,
+    visibleStrikes,
+    candles,
+    columnsByBar,
+    pivotSignals5m,
+    mtfByBar,
+  };
+}
+
+export function GaiaView() {
+  const storeTicker = useDashboardStore((state) => state.activeTicker);
+  const gammaLevels = useDashboardStore((state) => state.gammaLevels);
+  const setStoreTicker = useDashboardStore((state) => state.setTicker);
+  const fetchOptionsChain = useDashboardStore(
+    (state) => state.fetchOptionsChain
+  );
+  const [atlasPalette, setAtlasPalette] = useState<"ice" | "polarity">("ice");
+  const [countdownSec, setCountdownSec] = useState<number>(() => {
+    const now = new Date();
+    return 300 - ((now.getUTCMinutes() % 5) * 60 + now.getUTCSeconds());
+  });
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = new Date();
+      setCountdownSec(
+        300 - ((now.getUTCMinutes() % 5) * 60 + now.getUTCSeconds())
+      );
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const DIVSYM = useMemo(() => new Set(["SPY", "QQQ", "SPXW", "IWM"]), []);
+
+  const [tickerInput, setTickerInput] = useState<string>(storeTicker || "SPY");
+  const [loadedTicker, setLoadedTicker] = useState<string>(storeTicker || "SPY");
+  const [guideExpanded, setGuideExpanded] = useState<boolean>(false);
+  const [selectedSessionIso, setSelectedSessionIso] = useState<string>("");
+
+  const [livePayload, setLivePayload] = useState<GaiaLivePayload | null>(
+    null
+  );
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const [exposureMode, setExposureMode] = useState<ExposureMode>("GEX");
+  const [expFilter, setExpFilter] = useState<ExpFilterMode>("ALL");
+  const [selectedDateExp, setSelectedDateExp] = useState<string>("");
+  const [pathToKing, setPathToKing] = useState<boolean>(true);
+
+  const [activeBarIndex, setActiveBarIndex] = useState<number>(0);
+  const [hoverBarIndex, setHoverBarIndex] = useState<number | null>(null);
+  const [isReplaying, setIsReplaying] = useState<boolean>(false);
+  const [openDivTf, setOpenDivTf] = useState<string | null>(null);
+  const [divPayload, setDivPayload] = useState<DivergencePayload | null>(null);
+
+  // Adjustable Chart Window States
+  const [chartHeight, setChartHeight] = useState<number>(540); // 380 .. 950 px
+  const [yScale, setYScale] = useState<number>(1.0); // 0.2 .. 10.0
+  const [yPanOffset, setYPanOffset] = useState<number>(0); // price points
+  const [scopePreset, setScopePreset] = useState<"focus" | "tactical" | "cone">("cone");
+  const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [dragMode, setDragMode] = useState<"pan" | "scaleY" | null>(null);
+  const [dragStart, setDragStart] = useState<{
+    x: number;
+    y: number;
+    yPan: number;
+    yScale: number;
+  }>({
+    x: 0,
+    y: 0,
+    yPan: 0,
+    yScale: 1.0,
+  });
+  const [hoverCursor, setHoverCursor] = useState<{ x: number; y: number } | null>(null);
+
+  // Global mouseup listener to release any active drag
+  useEffect(() => {
+    const onWindowMouseUp = () => {
+      setIsDragging(false);
+      setDragMode(null);
+    };
+    window.addEventListener("mouseup", onWindowMouseUp);
+    return () => window.removeEventListener("mouseup", onWindowMouseUp);
+  }, []);
+
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [canvasWidth, setCanvasWidth] = useState<number>(1016);
+
+  const fetchLiveGaia = useCallback(
+    async (tickerSymbol: string, sessionIso?: string) => {
+      setIsLoading(true);
+      setErrorMsg(null);
+      try {
+        const qs = new URLSearchParams({ ticker: tickerSymbol });
+        if (sessionIso) qs.set("session", sessionIso);
+        const res = await fetch(`/api/gaia?${qs.toString()}`, {
+          cache: "no-store",
+        });
+        const data = await res.json();
+        if (!res.ok || data?.error) {
+          throw new Error(data?.error ?? `HTTP ${res.status}`);
+        }
+        const payload = data as GaiaLivePayload;
+        setLivePayload(payload);
+        setSelectedSessionIso(payload.sessionDate);
+        setActiveBarIndex(Math.max(0, payload.candles.length - 1));
+        setHoverBarIndex(null);
+      } catch (err) {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : "Live market feed unavailable";
+        setErrorMsg(msg);
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    []
+  );
+
+  // Initial load and sync when global store ticker changes externally
+  useEffect(() => {
+    if (storeTicker && storeTicker !== loadedTicker) {
+      setTickerInput(storeTicker);
+      setLoadedTicker(storeTicker);
+      setSelectedSessionIso("");
+      fetchLiveGaia(storeTicker, "");
+    }
+  }, [storeTicker, loadedTicker, fetchLiveGaia]);
+
+  useEffect(() => {
+    fetchLiveGaia(loadedTicker, selectedSessionIso);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const sym = loadedTicker.toUpperCase();
+    if (!DIVSYM.has(sym)) {
+      setDivPayload(null);
+      return;
+    }
+    let active = true;
+    fetch(`/api/divergence?symbol=${encodeURIComponent(sym)}`, { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (active && data && Array.isArray(data.rows)) {
+          setDivPayload(data as DivergencePayload);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [loadedTicker, DIVSYM]);
+
+  // Observe chart container width for responsive high-DPI canvas rendering
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const updateWidth = () => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 200) {
+        setCanvasWidth(Math.floor(rect.width));
+      }
+    };
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const maxBarIdx = useMemo(
+    () => Math.max(0, (livePayload?.candles.length ?? 1) - 1),
+    [livePayload]
+  );
+
+  // Automatic bar-by-bar replay timer
+  useEffect(() => {
+    if (!isReplaying) return;
+    const timer = setInterval(() => {
+      setActiveBarIndex((prev) => {
+        if (prev >= maxBarIdx) {
+          setIsReplaying(false);
+          return maxBarIdx;
+        }
+        return prev + 1;
+      });
+    }, 140);
+    return () => clearInterval(timer);
+  }, [isReplaying, maxBarIdx]);
+
+  const dataset = useMemo(() => {
+    if (!livePayload) return null;
+    return buildLiveGaiaDataset(livePayload, exposureMode, expFilter);
+  }, [livePayload, exposureMode, expFilter]);
+
+  // Dynamic Price Domain Bounds based on Scope Preset, Zoom (yScale) and Pan (yPanOffset)
+  const priceBounds = useMemo(() => {
+    if (!dataset) return { yMin: 0, yMax: 100, yAxisTicks: [] };
+
+    let anchorPrices: number[] = [];
+    const candleHighs = dataset.candles.map((c) => c.high);
+    const candleLows = dataset.candles.map((c) => c.low);
+    const spot =
+      dataset.candles[dataset.candles.length - 1]?.close ?? dataset.priorClose;
+
+    if (scopePreset === "focus") {
+      // Focus: tightly around candle action and spot (Image 2)
+      anchorPrices = [
+        ...candleHighs,
+        ...candleLows,
+        spot,
+        dataset.priorClose,
+        dataset.priorClose + dataset.sigma1Move * 0.45,
+        dataset.priorClose - dataset.sigma1Move * 0.45,
+      ];
+    } else if (scopePreset === "tactical") {
+      // Tactical: candles + 1σ expected move
+      anchorPrices = [
+        ...candleHighs,
+        ...candleLows,
+        spot,
+        dataset.priorClose - dataset.sigma1Move,
+        dataset.priorClose + dataset.sigma1Move,
+      ];
+    } else {
+      // Cone: full ±2σ cone bounds + Kings (Image 1)
+      anchorPrices = [
+        ...dataset.visibleStrikes,
+        ...candleHighs,
+        ...candleLows,
+        dataset.priorClose - dataset.sigma2Move,
+        dataset.priorClose + dataset.sigma2Move,
+        dataset.columnsByBar[dataset.columnsByBar.length - 1]?.allExpKingStrike ??
+          dataset.priorClose,
+        dataset.columnsByBar[dataset.columnsByBar.length - 1]?.filteredKingStrike ??
+          dataset.priorClose,
+      ];
+    }
+
+    const minP = Math.min(...anchorPrices);
+    const maxP = Math.max(...anchorPrices);
+    const rawSpan = Math.max(2.0, maxP - minP);
+    const pad = Math.max(
+      1.0,
+      rawSpan * (scopePreset === "focus" ? 0.14 : 0.06)
+    );
+
+    const baseCenter = (minP + maxP) / 2;
+    const baseSpan = rawSpan + pad * 2;
+
+    const effectiveSpan = baseSpan / Math.max(0.1, yScale);
+    const effectiveCenter = baseCenter + yPanOffset;
+
+    const yMin = Number((effectiveCenter - effectiveSpan / 2).toFixed(2));
+    const yMax = Number((effectiveCenter + effectiveSpan / 2).toFixed(2));
+    const yAxisTicks = computeNicePriceTicks(yMin, yMax, 5);
+
+    return { yMin, yMax, yAxisTicks };
+  }, [dataset, scopePreset, yScale, yPanOffset]);
+
+  const handleLoadTicker = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const cleaned = tickerInput.trim().toUpperCase() || "SPY";
+    setTickerInput(cleaned);
+    setLoadedTicker(cleaned);
+    setStoreTicker(cleaned);
+    fetchOptionsChain(cleaned, true);
+    setIsReplaying(false);
+    setSelectedSessionIso("");
+    fetchLiveGaia(cleaned, "");
+  };
+
+  const handleSessionChange = (newSessionIso: string) => {
+    setSelectedSessionIso(newSessionIso);
+    setIsReplaying(false);
+    fetchLiveGaia(loadedTicker, newSessionIso);
+  };
+
+  const handleResetView = () => {
+    setExposureMode("GEX");
+    setExpFilter("ALL");
+    setSelectedDateExp("");
+    setPathToKing(true);
+    setIsReplaying(false);
+    setActiveBarIndex(maxBarIdx);
+    setHoverBarIndex(null);
+    setYScale(1.0);
+    setYPanOffset(0);
+    setScopePreset("cone");
+  };
+
+  const handleResetZoom = () => {
+    setYScale(1.0);
+    setYPanOffset(0);
+  };
+
+  const handleToggleReplay = () => {
+    if (isReplaying) {
+      setIsReplaying(false);
+    } else {
+      if (activeBarIndex >= maxBarIdx) {
+        setActiveBarIndex(0);
+      }
+      setIsReplaying(true);
+    }
+  };
+
+  // Canvas Mouse & Interaction Handlers for Zooming and Panning
+  const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !dataset) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    const rightAxisWidth = 64;
+    const outlookRightX = canvasWidth - rightAxisWidth;
+
+    if (x >= outlookRightX) {
+      setIsDragging(true);
+      setDragMode("scaleY");
+      setDragStart({ x, y, yPan: yPanOffset, yScale });
+    } else {
+      setIsDragging(true);
+      setDragMode("pan");
+      setDragStart({ x, y, yPan: yPanOffset, yScale });
+    }
+  };
+
+  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!dataset) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    setHoverCursor({ x: mouseX, y: mouseY });
+
+    const padLeft = 18;
+    const rightAxisWidth = 64;
+    const padTop = 18;
+    const padBottom = 32;
+    const plotHeight = chartHeight - padTop - padBottom;
+    const totalPlotWidth = rect.width - padLeft - rightAxisWidth;
+    const dividerX = padLeft + totalPlotWidth * 0.76;
+
+    if (isDragging && dragMode) {
+      if (dragMode === "scaleY") {
+        // Dragging up zooms in, dragging down zooms out
+        const dy = dragStart.y - mouseY;
+        const multiplier = Math.exp(dy * 0.008);
+        setYScale(Math.min(10.0, Math.max(0.2, dragStart.yScale * multiplier)));
+      } else if (dragMode === "pan") {
+        // Dragging up/down pans vertically
+        const dy = mouseY - dragStart.y;
+        const { yMin, yMax } = priceBounds;
+        const pricePerPx = (yMax - yMin) / Math.max(1, plotHeight);
+        setYPanOffset(dragStart.yPan + dy * pricePerPx);
+      }
+      return;
+    }
+
+    if (mouseX < padLeft || mouseX > dividerX) {
+      setHoverBarIndex(null);
+      return;
+    }
+
+    const totalSlots = Math.max(78, dataset.candles.length);
+    const ratio = (mouseX - padLeft) / Math.max(1, dividerX - padLeft);
+    const barIdx = Math.max(
+      0,
+      Math.min(safeActiveIdx, Math.floor(ratio * totalSlots))
+    );
+    setHoverBarIndex(barIdx);
+  };
+
+  const handleCanvasMouseUp = () => {
+    setIsDragging(false);
+    setDragMode(null);
+  };
+
+  const handleCanvasMouseLeave = () => {
+    setHoverBarIndex(null);
+    setHoverCursor(null);
+  };
+
+  const handleCanvasWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
+    setYScale((prev) => Math.min(10.0, Math.max(0.2, prev * zoomFactor)));
+  };
+
+  const handleCanvasDoubleClick = () => {
+    setYScale(1.0);
+    setYPanOffset(0);
+    setScopePreset("cone");
+  };
+
+  const cursorStyle = isDragging
+    ? dragMode === "scaleY"
+      ? "ns-resize"
+      : "grabbing"
+    : hoverCursor && hoverCursor.x >= canvasWidth - 64
+      ? "ns-resize"
+      : "crosshair";
+
+  const safeActiveIdx = dataset
+    ? Math.min(activeBarIndex, dataset.candles.length - 1)
+    : 0;
+  const displayBarIdx =
+    hoverBarIndex !== null
+      ? Math.min(safeActiveIdx, hoverBarIndex)
+      : safeActiveIdx;
+
+  const activeCandle = dataset?.candles[displayBarIdx];
+  const activeBookCol = dataset?.columnsByBar[displayBarIdx];
+  const mtfDivergence = dataset?.mtfByBar[safeActiveIdx] ?? {
+    tf5m: "NO",
+    tf30m: "NO",
+    tf2h: "NO",
+    tfDaily: "NO",
+    tfWeekly: "NO",
+  };
+
+  const sessionOptions: GaiaSessionOption[] = livePayload?.sessions ?? [];
+  const expirationOptions: GaiaExpirationInfo[] =
+    livePayload?.expirations ?? [];
+  const has0DteActive = Boolean(livePayload?.has0DteActive);
+  const nextExpPillLabel = has0DteActive ? "0DTE" : "Next exp";
+  const nextExpShortDate = expirationOptions[0]?.dateLabel ?? "";
+
+  const canvasFilterBadgePrefix =
+    expFilter === "ALL"
+      ? "All-exp"
+      : expFilter === "NEXT"
+        ? has0DteActive
+          ? "0DTE"
+          : "Next exp"
+        : expFilter === "WEEK"
+          ? "Week"
+          : `${expFilter}`;
+
+  // High-DPI 5-Layer Canvas Rendering Engine
+  useEffect(() => {
+    if (!dataset || !activeBookCol) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+    const width = canvasWidth;
+    const height = chartHeight;
+
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+
+    ctx.save();
+    ctx.scale(dpr, dpr);
+
+    // Clear canvas background (Pitch black for high-contrast Atlas luminous beads)
+    ctx.fillStyle = "#000000";
+    ctx.fillRect(0, 0, width, height);
+
+    // 1. Reserve 84px right-hand axis gutter for {Strike} — {Concentration %} & countdown badge
+    const padLeft = 18;
+    const rightAxisWidth = 84;
+    const outlookRightX = width - rightAxisWidth;
+    const padTop = 18;
+    const padBottom = 32;
+    const plotHeight = height - padTop - padBottom;
+    const totalPlotWidth = outlookRightX - padLeft;
+
+    // Left Zone (76% width — Intraday Session) & Right Zone (24% width — outlook Zone)
+    const dividerX = Math.round(padLeft + totalPlotWidth * 0.76);
+    const sessionWidth = dividerX - padLeft;
+    const totalSessionSlots = Math.max(78, dataset.candles.length);
+
+    const { yMin, yMax, yAxisTicks } = priceBounds;
+    const priceToY = (price: number): number => {
+      const ratio = (price - yMin) / Math.max(0.0001, yMax - yMin);
+      return padTop + (1 - ratio) * plotHeight;
+    };
+
+    const barToX = (barIdx: number): number => {
+      const stepX = sessionWidth / totalSessionSlots;
+      return padLeft + (barIdx + 0.5) * stepX;
+    };
+
+    // Subtle horizontal grid lines at the price axis ticks
+    ctx.strokeStyle = "rgba(30, 38, 56, 0.55)";
+    ctx.lineWidth = 1;
+    yAxisTicks.forEach((tickPrice) => {
+      const y = Math.round(priceToY(tickPrice)) + 0.5;
+      if (y >= padTop && y <= height - padBottom) {
+        ctx.beginPath();
+        ctx.moveTo(padLeft, y);
+        ctx.lineTo(outlookRightX, y);
+        ctx.stroke();
+      }
+    });
+
+    // Vertical outlook divider line (1px solid #1e2638) and right boundary border at outlookRightX
+    ctx.strokeStyle = "#1e2638";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(dividerX + 0.5, padTop);
+    ctx.lineTo(dividerX + 0.5, height - padBottom);
+    ctx.moveTo(outlookRightX + 0.5, padTop);
+    ctx.lineTo(outlookRightX + 0.5, height - padBottom);
+    ctx.stroke();
+
+    // Clip plot layers to avoid overflowing top padding or bottom time axis
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(padLeft, padTop, totalPlotWidth, plotHeight);
+    ctx.clip();
+
+    // =========================================================================
+    // LAYER 1: Intraday Strike Position & Exposure Growth Over Time (Atlas Scheme)
+    // =========================================================================
+    let maxSessionExposure = 1;
+    for (let t = 0; t <= safeActiveIdx; t++) {
+      const col = dataset.columnsByBar[t];
+      if (!col) continue;
+      for (const s of dataset.visibleStrikes) {
+        const absVal = Math.abs(col.strikeValues[s] ?? 0);
+        if (absVal > maxSessionExposure) maxSessionExposure = absVal;
+      }
+    }
+
+    const colStepX = sessionWidth / totalSessionSlots;
+    const allExpKingStrike = activeBookCol.allExpKingStrike;
+    const yAllExpKing = priceToY(allExpKingStrike);
+    const isFiltered = expFilter !== "ALL";
+    const filteredKingStrike = activeBookCol.filteredKingStrike;
+    const yFilteredKing = priceToY(filteredKingStrike);
+    const outlookEndX = outlookRightX - 18;
+
+    // Determine Call Wall (largest positive exposure) and Put Wall (largest negative exposure)
+    let callWallStrike = allExpKingStrike;
+    let putWallStrike = allExpKingStrike;
+    let maxCallVal = 0;
+    let maxPutVal = 0;
+    for (const s of dataset.visibleStrikes) {
+      const val = activeBookCol.strikeValues[s] ?? 0;
+      if (val > maxCallVal) {
+        maxCallVal = val;
+        callWallStrike = s;
+      }
+      if (val < maxPutVal) {
+        maxPutVal = val;
+        putWallStrike = s;
+      }
+    }
+
+    // 1. Key Level Continuous Horizontal Lines:
+    // King Line: Continuous radiant line across session
+    ctx.save();
+    ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.45)" : "#eab308";
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    ctx.moveTo(padLeft, yAllExpKing);
+    ctx.lineTo(outlookEndX, yAllExpKing);
+    ctx.stroke();
+
+    // Call Wall line (subtle dashed line)
+    if (callWallStrike !== allExpKingStrike) {
+      const yCall = priceToY(callWallStrike);
+      ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.22)" : "rgba(34, 211, 238, 0.35)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath();
+      ctx.moveTo(padLeft, yCall);
+      ctx.lineTo(outlookEndX, yCall);
+      ctx.stroke();
+    }
+
+    // Put Wall line (subtle dashed line)
+    if (putWallStrike !== allExpKingStrike && putWallStrike !== callWallStrike) {
+      const yPut = priceToY(putWallStrike);
+      ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.22)" : "rgba(192, 132, 252, 0.35)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.beginPath();
+      ctx.moveTo(padLeft, yPut);
+      ctx.lineTo(outlookEndX, yPut);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    ctx.restore();
+
+    // Strike step and Proximity scale for moneyflow calculation
+    const strikeStep = dataset.visibleStrikes.length > 1
+      ? Math.abs(dataset.visibleStrikes[0] - dataset.visibleStrikes[1])
+      : 1;
+    const sigmaProx = Math.max(2.0, strikeStep * 2.5, dataset.sigma1Move * 0.25);
+    const sigmaProxSq2 = 2 * sigmaProx * sigmaProx;
+
+    // Render bar-by-bar position beads / diamonds / triangles across time (t in [0, safeActiveIdx])
+    for (let t = 0; t <= safeActiveIdx; t++) {
+      const col = dataset.columnsByBar[t];
+      if (!col) continue;
+      const cx = barToX(t);
+      const spotAtBar = dataset.candles[t]?.close ?? dataset.priorClose;
+      const colKingStrike = isFiltered ? col.filteredKingStrike : col.allExpKingStrike;
+
+      for (const strike of dataset.visibleStrikes) {
+        const cy = priceToY(strike);
+        if (cy < padTop - 12 || cy > height - padBottom + 12) continue;
+
+        const val = col.strikeValues[strike] ?? 0;
+        const absVal = Math.abs(val);
+        const conc = Math.min(1.0, absVal / maxSessionExposure);
+
+        const dist = Math.abs(strike - spotAtBar);
+        const prox = Math.exp(-(dist * dist) / sigmaProxSq2);
+        // Dynamic intensity combining raw position size and dealer hedging proximity
+        const intensity = Math.min(
+          1.0,
+          Math.max(0.0, Math.pow(conc, 0.72) * (0.28 + 0.72 * prox) * 1.25)
+        );
+
+        const isKing = strike === colKingStrike || (strike === allExpKingStrike && conc >= 0.75);
+        const isCallWall = !isKing && (strike === callWallStrike);
+        const isPutWall = !isKing && (strike === putWallStrike);
+
+        // Maximum bead width allowed based on horizontal bar spacing
+        const maxBeadW = Math.min(colStepX * 0.48, 4.6);
+        const beadRadius = Math.max(1.6, Math.min(maxBeadW, 1.6 + intensity * 2.8));
+
+        // 1. Quiescent / Low Position: subtle micro-dash to keep chart sharp and uncluttered
+        if (intensity < 0.16 && !isKing) {
+          ctx.save();
+          ctx.fillStyle =
+            atlasPalette === "ice"
+              ? "rgba(255, 255, 255, 0.14)"
+              : val >= 0
+                ? "rgba(34, 211, 238, 0.18)"
+                : "rgba(192, 132, 252, 0.18)";
+          ctx.fillRect(cx - 1.5, cy - 0.75, 3, 1.5);
+          ctx.restore();
+          continue;
+        }
+
+        // 2. King Strike: Solid circular beads `●` glowing brightly
+        if (isKing) {
+          ctx.save();
+          if (atlasPalette === "ice") {
+            ctx.shadowColor = "rgba(255, 255, 255, 0.95)";
+            ctx.shadowBlur = Math.round(10 + intensity * 6);
+            ctx.fillStyle = "#ffffff";
+          } else {
+            ctx.shadowColor = "rgba(250, 204, 21, 0.85)";
+            ctx.shadowBlur = Math.round(10 + intensity * 6);
+            ctx.fillStyle = "#facc15";
+          }
+          ctx.globalAlpha = Math.min(0.98, 0.75 + intensity * 0.23);
+          ctx.beginPath();
+          ctx.arc(cx, cy, Math.max(2.4, beadRadius), 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+          continue;
+        }
+
+        // 3. Call Wall: Row of diamonds `◆` (hollow when small, solid with glow when position grows)
+        if (isCallWall) {
+          const dw = Math.max(3.0, Math.min(maxBeadW * 1.9, 3.0 + intensity * 4.6));
+          ctx.save();
+          if (atlasPalette === "ice") {
+            if (intensity >= 0.35) {
+              ctx.shadowColor = "rgba(255, 255, 255, 0.85)";
+              ctx.shadowBlur = Math.round(8 * intensity);
+            }
+            ctx.fillStyle = "#ffffff";
+            ctx.strokeStyle = "#ffffff";
+          } else {
+            if (intensity >= 0.35) {
+              ctx.shadowColor = "rgba(34, 211, 238, 0.75)";
+              ctx.shadowBlur = Math.round(8 * intensity);
+            }
+            ctx.fillStyle = "#22d3ee";
+            ctx.strokeStyle = "#22d3ee";
+          }
+          ctx.globalAlpha = Math.min(0.95, 0.4 + intensity * 0.55);
+          ctx.beginPath();
+          ctx.moveTo(cx, cy - dw / 2);
+          ctx.lineTo(cx + dw / 2, cy);
+          ctx.lineTo(cx, cy + dw / 2);
+          ctx.lineTo(cx - dw / 2, cy);
+          ctx.closePath();
+          if (intensity < 0.32) {
+            ctx.lineWidth = 1.15;
+            ctx.stroke();
+          } else {
+            ctx.fill();
+          }
+          ctx.restore();
+          continue;
+        }
+
+        // 4. Put Wall: Row of triangles `▲` (hollow when small, solid with glow when position grows)
+        if (isPutWall) {
+          const tw = Math.max(3.2, Math.min(maxBeadW * 1.9, 3.2 + intensity * 4.4));
+          ctx.save();
+          if (atlasPalette === "ice") {
+            if (intensity >= 0.35) {
+              ctx.shadowColor = "rgba(255, 255, 255, 0.85)";
+              ctx.shadowBlur = Math.round(8 * intensity);
+            }
+            ctx.fillStyle = "#ffffff";
+            ctx.strokeStyle = "#ffffff";
+          } else {
+            if (intensity >= 0.35) {
+              ctx.shadowColor = "rgba(192, 132, 252, 0.75)";
+              ctx.shadowBlur = Math.round(8 * intensity);
+            }
+            ctx.fillStyle = "#c084fc";
+            ctx.strokeStyle = "#c084fc";
+          }
+          ctx.globalAlpha = Math.min(0.95, 0.4 + intensity * 0.55);
+          ctx.beginPath();
+          ctx.moveTo(cx, cy - tw / 2);
+          ctx.lineTo(cx + tw / 2, cy + tw / 2);
+          ctx.lineTo(cx - tw / 2, cy + tw / 2);
+          ctx.closePath();
+          if (intensity < 0.32) {
+            ctx.lineWidth = 1.15;
+            ctx.stroke();
+          } else {
+            ctx.fill();
+          }
+          ctx.restore();
+          continue;
+        }
+
+        // 5. Other Active Strikes:
+        // Position grows from hollow ring `○` into solid glowing bead `●`
+        const nodeColor =
+          atlasPalette === "ice"
+            ? (intensity >= 0.5 ? "#ffffff" : "#bae6fd")
+            : exposureMode === "VEX"
+              ? (val >= 0 ? "#f59e0b" : "#8b5cf6")
+              : (val >= 0 ? "#22d3ee" : "#a855f7");
+
+        ctx.save();
+        if (intensity < 0.38) {
+          // Hollow ring indicating nascent / intermediate position
+          ctx.strokeStyle = nodeColor;
+          ctx.lineWidth = 1.1;
+          ctx.globalAlpha = Math.min(0.65, 0.25 + intensity * 0.5);
+          ctx.beginPath();
+          ctx.arc(cx, cy, Math.max(1.5, beadRadius * 0.85), 0, Math.PI * 2);
+          ctx.stroke();
+        } else {
+          // Solid bead indicating substantial accumulated position
+          if (intensity >= 0.5) {
+            ctx.shadowColor =
+              atlasPalette === "ice"
+                ? "rgba(255, 255, 255, 0.75)"
+                : (val >= 0 ? "rgba(34, 211, 238, 0.65)" : "rgba(192, 132, 252, 0.65)");
+            ctx.shadowBlur = Math.round(6 * intensity);
+          }
+          ctx.fillStyle = nodeColor;
+          ctx.globalAlpha = Math.min(0.92, 0.45 + intensity * 0.5);
+          ctx.beginPath();
+          ctx.arc(cx, cy, beadRadius, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+    }
+
+    // =========================================================================
+    // LAYER 2: Book Center & Moving Averages
+    // =========================================================================
+    // 1. Book Center: 1.25px dotted white/silver line (#cbd5e1, lineDash [2, 3])
+    if (safeActiveIdx >= 1) {
+      ctx.save();
+      ctx.strokeStyle = "#cbd5e1";
+      ctx.lineWidth = 1.25;
+      ctx.setLineDash([2, 3]);
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      for (let t = 0; t <= safeActiveIdx; t++) {
+        const x = barToX(t);
+        const y = priceToY(dataset.columnsByBar[t].bookCenter);
+        if (t === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    // 2. Stepped Daily MAs:
+    // SMA 5 (D) as a stepped 1.5px solid white line (#ffffff)
+    // EMA 21 (D) (#14b8a6, 1.25px) and SMA 55 (D) (#f97316, 1.25px)
+    const drawSteppedLine = (
+      getPointY: (idx: number) => number,
+      strokeColor: string,
+      lineWidth: number
+    ) => {
+      if (safeActiveIdx < 1) return;
+      ctx.save();
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = lineWidth;
+      ctx.beginPath();
+      for (let t = 0; t <= safeActiveIdx; t++) {
+        const x = barToX(t);
+        const y = getPointY(t);
+        if (t === 0) {
+          ctx.moveTo(x - colStepX * 0.4, y);
+          ctx.lineTo(x + colStepX * 0.5, y);
+        } else {
+          ctx.lineTo(x - colStepX * 0.5, y);
+          ctx.lineTo(x + colStepX * 0.5, y);
+        }
+      }
+      ctx.stroke();
+      ctx.restore();
+    };
+
+    drawSteppedLine((t) => priceToY(dataset.candles[t].sma5d), "#ffffff", 1.5);
+    drawSteppedLine((t) => priceToY(dataset.candles[t].ema21d), "#14b8a6", 1.25);
+    drawSteppedLine((t) => priceToY(dataset.candles[t].sma55d), "#f97316", 1.25);
+
+    // 3. Dynamic Intraday SMA 34 (5m) (1.75px, #ef4444 when close < sma34, #22c55e when close >= sma34)
+    if (safeActiveIdx >= 1) {
+      ctx.save();
+      ctx.lineWidth = 1.75;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      for (let t = 1; t <= safeActiveIdx; t++) {
+        const prevBar = dataset.candles[t - 1];
+        const curBar = dataset.candles[t];
+        ctx.strokeStyle =
+          curBar.close >= curBar.sma34 ? "#22c55e" : "#ef4444";
+        ctx.beginPath();
+        ctx.moveTo(barToX(t - 1), priceToY(prevBar.sma34));
+        ctx.lineTo(barToX(t), priceToY(curBar.sma34));
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // =========================================================================
+    // LAYER 3: 5-Minute Candlesticks & Non-Repainting Pivot Divergence Engine
+    // =========================================================================
+    const candleBodyWidth = Math.max(3, Math.min(6.5, colStepX * 0.58));
+
+    for (let t = 0; t <= safeActiveIdx; t++) {
+      const c = dataset.candles[t];
+      const x = barToX(t);
+      const yHigh = priceToY(c.high);
+      const yLow = priceToY(c.low);
+      const yOpen = priceToY(c.open);
+      const yClose = priceToY(c.close);
+      const isBull = c.close >= c.open;
+      const color =
+        atlasPalette === "ice"
+          ? isBull
+            ? "#60a5fa"
+            : "#cbd5e1"
+          : isBull
+            ? "#22c55e"
+            : "#ef4444";
+
+      // High-Low Wick
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.15;
+      ctx.beginPath();
+      ctx.moveTo(x, yHigh);
+      ctx.lineTo(x, yLow);
+      ctx.stroke();
+
+      // Open-Close Body
+      const bodyTop = Math.min(yOpen, yClose);
+      const bodyH = Math.max(1.8, Math.abs(yClose - yOpen));
+      ctx.fillStyle = color;
+      ctx.fillRect(
+        x - candleBodyWidth / 2,
+        bodyTop,
+        candleBodyWidth,
+        bodyH
+      );
+    }
+
+    // Non-Repainting 3-Left / 3-Right Pivot Divergence Lines & Triangles
+    const drawTriangle = (tx: number, ty: number, isBull: boolean, isNearLevel: boolean = false) => {
+      ctx.fillStyle = isBull ? "#22c55e" : "#ef4444";
+      ctx.beginPath();
+      if (isBull) {
+        ctx.moveTo(tx, ty + 3);
+        ctx.lineTo(tx - 3.8, ty + 9.5);
+        ctx.lineTo(tx + 3.8, ty + 9.5);
+      } else {
+        ctx.moveTo(tx, ty - 3);
+        ctx.lineTo(tx - 3.8, ty - 9.5);
+        ctx.lineTo(tx + 3.8, ty - 9.5);
+      }
+      ctx.closePath();
+      ctx.fill();
+      if (isNearLevel) {
+        ctx.strokeStyle = "#facc15";
+        ctx.lineWidth = 1.4;
+        ctx.stroke();
+      }
+    };
+
+    const curKing = dataset.columnsByBar[safeActiveIdx]?.allExpKingStrike ?? 0;
+    for (const sig of dataset.pivotSignals5m) {
+      if (safeActiveIdx < sig.confirmedAtIndex) continue;
+
+      const x2 = barToX(sig.p2Index);
+      const y2 = priceToY(sig.p2Price);
+      const isNear = curKing > 0 && Math.abs(sig.p2Price - curKing) / curKing <= 0.0015;
+
+      ctx.save();
+      if (sig.p1Index >= 0) {
+        const x1 = barToX(sig.p1Index);
+        const y1 = priceToY(sig.p1Price);
+
+        // Solid white line (#ffffff, 2px) connecting pivot wicks P1 to P2
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+
+        drawTriangle(x1, y1, sig.type === "BULL", false);
+      }
+
+      drawTriangle(x2, y2, sig.type === "BULL", isNear);
+      ctx.restore();
+    }
+
+    // =========================================================================
+    // LAYER 5: Outlook Zone (Expected-Move Cone, Plateau Fills & Path to King)
+    // =========================================================================
+    const yPriorClose = priceToY(dataset.priorClose);
+    const pPlus1 = dataset.priorClose + dataset.sigma1Move;
+    const pMinus1 = dataset.priorClose - dataset.sigma1Move;
+    const pPlus2 = dataset.priorClose + dataset.sigma2Move;
+    const pMinus2 = dataset.priorClose - dataset.sigma2Move;
+
+    const yPlus1 = priceToY(pPlus1);
+    const yMinus1 = priceToY(pMinus1);
+    const yPlus2 = priceToY(pPlus2);
+    const yMinus2 = priceToY(pMinus2);
+
+    ctx.save();
+    // Outer ±2σ wings fill (rgba(168, 85, 247, 0.14))
+    ctx.fillStyle = "rgba(168, 85, 247, 0.14)";
+    ctx.beginPath();
+    ctx.moveTo(dividerX, yPriorClose);
+    ctx.lineTo(outlookRightX, yPlus2);
+    ctx.lineTo(outlookRightX, yPlus1);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.moveTo(dividerX, yPriorClose);
+    ctx.lineTo(outlookRightX, yMinus1);
+    ctx.lineTo(outlookRightX, yMinus2);
+    ctx.closePath();
+    ctx.fill();
+
+    // Subtle horizontal plateau band fills at the right edge of the 2σ cone
+    const plateauRatio2 = 0.72;
+    const plateauX2 = dividerX + (outlookRightX - dividerX) * plateauRatio2;
+    const plateauYTop2 = yPriorClose + (yPlus2 - yPriorClose) * plateauRatio2;
+    const plateauYBot2 = yPriorClose + (yMinus2 - yPriorClose) * plateauRatio2;
+
+    ctx.fillStyle = "rgba(168, 85, 247, 0.22)";
+    ctx.beginPath();
+    ctx.moveTo(plateauX2, plateauYTop2);
+    ctx.lineTo(outlookRightX, yPlus2);
+    ctx.lineTo(outlookRightX, plateauYTop2);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.moveTo(plateauX2, plateauYBot2);
+    ctx.lineTo(outlookRightX, yMinus2);
+    ctx.lineTo(outlookRightX, plateauYBot2);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = "rgba(168, 85, 247, 0.45)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(plateauX2, plateauYTop2);
+    ctx.lineTo(outlookRightX, plateauYTop2);
+    ctx.moveTo(plateauX2, plateauYBot2);
+    ctx.lineTo(outlookRightX, plateauYBot2);
+    ctx.stroke();
+
+    // Inner ±1σ cone fill (rgba(56, 189, 248, 0.16))
+    ctx.fillStyle = "rgba(56, 189, 248, 0.16)";
+    ctx.beginPath();
+    ctx.moveTo(dividerX, yPriorClose);
+    ctx.lineTo(outlookRightX, yPlus1);
+    ctx.lineTo(outlookRightX, yMinus1);
+    ctx.closePath();
+    ctx.fill();
+
+    // Stroke ±2σ rays (#a855f7, 1.25px)
+    ctx.strokeStyle = "#a855f7";
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    ctx.moveTo(dividerX, yPriorClose);
+    ctx.lineTo(outlookRightX, yPlus2);
+    ctx.moveTo(dividerX, yPriorClose);
+    ctx.lineTo(outlookRightX, yMinus2);
+    ctx.stroke();
+
+    // Stroke ±1σ rays (#38bdf8, 1.25px)
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    ctx.moveTo(dividerX, yPriorClose);
+    ctx.lineTo(outlookRightX, yPlus1);
+    ctx.moveTo(dividerX, yPriorClose);
+    ctx.lineTo(outlookRightX, yMinus1);
+    ctx.stroke();
+
+    // Crisp white circular vertex dot (#ffffff, radius 3.5px) at Prior Close on outlook divider
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.arc(dividerX, yPriorClose, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Pin (+GEX, cyan tint) and Fast-move (-GEX, purple tint) shading inside right-side outlook cone
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(dividerX, yPriorClose);
+    ctx.lineTo(outlookRightX, yPlus2);
+    ctx.lineTo(outlookRightX, yMinus2);
+    ctx.closePath();
+    ctx.clip();
+
+    const activeCol = dataset.columnsByBar[safeActiveIdx];
+    if (activeCol) {
+      // Shade Pin zones (+exposure)
+      const posStrikes = dataset.visibleStrikes.filter(
+        (k) =>
+          (activeCol.strikeValues[k] ?? 0) > 0 &&
+          Math.abs(k - dataset.priorClose) <= dataset.sigma2Move
+      );
+      posStrikes.forEach((k) => {
+        const y = priceToY(k);
+        ctx.fillStyle = "rgba(34, 211, 238, 0.22)";
+        ctx.fillRect(dividerX, y - 4, outlookRightX - dividerX, 8);
+      });
+
+      // Shade Fast zones (-exposure)
+      const negStrikes = dataset.visibleStrikes.filter(
+        (k) =>
+          (activeCol.strikeValues[k] ?? 0) < 0 &&
+          Math.abs(k - dataset.priorClose) <= dataset.sigma2Move
+      );
+      negStrikes.forEach((k) => {
+        const y = priceToY(k);
+        ctx.fillStyle = "rgba(232, 121, 249, 0.24)";
+        ctx.fillRect(dividerX, y - 4, outlookRightX - dividerX, 8);
+      });
+    }
+    ctx.restore();
+    ctx.restore();
+
+    // Luminous Volumetric Rays from Active Spot to Key Levels (Screenshots 3, 4, 5)
+    const curSpot = dataset.candles[safeActiveIdx]?.close ?? dataset.priorClose;
+    const spotX = barToX(safeActiveIdx);
+    const spotY = priceToY(curSpot);
+
+    // Draw active spot crosshair ring on current candle
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+    ctx.lineWidth = 1.25;
+    ctx.beginPath();
+    ctx.arc(spotX, spotY, 4.5, 0, Math.PI * 2);
+    ctx.stroke();
+    // Crosshair reticle
+    ctx.beginPath();
+    ctx.moveTo(spotX - 6.5, spotY);
+    ctx.lineTo(spotX + 6.5, spotY);
+    ctx.moveTo(spotX, spotY - 6.5);
+    ctx.lineTo(spotX, spotY + 6.5);
+    ctx.stroke();
+    ctx.restore();
+
+    // Volumetric Light Beams expanding to key strikes at outlookRightX
+    const keyStrikesToBeam = dataset.visibleStrikes
+      .map((s) => {
+        const val = activeBookCol.strikeValues[s] ?? 0;
+        const absVal = Math.abs(val);
+        const concPct = Math.round((absVal / Math.max(1, maxSessionExposure)) * 100);
+        const isKing = s === activeBookCol.allExpKingStrike || s === activeBookCol.filteredKingStrike;
+        return { strike: s, absVal, concPct, isKing };
+      })
+      .filter((item) => item.concPct >= 14 || item.isKing)
+      .sort((a, b) => b.concPct - a.concPct)
+      .slice(0, 6);
+
+    keyStrikesToBeam.forEach(({ strike, concPct, isKing }) => {
+      const targetY = priceToY(strike);
+      const u = Math.min(1.0, concPct / 100);
+      const beamH = Math.max(3.5, 3.5 + u * 12);
+      const beamGrad = ctx.createLinearGradient(spotX, spotY, outlookRightX, targetY);
+
+      if (atlasPalette === "ice") {
+        beamGrad.addColorStop(0, `rgba(255, 255, 255, ${isKing ? 0.38 : 0.12 + u * 0.22})`);
+        beamGrad.addColorStop(0.35, `rgba(255, 255, 255, ${isKing ? 0.22 : 0.06 + u * 0.14})`);
+        beamGrad.addColorStop(1, `rgba(255, 255, 255, ${isKing ? 0.05 : 0.01})`);
+      } else {
+        const beamColor = isKing
+          ? "250, 204, 21"
+          : (activeBookCol.strikeValues[strike] ?? 0) >= 0
+            ? "34, 211, 238"
+            : "192, 132, 252";
+        beamGrad.addColorStop(0, `rgba(${beamColor}, ${isKing ? 0.40 : 0.14 + u * 0.24})`);
+        beamGrad.addColorStop(0.35, `rgba(${beamColor}, ${isKing ? 0.24 : 0.08 + u * 0.15})`);
+        beamGrad.addColorStop(1, `rgba(${beamColor}, 0.02)`);
+      }
+
+      ctx.save();
+      ctx.fillStyle = beamGrad;
+      ctx.beginPath();
+      ctx.moveTo(spotX, spotY);
+      ctx.lineTo(outlookRightX, targetY - beamH / 2);
+      ctx.lineTo(outlookRightX, targetY + beamH / 2);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    });
+
+    // Path to King Projection (dashed gold curve #eab308, stroke-dasharray: 4 4, anchored to All-exp King)
+    if (pathToKing && dataset.candles[safeActiveIdx]) {
+      const startX = barToX(safeActiveIdx);
+      const startY = priceToY(dataset.candles[safeActiveIdx].close);
+      const endX = outlookEndX;
+      const endY = yAllExpKing;
+
+      ctx.save();
+      ctx.strokeStyle = "#eab308";
+      ctx.lineWidth = 1.4;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(startX, startY);
+
+      const steps = 16;
+      for (let s = 1; s <= steps; s++) {
+        const u = s / steps;
+        const px = startX + (endX - startX) * u;
+        const ease = 1 - Math.pow(1 - u, 1.65);
+        const waveOffset =
+          s === steps ? 0 : Math.sin(u * Math.PI * 3) * 2.5 * (1 - u);
+        const py = startY + (endY - startY) * ease + waveOffset;
+        ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Gold terminal dot (#facc15) at (endX, yAllExpKing)
+      ctx.fillStyle = "#facc15";
+      ctx.beginPath();
+      ctx.arc(endX, endY, 2.6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Dark pill badges for 1σ, 2σ, and King {Strike}
+    const drawBadge = (
+      text: string,
+      edgeX: number,
+      rawCenterY: number,
+      options?: {
+        bgColor?: string;
+        borderColor?: string;
+        textColor?: string;
+        maskBehind?: boolean;
+        align?: "left" | "right";
+      }
+    ): number => {
+      const {
+        bgColor = "#0f1522",
+        borderColor = "#232d42",
+        textColor = "#e2e8f0",
+        maskBehind = false,
+        align = "right",
+      } = options ?? {};
+      ctx.save();
+      ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      const metrics = ctx.measureText(text);
+      const padH = 6;
+      const badgeW = metrics.width + padH * 2;
+      const badgeH = 18;
+      const centerY = Math.max(
+        padTop + badgeH / 2 + 2,
+        Math.min(height - padBottom - badgeH / 2 - 2, rawCenterY)
+      );
+      const bx = align === "left" ? edgeX : edgeX - badgeW;
+      const by = centerY - badgeH / 2;
+
+      if (maskBehind) {
+        ctx.fillStyle = "#0d111a";
+        ctx.fillRect(bx - 3, by - 1, badgeW + 6, badgeH + 2);
+      }
+
+      ctx.fillStyle = bgColor;
+      ctx.strokeStyle = borderColor;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(bx, by, badgeW, badgeH, 5);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = textColor;
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, bx + padH, centerY + 0.5);
+      ctx.restore();
+      return badgeW;
+    };
+
+    // 2σ and 1σ badges inside the outlook column
+    drawBadge(`2σ ${pPlus2.toFixed(2)}`, outlookRightX - 4, yPlus2 + 9, {
+      bgColor: "#111726",
+      borderColor: "rgba(168, 85, 247, 0.45)",
+      textColor: "#f8fafc",
+    });
+    drawBadge("1σ", outlookRightX - 4, yPlus1 + 6, {
+      bgColor: "#111726",
+      borderColor: "rgba(56, 189, 248, 0.45)",
+      textColor: "#f8fafc",
+    });
+    drawBadge("1σ", outlookRightX - 4, yMinus1 - 6, {
+      bgColor: "#111726",
+      borderColor: "rgba(56, 189, 248, 0.45)",
+      textColor: "#f8fafc",
+    });
+    drawBadge("2σ", outlookRightX - 4, yMinus2 - 9, {
+      bgColor: "#111726",
+      borderColor: "rgba(168, 85, 247, 0.45)",
+      textColor: "#f8fafc",
+    });
+
+    // Global All-exp King {Strike} callout badge immediately inside the left edge of the outlook column (outlookStartX + 6px)
+    const kingBadgeW = drawBadge(
+      `King ${allExpKingStrike}`,
+      dividerX + 6,
+      yAllExpKing,
+      {
+        bgColor: "#101520",
+        borderColor: "rgba(202, 138, 4, 0.5)",
+        textColor: "#facc15",
+        maskBehind: true,
+        align: "left",
+      }
+    );
+
+    // Filtered King {Strike} callout badge immediately inside the left edge of the outlook column (outlookStartX + 6px)
+    if (isFiltered && Number.isFinite(filteredKingStrike)) {
+      const isCloseToAllExpKing = Math.abs(yFilteredKing - yAllExpKing) < 20;
+      const filteredBadgeLeftX = isCloseToAllExpKing
+        ? dividerX + 6 + kingBadgeW + 6
+        : dividerX + 6;
+      drawBadge(
+        `${canvasFilterBadgePrefix} ${filteredKingStrike}`,
+        filteredBadgeLeftX,
+        yFilteredKing,
+        {
+          bgColor: "#151b28",
+          borderColor: "#232d42",
+          textColor: "#ffffff",
+          maskBehind: true,
+          align: "left",
+        }
+      );
+    }
+
+    // Restore plot clip before drawing axis labels
+    ctx.restore();
+
+    // Right Price Axis Ticks & Concentration Badges inside the [outlookRightX + 6, width] gutter
+    ctx.save();
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "left";
+
+    // Build a strike concentration map for activeBookCol
+    const maxActiveExp = Math.max(
+      1,
+      ...Object.values(activeBookCol.strikeValues).map((v) => Math.abs(v))
+    );
+
+    // Map visible strikes to {Strike} — {Concentration %} labels if within visible Y bounds
+    dataset.visibleStrikes.forEach((strike) => {
+      const y = priceToY(strike);
+      if (y < padTop + 6 || y > height - padBottom - 6) return;
+
+      const val = activeBookCol.strikeValues[strike] ?? 0;
+      const absVal = Math.abs(val);
+      const concPct = Math.round((absVal / maxActiveExp) * 100);
+      const isKing =
+        strike === activeBookCol.allExpKingStrike ||
+        strike === activeBookCol.filteredKingStrike;
+
+      // Show if concPct >= 10% or is King
+      if (concPct >= 10 || isKing) {
+        ctx.font = isKing
+          ? "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace"
+          : "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+
+        if (isKing) {
+          ctx.fillStyle = atlasPalette === "ice" ? "#ffffff" : "#facc15";
+        } else if (concPct >= 50) {
+          ctx.fillStyle =
+            atlasPalette === "ice"
+              ? "#f1f5f9"
+              : val >= 0
+                ? "#38bdf8"
+                : "#c084fc";
+        } else {
+          ctx.fillStyle = "#94a3b8";
+        }
+
+        const label = `${strike} — ${concPct}%`;
+        ctx.fillText(label, outlookRightX + 6, y);
+
+        // Subtle tick dash on axis edge
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(outlookRightX + 1, y);
+        ctx.lineTo(outlookRightX + 4, y);
+        ctx.stroke();
+      }
+    });
+
+    // Also ensure standard price ticks without levels are shown if no strike was drawn nearby
+    yAxisTicks.forEach((tickPrice) => {
+      const y = priceToY(tickPrice);
+      if (y >= padTop && y <= height - padBottom) {
+        const hasNearby = dataset.visibleStrikes.some(
+          (s) => Math.abs(priceToY(s) - y) < 9
+        );
+        if (!hasNearby) {
+          ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+          ctx.fillStyle = "#64748b";
+          ctx.fillText(tickPrice.toFixed(2), outlookRightX + 6, y);
+        }
+      }
+    });
+
+    // Active Spot Badge on Right Axis (with Countdown Clock Timer, e.g. 774.00 02:01)
+    const ySpot = priceToY(curSpot);
+    if (ySpot >= padTop && ySpot <= height - padBottom) {
+      // Dotted guide line across from active candle to spot badge
+      ctx.save();
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.4)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 3]);
+      ctx.beginPath();
+      ctx.moveTo(spotX, ySpot);
+      ctx.lineTo(outlookRightX, ySpot);
+      ctx.stroke();
+      ctx.restore();
+
+      // Spot Pill with Countdown Timer
+      const spotLabel = curSpot.toFixed(2);
+      const minLeft = Math.floor(countdownSec / 60);
+      const secLeft = countdownSec % 60;
+      const timerStr = `${String(minLeft).padStart(2, "0")}:${String(secLeft).padStart(2, "0")}`;
+      const badgeW = 76;
+      const badgeH = 24;
+      const bx = outlookRightX + 4;
+      const by = ySpot - badgeH / 2;
+
+      ctx.save();
+      ctx.fillStyle = "#0c101c";
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.55)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(bx, by, badgeW, badgeH, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      // Draw Price and Timer
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(spotLabel, bx + badgeW / 2, by + 9);
+
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "9px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.fillText(timerStr, bx + badgeW / 2, by + 19);
+      ctx.restore();
+    }
+    ctx.restore();
+
+    // Right axis hover cursor price badge
+    if (
+      hoverCursor &&
+      hoverCursor.x >= padLeft &&
+      hoverCursor.x <= outlookRightX &&
+      hoverCursor.y >= padTop &&
+      hoverCursor.y <= height - padBottom
+    ) {
+      const cursorRatio = 1 - (hoverCursor.y - padTop) / plotHeight;
+      const cursorPrice = yMin + cursorRatio * (yMax - yMin);
+      ctx.save();
+      ctx.fillStyle = "#1e293b";
+      ctx.strokeStyle = "#38bdf8";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(outlookRightX + 3, hoverCursor.y - 8, rightAxisWidth - 6, 16, 3);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = "#38bdf8";
+      ctx.font = "bold 9px ui-monospace, monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText(cursorPrice.toFixed(2), outlookRightX + 6, hoverCursor.y);
+      ctx.restore();
+    }
+
+    // Bottom X-Axis Labels: 9:30 AM, 12:45 PM, 3:55 PM, and outlook
+    ctx.save();
+    ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+    ctx.fillStyle = "#94a3b8";
+    ctx.textBaseline = "bottom";
+
+    ctx.textAlign = "left";
+    ctx.fillText(dataset.candles[0]?.timeLabel ?? "9:30 AM", padLeft, height - 8);
+
+    const midIdx = Math.min(39, Math.floor(dataset.candles.length / 2));
+    ctx.textAlign = "center";
+    ctx.fillText(
+      dataset.candles[midIdx]?.timeLabel ?? "12:45 PM",
+      barToX(midIdx),
+      height - 8
+    );
+
+    ctx.textAlign = "right";
+    ctx.fillText(
+      dataset.candles[dataset.candles.length - 1]?.timeLabel ?? "3:55 PM",
+      dividerX - 6,
+      height - 8
+    );
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#64748b";
+    ctx.fillText(
+      "outlook",
+      dividerX + (outlookRightX - dividerX) / 2,
+      height - 8
+    );
+    ctx.restore();
+
+    // Subtle crosshair on hover
+    if (hoverBarIndex !== null && hoverBarIndex <= safeActiveIdx) {
+      const hx = barToX(hoverBarIndex);
+      ctx.save();
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.35)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(hx, padTop);
+      ctx.lineTo(hx, height - padBottom);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.restore();
+  }, [
+    dataset,
+    safeActiveIdx,
+    hoverBarIndex,
+    pathToKing,
+    canvasWidth,
+    activeBookCol,
+    exposureMode,
+    expFilter,
+    canvasFilterBadgePrefix,
+    priceBounds,
+    chartHeight,
+    hoverCursor,
+    atlasPalette,
+    countdownSec,
+  ]);
+
+  const isSma34Bullish = activeCandle
+    ? activeCandle.close >= activeCandle.sma34
+    : true;
+  const sliderProgressPct =
+    maxBarIdx > 0 ? (safeActiveIdx / maxBarIdx) * 100 : 100;
+
+  return (
+    <div className="space-y-3.5 pb-4">
+      {/* 2A. Section Title & Scheme Selector */}
+      <div className="space-y-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <h1 className="text-xl font-bold text-white tracking-tight">Gaia</h1>
+
+            {/* Scheme Selector: Ice (Skylit) vs Polarity (GEX/VEX) */}
+            <div className="bg-[#101520] border border-[#1e2638] rounded-xl p-0.5 flex items-center gap-0.5">
+              <button
+                type="button"
+                onClick={() => setAtlasPalette("ice")}
+                className={cn(
+                  "px-3 py-1 rounded-lg text-xs font-semibold transition cursor-pointer flex items-center gap-1.5",
+                  atlasPalette === "ice"
+                    ? "bg-gradient-to-r from-teal-500/25 via-sky-500/20 to-indigo-500/25 border border-teal-400/60 text-white font-bold shadow-[0_0_10px_rgba(45,212,191,0.2)]"
+                    : "text-slate-400 hover:text-white"
+                )}
+              >
+                <span>❄ Ice (Skylit)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setAtlasPalette("polarity")}
+                className={cn(
+                  "px-3 py-1 rounded-lg text-xs font-semibold transition cursor-pointer flex items-center gap-1.5",
+                  atlasPalette === "polarity"
+                    ? "bg-gradient-to-r from-teal-500/25 via-sky-500/20 to-indigo-500/25 border border-teal-400/60 text-white font-bold shadow-[0_0_10px_rgba(45,212,191,0.2)]"
+                    : "text-slate-400 hover:text-white"
+                )}
+              >
+                <span>⚡ Polarity (GEX/VEX)</span>
+              </button>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setGuideExpanded((prev) => !prev)}
+            className="text-xs font-bold text-[#38bdf8] hover:text-sky-300 transition cursor-pointer flex items-center gap-1 px-3 py-1.5 rounded-lg bg-[#101520] border border-[#1e2638]"
+          >
+            <span>? How to read Gaia</span>
+          </button>
+        </div>
+
+        {guideExpanded && (
+          <div className="bg-[#101520] border border-[#1e2638] rounded-xl px-4 pb-4 pt-3 grid grid-cols-1 md:grid-cols-[150px_1fr] gap-y-2.5 gap-x-4 text-xs leading-relaxed">
+            <div className="font-bold text-white">Position Growth</div>
+            <div className="text-slate-300">
+              Each strike level displays position growth across the session in 5-minute beads. As positioning builds or dealers re-hedge near spot, beads swell and glow intensely. King nodes are radiant circles (●), Call Walls are diamonds (◆), and Put Walls are triangles (▲/▼).
+            </div>
+
+            <div className="font-bold text-white">Candles</div>
+            <div className="text-slate-300">
+              One regular session (9:30am–4pm ET) in 5-minute candles. Blue/Green closed up, Slate/Red closed down.
+            </div>
+
+            <div className="font-bold text-white">Divergence</div>
+            <div className="text-slate-300">
+              SPY, QQQ, SPXW and IWM only. The table at the chart&apos;s top-left reads{" "}
+              <span className="text-[#22c55e] font-bold">BULL</span> when price made a lower low while RSI(14) and the MACD(12,26,9) histogram both made a higher low on the same two pivots,{" "}
+              <span className="text-[#ef4444] font-bold">BEAR</span> for a higher high with both making a lower high, and NO otherwise.
+            </div>
+
+            <div className="font-bold text-white">Expected Cone & Rays</div>
+            <div className="text-slate-300">
+              The cone on the right is the options-implied range from prior close: inner is 1σ (~68%), outer is 2σ (~95%). Luminous volumetric rays beam towards the primary gravitational strikes.
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* 2B. Session Context & Ticker Loader Bar */}
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 font-mono">
+          <span>
+            {dataset
+              ? `${dataset.ticker} · ${dataset.sessionDate} · ${dataset.bookLabel}`
+              : `${loadedTicker} · loading live session...`}
+          </span>
+          {sessionOptions.length > 0 && (
+            <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-400">
+              <span>Session:</span>
+              <select
+                aria-label="Select trading session"
+                value={selectedSessionIso}
+                onChange={(e) => handleSessionChange(e.target.value)}
+                className="bg-[#101520] border border-[#1e2638] rounded-md px-2 py-0.5 text-[11px] font-mono text-slate-300 focus:outline-none focus:border-[#38bdf8]"
+              >
+                {sessionOptions.map((s) => (
+                  <option key={s.isoDate} value={s.isoDate}>
+                    {s.isoDate}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+        </div>
+
+        <form
+          onSubmit={handleLoadTicker}
+          className="bg-[#101520] border border-[#1e2638] rounded-xl p-1.5 flex items-center justify-between"
+        >
+          <input
+            type="text"
+            value={tickerInput}
+            onChange={(e) => setTickerInput(e.target.value.toUpperCase())}
+            placeholder="SPY"
+            aria-label="Ticker symbol"
+            className="bg-transparent text-white font-bold text-sm px-3 py-1 focus:outline-none flex-1 uppercase font-sans"
+          />
+          <button
+            type="submit"
+            disabled={isLoading}
+            className="bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold text-xs px-5 py-2 rounded-lg hover:opacity-95 transition cursor-pointer disabled:opacity-50"
+          >
+            {isLoading ? "Loading..." : "Load"}
+          </button>
+        </form>
+      </div>
+
+      {/* 2C. Horizontal Pill Filter Toolbar */}
+      <div className="flex flex-wrap items-center gap-2">
+        {/* 1. Exposure Mode Group */}
+        <div className="bg-[#151b28] border border-[#232d42] rounded-full p-1 flex items-center gap-1">
+          {(["GEX", "VEX", "Combined"] as const).map((mode) => {
+            const active = exposureMode === mode;
+            return (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => setExposureMode(mode)}
+                className={cn(
+                  "px-3.5 py-1 text-xs rounded-full transition cursor-pointer",
+                  active
+                    ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold"
+                    : "text-slate-300 hover:text-white"
+                )}
+              >
+                {mode}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* 2. Expiration Filter Group */}
+        <div className="bg-[#151b28] border border-[#232d42] rounded-full p-1 flex items-center gap-1">
+          {[
+            { id: "ALL", label: "All exp" },
+            { id: "NEXT", label: nextExpPillLabel },
+            { id: "WEEK", label: "This week" },
+          ].map((item) => {
+            const active = expFilter === item.id && selectedDateExp === "";
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => {
+                  setSelectedDateExp("");
+                  setExpFilter(item.id);
+                }}
+                className={cn(
+                  "px-3.5 py-1 text-xs rounded-full transition cursor-pointer",
+                  active
+                    ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold"
+                    : "text-slate-300 hover:text-white"
+                )}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* 3. Date Dropdown Pill */}
+        <div className="relative inline-flex items-center">
+          <select
+            aria-label="Filter by expiration date"
+            value={selectedDateExp}
+            onChange={(e) => {
+              const val = e.target.value;
+              setSelectedDateExp(val);
+              if (val) {
+                setExpFilter(val);
+              } else {
+                setExpFilter("ALL");
+              }
+            }}
+            className={cn(
+              "appearance-none bg-[#151b28] border border-[#232d42] rounded-full pl-3.5 pr-7 py-1.5 text-xs cursor-pointer focus:outline-none",
+              selectedDateExp
+                ? "text-[#38bdf8] font-bold border-[#38bdf8]/60"
+                : "text-slate-200 hover:text-white"
+            )}
+          >
+            <option value="">Date</option>
+            {expirationOptions.map((exp) => (
+              <option key={exp.isoDate} value={exp.dateLabel}>
+                {exp.dateLabel}
+              </option>
+            ))}
+          </select>
+          <span className="pointer-events-none absolute right-2.5 text-[10px] text-slate-400">
+            ▾
+          </span>
+        </div>
+
+        {/* 4. Path to King Pill */}
+        <button
+          type="button"
+          onClick={() => setPathToKing((prev) => !prev)}
+          className={cn(
+            "rounded-full px-3.5 py-1.5 text-xs transition cursor-pointer",
+            pathToKing
+              ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold"
+              : "bg-[#151b28] border border-[#232d42] text-slate-300 hover:text-white"
+          )}
+        >
+          Path to King
+        </button>
+
+        {/* 5. Reset View Pill */}
+        <button
+          type="button"
+          onClick={handleResetView}
+          className="bg-[#151b28] border border-[#232d42] text-slate-300 hover:text-white rounded-full px-3.5 py-1.5 text-xs transition cursor-pointer"
+        >
+          Reset view
+        </button>
+
+        {/* 6. Window Scope Presets (Focus | Tactical | Cone 2σ) */}
+        <div className="bg-[#151b28] border border-[#232d42] rounded-full p-1 flex items-center gap-1 font-mono text-xs">
+          <button
+            type="button"
+            onClick={() => {
+              setScopePreset("focus");
+              setYScale(1.0);
+              setYPanOffset(0);
+            }}
+            title="Focus: Tight view centered on intraday candle action"
+            className={cn(
+              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
+              scopePreset === "focus"
+                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
+                : "text-slate-300 hover:text-white"
+            )}
+          >
+            Focus
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setScopePreset("tactical");
+              setYScale(1.0);
+              setYPanOffset(0);
+            }}
+            title="Tactical: Intraday candles + 1σ expected-move range"
+            className={cn(
+              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
+              scopePreset === "tactical"
+                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
+                : "text-slate-300 hover:text-white"
+            )}
+          >
+            Tactical (1σ)
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setScopePreset("cone");
+              setYScale(1.0);
+              setYPanOffset(0);
+            }}
+            title="Cone: Full options board with ±2σ expected-move cone"
+            className={cn(
+              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
+              scopePreset === "cone"
+                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
+                : "text-slate-300 hover:text-white"
+            )}
+          >
+            Cone (2σ)
+          </button>
+        </div>
+
+        {/* 7. Zoom & Scale Adjustments */}
+        <div className="flex items-center gap-0.5 bg-[#151b28] border border-[#232d42] rounded-full p-0.5 font-mono text-xs">
+          <button
+            type="button"
+            onClick={() => setYScale((s) => Math.max(0.2, s * 0.82))}
+            title="Zoom Out (Expand Price Range)"
+            className="w-6 h-6 flex items-center justify-center rounded-full text-slate-300 hover:text-white hover:bg-white/10 transition cursor-pointer font-bold"
+          >
+            −
+          </button>
+          <button
+            type="button"
+            onClick={handleResetZoom}
+            title="Auto-Fit / Reset Zoom Scale (Double-click canvas)"
+            className={cn(
+              "px-2.5 py-0.5 rounded-full text-[11px] font-bold transition cursor-pointer",
+              yScale !== 1.0 || yPanOffset !== 0
+                ? "bg-cyan-500/20 text-cyan-300 border border-cyan-400/40"
+                : "text-slate-400 hover:text-white"
+            )}
+          >
+            {(yScale * 100).toFixed(0)}%
+          </button>
+          <button
+            type="button"
+            onClick={() => setYScale((s) => Math.min(10.0, s * 1.22))}
+            title="Zoom In (Focus on Candlesticks)"
+            className="w-6 h-6 flex items-center justify-center rounded-full text-slate-300 hover:text-white hover:bg-white/10 transition cursor-pointer font-bold"
+          >
+            +
+          </button>
+        </div>
+      </div>
+
+      {/* Error State if Live Feed Fails */}
+      {errorMsg && (
+        <div className="bg-red-950/40 border border-red-500/40 rounded-xl px-4 py-3 text-xs text-red-200 flex items-center justify-between">
+          <span>{errorMsg}</span>
+          <button
+            type="button"
+            onClick={() => fetchLiveGaia(loadedTicker, selectedSessionIso)}
+            className="px-3 py-1 rounded-md bg-red-500/20 hover:bg-red-500/30 text-red-100 font-semibold cursor-pointer"
+          >
+            Retry Live Feed
+          </button>
+        </div>
+      )}
+
+      {/* 2D. Pre-Chart Telemetry & Legend Strip */}
+      {dataset && activeCandle && activeBookCol && (
+        <div className="space-y-2 pt-0.5">
+          {/* 1. Dual Pre-Chart King Pill Badges */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="bg-yellow-500/12 border border-yellow-500/80 text-[#fde047] rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
+              All-exp King {activeBookCol.allExpKingStrike} ·{" "}
+              {formatPct(activeBookCol.allExpKingConcPct)}%
+            </span>
+            {(exposureMode === "VEX" || exposureMode === "Combined") && (
+              <span className="bg-amber-500/15 border border-amber-400/80 text-[#fde047] rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
+                VEX King (multi-day) {activeBookCol.allExpKingStrike}
+              </span>
+            )}
+            {expFilter !== "ALL" && (
+              <span className="bg-[#151b28] border border-slate-500/60 text-white rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
+                {expFilter === "NEXT"
+                  ? has0DteActive
+                    ? `0DTE King ${activeBookCol.filteredKingStrike} · ${formatPct(activeBookCol.filteredKingConcPct)}%`
+                    : `Next exp King ${activeBookCol.filteredKingStrike}${nextExpShortDate ? ` (${nextExpShortDate})` : ""} · ${formatPct(activeBookCol.filteredKingConcPct)}%`
+                  : expFilter === "WEEK"
+                    ? `Week King ${activeBookCol.filteredKingStrike} · ${formatPct(activeBookCol.filteredKingConcPct)}%`
+                    : `${expFilter} King ${activeBookCol.filteredKingStrike} · ${formatPct(activeBookCol.filteredKingConcPct)}%`}
+              </span>
+            )}
+          </div>
+
+          {/* 2. Moving Average Readout Row */}
+          <div className="text-[11px] font-mono tabular-nums flex flex-wrap items-center gap-4 text-slate-400">
+            <span className="inline-flex items-center gap-1.5">
+              <span className="inline-block w-3 h-[2px] bg-[#ffffff]" />
+              <span>SMA 5 (D)</span>
+              <span className="font-bold text-white">
+                {activeCandle.sma5d.toFixed(2)}
+              </span>
+            </span>
+
+            <span className="inline-flex items-center gap-1.5">
+              <span className="inline-block w-3 h-[2px] bg-[#14b8a6]" />
+              <span>EMA 21 (D)</span>
+              <span className="font-bold text-white">
+                {activeCandle.ema21d.toFixed(2)}
+              </span>
+            </span>
+
+            <span className="inline-flex items-center gap-1.5">
+              <span
+                className="inline-block w-3 h-[2px]"
+                style={{
+                  backgroundColor: isSma34Bullish ? "#22c55e" : "#ef4444",
+                }}
+              />
+              <span>SMA 34 (5m)</span>
+              <span className="font-bold text-white">
+                {activeCandle.sma34.toFixed(2)}
+              </span>
+            </span>
+
+            <span className="inline-flex items-center gap-1.5">
+              <span className="inline-block w-3 h-[2px] bg-[#f97316]" />
+              <span>SMA 55 (D)</span>
+              <span className="font-bold text-white">
+                {activeCandle.sma55d.toFixed(2)}
+              </span>
+            </span>
+          </div>
+
+          {/* 3. Active Candle Book Readout */}
+          <div className="text-[11px] font-mono tabular-nums text-slate-400 flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span>{activeCandle.timeLabel}</span>
+            <span>·</span>
+            <span>
+              Net {exposureMode}{" "}
+              <strong className="text-white font-bold">
+                {activeBookCol.netGexB >= 0 ? "+" : ""}
+                {activeBookCol.netGexB.toFixed(2)}B
+              </strong>
+            </span>
+            <span>·</span>
+            <span className="inline-flex flex-wrap items-center gap-2">
+              <span>{exposureMode} levels</span>
+              {activeBookCol.topLevels.map((lvl, idx) => {
+                const isKingLvl = idx === 0;
+                const valFormatted = formatBookLevelValue(lvl.valueM);
+                if (isKingLvl) {
+                  return (
+                    <span key={lvl.strike} className="font-bold text-[#facc15]">
+                      {lvl.strike} {valFormatted}
+                    </span>
+                  );
+                }
+                return (
+                  <span key={lvl.strike} className="inline-flex items-center gap-1">
+                    <strong className="text-white font-bold">{lvl.strike}</strong>
+                    <span
+                      className={cn(
+                        "font-bold",
+                        lvl.valueM >= 0 ? "text-[#22d3ee]" : "text-[#a855f7]"
+                      )}
+                    >
+                      {valFormatted}
+                    </span>
+                  </span>
+                );
+              })}
+            </span>
+            <span>·</span>
+            <span>today&apos;s book</span>
+          </div>
+
+          {/* 4. Interactive Legend Row */}
+          <div className="text-[11px] text-slate-400 flex flex-wrap items-center gap-4">
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#22d3ee] shadow-[0_0_8px_#22d3ee] inline-block" />
+              <span>Positive γ</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#a855f7] inline-block" />
+              <span>Negative γ</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#facc15] shadow-[0_0_8px_rgba(250,204,21,0.7)] inline-block" />
+              <span>King</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-full bg-[#f8fafc] inline-block" />
+              <span>Center</span>
+            </span>
+            {expFilter !== "ALL" && (
+              <span className="inline-flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#38bdf8] inline-block" />
+                <span>Filter</span>
+              </span>
+            )}
+            <span className="inline-flex items-center gap-1.5">
+              <span className="w-4 border-b-2 border-dotted border-[#eab308] inline-block" />
+              <span>Path to King · projection</span>
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* 3 & 4A. Core Chart Canvas Card + Interactive Session Replay Bar */}
+      <div
+        ref={containerRef}
+        className="bg-[#0d111a] border border-[#1e2638] rounded-2xl p-4 space-y-3"
+      >
+        <div
+          className="relative w-full overflow-hidden flex items-center justify-center rounded-xl"
+          style={{ minHeight: `${chartHeight}px` }}
+        >
+          {!dataset && isLoading && (
+            <div className="text-xs font-mono text-slate-400">
+              Loading live intraday candles &amp; options book for {loadedTicker}...
+            </div>
+          )}
+
+          <canvas
+            ref={canvasRef}
+            onMouseDown={handleCanvasMouseDown}
+            onMouseMove={handleCanvasMouseMove}
+            onMouseLeave={handleCanvasMouseLeave}
+            onMouseUp={handleCanvasMouseUp}
+            onWheel={handleCanvasWheel}
+            onDoubleClick={handleCanvasDoubleClick}
+            className={cn(
+              "block w-full select-none",
+              !dataset && "hidden"
+            )}
+            style={{ height: `${chartHeight}px`, cursor: cursorStyle }}
+          />
+
+          {/* Floating Auto-Fit Reset Button on Canvas when zoomed / panned */}
+          {(yScale !== 1.0 || yPanOffset !== 0 || scopePreset !== "cone") && (
+            <button
+              type="button"
+              onClick={handleCanvasDoubleClick}
+              title="Click to reset window (or double-click canvas)"
+              className="absolute bottom-4 right-20 z-20 px-2.5 py-1 rounded-md bg-[#0e131d]/90 border border-cyan-400/50 text-[10px] font-mono font-bold text-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.25)] backdrop-blur-md hover:bg-cyan-500/20 transition flex items-center gap-1.5 cursor-pointer"
+            >
+              <span>Auto-Fit · {(yScale * 100).toFixed(0)}%</span>
+            </button>
+          )}
+
+          {/* Layer 4: Multi-Timeframe Divergence HUD Table (top-left of candlestick zone, SPY, QQQ, SPXW, IWM only) */}
+          {dataset && DIVSYM.has(loadedTicker.toUpperCase()) && (
+            <div
+              className="absolute top-3.5 left-5 z-10 bg-[#0d121c]/95 border border-[#232d42] rounded-md text-[11px] font-mono overflow-hidden shadow-lg backdrop-blur-sm"
+            >
+              <table className="border-collapse">
+                <tbody>
+                  {(divPayload?.rows && divPayload.rows.length === 5
+                    ? divPayload.rows.map((r) => ({
+                        tf: r.tf,
+                        label:
+                          r.tf === "5"
+                            ? "5 min divergence"
+                            : r.tf === "30"
+                              ? "30 min divergence"
+                              : r.tf === "120"
+                                ? "2HR divergence"
+                                : r.tf === "D"
+                                  ? "Daily divergence"
+                                  : "Weekly divergence",
+                        status: r.state,
+                        detail:
+                          r.state === "NO" || !r.signal
+                            ? "No confirmed divergence in the last 30 bars"
+                            : `${r.signal.type.toUpperCase()} · pivots ${divWhen(r.signal.t1, r.intraday)} (${r.signal.p1}) → ${divWhen(r.signal.t2, r.intraday)} (${r.signal.p2})`,
+                        near:
+                          r.signal?.near && r.signal.near.length > 0
+                            ? r.signal.near.map((n) => `${n[0]} ${n[1]}`).join(", ")
+                            : null,
+                      }))
+                    : [
+                        { tf: "5", label: "5 min divergence", status: mtfDivergence.tf5m, detail: "No confirmed divergence in the last 30 bars", near: null },
+                        { tf: "30", label: "30 min divergence", status: mtfDivergence.tf30m, detail: "No confirmed divergence in the last 30 bars", near: null },
+                        { tf: "120", label: "2HR divergence", status: mtfDivergence.tf2h, detail: "No confirmed divergence in the last 30 bars", near: null },
+                        { tf: "D", label: "Daily divergence", status: mtfDivergence.tfDaily, detail: "No confirmed divergence in the last 30 bars", near: null },
+                        { tf: "W", label: "Weekly divergence", status: mtfDivergence.tfWeekly, detail: "No confirmed divergence in the last 30 bars", near: null },
+                      ]
+                  ).map((row, idx) => {
+                    const isOpen = openDivTf === row.tf;
+                    return (
+                      <React.Fragment key={row.tf}>
+                        <tr
+                          onClick={() => setOpenDivTf(isOpen ? null : row.tf)}
+                          className={cn(
+                            "cursor-pointer hover:bg-white/5 transition-colors",
+                            idx > 0 && "border-t border-[#1e2638]"
+                          )}
+                        >
+                          <td className="px-2.5 py-1 text-slate-200 border-r border-[#1e2638]">
+                            {row.label}
+                          </td>
+                          <td
+                            className={cn(
+                              "px-2.5 py-1 text-center font-bold min-w-[42px]",
+                              row.status === "BULL"
+                                ? "text-[#22c55e]"
+                                : row.status === "BEAR"
+                                  ? "text-[#ef4444]"
+                                  : "text-slate-400"
+                            )}
+                          >
+                            {row.status}
+                          </td>
+                        </tr>
+                        {isOpen && (
+                          <tr className="border-t border-[#1e2638]/50 bg-[#080d17]">
+                            <td colSpan={2} className="px-2.5 py-1 text-[10px] text-slate-400 max-w-[240px]">
+                              <span>{row.detail}</span>
+                              {row.near && (
+                                <span className="text-[#facc15] font-semibold ml-1">
+                                  · near {row.near}
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        {/* Draggable Chart Height Resizer Grip */}
+        <div
+          onMouseDown={(e) => {
+            e.preventDefault();
+            const startY = e.clientY;
+            const startH = chartHeight;
+            const onMove = (moveEvt: MouseEvent) => {
+              const delta = moveEvt.clientY - startY;
+              setChartHeight(
+                Math.max(380, Math.min(950, Math.round(startH + delta)))
+              );
+            };
+            const onUp = () => {
+              window.removeEventListener("mousemove", onMove);
+              window.removeEventListener("mouseup", onUp);
+            };
+            window.addEventListener("mousemove", onMove);
+            window.addEventListener("mouseup", onUp);
+          }}
+          title="Drag up or down to adjust chart window height"
+          className="w-full h-3 -my-1 flex items-center justify-center cursor-row-resize hover:bg-cyan-500/10 active:bg-cyan-500/20 rounded transition-colors group z-20 select-none"
+        >
+          <div className="w-16 h-1 rounded-full bg-white/15 group-hover:bg-cyan-400/60 group-active:bg-cyan-400 transition-colors" />
+        </div>
+
+        {/* 4A. Interactive Session Replay Bar */}
+        {dataset && (
+          <div className="bg-[#101520] border border-[#1e2638] rounded-xl px-4 py-2.5 flex items-center gap-4">
+            <button
+              type="button"
+              onClick={handleToggleReplay}
+              className="bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold text-xs px-4 py-1.5 rounded-full hover:opacity-95 transition cursor-pointer shrink-0"
+            >
+              {isReplaying ? "Pause" : "Replay"}
+            </button>
+
+            {/* Custom Glowing Cyan Range Scrubber */}
+            <div className="relative flex-1 flex items-center h-5">
+              <div className="w-full h-1.5 rounded-full bg-[#1e2638] overflow-hidden">
+                <div
+                  className="h-full bg-[#22d3ee] shadow-[0_0_8px_#22d3ee]"
+                  style={{ width: `${sliderProgressPct}%` }}
+                />
+              </div>
+              <div
+                className="pointer-events-none absolute w-4 h-4 rounded-full bg-[#22d3ee] shadow-[0_0_10px_#22d3ee] -translate-x-1/2"
+                style={{ left: `${sliderProgressPct}%` }}
+              />
+              <input
+                type="range"
+                min={0}
+                max={maxBarIdx}
+                value={safeActiveIdx}
+                aria-label="Session replay scrubber"
+                onChange={(e) => {
+                  setIsReplaying(false);
+                  setActiveBarIndex(Number(e.target.value));
+                }}
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+              />
+            </div>
+
+            <span className="font-mono text-xs text-slate-300 tabular-nums shrink-0">
+              {dataset.candles[safeActiveIdx]?.timeLabel ?? "3:55 PM"}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* 4B. Range Outlook Summary Card */}
+      {dataset && (
+        <div className="bg-[#101520] border border-[#1e2638] rounded-xl p-4 space-y-2.5">
+          <div className="text-[11px] font-bold uppercase tracking-wider text-[#38bdf8]">
+            RANGE OUTLOOK
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5">
+            <span className="bg-[#151b28] border border-[#232d42] rounded-full px-3.5 py-1.5 text-xs font-mono font-bold text-white">
+              Prior close ${dataset.priorClose.toFixed(2)}
+            </span>
+            <span className="bg-[#151b28] border border-[#232d42] rounded-full px-3.5 py-1.5 text-xs font-mono font-bold text-white">
+              ±1σ ${(dataset.priorClose - dataset.sigma1Move).toFixed(2)} – $
+              {(dataset.priorClose + dataset.sigma1Move).toFixed(2)}
+            </span>
+            <span className="bg-[#151b28] border border-[#232d42] rounded-full px-3.5 py-1.5 text-xs font-mono font-bold text-white">
+              ±2σ ${(dataset.priorClose - dataset.sigma2Move).toFixed(2)} – $
+              {(dataset.priorClose + dataset.sigma2Move).toFixed(2)}
+            </span>
+          </div>
+
+          <p className="text-[11px] text-slate-400">
+            Probabilistic range from options pricing. Not a forecast. Not
+            financial advice.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export const AntaeusView = GaiaView;
+export default GaiaView;

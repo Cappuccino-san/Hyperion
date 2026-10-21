@@ -2,7 +2,7 @@
 
 import React, { useEffect } from "react";
 import { TopNavBar } from "@/components/header/TopNavBar";
-import { AntaeusView } from "@/components/views/AntaeusView";
+import { GaiaView } from "@/components/views/GaiaView";
 import { useDashboardStore } from "@/store/useDashboardStore";
 
 export default function AntaeusPage() {
@@ -16,7 +16,7 @@ export default function AntaeusPage() {
     <div className="min-h-screen bg-[#0b0d17] text-slate-100 flex flex-col">
       <TopNavBar />
       <main className="flex-1 max-w-[1100px] w-full mx-auto px-4 py-4">
-        <AntaeusView />
+        <GaiaView />
       </main>
       <footer className="border-t border-white/10 bg-[#111422]/80 py-4 px-4 mt-6">
         <div className="max-w-[1100px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px] font-mono text-slate-400">

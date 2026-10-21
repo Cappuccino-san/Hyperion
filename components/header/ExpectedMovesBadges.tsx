@@ -1,7 +1,11 @@
 "use client";
 
 import React from "react";
-import { useDashboardStore } from "@/store/useDashboardStore";
+import {
+  getFridayEtShort,
+  getTodayEtShort,
+  useDashboardStore,
+} from "@/store/useDashboardStore";
 import { cn } from "@/lib/utils";
 
 export function ExpectedMovesBadges() {
@@ -13,52 +17,48 @@ export function ExpectedMovesBadges() {
   const chainExpirations = useDashboardStore((state) => state.chainExpirations);
   const expectedMoves = useDashboardStore((state) => state.expectedMoves);
 
+  if (!expectedMoves) {
+    return (
+      <div className="flex flex-wrap items-center gap-2 text-xs font-mono py-1">
+        <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+        <span className="text-slate-400">Loading live expected moves...</span>
+      </div>
+    );
+  }
+
   const dailyDate =
-    expectedMoves?.daily?.exp?.slice(5) ??
+    expectedMoves.daily?.exp?.slice(5) ??
     chainExpirations[0]?.dateLabel ??
-    "10-19";
+    getTodayEtShort();
   const weekCols = chainExpirations.filter((c) => c.inThisWeek);
   const weeklyDate =
-    expectedMoves?.weekly?.exp?.slice(5) ??
+    expectedMoves.weekly?.exp?.slice(5) ??
     weekCols[weekCols.length - 1]?.dateLabel ??
     chainExpirations[Math.min(4, Math.max(0, chainExpirations.length - 1))]
       ?.dateLabel ??
-    "10-23";
+    getFridayEtShort();
   const monthlyDate =
-    expectedMoves?.monthly?.exp?.slice(5) ??
+    expectedMoves.monthly?.exp?.slice(5) ??
     chainExpirations.find((c) => c.filterGroup === "OPEX")?.dateLabel ??
-    "10-30";
+    "11-20";
 
-  // Fallback 0.85 * ATM straddle approximation when chain hasn't hydrated yet
-  const approxEm = (days: number) =>
-    Number(
-      (
-        0.85 *
-        spotPrice *
-        impliedVolatility *
-        Math.sqrt(days / 252) *
-        Math.sqrt(2 / Math.PI) *
-        2
-      ).toFixed(2)
-    );
-
-  const dailyEm = expectedMoves?.daily?.em ?? approxEm(1);
+  const dailyEm = expectedMoves.daily?.em ?? 1.28;
   const dailyLow =
-    expectedMoves?.daily?.low ?? Number((spotPrice - dailyEm).toFixed(2));
+    expectedMoves.daily?.low ?? Number((spotPrice - dailyEm).toFixed(2));
   const dailyHigh =
-    expectedMoves?.daily?.high ?? Number((spotPrice + dailyEm).toFixed(2));
+    expectedMoves.daily?.high ?? Number((spotPrice + dailyEm).toFixed(2));
 
-  const weeklyEm = expectedMoves?.weekly?.em ?? approxEm(5);
+  const weeklyEm = expectedMoves.weekly?.em ?? 5.09;
   const weeklyLow =
-    expectedMoves?.weekly?.low ?? Number((spotPrice - weeklyEm).toFixed(2));
+    expectedMoves.weekly?.low ?? Number((spotPrice - weeklyEm).toFixed(2));
   const weeklyHigh =
-    expectedMoves?.weekly?.high ?? Number((spotPrice + weeklyEm).toFixed(2));
+    expectedMoves.weekly?.high ?? Number((spotPrice + weeklyEm).toFixed(2));
 
-  const monthlyEm = expectedMoves?.monthly?.em ?? approxEm(21);
+  const monthlyEm = expectedMoves.monthly?.em ?? 20.0;
   const monthlyLow =
-    expectedMoves?.monthly?.low ?? Number((spotPrice - monthlyEm).toFixed(2));
+    expectedMoves.monthly?.low ?? Number((spotPrice - monthlyEm).toFixed(2));
   const monthlyHigh =
-    expectedMoves?.monthly?.high ?? Number((spotPrice + monthlyEm).toFixed(2));
+    expectedMoves.monthly?.high ?? Number((spotPrice + monthlyEm).toFixed(2));
 
   const isAnnualSupported = ["SPX", "SPXW", "SPY", "QQQ"].includes(
     activeTicker.toUpperCase()

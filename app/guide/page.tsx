@@ -217,6 +217,16 @@ export default function GuidePage() {
             Candlestick and gamma bubble engine. 5-minute bars over cyan (+GEX) and purple (-GEX) strike bubbles, with daily SMA 5 (white), EMA 21 (teal), SMA 55 (orange) levels, and intraday SMA 34 (green/red). Includes non-repainting 3-left/3-right pivot divergence table (5m, 30m, 2h, Daily, Weekly) and an expected-move cone with Pin and Fast-move shading.
           </p>
         </section>
+
+        {/* 8. Atlas */}
+        <section id="atlas" className="bg-[#111827]/60 border border-slate-800 rounded-2xl p-4 space-y-3">
+          <h2 className="text-xs font-bold uppercase tracking-widest text-cyan-400 font-mono">
+            Atlas (Live Pulse inside Gaia)
+          </h2>
+          <p className="text-xs text-slate-300 leading-relaxed">
+            Live pitch-black node-pulse tracking canvas built directly into Gaia. Renders multi-timeframe candlesticks alongside dynamic comet-tail acoustic waveform ribbons at active structural nodes (King, 0DTE King, Call Wall, Put Wall, Zero γ). Features right-axis live spot countdown timer, interactive nodes drawer, adjustable vertical/horizontal scaling & pan, and a dedicated Replay button (⟲) with scrubber transport controls.
+          </p>
+        </section>
       </main>
 
       <footer className="border-t border-white/10 bg-[#111422]/80 py-4 px-4 mt-8">

@@ -29,6 +29,14 @@ export interface TickerIntradayData {
   history: IntradayHistoryPoint[];
   alerts: IntradayAlert[];
   lastBackfillAttempt?: number;
+  officialLevels?: {
+    callWall: number;
+    callWallGex?: number;
+    putWall: number;
+    putWallGex?: number;
+    zeroGamma: number;
+    hasZeroGammaFlip?: boolean;
+  };
 }
 
 export interface DailyStore {
@@ -80,6 +88,17 @@ function loadStore(): DailyStore {
   }
 
   const cacheDir = getCacheDir();
+  try {
+    const files = fs.readdirSync(cacheDir);
+    for (const f of files) {
+      if (f.startsWith("intraday-") && !f.includes(today)) {
+        try {
+          fs.unlinkSync(path.join(cacheDir, f));
+        } catch {}
+      }
+    }
+  } catch {}
+
   const filePath = path.join(cacheDir, `intraday-${today}.json`);
 
   if (fs.existsSync(filePath)) {
@@ -217,6 +236,21 @@ async function backfillFromTerraShade(
       tickerData.alerts.sort((a, b) => a.ts - b.ts);
     }
 
+    if (data.levels) {
+      tickerData.officialLevels = {
+        callWall: Number(data.levels.call_wall?.strike ?? 0),
+        callWallGex: Number(
+          ((data.levels.call_wall?.gex ?? 0) / 1e6).toFixed(2)
+        ),
+        putWall: Number(data.levels.put_wall?.strike ?? 0),
+        putWallGex: Number(
+          ((data.levels.put_wall?.gex ?? 0) / 1e6).toFixed(2)
+        ),
+        zeroGamma: Number((data.levels.zero_gamma ?? 0).toFixed(2)),
+        hasZeroGammaFlip: true,
+      };
+    }
+
     store.tickers[sym] = tickerData;
     saveStore(store);
   } catch {
@@ -233,6 +267,14 @@ export async function recordIntradaySnapshot(params: {
 }): Promise<{
   history: IntradayHistoryPoint[];
   alerts: IntradayAlert[];
+  officialLevels?: {
+    callWall: number;
+    callWallGex?: number;
+    putWall: number;
+    putWallGex?: number;
+    zeroGamma: number;
+    hasZeroGammaFlip?: boolean;
+  };
 }> {
   const { ticker, spotPrice, callWall, putWall, zeroGamma } = params;
   const sym = ticker.trim().toUpperCase();
@@ -359,12 +401,21 @@ export async function recordIntradaySnapshot(params: {
   return {
     history: tickerData.history,
     alerts: tickerData.alerts,
+    officialLevels: tickerData.officialLevels,
   };
 }
 
 export async function getIntradayHistoryAndAlerts(ticker: string): Promise<{
   history: IntradayHistoryPoint[];
   alerts: IntradayAlert[];
+  officialLevels?: {
+    callWall: number;
+    callWallGex?: number;
+    putWall: number;
+    putWallGex?: number;
+    zeroGamma: number;
+    hasZeroGammaFlip?: boolean;
+  };
 }> {
   const sym = ticker.trim().toUpperCase();
   const store = loadStore();
@@ -377,5 +428,6 @@ export async function getIntradayHistoryAndAlerts(ticker: string): Promise<{
   return {
     history: tickerData.history,
     alerts: tickerData.alerts,
+    officialLevels: tickerData.officialLevels,
   };
 }

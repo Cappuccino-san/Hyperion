@@ -31,22 +31,23 @@ export function SpotDisplay() {
   const showExtended =
     extendedQuote && !NO_EXT.has(activeTicker.toUpperCase());
 
-  const sourceBadge =
-    dataSource === "TRADIER_LIVE"
+  const sourceBadge = isLoadingChain
+    ? {
+        label: "LOADING LIVE...",
+        className:
+          "bg-cyan-500/15 text-cyan-300 border-cyan-400/40 animate-pulse",
+      }
+    : dataSource === "TRADIER_LIVE"
       ? {
           label: "TRADIER LIVE",
           className:
             "bg-emerald-500/15 text-emerald-300 border-emerald-400/40",
         }
-      : dataSource === "CBOE_MARKET_DATA"
-        ? {
-            label: "CBOE MARKET DATA",
-            className: "bg-cyan-500/15 text-cyan-300 border-cyan-400/40",
-          }
-        : {
-            label: "SIMULATED",
-            className: "bg-amber-500/15 text-amber-300 border-amber-400/40",
-          };
+      : {
+          label: "LIVE",
+          className:
+            "bg-emerald-500/15 text-emerald-300 border-emerald-400/40",
+        };
 
   return (
     <div className="argon-card rounded-xl p-4 space-y-2">
@@ -128,14 +129,36 @@ export function SpotDisplay() {
             {bookTimestamp ? `book ${bookTimestamp}` : `${lastUpdated} UTC`}
           </span>
 
-          {/* Green LIVE indicator */}
-          <div className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 border border-emerald-400/40 px-2.5 py-0.5">
+          {/* Green LIVE / Connecting indicator */}
+          <div
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 border",
+              isLoadingChain
+                ? "bg-cyan-500/15 border-cyan-400/40"
+                : "bg-emerald-500/15 border-emerald-400/40"
+            )}
+          >
             <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
+              <span
+                className={cn(
+                  "animate-ping absolute inline-flex h-full w-full rounded-full opacity-75",
+                  isLoadingChain ? "bg-cyan-400" : "bg-emerald-400"
+                )}
+              />
+              <span
+                className={cn(
+                  "relative inline-flex rounded-full h-2 w-2",
+                  isLoadingChain ? "bg-cyan-400" : "bg-emerald-400"
+                )}
+              />
             </span>
-            <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-emerald-300">
-              LIVE
+            <span
+              className={cn(
+                "text-[10px] font-mono font-bold uppercase tracking-wider",
+                isLoadingChain ? "text-cyan-300" : "text-emerald-300"
+              )}
+            >
+              {isLoadingChain ? "CONNECTING" : "LIVE"}
             </span>
           </div>
 
