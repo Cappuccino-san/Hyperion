@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   ExposureMetric,
   getTickerPreset,
@@ -49,6 +50,7 @@ function isAliveExpiration(isoDate: string): boolean {
 }
 
 export function QuadView() {
+  const router = useRouter();
   const metric = useDashboardStore((state) => state.gridFilters.metric);
   const globalExpFilter = useDashboardStore(
     (state) => state.gridFilters.expiration
@@ -206,62 +208,41 @@ export function QuadView() {
           const cardSel = cardHorizons[sym] ?? "";
           const effectiveHorizon = cardSel === "" ? globalExpFilter : cardSel;
 
-          const allExpKing =
+          const fallbackAllExpKing =
             payload?.kingNode.allExpKing ?? preset.kingPreset.allExpKing;
           const contested = payload?.kingNode.isContested ?? false;
 
-          let activeKing = allExpKing;
-          let activeExpDate = "";
-          if (effectiveHorizon === "0DTE") {
-            activeKing =
-              payload?.kingByFilter["0DTE"].strike ??
-              preset.kingPreset.zeroDteKing;
-            activeExpDate = payload?.kingByFilter["0DTE"].exp ?? "";
-          } else if (effectiveHorizon === "THIS_WEEK") {
-            activeKing =
-              payload?.kingByFilter.THIS_WEEK.strike ??
-              preset.kingPreset.weeklyKing;
-            activeExpDate =
-              payload?.kingByFilter.THIS_WEEK.exp ?? "";
-          } else if (effectiveHorizon !== "ALL") {
-            const filterKing = (payload?.kingByFilter as Record<string, { strike: number; label: string; exp?: string } | undefined>)?.[effectiveHorizon];
-            activeKing = filterKing?.strike ?? allExpKing;
-            activeExpDate = effectiveHorizon;
-          }
-
-          // Format king phrase
-          const nearLabel = getNearExpLabel(payload);
-          let kingPhrase = `All-exp King <b>${allExpKing}</b>${contested ? " · contested" : ""}`;
-          if (effectiveHorizon !== "ALL") {
-            const pre =
-              effectiveHorizon === "0DTE"
-                ? `${nearLabel} King`
-                : effectiveHorizon === "THIS_WEEK"
-                  ? "Week King"
-                  : `${effectiveHorizon.slice(5)} King`;
-            const day = activeExpDate ? ` (${activeExpDate.slice(5)})` : "";
-            kingPhrase = `${pre} <b>${activeKing}</b>${day} · ${kingPhrase}`;
-          }
-
           // Determine columns to sum
-          let colsToSum = payload?.expirations ?? [];
+          const allExps = payload?.expirations ?? [];
+          let colsToSum = allExps;
           if (effectiveHorizon === "0DTE") {
-            const alive = (payload?.expirations ?? []).filter((e) =>
+            const alive = allExps.filter((e) =>
               isAliveExpiration(e.isoDate)
             );
             colsToSum = alive.length > 0 ? [alive[0]] : colsToSum.slice(0, 1);
           } else if (effectiveHorizon === "THIS_WEEK") {
-            colsToSum = (payload?.expirations ?? []).filter(
-              (e) => e.filterGroup === "THIS_WEEK"
+            const wk = allExps.filter(
+              (e) =>
+                e.inThisWeek !== undefined
+                  ? e.inThisWeek
+                  : e.filterGroup === "0DTE" || e.filterGroup === "THIS_WEEK"
             );
+            colsToSum = wk.length > 0 ? wk : allExps.slice(0, Math.min(5, allExps.length));
           } else if (effectiveHorizon !== "ALL") {
-            colsToSum = (payload?.expirations ?? []).filter(
-              (e) => e.isoDate === effectiveHorizon
+            const matched = allExps.filter(
+              (e) => e.isoDate === effectiveHorizon || e.dateLabel === effectiveHorizon
             );
+            colsToSum = matched.length > 0 ? matched : allExps;
           }
 
-          // Generate ladder strikes
+          // Generate ladder strikes and dynamically compute activeKing & allExpKing for the selected metric
           const strikesData = payload?.strikes ?? [];
+          let computedAllKing = fallbackAllExpKing;
+          let maxAllAbs = -1;
+          let computedActiveKing = fallbackAllExpKing;
+          let maxActiveAbs = -1;
+          let peakActiveExpIso = colsToSum[0]?.isoDate ?? "";
+
           const rows = strikesData.map((sRow) => {
             const map =
               metric === "GEX"
@@ -272,10 +253,31 @@ export function QuadView() {
                     ? sRow.dex
                     : sRow.charm;
 
-            const sumVal = colsToSum.reduce(
+            const allVal = allExps.reduce(
               (acc, c) => acc + (map[c.id] ?? 0),
               0
             );
+            if (Math.abs(allVal) > maxAllAbs) {
+              maxAllAbs = Math.abs(allVal);
+              computedAllKing = sRow.strike;
+            }
+
+            let sumVal = 0;
+            let rowPeakColAbs = -1;
+            let rowPeakIso = colsToSum[0]?.isoDate ?? "";
+            for (const c of colsToSum) {
+              const v = map[c.id] ?? 0;
+              sumVal += v;
+              if (Math.abs(v) > rowPeakColAbs) {
+                rowPeakColAbs = Math.abs(v);
+                rowPeakIso = c.isoDate;
+              }
+            }
+            if (Math.abs(sumVal) > maxActiveAbs) {
+              maxActiveAbs = Math.abs(sumVal);
+              computedActiveKing = sRow.strike;
+              peakActiveExpIso = rowPeakIso;
+            }
 
             // Compute open pct
             let pct: number | null = null;
@@ -300,6 +302,43 @@ export function QuadView() {
               pct,
             };
           });
+
+          const allExpKing = maxAllAbs > 0 ? computedAllKing : fallbackAllExpKing;
+          let activeKing = maxActiveAbs > 0 ? computedActiveKing : allExpKing;
+          let activeExpDate = peakActiveExpIso;
+
+          if (maxActiveAbs <= 0) {
+            if (effectiveHorizon === "0DTE") {
+              activeKing =
+                payload?.kingByFilter["0DTE"].strike ??
+                preset.kingPreset.zeroDteKing;
+              activeExpDate = payload?.kingByFilter["0DTE"].exp ?? "";
+            } else if (effectiveHorizon === "THIS_WEEK") {
+              activeKing =
+                payload?.kingByFilter.THIS_WEEK.strike ??
+                preset.kingPreset.weeklyKing;
+              activeExpDate =
+                payload?.kingByFilter.THIS_WEEK.exp ?? "";
+            } else if (effectiveHorizon !== "ALL") {
+              const filterKing = (payload?.kingByFilter as Record<string, { strike: number; label: string; exp?: string } | undefined>)?.[effectiveHorizon];
+              activeKing = filterKing?.strike ?? allExpKing;
+              activeExpDate = effectiveHorizon;
+            }
+          }
+
+          // Format king phrase
+          const nearLabel = getNearExpLabel(payload);
+          let kingPhrase = `All-exp King <b>${allExpKing}</b>${contested ? " · contested" : ""}`;
+          if (effectiveHorizon !== "ALL") {
+            const pre =
+              effectiveHorizon === "0DTE"
+                ? `${nearLabel} King`
+                : effectiveHorizon === "THIS_WEEK"
+                  ? "Week King"
+                  : `${effectiveHorizon.slice(5)} King`;
+            const day = activeExpDate ? ` (${activeExpDate.slice(5)})` : "";
+            kingPhrase = `${pre} <b>${activeKing}</b>${day} · ${kingPhrase}`;
+          }
 
           // Sort strikes descending (high to low)
           rows.sort((a, b) => b.strike - a.strike);
@@ -351,6 +390,7 @@ export function QuadView() {
                     onClick={() => {
                       setTicker(sym);
                       setActiveView("Heatmap");
+                      router.push("/");
                     }}
                     className="flex items-baseline gap-2 text-left group cursor-pointer"
                   >
@@ -397,6 +437,8 @@ export function QuadView() {
 
                 {/* Expiration Select Dropdown */}
                 <select
+                  id={`quad-exp-${sym.toLowerCase()}`}
+                  name={`quadExp_${sym}`}
                   aria-label={`${sym} Expiration`}
                   value={cardSel}
                   onChange={(e) =>

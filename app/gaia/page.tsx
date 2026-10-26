@@ -15,7 +15,7 @@ export default function GaiaPage() {
   return (
     <div className="min-h-screen bg-[#0b0d17] text-slate-100 flex flex-col">
       <TopNavBar />
-      <main className="flex-1 max-w-[1100px] w-full mx-auto px-4 py-4">
+      <main className="flex-1 max-w-[1600px] w-full mx-auto px-4 py-4">
         <GaiaView />
       </main>
       <footer className="border-t border-white/10 bg-[#111422]/80 py-4 px-4 mt-6">

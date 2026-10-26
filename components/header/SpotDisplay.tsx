@@ -16,6 +16,8 @@ export function SpotDisplay() {
   const { netGex } = useDashboardStore((state) => state.netMetrics);
   const dataSource = useDashboardStore((state) => state.dataSource);
   const isLoadingChain = useDashboardStore((state) => state.isLoadingChain);
+  const connectionStatus = useDashboardStore((state) => state.connectionStatus);
+  const isStaleSnapshot = useDashboardStore((state) => state.isStaleSnapshot);
   const lastUpdated = useDashboardStore((state) => state.lastUpdated);
   const bookTimestamp = useDashboardStore((state) => state.bookTimestamp);
   const extendedQuote = useDashboardStore((state) => state.extendedQuote);
@@ -31,23 +33,41 @@ export function SpotDisplay() {
   const showExtended =
     extendedQuote && !NO_EXT.has(activeTicker.toUpperCase());
 
+  const isSyncing =
+    connectionStatus === "SYNCING" ||
+    connectionStatus === "RECONNECTING" ||
+    isStaleSnapshot;
+  const isSimulated = dataSource === "SIMULATED";
+
   const sourceBadge = isLoadingChain
     ? {
-        label: "LOADING LIVE...",
+        label: isSyncing ? "SYNCING..." : "LOADING...",
         className:
           "bg-cyan-500/15 text-cyan-300 border-cyan-400/40 animate-pulse",
       }
-    : dataSource === "TRADIER_LIVE"
+    : isSyncing
       ? {
-          label: "TRADIER LIVE",
+          label: "LIVE (SYNCING)",
           className:
-            "bg-emerald-500/15 text-emerald-300 border-emerald-400/40",
+            "bg-amber-500/15 text-amber-300 border-amber-400/40 shadow-[0_0_10px_rgba(245,158,11,0.2)]",
         }
-      : {
-          label: "LIVE",
-          className:
-            "bg-emerald-500/15 text-emerald-300 border-emerald-400/40",
-        };
+      : dataSource === "TRADIER_LIVE"
+        ? {
+            label: "TRADIER LIVE",
+            className:
+              "bg-emerald-500/15 text-emerald-300 border-emerald-400/40",
+          }
+        : isSimulated
+          ? {
+              label: "OFFLINE SIM",
+              className:
+                "bg-amber-500/15 text-amber-300 border-amber-400/40",
+            }
+          : {
+              label: "LIVE",
+              className:
+                "bg-emerald-500/15 text-emerald-300 border-emerald-400/40",
+            };
 
   return (
     <div className="argon-card rounded-xl p-4 space-y-2">
@@ -129,36 +149,66 @@ export function SpotDisplay() {
             {bookTimestamp ? `book ${bookTimestamp}` : `${lastUpdated} UTC`}
           </span>
 
-          {/* Green LIVE / Connecting indicator */}
+          {/* Green LIVE / Amber SYNCING / Connecting indicator */}
           <div
             className={cn(
               "inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 border",
               isLoadingChain
                 ? "bg-cyan-500/15 border-cyan-400/40"
-                : "bg-emerald-500/15 border-emerald-400/40"
+                : isSyncing
+                  ? "bg-amber-500/15 border-amber-400/40"
+                  : isSimulated
+                    ? "bg-slate-800/80 border-slate-700"
+                    : "bg-emerald-500/15 border-emerald-400/40"
             )}
           >
             <span className="relative flex h-2 w-2">
               <span
                 className={cn(
                   "animate-ping absolute inline-flex h-full w-full rounded-full opacity-75",
-                  isLoadingChain ? "bg-cyan-400" : "bg-emerald-400"
+                  isLoadingChain
+                    ? "bg-cyan-400"
+                    : isSyncing
+                      ? "bg-amber-400"
+                      : isSimulated
+                        ? "bg-slate-400"
+                        : "bg-emerald-400"
                 )}
               />
               <span
                 className={cn(
                   "relative inline-flex rounded-full h-2 w-2",
-                  isLoadingChain ? "bg-cyan-400" : "bg-emerald-400"
+                  isLoadingChain
+                    ? "bg-cyan-400"
+                    : isSyncing
+                      ? "bg-amber-400"
+                      : isSimulated
+                        ? "bg-slate-400"
+                        : "bg-emerald-400"
                 )}
               />
             </span>
             <span
               className={cn(
                 "text-[10px] font-mono font-bold uppercase tracking-wider",
-                isLoadingChain ? "text-cyan-300" : "text-emerald-300"
+                isLoadingChain
+                  ? "text-cyan-300"
+                  : isSyncing
+                    ? "text-amber-300 font-extrabold"
+                    : isSimulated
+                      ? "text-slate-400"
+                      : "text-emerald-300"
               )}
             >
-              {isLoadingChain ? "CONNECTING" : "LIVE"}
+              {isLoadingChain
+                ? isSyncing
+                  ? "SYNCING..."
+                  : "CONNECTING"
+                : isSyncing
+                  ? "LIVE (SYNCING)"
+                  : isSimulated
+                    ? "OFFLINE"
+                    : "LIVE"}
             </span>
           </div>
 

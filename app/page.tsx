@@ -25,8 +25,10 @@ export default function DashboardPage() {
     (state) => state.fetchOptionsChain
   );
 
-  // Poll /api/options?ticker=${activeTicker} immediately on ticker change & every 15 seconds
+  // Poll /api/options?ticker=${activeTicker} immediately on ticker change & every 15 seconds while on Heatmap
   useEffect(() => {
+    if (activeView !== "Heatmap") return;
+
     fetchOptionsChain(activeTicker);
 
     const pollInterval = setInterval(() => {
@@ -34,15 +36,21 @@ export default function DashboardPage() {
     }, 15_000);
 
     return () => clearInterval(pollInterval);
-  }, [activeTicker, fetchOptionsChain]);
+  }, [activeTicker, activeView, fetchOptionsChain]);
 
   return (
     <div className="min-h-screen bg-[#0b0d17] text-argon-text flex flex-col">
       {/* Global Navigation & Top Header */}
       <TopNavBar />
 
-      {/* Single-Column Obsidian Layout (max-w-[1080px] mx-auto) */}
-      <main className="flex-1 max-w-[1080px] w-full mx-auto px-4 py-4 space-y-4">
+      {/* Single-Column Layout (expands to max-w-[1600px] on Gaia, max-w-[1080px] on Heatmap) */}
+      <main
+        className={`flex-1 w-full mx-auto px-4 py-4 space-y-4 ${
+          activeView === "Gaia" || activeView === "Antaeus" || activeView === "Atlas"
+            ? "max-w-[1600px]"
+            : "max-w-[1080px]"
+        }`}
+      >
         {activeView === "Heatmap" && (
           <>
             {/* 1. Search Bar & 2-Row Ticker Grid */}

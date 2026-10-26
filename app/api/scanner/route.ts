@@ -1,17 +1,105 @@
 import { NextResponse } from "next/server";
+import { optionsMemoryCache } from "@/lib/marketCache";
 
 export const dynamic = "force-dynamic";
 
+interface RawScannerRow {
+  t: string;
+  px: number;
+  king: number;
+  pts: number;
+  pct: number;
+  xem: number;
+  neg: boolean;
+  str: number;
+  share: number;
+  base: number;
+  score: number;
+  rr: number;
+  book: string;
+  contested: boolean;
+  moved?: boolean;
+}
+
+function overlayLiveKingMetrics(rows: RawScannerRow[]): RawScannerRow[] {
+  const updated = rows.map((row) => {
+    const cached = optionsMemoryCache.get(row.t.toUpperCase())?.payload;
+    if (!cached || cached.strikes.length === 0) {
+      return row;
+    }
+
+    const px = Number(cached.spotPrice.toFixed(2));
+    const king = cached.kingNode.allExpKing;
+    const pts = Number((king - px).toFixed(2));
+    const pct = px > 0 ? Number(((pts / px) * 100).toFixed(2)) : row.pct;
+    const dailyEm =
+      cached.expectedMoves?.daily?.em && cached.expectedMoves.daily.em > 0
+        ? cached.expectedMoves.daily.em
+        : Math.max(0.5, px * cached.impliedVolatility * Math.sqrt(1 / 252));
+    const xem = Number((Math.abs(pts) / Math.max(0.01, dailyEm)).toFixed(2));
+    const neg = cached.netMetrics.netGex < 0;
+    const str = cached.kingNode.kingStrength;
+    const share =
+      cached.kingNode.totalBoardGamma > 0
+        ? Number(
+            (
+              (cached.kingNode.kingValue / cached.kingNode.totalBoardGamma) *
+              100
+            ).toFixed(1)
+          )
+        : row.share;
+    const contested = cached.kingNode.isContested;
+    const moved = row.moved || king !== row.king;
+
+    // Recompute conviction score dynamically based on live King strength & proximity to EM
+    const emAlignmentScore = Math.max(0, 35 - Math.abs(xem - 1.15) * 12);
+    const base = Math.round(Math.min(99, str * 0.65 + emAlignmentScore));
+    const score = Math.round(
+      Math.max(
+        0,
+        Math.min(
+          99,
+          base * (contested ? 0.82 : 1.0) - (xem > 4 ? (xem - 4) * 5 : 0)
+        )
+      )
+    );
+
+    return {
+      ...row,
+      px,
+      king,
+      pts,
+      pct,
+      xem,
+      neg,
+      str,
+      share,
+      base,
+      score,
+      book: cached.bookTimestamp ?? row.book,
+      contested,
+      moved,
+    };
+  });
+
+  return updated.sort((a, b) => b.score - a.score);
+}
+
 export async function GET() {
+  const todayEt = new Date().toLocaleDateString("en-CA", {
+    timeZone: "America/New_York",
+  });
+  const nowIso = new Date().toISOString();
+
   const scannerPayload = {
     scans: [
       {
         slot: "09:35",
-        day: "2026-10-16",
-        at: "2026-10-16T10:31:24-04:00",
+        day: todayEt,
+        at: nowIso,
         secs: 3381.5,
         credits: 0,
-        rows: [
+        rows: overlayLiveKingMetrics([
           { t: "AAPL", px: 346.23, king: 350.0, pts: 3.77, pct: 1.09, xem: 0.81, neg: false, str: 64, share: 24.4, base: 68, score: 50, rr: 0.2039, book: "Oct 16, 4:14 PM ET", contested: false, moved: true },
           { t: "MU", px: 879.99, king: 850.0, pts: -29.99, pct: -3.41, xem: 1.28, neg: true, str: 15, share: 5.8, base: 53, score: 43, rr: 0.998, book: "Oct 16, 4:00 PM ET", contested: true, moved: true },
           { t: "META", px: 720.1, king: 750.0, pts: 29.9, pct: 4.15, xem: 2.99, neg: false, str: 57, share: 18.9, base: 46, score: 41, rr: 1.4876, book: "Oct 16, 4:00 PM ET", contested: false, moved: true },
@@ -36,15 +124,15 @@ export async function GET() {
           { t: "NDXP", px: 29161.17, king: 29200.0, pts: 38.83, pct: 0.13, xem: 0.12, neg: true, str: 25, share: 8.6, base: 16, score: 0, rr: 0.2409, book: "Oct 16, 4:00 PM ET", contested: false, moved: true },
           { t: "AMD", px: 529.07, king: 620.0, pts: 90.93, pct: 17.19, xem: 6.16, neg: true, str: 18, share: 4.4, base: 10, score: 0, rr: 0.2285, book: "Oct 16, 3:59 PM ET", contested: false, moved: true },
           { t: "TSLA", px: 354.72, king: 400.0, pts: 45.28, pct: 12.76, xem: 6.01, neg: false, str: 39, share: 8.4, base: 18, score: 0, rr: 0.1333, book: "Oct 16, 4:14 PM ET", contested: false, moved: true },
-        ],
+        ]),
       },
       {
         slot: "15:50",
-        day: "2026-10-16",
-        at: "2026-10-16T15:39:39-04:00",
+        day: todayEt,
+        at: nowIso,
         secs: 858.2,
         credits: 0,
-        rows: [
+        rows: overlayLiveKingMetrics([
           { t: "BAC", px: 51.34, king: 50.0, pts: -1.34, pct: -2.61, xem: 2.35, neg: true, str: 68, share: 27.3, base: 75, score: 69, rr: 1.4167, book: "Oct 16, 4:00 PM ET", contested: false },
           { t: "XLE", px: 68.24, king: 70.0, pts: 1.76, pct: 2.58, xem: 2.15, neg: false, str: 63, share: 21.0, base: 65, score: 65, rr: 2.3784, book: "Oct 16, 4:00 PM ET", contested: false, moved: true },
           { t: "TSM", px: 413.4, king: 400.0, pts: -13.4, pct: -3.24, xem: 1.87, neg: true, str: 38, share: 12.6, base: 66, score: 52, rr: 0.5625, book: "Oct 16, 4:05 PM ET", contested: false },
@@ -76,7 +164,7 @@ export async function GET() {
           { t: "RIVN", px: 12.42, king: 20.0, pts: 7.58, pct: 61.03, xem: 12.23, neg: false, str: 24, share: 10.9, base: 11, score: 0, rr: 0.1905, book: "Oct 16, 4:00 PM ET", contested: true, moved: true },
           { t: "AMD", px: 529.07, king: 620.0, pts: 90.93, pct: 17.19, xem: 6.16, neg: true, str: 18, share: 4.4, base: 10, score: 0, rr: 0.2285, book: "Oct 16, 3:59 PM ET", contested: false, moved: true },
           { t: "TSLA", px: 354.72, king: 400.0, pts: 45.28, pct: 12.76, xem: 6.01, neg: false, str: 39, share: 8.4, base: 18, score: 0, rr: 0.1333, book: "Oct 16, 4:14 PM ET", contested: false, moved: true },
-        ],
+        ]),
       },
     ],
     running: null,
@@ -85,7 +173,7 @@ export async function GET() {
 
   return NextResponse.json(scannerPayload, {
     headers: {
-      "Cache-Control": "public, s-maxage=60, stale-while-revalidate=120",
+      "Cache-Control": "no-store, max-age=0",
     },
   });
 }

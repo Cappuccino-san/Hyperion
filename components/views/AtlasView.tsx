@@ -9,6 +9,14 @@ import React, {
 } from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { normPDF } from "@/lib/optionsExposure";
+import {
+  computeBarFlowGammaVwapSeries,
+  FlowGammaVwapSnapshot,
+} from "@/lib/flowGammaVwap";
+import {
+  drawFlowGammaVwapOverlay,
+  ConfluenceLevel,
+} from "@/components/chart/FlowGammaVwapOverlay";
 import type {
   AntaeusExpirationInfo,
   AntaeusIntradayCandle,
@@ -348,6 +356,8 @@ export function AtlasView() {
   const [glowIntensity, setGlowIntensity] = useState<number>(1.0); // 0.2 .. 2.0
   const [showGridlines, setShowGridlines] = useState<boolean>(true);
   const [showPriceRay, setShowPriceRay] = useState<boolean>(true);
+  const [showFlowVwap, setShowFlowVwap] = useState<boolean>(true);
+  const [apiFlowPoints, setApiFlowPoints] = useState<FlowGammaVwapSnapshot[]>([]);
 
   // Interactive Sizing & Zoom/Pan Adjustment States
   const [chartHeight, setChartHeight] = useState<number>(600); // 480 .. 860 px
@@ -441,6 +451,30 @@ export function AtlasView() {
     return () => clearInterval(interval);
   }, [isReplayActive, activeTicker, fetchLiveAtlas]);
 
+  // Fetch session Flow VWAP x Gamma points
+  useEffect(() => {
+    let active = true;
+    const loadFlow = async () => {
+      try {
+        const res = await fetch(
+          `/api/flow-vwap?ticker=${encodeURIComponent(activeTicker)}&timeframe=${encodeURIComponent(timeframe)}`
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (active && Array.isArray(data) && data.length > 0) {
+            setApiFlowPoints(data);
+          }
+        }
+      } catch {}
+    };
+    loadFlow();
+    const interval = setInterval(loadFlow, 5000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [activeTicker, timeframe]);
+
   // Handle countdown timer tick (1s interval)
   useEffect(() => {
     const tfSec =
@@ -510,6 +544,20 @@ export function AtlasView() {
     }
     return all;
   }, [livePayload?.optionBuckets, livePayload?.expirations, horizonFilter]);
+
+  // Reconstruct Flow VWAP x Gamma series aligned with candles
+  const flowVwapPoints = useMemo<FlowGammaVwapSnapshot[]>(() => {
+    if (candles.length === 0) return [];
+    if (apiFlowPoints.length >= candles.length && apiFlowPoints.length > 0) {
+      return apiFlowPoints;
+    }
+    const optionsBook = (filteredBuckets || []).map((b) => ({
+      strike: b.strike,
+      gamma: (b.callGamma || 0) + (b.putGamma || 0),
+      volume: (b.callOI || 0) * 0.1 + (b.putOI || 0) * 0.1,
+    }));
+    return computeBarFlowGammaVwapSeries(candles, optionsBook);
+  }, [candles, filteredBuckets, apiFlowPoints]);
 
   // Calculate top structural strikes, price domain & columns across all candles
   const atlasModel = useMemo(() => {
@@ -1007,6 +1055,28 @@ export function AtlasView() {
       ctx.restore();
     }
 
+    // Flow VWAP Dispersion Cloud Bands & Envelope Shading (Background Layer)
+    if (showFlowVwap && flowVwapPoints.length > 0) {
+      drawFlowGammaVwapOverlay({
+        ctx,
+        points: flowVwapPoints,
+        safeActiveIdx,
+        barToX,
+        priceToY,
+        padLeft,
+        plotRightX,
+        padTop,
+        padBottom,
+        chartHeight: height,
+        rightAxisWidth,
+        showCenterline: false,
+        showBands: true,
+        showShading: true,
+        showConfluenceMarkers: false,
+        showRightAxisBadge: false,
+      });
+    }
+
     // 4. LAYER 2: Candlesticks Overlay
     const candleWidth = Math.max(3.0, Math.min(stepX * 0.62, 7.5));
     for (let t = 0; t <= safeActiveIdx; t++) {
@@ -1038,6 +1108,49 @@ export function AtlasView() {
       ctx.fillRect(cx - candleWidth / 2, topBody, candleWidth, bodyHeight);
     }
 
+    // Flow VWAP Centerline & Dynamic Confluence Callouts (Foreground Layer)
+    if (showFlowVwap && flowVwapPoints.length > 0) {
+      const confluenceLevels: ConfluenceLevel[] = [];
+      if (currentColumn?.allExpKingStrike) {
+        confluenceLevels.push({
+          name: "King Node",
+          strike: currentColumn.allExpKingStrike,
+        });
+      }
+      if (currentColumn?.callWallStrike) {
+        confluenceLevels.push({
+          name: "Call Wall",
+          strike: currentColumn.callWallStrike,
+        });
+      }
+      if (currentColumn?.putWallStrike) {
+        confluenceLevels.push({
+          name: "Put Wall",
+          strike: currentColumn.putWallStrike,
+        });
+      }
+
+      drawFlowGammaVwapOverlay({
+        ctx,
+        points: flowVwapPoints,
+        safeActiveIdx,
+        barToX,
+        priceToY,
+        padLeft,
+        plotRightX,
+        padTop,
+        padBottom,
+        chartHeight: height,
+        rightAxisWidth,
+        confluenceLevels,
+        showCenterline: true,
+        showBands: false,
+        showShading: false,
+        showConfluenceMarkers: true,
+        showRightAxisBadge: false,
+      });
+    }
+
     // 5. Forming Candle Pulsing Indicator & Live Price Ray
     if (activeCandle && showPriceRay) {
       const tipX = barToX(safeActiveIdx);
@@ -1056,30 +1169,14 @@ export function AtlasView() {
       ctx.lineTo(plotRightX, tipY);
       ctx.stroke();
       ctx.restore();
-
-      // Pulsing dot at forming candle tip
-      ctx.save();
-      ctx.shadowBlur = 8;
-      ctx.shadowColor = isGreen ? "#10b981" : "#f43f5e";
-      ctx.fillStyle = isGreen ? "#10b981" : "#f43f5e";
-      ctx.beginPath();
-      ctx.arc(tipX, tipY, 3.5, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Subtle outer ring
-      ctx.strokeStyle = isGreen
-        ? "rgba(16, 185, 129, 0.5)"
-        : "rgba(244, 63, 94, 0.5)";
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.arc(tipX, tipY, 7.0, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
     }
 
     // 6. Crosshair on Hover
     if (hoverCursor) {
-      const hx = Math.max(padLeft, Math.min(plotRightX, hoverCursor.x));
+      const hx =
+        hoverBarIndex !== null && candles[hoverBarIndex]
+          ? barToX(hoverBarIndex)
+          : Math.max(padLeft, Math.min(plotRightX, hoverCursor.x));
       const hy = Math.max(padTop, Math.min(height - padBottom, hoverCursor.y));
 
       ctx.save();
@@ -1087,7 +1184,7 @@ export function AtlasView() {
       ctx.lineWidth = 1;
       ctx.setLineDash([2, 2]);
 
-      // Vertical line
+      // Vertical line snapped strictly to candle center
       ctx.beginPath();
       ctx.moveTo(hx, padTop);
       ctx.lineTo(hx, height - padBottom);
@@ -1141,6 +1238,28 @@ export function AtlasView() {
         ctx.fillText(`★ ${kingPrice.toFixed(0)}`, plotRightX + 8, ky + 3);
         ctx.restore();
       }
+    }
+
+    // Flow VWAP Right Axis Tag: Gold badge FVWAP {val}
+    if (showFlowVwap && flowVwapPoints.length > 0) {
+      drawFlowGammaVwapOverlay({
+        ctx,
+        points: flowVwapPoints,
+        safeActiveIdx,
+        barToX,
+        priceToY,
+        padLeft,
+        plotRightX,
+        padTop,
+        padBottom,
+        chartHeight: height,
+        rightAxisWidth,
+        showCenterline: false,
+        showBands: false,
+        showShading: false,
+        showConfluenceMarkers: false,
+        showRightAxisBadge: true,
+      });
     }
 
     // Live Spot Price Badge on Right Axis
@@ -1242,6 +1361,8 @@ export function AtlasView() {
     paletteMode,
     xScale,
     xPanOffset,
+    showFlowVwap,
+    flowVwapPoints,
   ]);
 
   // Window mouseup listener to end any active drag even outside canvas
@@ -1259,8 +1380,10 @@ export function AtlasView() {
     const canvas = canvasRef.current;
     if (!canvas || !atlasModel) return;
     const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const scaleX = rect.width > 0 ? canvasWidth / rect.width : 1;
+    const scaleY = rect.height > 0 ? chartHeight / rect.height : 1;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
 
     const rightAxisWidth = 74;
     const plotRightX = canvasWidth - rightAxisWidth;
@@ -1289,8 +1412,10 @@ export function AtlasView() {
     const canvas = canvasRef.current;
     if (!canvas || !atlasModel) return;
     const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const scaleX = rect.width > 0 ? canvasWidth / rect.width : 1;
+    const scaleY = rect.height > 0 ? chartHeight / rect.height : 1;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
 
     setHoverCursor({ x, y });
 
@@ -1337,10 +1462,12 @@ export function AtlasView() {
 
     const totalSlots = Math.max(candles.length, 36);
     const stepX = (plotWidth / totalSlots) * xScale;
-    const barIdx = Math.floor(
-      (x - padLeft - xPanOffset * stepX) / Math.max(1, stepX)
-    );
-    if (barIdx >= 0 && barIdx <= safeActiveIdx) {
+    const relX = x - padLeft - xPanOffset * stepX;
+    // Map coordinate to nearest candlestick center with entry/exit boundaries switching cleanly at exact bar midpoint
+    const floatIdx = (relX - 0.5 * stepX) / Math.max(0.001, stepX);
+    const rawBarIdx = Math.round(floatIdx);
+    const barIdx = Math.max(0, Math.min(safeActiveIdx, rawBarIdx));
+    if (x >= padLeft && x <= plotRightX && rawBarIdx >= 0 && rawBarIdx <= safeActiveIdx) {
       setHoverBarIndex(barIdx);
     } else {
       setHoverBarIndex(null);
@@ -2114,6 +2241,34 @@ export function AtlasView() {
               Macro
             </button>
           </div>
+
+          {/* 7. Flow VWAP x Gamma Quick Toggle Pill */}
+          <button
+            type="button"
+            onClick={() => setShowFlowVwap(!showFlowVwap)}
+            title="Toggle Flow VWAP × Gamma Anchor Line & Dynamic Dispersion Bands Overlay"
+            className={cn(
+              "px-2.5 py-1.5 rounded-lg border text-xs font-mono font-bold flex items-center gap-1.5 transition cursor-pointer select-none",
+              showFlowVwap
+                ? "bg-amber-500/20 border-amber-400/60 text-amber-300 shadow-[0_0_10px_rgba(234,179,8,0.2)]"
+                : "bg-[#141923] border-white/10 text-slate-400 hover:text-white"
+            )}
+          >
+            <i
+              className={cn(
+                "w-2 h-2 rounded-full",
+                showFlowVwap ? "bg-amber-400 shadow-[0_0_6px_#facc15]" : "bg-slate-600"
+              )}
+            />
+            <span>FVWAP</span>
+            {flowVwapPoints.length > 0 && (
+              <span className="text-[10px] text-amber-200/90 font-mono font-normal">
+                {flowVwapPoints[
+                  Math.min(safeActiveIdx, flowVwapPoints.length - 1)
+                ]?.flowVwap.toFixed(1)}
+              </span>
+            )}
+          </button>
         </div>
 
         {/* Right Side Controls: Favorite Star, Separate Replay Button, Settings */}
@@ -2270,6 +2425,18 @@ export function AtlasView() {
                       checked={showPriceRay}
                       onChange={(e) => setShowPriceRay(e.target.checked)}
                       className="accent-cyan-400 rounded"
+                    />
+                  </label>
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <span className="text-yellow-300 flex items-center gap-1.5">
+                      <i className="inline-block w-2 h-2 rounded-full bg-yellow-400" />
+                      Flow VWAP × Gamma
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={showFlowVwap}
+                      onChange={(e) => setShowFlowVwap(e.target.checked)}
+                      className="accent-yellow-400 rounded"
                     />
                   </label>
                 </div>

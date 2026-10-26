@@ -6,7 +6,11 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test": "npm run test:flow-vwap && npm run test:playbook && npm run test:invariants",
+    "test:flow-vwap": "npx tsx lib/__tests__/flowGammaVwap.test.ts",
+    "test:playbook": "npx tsx lib/__tests__/playbookEngine.test.ts",
+    "test:invariants": "npx tsx scripts/verifyExecutionInvariants.ts"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.3.1",

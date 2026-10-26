@@ -4,7 +4,8 @@ import {
   KingNodeMetrics,
   TickerSymbol,
   GammaLevels,
-} from "@/store/useDashboardStore";
+  TickerPreset,
+} from "@/lib/tickerPresets";
 
 export type DataSourceType = "TRADIER_LIVE" | "CBOE_MARKET_DATA" | "SIMULATED";
 
@@ -24,6 +25,8 @@ export interface NormalizedOptionContract {
   ask?: number;
   last?: number;
 }
+
+export const globalContractsCache = new Map<string, NormalizedOptionContract[]>();
 
 export interface ExpirationColumnSpec {
   id: string;
@@ -134,8 +137,10 @@ export interface OptionsAnalyticsPayload {
     time?: string;
     message: string;
     msg?: string;
-    type: "call" | "put" | "zero" | "king";
+    type: "call" | "put" | "zero" | "king" | "bto" | "stc";
   }>;
+  isStale?: boolean;
+  connectionStatus?: "LIVE" | "SYNCING" | "RECONNECTING" | "OFFLINE";
 }
 
 export const normPDF = (x: number): number =>
@@ -486,6 +491,7 @@ export function computeOptionsAnalytics(params: {
   extendedQuote?: ExtendedQuoteInfo | null;
   bookTimestamp?: string;
   officialLevels?: GammaLevels | null;
+  openGexMap?: Map<string, number> | null;
 }): OptionsAnalyticsPayload {
   const {
     ticker,
@@ -497,6 +503,7 @@ export function computeOptionsAnalytics(params: {
     activeExpirationFilter = "0DTE",
     extendedQuote = null,
     bookTimestamp,
+    openGexMap = null,
   } = params;
 
   const preset = getTickerPreset(ticker);
@@ -740,17 +747,31 @@ export function computeOptionsAnalytics(params: {
       const cellCharmM =
         ((cell.callCharmOI - cell.putCharmOI) * 100 * spotPrice * (1 / 252)) / 1e6;
 
-      gex[exp.id] = Number(cellGexM.toFixed(2));
-      callGex[exp.id] = Number(callGexM.toFixed(2));
-      putGex[exp.id] = Number(putGexM.toFixed(2));
-      vex[exp.id] = Number(cellVexM.toFixed(2));
-      dex[exp.id] = Number(cellDexM.toFixed(2));
-      charm[exp.id] = Number(cellCharmM.toFixed(2));
+      gex[exp.id] = Number(cellGexM.toFixed(4));
+      callGex[exp.id] = Number(callGexM.toFixed(4));
+      putGex[exp.id] = Number(putGexM.toFixed(4));
+      vex[exp.id] = Number(cellVexM.toFixed(4));
+      dex[exp.id] = Number(cellDexM.toFixed(4));
+      charm[exp.id] = Number(cellCharmM.toFixed(4));
 
-      const avgPct =
+      let avgPct = 0;
+      if (openGexMap && openGexMap.size > 0) {
+        const openValM = openGexMap.get(`${strike}|${exp.isoDate}`);
+        if (openValM !== undefined && Math.abs(openValM) >= 0.000001) {
+          const rawPct = ((cellGexM - openValM) / Math.abs(openValM)) * 100;
+          if (Number.isFinite(rawPct)) {
+            avgPct = Math.round(rawPct);
+          }
+        }
+      } else if (
+        (exp.id === "exp_0" || exp.id === "exp_1") &&
         cell.totalWeight > 0
-          ? Math.max(-99, Math.min(199, Math.round(cell.weightedPctChange / cell.totalWeight)))
-          : 0;
+      ) {
+        avgPct = Math.max(
+          -99,
+          Math.min(199, Math.round(cell.weightedPctChange / cell.totalWeight))
+        );
+      }
       openPctChange[exp.id] = avgPct;
 
       rowNetGex += cellGexM;
@@ -1264,3 +1285,87 @@ export function computeOptionsAnalytics(params: {
     strikes: strikesDesc,
   };
 }
+
+/**
+ * Tier 3: Deterministic Fallback generator when offline or live market data is unreachable
+ */
+export function buildSimulatedAnalyticsPayload(
+  ticker: TickerSymbol,
+  activeExpirationFilter = "0DTE"
+): OptionsAnalyticsPayload {
+  const preset = getTickerPreset(ticker);
+  const step = preset.strikeStep;
+  const centerStrike = Math.round(preset.spotPrice / step) * step;
+  const halfRows = Math.min(110, Math.max(40, Math.round((preset.spotPrice * 0.15) / step)));
+
+  const simExpirations = [
+    "2026-10-23",
+    "2026-10-26",
+    "2026-10-27",
+    "2026-10-28",
+    "2026-10-29",
+    "2026-10-30",
+    "2026-11-06",
+    "2026-11-13",
+    "2026-11-20",
+    "2026-11-27",
+    "2026-12-18",
+    "2027-01-15",
+  ];
+
+  const contracts: NormalizedOptionContract[] = [];
+  for (let i = -halfRows; i <= halfRows; i++) {
+    const strike = centerStrike + i * step;
+    if (strike <= 0) continue;
+
+    simExpirations.forEach((exp, expIdx) => {
+      const distCall = Math.abs(strike - preset.gammaLevels.callWall) / (step * 8);
+      const distPut = Math.abs(strike - preset.gammaLevels.putWall) / (step * 8);
+      const callBell = Math.exp(-distCall * distCall);
+      const putBell = Math.exp(-distPut * distPut);
+      const dteScale = expIdx === 0 ? 1.4 : expIdx === 4 ? 1.7 : 0.9;
+
+      const callOI = Math.round((800 + callBell * 18000) * dteScale);
+      const putOI = Math.round((800 + putBell * 17000) * dteScale);
+
+      contracts.push({
+        symbol: `${ticker}_${exp}_C_${strike}`,
+        expiration: exp,
+        optionType: "C",
+        strike,
+        openInterest: callOI,
+        volume: Math.round(callOI * 0.4),
+        iv: preset.impliedVolatility,
+        delta: 0,
+        gamma: 0,
+        vega: 0,
+        percentChange: Math.round((callBell - 0.3) * 28),
+      });
+
+      contracts.push({
+        symbol: `${ticker}_${exp}_P_${strike}`,
+        expiration: exp,
+        optionType: "P",
+        strike,
+        openInterest: putOI,
+        volume: Math.round(putOI * 0.4),
+        iv: preset.impliedVolatility,
+        delta: 0,
+        gamma: 0,
+        vega: 0,
+        percentChange: Math.round((putBell - 0.3) * 24),
+      });
+    });
+  }
+
+  return computeOptionsAnalytics({
+    ticker,
+    dataSource: "SIMULATED",
+    spotPrice: preset.spotPrice,
+    previousClose: preset.previousClose,
+    impliedVolatility: preset.impliedVolatility,
+    contracts,
+    activeExpirationFilter,
+  });
+}
+

@@ -1,13 +1,26 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import Link from "next/link";
+import { useRouter, usePathname } from "next/navigation";
 import { ActiveView, useDashboardStore } from "@/store/useDashboardStore";
 import { GuideModal } from "@/components/modals/GuideModal";
 import { CheatCodesModal } from "@/components/modals/CheatCodesModal";
 import { SetupModal } from "@/components/modals/SetupModal";
 import { cn } from "@/lib/utils";
 
-const VIEW_TABS: ActiveView[] = ["Heatmap", "Quad", "Gaia", "Scanner"];
+const VIEW_TABS: ActiveView[] = ["Heatmap", "Quad", "Gaia", "Scanner", "Recap"];
+
+const TAB_ROUTES: Record<ActiveView, string> = {
+  Heatmap: "/",
+  Quad: "/quad",
+  Gaia: "/gaia",
+  Antaeus: "/gaia",
+  Atlas: "/gaia",
+  Scanner: "/scanner",
+  Charts: "/",
+  Recap: "/recap",
+};
 
 const HOLIDAYS_2026 = new Set([
   "2026-01-01",
@@ -135,8 +148,13 @@ function computeMarketStatus(): MarketStatusInfo {
 }
 
 export function TopNavBar() {
+  const router = useRouter();
+  const pathname = usePathname();
   const activeView = useDashboardStore((state) => state.activeView);
+  const activeTicker = useDashboardStore((state) => state.activeTicker);
   const setActiveView = useDashboardStore((state) => state.setActiveView);
+  const setFilters = useDashboardStore((state) => state.setFilters);
+  const fetchOptionsChain = useDashboardStore((state) => state.fetchOptionsChain);
   const isSetupModalOpen = useDashboardStore((state) => state.isSetupModalOpen);
   const setSetupModalOpen = useDashboardStore((state) => state.setSetupModalOpen);
   const [guideOpen, setGuideOpen] = useState(false);
@@ -145,6 +163,38 @@ export function TopNavBar() {
   const [mktStatus, setMktStatus] = useState<MarketStatusInfo>(() =>
     computeMarketStatus()
   );
+
+  const handleTabClick = (tab: ActiveView) => {
+    setActiveView(tab);
+    if (tab === "Heatmap") {
+      router.push("/");
+    } else if (tab === "Quad") {
+      router.push("/quad");
+    } else if (tab === "Gaia" || tab === "Antaeus" || tab === "Atlas") {
+      router.push("/gaia");
+    } else if (tab === "Scanner") {
+      router.push("/scanner");
+    } else if (tab === "Recap") {
+      router.push("/recap");
+    }
+  };
+
+  const isTabActive = (tab: ActiveView) => {
+    if (pathname === "/") {
+      return activeView === tab;
+    }
+    if (pathname === "/quad") return tab === "Quad";
+    if (
+      pathname === "/gaia" ||
+      pathname === "/atlas" ||
+      pathname === "/antaeus"
+    ) {
+      return tab === "Gaia";
+    }
+    if (pathname === "/scanner") return tab === "Scanner";
+    if (pathname === "/recap") return tab === "Recap";
+    return activeView === tab;
+  };
 
   useEffect(() => {
     setMounted(true);
@@ -155,6 +205,50 @@ export function TopNavBar() {
     return () => clearInterval(id);
   }, []);
 
+  // Global Quantitative Terminal Keyboard Shortcuts
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toUpperCase() ?? "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable) {
+        if (e.key === "Escape") {
+          target?.blur();
+        }
+        return;
+      }
+
+      if (e.key === "/") {
+        e.preventDefault();
+        const searchEl = document.getElementById("ticker-search-input") as HTMLInputElement | null;
+        if (searchEl) searchEl.focus();
+      } else if (e.key === "1") {
+        handleTabClick("Heatmap");
+      } else if (e.key === "2") {
+        handleTabClick("Quad");
+      } else if (e.key === "3") {
+        handleTabClick("Gaia");
+      } else if (e.key === "4") {
+        handleTabClick("Scanner");
+      } else if (e.key === "5") {
+        handleTabClick("Recap");
+      } else if (e.key.toLowerCase() === "r") {
+        void fetchOptionsChain(activeTicker, true);
+      } else if (e.key.toLowerCase() === "g") {
+        setFilters({ metric: "GEX" });
+      } else if (e.key.toLowerCase() === "v") {
+        setFilters({ metric: "VEX" });
+      } else if (e.key.toLowerCase() === "d") {
+        setFilters({ metric: "DEX" });
+      } else if (e.key.toLowerCase() === "c") {
+        setFilters({ metric: "Charm" });
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTicker, fetchOptionsChain, setFilters]);
+
   return (
     <>
       <header className="w-full bg-[#0b0d17]/95 backdrop-blur-md">
@@ -162,8 +256,8 @@ export function TopNavBar() {
           {/* Brand & Top Action Links Row */}
           <div className="flex flex-wrap items-center justify-between gap-3">
             {/* Left: Hyperion solar/orbital icon + Brand */}
-            <button
-              type="button"
+            <Link
+              href="/"
               onClick={() => setActiveView("Heatmap")}
               className="flex items-center gap-2.5 text-left group cursor-pointer"
             >
@@ -190,7 +284,7 @@ export function TopNavBar() {
                   Quant Options &amp; Gamma Intelligence
                 </div>
               </div>
-            </button>
+            </Link>
 
             {/* Right: Action Pills (All 6 matching reference layout) */}
             <div className="flex flex-wrap items-center justify-end gap-2">
@@ -260,36 +354,33 @@ export function TopNavBar() {
             </div>
           </div>
 
-          {/* Full-Width 4-Tab Segmented View Switcher */}
+          {/* Full-Width 5-Tab Segmented View Switcher */}
           <nav
             aria-label="Primary View Switcher"
-            className="bg-[#0e121b] border border-[#1e2638] rounded-xl p-1 grid grid-cols-4 gap-1"
+            className="bg-[#0e121b] border border-[#1e2638] rounded-xl p-1 grid grid-cols-5 gap-1"
           >
             {VIEW_TABS.map((tab) => {
-              const isActive =
-                activeView === tab ||
-                ((tab === "Antaeus" || tab === "Gaia") &&
-                  (activeView === "Antaeus" || activeView === "Gaia"));
+              const active = isTabActive(tab);
               return (
-                <button
+                <Link
                   key={tab}
-                  type="button"
+                  href={TAB_ROUTES[tab]}
                   onClick={() => setActiveView(tab)}
                   className={cn(
-                    "py-1.5 px-3 text-xs transition-all text-center cursor-pointer",
-                    isActive
+                    "py-1.5 px-3 text-xs transition-all text-center cursor-pointer block",
+                    active
                       ? "bg-gradient-to-r from-teal-500/25 via-sky-500/20 to-indigo-500/25 border border-teal-400/60 text-white font-semibold rounded-lg shadow-[0_0_15px_rgba(45,212,191,0.15)]"
                       : "text-slate-400 hover:text-white font-medium rounded-lg border border-transparent"
                   )}
                 >
                   {tab}
-                </button>
+                </Link>
               );
             })}
           </nav>
 
-          {/* 4-State Live Market Status Badge (Pre-market | Market Open | After hours | Closed) */}
-          <div className="flex items-center">
+          {/* 4-State Live Market Status Badge & Keyboard Shortcuts Hint */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div
               id="mkt"
               className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#111520] border border-[#1e2638] text-xs font-mono text-slate-400"
@@ -306,6 +397,21 @@ export function TopNavBar() {
               />
               <b className="text-slate-200 font-semibold">{mktStatus.label}</b>
               <span suppressHydrationWarning>{mounted ? `· ${mktStatus.countdown}` : ""}</span>
+            </div>
+
+            <div className="hidden md:flex items-center gap-2 text-[10px] font-mono text-slate-500">
+              <span>
+                <kbd className="px-1.5 py-0.5 rounded bg-[#111520] border border-[#1e2638] text-slate-300">/</kbd> Search
+              </span>
+              <span>
+                <kbd className="px-1.5 py-0.5 rounded bg-[#111520] border border-[#1e2638] text-slate-300">1–5</kbd> Views
+              </span>
+              <span>
+                <kbd className="px-1.5 py-0.5 rounded bg-[#111520] border border-[#1e2638] text-slate-300">G/V/D/C</kbd> Greek
+              </span>
+              <span>
+                <kbd className="px-1.5 py-0.5 rounded bg-[#111520] border border-[#1e2638] text-slate-300">R</kbd> Refresh
+              </span>
             </div>
           </div>
         </div>

@@ -15,7 +15,7 @@ import {
   useDashboardStore,
 } from "@/store/useDashboardStore";
 import { cn } from "@/lib/utils";
-import { RotateCcw, Share2, ZoomIn, ZoomOut } from "lucide-react";
+import { Crosshair, Crown, Download, Pin, Share2, X } from "lucide-react";
 import { Surface3DView } from "./Surface3DView";
 import { formatExposure } from "@/lib/optionsExposure";
 
@@ -62,6 +62,10 @@ export interface StrikeRowData {
   emMarkers?: EmMarkerTag[];
   kingPeakColId: string;
   values: Record<string, number>;
+  gexValues?: Record<string, number>;
+  vexValues?: Record<string, number>;
+  dexValues?: Record<string, number>;
+  charmValues?: Record<string, number>;
   openPctChange: Record<string, number>;
 }
 
@@ -73,51 +77,83 @@ function seededStrikeHash(seed: number): number {
 }
 
 /**
- * TerraShade Viridis 5-Stop Color Scale:
- * [[68,1,84],[59,82,139],[33,145,140],[94,201,98],[253,231,37]]
+ * TerraShade Signed Heatmap Color Scale:
+ * Negative runs blue to purple (HNEG), positive runs dark green to lime (HPOS), zero is slate (HZERO).
  */
-const VIRIDIS_STOPS: [number, number, number][] = [
-  [68, 1, 84],
-  [59, 82, 139],
-  [33, 145, 140],
-  [94, 201, 98],
-  [253, 231, 37],
+const HNEG: [number, number, number][] = [
+  [30, 45, 110],
+  [62, 52, 180],
+  [147, 51, 234],
 ];
+const HPOS: [number, number, number][] = [
+  [18, 84, 44],
+  [22, 163, 74],
+  [163, 230, 53],
+];
+const HZERO = "rgb(30, 41, 59)";
 
-function sampleViridis(t: number): string {
-  const x = Math.max(0, Math.min(1, t)) * (VIRIDIS_STOPS.length - 1);
-  const i = Math.min(VIRIDIS_STOPS.length - 2, Math.floor(x));
-  const f = x - i;
-  const a = VIRIDIS_STOPS[i];
-  const b = VIRIDIS_STOPS[i + 1];
-  const r = Math.round(a[0] + (b[0] - a[0]) * f);
-  const g = Math.round(a[1] + (b[1] - a[1]) * f);
-  const bl = Math.round(a[2] + (b[2] - a[2]) * f);
-  return `rgb(${r}, ${g}, ${bl})`;
+function ramp3(
+  stops: [number, number, number][],
+  t: number
+): [number, number, number] {
+  const scaled = Math.max(0, Math.min(1, t)) * 2;
+  const i = Math.min(1, Math.floor(scaled));
+  const f = scaled - i;
+  const a = stops[i];
+  const b = stops[i + 1];
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * f),
+    Math.round(a[1] + (b[1] - a[1]) * f),
+    Math.round(a[2] + (b[2] - a[2]) * f),
+  ];
+}
+
+export function formatHeatmapCell(valInMillions: number): string {
+  const absDollars = Math.abs(valInMillions) * 1e6;
+  if (absDollars < 1) return "–";
+  const s = valInMillions < 0 ? "-" : "+";
+  if (absDollars >= 1e6) {
+    const n = absDollars / 1e6;
+    return `${s}${n >= 10 ? Math.round(n) : n.toFixed(1)}M`;
+  }
+  if (absDollars >= 1e3) {
+    const n = absDollars / 1e3;
+    return `${s}${n >= 10 ? Math.round(n) : n.toFixed(1)}K`;
+  }
+  return `${s}${Math.round(absDollars)}`;
 }
 
 export function getHyperionCellStyle(
   cellValue: number,
-  maxColumnValue: number,
+  maxAbsValue: number,
   isKingCell: boolean
-): { backgroundColor: string; isBrightYellow: boolean } {
+): { backgroundColor: string; isBrightYellow: boolean; isZeroCell?: boolean } {
   if (isKingCell) {
     return {
       backgroundColor: "#facc15",
       isBrightYellow: true,
+      isZeroCell: false,
     };
   }
 
-  const u = Math.max(
-    0,
-    Math.min(1, 0.5 + 0.5 * (cellValue / (maxColumnValue || 1)))
-  );
-  const t =
-    u >= 0.5 ? Math.pow(u, 0.55) : 1 - Math.pow(1 - u, 0.55);
+  const absDollars = Math.abs(cellValue) * 1e6;
+  if (!(maxAbsValue > 0) || absDollars < 1) {
+    return {
+      backgroundColor: HZERO,
+      isBrightYellow: false,
+      isZeroCell: true,
+    };
+  }
+
+  const d =
+    0.22 + 0.78 * Math.min(1, Math.abs(cellValue) / Math.max(0.0001, maxAbsValue));
+  const pos = cellValue > 0;
+  const [r, g, b] = ramp3(pos ? HPOS : HNEG, d);
 
   return {
-    backgroundColor: sampleViridis(t),
-    isBrightYellow: t > 0.62,
+    backgroundColor: `rgb(${r}, ${g}, ${b})`,
+    isBrightYellow: pos && d > 0.62,
+    isZeroCell: false,
   };
 }
 
@@ -143,6 +179,16 @@ export function HeatmapTable() {
   const [zoom, setZoom] = useState<number>(1);
   const [pickedDateCol, setPickedDateCol] = useState<string>("");
   const [replayIndex, setReplayIndex] = useState<number>(100);
+  const [inspectedCell, setInspectedCell] = useState<{
+    strike: number;
+    colId: string;
+    pinned?: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    setPickedDateCol("");
+    setInspectedCell(null);
+  }, [activeTicker]);
 
   const preset = getTickerPreset(activeTicker);
   const hasZeroDte = kingNode.hasZeroDte ?? true;
@@ -321,6 +367,47 @@ export function HeatmapTable() {
 
       const emMap = assignEmMarkers(chainStrikes);
       const allCellMags: { key: string; mag: number }[] = [];
+
+      // Dynamically resolve the true King strike across allColumns and activeColumns for the active metric
+      let computedAllKingStrike = kingNode.allExpKing;
+      let maxAllRowAbs = -1;
+      let computedFilteredKingStrike = targetKingStrike;
+      let maxFilteredRowAbs = -1;
+
+      for (const sRow of chainStrikes) {
+        const metricValues =
+          metric === "GEX"
+            ? sRow.gex
+            : metric === "VEX"
+              ? sRow.vex
+              : metric === "DEX"
+                ? sRow.dex
+                : sRow.charm;
+
+        let allSum = 0;
+        for (const col of allColumns) {
+          allSum += metricValues[col.id] ?? 0;
+        }
+        if (Math.abs(allSum) > maxAllRowAbs) {
+          maxAllRowAbs = Math.abs(allSum);
+          computedAllKingStrike = sRow.strike;
+        }
+
+        let activeSum = 0;
+        for (const col of activeColumns) {
+          activeSum += metricValues[col.id] ?? 0;
+        }
+        if (Math.abs(activeSum) > maxFilteredRowAbs) {
+          maxFilteredRowAbs = Math.abs(activeSum);
+          computedFilteredKingStrike = sRow.strike;
+        }
+      }
+
+      const resolvedAllKingStrike =
+        maxAllRowAbs > 0 ? computedAllKingStrike : kingNode.allExpKing;
+      const resolvedKingStrike =
+        maxFilteredRowAbs > 0 ? computedFilteredKingStrike : targetKingStrike;
+
       let bestKingColId = activeColumns[0]?.id ?? "exp_0";
       let bestKingColMag = -1;
 
@@ -337,7 +424,7 @@ export function HeatmapTable() {
         let peakColId = activeColumns[0]?.id ?? sRow.kingPeakColId;
         let maxAbsInRow = -1;
         const isTargetKingRow =
-          Math.abs(sRow.strike - targetKingStrike) < strikeStep * 0.4;
+          Math.abs(sRow.strike - resolvedKingStrike) < strikeStep * 0.4;
 
         for (const col of activeColumns) {
           const val = metricValues[col.id] ?? 0;
@@ -362,7 +449,7 @@ export function HeatmapTable() {
           strike: sRow.strike,
           isAtm: idx === bestAtmIdx,
           isKingNode:
-            Math.abs(sRow.strike - kingNode.allExpKing) < strikeStep * 0.4,
+            Math.abs(sRow.strike - resolvedAllKingStrike) < strikeStep * 0.4,
           isFilteredKing: isTargetKingRow,
           isCallWall:
             Math.abs(sRow.strike - gammaLevels.callWall) < strikeStep * 0.4,
@@ -373,6 +460,10 @@ export function HeatmapTable() {
           emMarkers: markers,
           kingPeakColId: peakColId,
           values: metricValues,
+          gexValues: sRow.gex,
+          vexValues: sRow.vex,
+          dexValues: sRow.dex,
+          charmValues: sRow.charm,
           openPctChange: sRow.openPctChange,
         };
       });
@@ -384,7 +475,7 @@ export function HeatmapTable() {
         rowsData: rows,
         maxColumnValues: colMax,
         atmRowIndex: bestAtmIdx,
-        activeKingStrike: targetKingStrike,
+        activeKingStrike: resolvedKingStrike,
         activeKingColId: bestKingColId,
         topFiveCellKeys: topSet,
       };
@@ -582,13 +673,17 @@ export function HeatmapTable() {
     emHorizons,
   ]);
 
+  const globalMaxAbs = useMemo(() => {
+    const vals = Object.values(maxColumnValues);
+    return vals.length > 0 ? Math.max(0.001, ...vals) : 1;
+  }, [maxColumnValues]);
+
   const columns = useMemo<ColumnDef<StrikeRowData>[]>(() => {
     const strikeCol: ColumnDef<StrikeRowData> = {
       id: "strike",
       header: () => (
-        <div className="flex items-center justify-between px-2.5 py-2 text-[10px] font-mono font-bold uppercase tracking-wider text-slate-300">
+        <div className="flex items-center justify-center px-2 py-2 text-[10px] font-mono font-bold uppercase tracking-wider text-slate-300">
           <span>Strike</span>
-          <span className="text-[9px] text-slate-500">EM / LEVEL</span>
         </div>
       ),
       cell: ({ row }) => {
@@ -599,29 +694,47 @@ export function HeatmapTable() {
           emMarkers = [],
         } = row.original;
 
+        const strikeShadows: string[] = [];
+        emMarkers.forEach((m, idx) => {
+          if (m.side === "high") {
+            strikeShadows.push(`inset 0 ${2 + idx * 2}px 0 ${m.color}`);
+          } else {
+            strikeShadows.push(`inset 0 -${2 + idx * 2}px 0 ${m.color}`);
+          }
+        });
+        if (isAtm) {
+          strikeShadows.push("inset 4px 0 0 #3b82f6");
+        }
+
         return (
           <div
+            style={{
+              boxShadow:
+                strikeShadows.length > 0 ? strikeShadows.join(", ") : undefined,
+            }}
             className={cn(
-              "flex items-center justify-between px-2.5 h-full font-mono text-[11px] tabular-nums select-none",
+              "flex flex-col items-center justify-center px-1.5 h-full font-mono text-[11px] tabular-nums select-none leading-none",
               isAtm
-                ? "bg-[#13254a] text-[#60a5fa] font-bold shadow-[inset_4px_0_0_#3b82f6]"
+                ? "bg-[#13254a] text-[#60a5fa] font-bold"
                 : isFilteredKing
-                  ? "text-[#facc15] font-bold"
-                  : "text-slate-200 font-semibold"
+                  ? "bg-[#0b1220] text-[#facc15] font-bold"
+                  : "bg-[#0b1220] text-slate-200 font-bold"
             )}
           >
-            <div className="flex items-center gap-1">
-              {emMarkers.map((m) => (
-                <span
-                  key={m.tag}
-                  style={{ color: m.color }}
-                  className="text-[9px] font-extrabold leading-none"
-                >
-                  {m.tag}
-                </span>
-              ))}
-            </div>
             <span>{strike.toFixed(strike % 1 !== 0 ? 1 : 0)}</span>
+            {emMarkers.length > 0 && (
+              <div className="flex items-center justify-center gap-0.5 mt-[2px]">
+                {emMarkers.map((m) => (
+                  <span
+                    key={m.tag}
+                    style={{ color: m.color }}
+                    className="text-[8px] font-extrabold leading-none"
+                  >
+                    {m.tag}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         );
       },
@@ -659,23 +772,24 @@ export function HeatmapTable() {
                 ? rawCellValue * ((row.original.openPctChange[expCol.id] ?? 0) / 100)
                 : rawCellValue * replayScale;
 
-            const maxColumnValue =
+            const maxMatrixValue =
               cellMode === "Velocity"
-                ? Math.max(0.1, (maxColumnValues[expCol.id] || 1) * 0.35)
-                : maxColumnValues[expCol.id] || 1;
+                ? Math.max(0.1, globalMaxAbs * 0.35)
+                : globalMaxAbs;
 
             const isOneGoldGlowKingCell =
               cellMode !== "Velocity" &&
               row.original.isFilteredKing &&
               expCol.id === activeKingColId;
 
-            const { backgroundColor, isBrightYellow } = getHyperionCellStyle(
-              cellValue,
-              maxColumnValue,
-              isOneGoldGlowKingCell
-            );
+            const { backgroundColor, isBrightYellow, isZeroCell } =
+              getHyperionCellStyle(
+                cellValue,
+                maxMatrixValue,
+                isOneGoldGlowKingCell
+              );
 
-            const formattedVal = formatExposure(cellValue);
+            const formattedVal = formatHeatmapCell(cellValue);
             const pctSinceOpen = row.original.openPctChange[expCol.id] ?? 0;
             const formattedPct = `${pctSinceOpen >= 0 ? "+" : ""}${pctSinceOpen}%`;
 
@@ -689,6 +803,7 @@ export function HeatmapTable() {
             const showTopRightBadge =
               metric === "GEX" &&
               cellMode === "Value" &&
+              !isZeroCell &&
               (isTopFive || isNearSpot) &&
               Math.abs(pctSinceOpen) >= 1 &&
               Math.abs(pctSinceOpen) <= 999;
@@ -696,46 +811,70 @@ export function HeatmapTable() {
             // Expected Move horizontal boundary line shadows (D white, W yellow, M orange, A coral)
             const emMarkers = row.original.emMarkers ?? [];
             const boxShadows: string[] = [];
-            for (const m of emMarkers) {
+            emMarkers.forEach((m, idx) => {
               if (m.side === "high") {
-                boxShadows.push(`inset 0 2px 0 ${m.color}`);
+                boxShadows.push(`inset 0 ${2 + idx * 2}px 0 ${m.color}`);
               } else {
-                boxShadows.push(`inset 0 -2px 0 ${m.color}`);
+                boxShadows.push(`inset 0 -${2 + idx * 2}px 0 ${m.color}`);
               }
-            }
+            });
+            const isInspectedCell =
+              inspectedCell?.strike === row.original.strike &&
+              inspectedCell?.colId === expCol.id;
+
             if (isOneGoldGlowKingCell) {
               boxShadows.push(
                 "0 0 0 1px #facc15, 0 0 8px 1px rgba(250,204,21,0.8)"
+              );
+            } else if (isInspectedCell) {
+              boxShadows.push(
+                "inset 0 0 0 2px #38bdf8, 0 0 8px rgba(56,189,248,0.65)"
               );
             }
 
             return (
               <div
+                onMouseEnter={() => {
+                  setInspectedCell((prev) =>
+                    prev?.pinned
+                      ? prev
+                      : { strike: row.original.strike, colId: expCol.id, pinned: false }
+                  );
+                }}
+                onClick={() => {
+                  setInspectedCell((prev) =>
+                    prev?.pinned &&
+                    prev.strike === row.original.strike &&
+                    prev.colId === expCol.id
+                      ? null
+                      : { strike: row.original.strike, colId: expCol.id, pinned: true }
+                  );
+                }}
                 style={{
                   backgroundColor,
                   boxShadow:
                     boxShadows.length > 0 ? boxShadows.join(", ") : undefined,
                 }}
                 className={cn(
-                  "relative flex items-center justify-end px-1.5 h-full font-mono text-[11px] tabular-nums transition-colors select-none",
+                  "relative flex items-end justify-end pt-[11px] pb-[2px] px-1.5 h-full font-mono text-[11px] tabular-nums transition-colors select-none cursor-pointer leading-none",
                   isOneGoldGlowKingCell
                     ? "text-black font-extrabold z-20"
-                    : isBrightYellow
-                      ? "text-[#0a0e17] font-semibold"
-                      : "text-[#f1f5f9] font-medium"
+                    : isZeroCell
+                      ? "text-[#475569] font-normal"
+                      : isBrightYellow
+                        ? "text-[#0b1220] font-bold"
+                        : "text-[#e6edf6] font-bold"
                 )}
               >
                 {showTopRightBadge && (
-                  <span
+                  <i
                     className={cn(
-                      "absolute top-0.5 right-1 leading-none text-[8px] font-bold pointer-events-none",
-                      isOneGoldGlowKingCell || isBrightYellow
-                        ? "text-[#0a0e17]/80"
-                        : "text-white/85 drop-shadow-[0_1px_2px_rgba(0,0,0,0.85)]"
+                      "absolute top-[1px] right-[2px] z-10 not-italic text-[8px] font-bold leading-none px-[2px] py-[0.5px] rounded-[2px] bg-black/82 pointer-events-none",
+                      pctSinceOpen >= 0 ? "text-[#4ade80]" : "text-[#f87171]"
                     )}
                   >
                     {formattedPct}
-                  </span>
+                  </i>
                 )}
 
                 <span>
@@ -751,13 +890,14 @@ export function HeatmapTable() {
     return [strikeCol, ...expCols];
   }, [
     activeColumns,
-    maxColumnValues,
+    globalMaxAbs,
     activeKingColId,
     cellMode,
     replayIndex,
     metric,
     spotPrice,
     topFiveCellKeys,
+    inspectedCell,
   ]);
 
   const table = useReactTable({
@@ -782,6 +922,66 @@ export function HeatmapTable() {
     rowVirtualizer.scrollToIndex(atmRowIndex, { align: "center" });
   };
 
+  const jumpToKingRow = () => {
+    const kingIdx = rowsData.findIndex((r) => r.isFilteredKing || r.isKingNode);
+    if (kingIdx >= 0) {
+      rowVirtualizer.scrollToIndex(kingIdx, { align: "center" });
+    }
+  };
+
+  const handleExportCsv = () => {
+    const headers = ["Strike", ...activeColumns.map((c) => `${c.dateLabel} (${c.tag})`)];
+    const csvLines = [
+      headers.join(","),
+      ...rowsData.map((r) => {
+        const vals = activeColumns.map((c) => (r.values[c.id] ?? 0).toFixed(2));
+        return [r.strike, ...vals].join(",");
+      }),
+    ];
+    const blob = new Blob([csvLines.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${activeTicker}_${metric}_${expirationFilter}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Resolve inspected cell details
+  const activeInspectDetails = useMemo(() => {
+    const targetStrike = inspectedCell?.strike ?? rowsData[atmRowIndex]?.strike;
+    const targetColId = inspectedCell?.colId ?? activeKingColId ?? activeColumns[0]?.id;
+    const rowObj = rowsData.find((r) => r.strike === targetStrike) ?? rowsData[atmRowIndex];
+    const colObj = activeColumns.find((c) => c.id === targetColId) ?? activeColumns[0];
+    if (!rowObj || !colObj) return null;
+
+    const gexVal = rowObj.gexValues?.[colObj.id] ?? (metric === "GEX" ? rowObj.values[colObj.id] ?? 0 : 0);
+    const vexVal = rowObj.vexValues?.[colObj.id] ?? (metric === "VEX" ? rowObj.values[colObj.id] ?? 0 : 0);
+    const dexVal = rowObj.dexValues?.[colObj.id] ?? (metric === "DEX" ? rowObj.values[colObj.id] ?? 0 : 0);
+    const charmVal = rowObj.charmValues?.[colObj.id] ?? (metric === "Charm" ? rowObj.values[colObj.id] ?? 0 : 0);
+    const activeVal = rowObj.values[colObj.id] ?? 0;
+    const pctOpen = rowObj.openPctChange[colObj.id] ?? 0;
+    const rowNet = activeColumns.reduce((sum, c) => sum + (rowObj.values[c.id] ?? 0), 0);
+    const distPts = rowObj.strike - spotPrice;
+    const distPct = spotPrice > 0 ? (distPts / spotPrice) * 100 : 0;
+
+    return {
+      rowObj,
+      colObj,
+      gexVal,
+      vexVal,
+      dexVal,
+      charmVal,
+      activeVal,
+      pctOpen,
+      rowNet,
+      distPts,
+      distPct,
+      isPinned: Boolean(inspectedCell?.pinned),
+      isLiveHover: Boolean(inspectedCell),
+    };
+  }, [inspectedCell, rowsData, atmRowIndex, activeKingColId, activeColumns, metric, spotPrice]);
+
   useEffect(() => {
     const timer = setTimeout(() => {
       rowVirtualizer.scrollToIndex(atmRowIndex, { align: "center" });
@@ -799,7 +999,7 @@ export function HeatmapTable() {
     );
   };
 
-  const gridTemplate = `110px repeat(${activeColumns.length}, minmax(74px, 1fr))`;
+  const gridTemplate = `64px repeat(${activeColumns.length}, minmax(66px, 1fr))`;
   const replayTimeLabel =
     replayIndex >= 100
       ? "Live"
@@ -869,6 +1069,8 @@ export function HeatmapTable() {
               </button>
             ))}
             <select
+              id="heatmap-date-picker"
+              name="heatmapDatePicker"
               aria-label="Pick specific expiration date"
               value={pickedDateCol}
               onChange={(e) => {
@@ -937,8 +1139,17 @@ export function HeatmapTable() {
           </div>
         </div>
 
-        {/* Right Controls: [Share to X] */}
+        {/* Right Controls: [Export CSV] + [Share to X] */}
         <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={handleExportCsv}
+            title="Export active heatmap matrix to CSV"
+            className="inline-flex items-center gap-1 rounded-full bg-[#0b0d17] hover:bg-[#1c223a] border border-white/15 px-3 py-1 text-[11px] font-mono font-semibold text-slate-200 transition-colors cursor-pointer"
+          >
+            <Download className="h-3 w-3 text-emerald-400" />
+            <span>CSV</span>
+          </button>
           <button
             type="button"
             onClick={handleShareToX}
@@ -950,7 +1161,7 @@ export function HeatmapTable() {
         </div>
       </div>
 
-      {/* TerraShade Zoom & Replay Control Bar (.zbar): − | + | Reset | Velocity | Live | Scrubber */}
+      {/* TerraShade Zoom & Replay Control Bar (.zbar): − | + | Reset | Spot | King | Velocity | Live | Scrubber */}
       <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
         <button
           type="button"
@@ -971,9 +1182,20 @@ export function HeatmapTable() {
         <button
           type="button"
           onClick={resetZoomAndCenter}
-          className="px-3 py-1 rounded-lg bg-[#111520] border border-[#243044] text-slate-200 hover:border-slate-500 cursor-pointer"
+          className="px-2.5 py-1 rounded-lg bg-[#111520] border border-[#243044] text-slate-200 hover:border-slate-500 inline-flex items-center gap-1 cursor-pointer"
+          title="Reset zoom and center on ATM Spot strike"
         >
-          Reset
+          <Crosshair className="w-3 h-3 text-sky-400" />
+          <span>Center Spot</span>
+        </button>
+        <button
+          type="button"
+          onClick={jumpToKingRow}
+          className="px-2.5 py-1 rounded-lg bg-[#111520] border border-amber-500/40 text-amber-300 hover:bg-amber-500/10 inline-flex items-center gap-1 cursor-pointer"
+          title="Scroll directly to the King Node strike"
+        >
+          <Crown className="w-3 h-3 text-[#facc15]" />
+          <span>Jump to King</span>
         </button>
 
         {/* Heatmap Replay & Velocity Controls */}
@@ -1009,6 +1231,8 @@ export function HeatmapTable() {
             Live
           </button>
           <input
+            id="heatmap-snapshot-replay"
+            name="heatmapSnapshotReplay"
             type="range"
             min={0}
             max={100}
@@ -1022,6 +1246,93 @@ export function HeatmapTable() {
           </span>
         </div>
       </div>
+
+      {/* Interactive Cell Telemetry Inspector Bar */}
+      {displayMode === "Grid" && activeInspectDetails && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[#0d121f] border border-[#1e293b] px-3 py-1.5 text-[11px] font-mono">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-1 text-cyan-300 font-bold">
+              {activeInspectDetails.isPinned && <Pin className="w-3 h-3 text-amber-400" />}
+              <span>
+                Strike ${activeInspectDetails.rowObj.strike.toFixed(activeInspectDetails.rowObj.strike % 1 !== 0 ? 1 : 0)}
+              </span>
+            </span>
+            <span className="text-slate-400">
+              ({activeInspectDetails.distPts >= 0 ? "+" : ""}
+              {activeInspectDetails.distPts.toFixed(2)} pts /{" "}
+              {activeInspectDetails.distPct >= 0 ? "+" : ""}
+              {activeInspectDetails.distPct.toFixed(2)}%)
+            </span>
+            <span className="px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-slate-200 font-semibold">
+              Exp {activeInspectDetails.colObj.dateLabel} ({activeInspectDetails.colObj.tag})
+            </span>
+            {activeInspectDetails.rowObj.isFilteredKing && (
+              <span className="px-1.5 py-0.5 rounded bg-amber-400/20 border border-amber-400/50 text-[#facc15] font-bold">
+                ★ King Strike
+              </span>
+            )}
+            {activeInspectDetails.rowObj.isCallWall && (
+              <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 border border-cyan-400/40 text-cyan-300 font-bold">
+                Call Wall
+              </span>
+            )}
+            {activeInspectDetails.rowObj.isPutWall && (
+              <span className="px-1.5 py-0.5 rounded bg-fuchsia-500/15 border border-fuchsia-400/40 text-fuchsia-300 font-bold">
+                Put Wall
+              </span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 tabular-nums">
+            <span>
+              <span className="text-slate-500">GEX:</span>{" "}
+              <b className={activeInspectDetails.gexVal >= 0 ? "text-teal-300" : "text-purple-300"}>
+                {formatExposure(activeInspectDetails.gexVal)}
+              </b>
+            </span>
+            <span>
+              <span className="text-slate-500">VEX:</span>{" "}
+              <b className={activeInspectDetails.vexVal >= 0 ? "text-emerald-300" : "text-amber-300"}>
+                {formatExposure(activeInspectDetails.vexVal)}
+              </b>
+            </span>
+            <span>
+              <span className="text-slate-500">DEX:</span>{" "}
+              <b className="text-slate-200">{formatExposure(activeInspectDetails.dexVal)}</b>
+            </span>
+            <span>
+              <span className="text-slate-500">Charm:</span>{" "}
+              <b className="text-slate-200">{formatExposure(activeInspectDetails.charmVal)}</b>
+            </span>
+            <span>
+              <span className="text-slate-500">Δ Open:</span>{" "}
+              <b className={activeInspectDetails.pctOpen >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                {activeInspectDetails.pctOpen >= 0 ? "+" : ""}
+                {activeInspectDetails.pctOpen}%
+              </b>
+            </span>
+            <span>
+              <span className="text-slate-500">Row Net ({metric}):</span>{" "}
+              <b className="text-white">{formatExposure(activeInspectDetails.rowNet)}</b>
+            </span>
+            {activeInspectDetails.isPinned ? (
+              <button
+                type="button"
+                onClick={() => setInspectedCell(null)}
+                className="inline-flex items-center gap-0.5 text-[10px] text-amber-300 hover:text-white cursor-pointer"
+                title="Unpin cell inspector"
+              >
+                <X className="w-3 h-3" />
+                <span>Unpin</span>
+              </button>
+            ) : (
+              <span className="text-[10px] text-slate-500 hidden xl:inline">
+                {activeInspectDetails.isLiveHover ? "Click cell to pin" : "Hover any cell to inspect"}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* King Node & Expected Move Horizon Legend Subbar */}
       <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono">

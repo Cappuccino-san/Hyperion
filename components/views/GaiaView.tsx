@@ -3,6 +3,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { normPDF } from "@/lib/optionsExposure";
+import {
+  computeBarFlowGammaVwapSeries,
+  FlowGammaVwapSnapshot,
+} from "@/lib/flowGammaVwap";
+import {
+  drawFlowGammaVwapOverlay,
+  ConfluenceLevel,
+} from "@/components/chart/FlowGammaVwapOverlay";
 import type {
   GaiaExpirationInfo,
   GaiaIntradayCandle,
@@ -96,24 +104,33 @@ function evaluateBucketExposureM(
   bucket: GaiaStrikeExpBucket,
   mode: ExposureMode
 ): number {
-  const T = Math.max(1 / 365, (bucket.dteDays + 0.5) / 365);
+  const days = bucket.dteDays;
+  const T = Math.max(1 / 365, days / 365);
   const sqrtT = Math.sqrt(T);
-  const discountQ = Math.exp(-0.012 * T);
 
   let callGexM = 0;
   let callVexM = 0;
   if (bucket.callOI > 0) {
     const iv = Math.max(0.02, Math.min(3.5, bucket.callIv));
+    // Calibrated Black-Scholes Gamma (r = 0.046, q = 0.0, T = days / 365) matching optionsExposure.ts exactly
     const d1 =
       (Math.log(Math.max(1e-4, spot / bucket.strike)) +
-        (0.045 - 0.012 + 0.5 * iv * iv) * T) /
+        (0.046 + 0.5 * iv * iv) * T) /
       (iv * sqrtT);
-    const d2 = d1 - iv * sqrtT;
     const pdf = normPDF(d1);
-    const bsGamma = (discountQ * pdf) / (spot * iv * sqrtT);
-    const gamma =
-      bucket.callGamma && bucket.callGamma > 0 ? bucket.callGamma : bsGamma;
-    const vanna = -discountQ * pdf * (d2 / iv);
+    const gamma = pdf / (spot * iv * sqrtT);
+
+    // Calibrated VEX Vanna (r = 0.045, q = 0.012, T_vex = (days + 0.5) / 365)
+    const T_vex = Math.max(1 / 365, (days + 0.5) / 365);
+    const sqrtT_vex = Math.sqrt(T_vex);
+    const d1_vex =
+      (Math.log(Math.max(1e-4, spot / bucket.strike)) +
+        (0.045 - 0.012 + 0.5 * iv * iv) * T_vex) /
+      (iv * sqrtT_vex);
+    const d2_vex = d1_vex - iv * sqrtT_vex;
+    const pdf_vex = normPDF(d1_vex);
+    const discountQ_vex = Math.exp(-0.012 * T_vex);
+    const vanna = -discountQ_vex * pdf_vex * (d2_vex / iv);
 
     callGexM = (bucket.callOI * gamma * 100 * (spot * spot) * 0.01) / 1e6;
     callVexM = (bucket.callOI * vanna * 100 * spot * 0.01) / 1e6;
@@ -123,16 +140,25 @@ function evaluateBucketExposureM(
   let putVexM = 0;
   if (bucket.putOI > 0) {
     const iv = Math.max(0.02, Math.min(3.5, bucket.putIv));
+    // Calibrated Black-Scholes Gamma (r = 0.046, q = 0.0, T = days / 365) matching optionsExposure.ts exactly
     const d1 =
       (Math.log(Math.max(1e-4, spot / bucket.strike)) +
-        (0.045 - 0.012 + 0.5 * iv * iv) * T) /
+        (0.046 + 0.5 * iv * iv) * T) /
       (iv * sqrtT);
-    const d2 = d1 - iv * sqrtT;
     const pdf = normPDF(d1);
-    const bsGamma = (discountQ * pdf) / (spot * iv * sqrtT);
-    const gamma =
-      bucket.putGamma && bucket.putGamma > 0 ? bucket.putGamma : bsGamma;
-    const vanna = -discountQ * pdf * (d2 / iv);
+    const gamma = pdf / (spot * iv * sqrtT);
+
+    // Calibrated VEX Vanna (r = 0.045, q = 0.012, T_vex = (days + 0.5) / 365)
+    const T_vex = Math.max(1 / 365, (days + 0.5) / 365);
+    const sqrtT_vex = Math.sqrt(T_vex);
+    const d1_vex =
+      (Math.log(Math.max(1e-4, spot / bucket.strike)) +
+        (0.045 - 0.012 + 0.5 * iv * iv) * T_vex) /
+      (iv * sqrtT_vex);
+    const d2_vex = d1_vex - iv * sqrtT_vex;
+    const pdf_vex = normPDF(d1_vex);
+    const discountQ_vex = Math.exp(-0.012 * T_vex);
+    const vanna = -discountQ_vex * pdf_vex * (d2_vex / iv);
 
     putGexM = (bucket.putOI * gamma * 100 * (spot * spot) * 0.01) / 1e6;
     putVexM = (bucket.putOI * vanna * 100 * spot * 0.01) / 1e6;
@@ -216,6 +242,10 @@ function buildLiveGaiaDataset(
 
   const activeBuckets =
     filteredBuckets.length > 0 ? filteredBuckets : optionBuckets;
+  const nextExpBuckets =
+    nextExpIso.length > 0
+      ? optionBuckets.filter((b) => b.expiration === nextExpIso)
+      : activeBuckets;
 
   // Compute y-domain bounds from live session candles and ±2σ Expected-Move Cone
   const candleHighs = candles.map((c) => c.high);
@@ -232,13 +262,49 @@ function buildLiveGaiaDataset(
     priorClose + sigma2Move
   );
 
+  // Pre-calculate All-Exp King and Filtered King at spot to guarantee both are encompassed in the vertical price window
+  const preScanSpot = payload.spotPrice || priorClose;
+  const preScanAllTotals = new Map<number, number>();
+  for (const b of optionBuckets) {
+    const v = evaluateBucketExposureM(preScanSpot, b, exposureMode);
+    preScanAllTotals.set(b.strike, (preScanAllTotals.get(b.strike) ?? 0) + v);
+  }
+  let preScanAllKing = preScanSpot;
+  let maxAllAbs = -1;
+  for (const [s, v] of Array.from(preScanAllTotals.entries())) {
+    if (Math.abs(v) > maxAllAbs) {
+      maxAllAbs = Math.abs(v);
+      preScanAllKing = s;
+    }
+  }
+
+  const preScanFilteredTotals = new Map<number, number>();
+  const bucketsForPreScan = expFilter === "ALL" && nextExpBuckets.length > 0 ? nextExpBuckets : activeBuckets;
+  for (const b of bucketsForPreScan) {
+    const v = evaluateBucketExposureM(preScanSpot, b, exposureMode);
+    preScanFilteredTotals.set(b.strike, (preScanFilteredTotals.get(b.strike) ?? 0) + v);
+  }
+  let preScanFilteredKing = preScanAllKing;
+  let maxFilteredAbs = -1;
+  for (const [s, v] of Array.from(preScanFilteredTotals.entries())) {
+    if (Math.abs(v) > maxFilteredAbs) {
+      maxFilteredAbs = Math.abs(v);
+      preScanFilteredKing = s;
+    }
+  }
+
+  const chartBoundMin = Math.min(minChartRef, preScanAllKing, preScanFilteredKing);
+  const chartBoundMax = Math.max(maxChartRef, preScanAllKing, preScanFilteredKing);
+
   // Extract all live option strikes within the visible vertical price window
   const allUniqueStrikesDesc = Array.from(
     new Set(optionBuckets.map((b) => b.strike))
   ).sort((a, b) => b - a);
 
   const inWindowStrikes = allUniqueStrikesDesc.filter(
-    (s) => s >= minChartRef - sigma1Move * 0.35 && s <= maxChartRef + sigma1Move * 0.35
+    (s) =>
+      s >= chartBoundMin - sigma1Move * 0.35 &&
+      s <= chartBoundMax + sigma1Move * 0.35
   );
 
   const baseVisibleStrikes =
@@ -347,15 +413,43 @@ function buildLiveGaiaDataset(
 
     rankedFiltered.sort((a, b) => Math.abs(b.valueM) - Math.abs(a.valueM));
     const topLevels = rankedFiltered.slice(0, 3);
-    const filteredKingStrike =
+    let filteredKingStrike =
       topLevels[0]?.strike ??
       baseVisibleStrikes[baseVisibleStrikes.length - 1] ??
       Math.round(spot);
-    const filteredKingAbsM = Math.abs(topLevels[0]?.valueM ?? 0);
-    const filteredKingConcPct =
+    let filteredKingAbsM = Math.abs(topLevels[0]?.valueM ?? 0);
+    let filteredKingConcPct =
       totalAbsBoardM > 0
         ? Number(((filteredKingAbsM / totalAbsBoardM) * 100).toFixed(1))
         : 0;
+
+    // When viewing All-Exp, also compute the Tactical 0DTE/Next-Exp King so the chart always shows the nearest expiration magnet alongside All-Exp King
+    if (expFilter === "ALL" && nextExpBuckets.length > 0) {
+      const nextExpTotals = new Map<number, number>();
+      let nextExpAbsBoardM = 0;
+      for (const bucket of nextExpBuckets) {
+        const valM = evaluateBucketExposureM(spot, bucket, exposureMode);
+        nextExpTotals.set(bucket.strike, (nextExpTotals.get(bucket.strike) ?? 0) + valM);
+      }
+      let bestNextStrike = allExpKingStrike;
+      let bestNextAbsM = -1;
+      for (const [strike, valM] of Array.from(nextExpTotals.entries())) {
+        const absM = Math.abs(valM);
+        nextExpAbsBoardM += absM;
+        if (absM > bestNextAbsM) {
+          bestNextAbsM = absM;
+          bestNextStrike = strike;
+        }
+      }
+      if (bestNextAbsM > 0) {
+        filteredKingStrike = bestNextStrike;
+        filteredKingAbsM = bestNextAbsM;
+        filteredKingConcPct =
+          nextExpAbsBoardM > 0
+            ? Number(((bestNextAbsM / nextExpAbsBoardM) * 100).toFixed(1))
+            : 0;
+      }
+    }
 
     const kingStrike =
       expFilter === "ALL" ? allExpKingStrike : filteredKingStrike;
@@ -363,8 +457,9 @@ function buildLiveGaiaDataset(
       expFilter === "ALL" ? allExpKingConcPct : filteredKingConcPct;
 
     // Ensure both King strikes are included in strikeValues & visibleStrikeSet
-    if (topLevels[0] && strikeValues[filteredKingStrike] === undefined) {
-      strikeValues[filteredKingStrike] = topLevels[0].valueM;
+    if (strikeValues[filteredKingStrike] === undefined) {
+      const filtVal = strikeTotals.get(filteredKingStrike) ?? 0;
+      strikeValues[filteredKingStrike] = Number(filtVal.toFixed(2));
       visibleStrikeSet.add(filteredKingStrike);
     }
     if (rankedAllExp[0] && strikeValues[allExpKingStrike] === undefined) {
@@ -457,7 +552,7 @@ export function GaiaView() {
   const fetchOptionsChain = useDashboardStore(
     (state) => state.fetchOptionsChain
   );
-  const [atlasPalette, setAtlasPalette] = useState<"ice" | "polarity">("ice");
+  const [atlasPalette, setAtlasPalette] = useState<"ice" | "polarity">("polarity");
   const [countdownSec, setCountdownSec] = useState<number>(() => {
     const now = new Date();
     return 300 - ((now.getUTCMinutes() % 5) * 60 + now.getUTCSeconds());
@@ -491,29 +586,46 @@ export function GaiaView() {
   const [selectedDateExp, setSelectedDateExp] = useState<string>("");
   const [pathToKing, setPathToKing] = useState<boolean>(true);
 
+  // Chart Layout Metrics (Unified constants across canvas draw & pointer projection)
+  const CHART_PAD_LEFT = 18;
+  const CHART_RIGHT_AXIS_WIDTH = 84;
+  const CHART_PAD_TOP = 18;
+  const CHART_PAD_BOTTOM = 32;
+
   const [activeBarIndex, setActiveBarIndex] = useState<number>(0);
   const [hoverBarIndex, setHoverBarIndex] = useState<number | null>(null);
   const [isReplaying, setIsReplaying] = useState<boolean>(false);
   const [openDivTf, setOpenDivTf] = useState<string | null>(null);
   const [divPayload, setDivPayload] = useState<DivergencePayload | null>(null);
 
-  // Adjustable Chart Window States
+  // Adjustable Chart Window States (Horizontal & Vertical)
   const [chartHeight, setChartHeight] = useState<number>(540); // 380 .. 950 px
+  const [chartWidth, setChartWidth] = useState<number | null>(null); // null = 100% full width, or number in px (640 .. 2400)
+  const [dividerRatio, setDividerRatio] = useState<number>(0.76); // 0.35 .. 0.90 (Outlook cone vs Candlestick session width)
+  const [xScale, setXScale] = useState<number>(1.0); // 0.5 .. 4.0 horizontal candle zoom
+  const [xPanOffset, setXPanOffset] = useState<number>(0); // horizontal pan px
+  const [startHour, setStartHour] = useState<number>(7); // 7 = 7:00 AM Premkt (default), 8 = 8:00 AM, 9 = 9:30 AM RTH
   const [yScale, setYScale] = useState<number>(1.0); // 0.2 .. 10.0
   const [yPanOffset, setYPanOffset] = useState<number>(0); // price points
   const [scopePreset, setScopePreset] = useState<"focus" | "tactical" | "cone">("cone");
   const [isDragging, setIsDragging] = useState<boolean>(false);
-  const [dragMode, setDragMode] = useState<"pan" | "scaleY" | null>(null);
+  const [dragMode, setDragMode] = useState<"pan" | "scaleY" | "scaleX" | "divider" | null>(null);
   const [dragStart, setDragStart] = useState<{
     x: number;
     y: number;
     yPan: number;
     yScale: number;
+    xPan: number;
+    xScale: number;
+    dividerRatio: number;
   }>({
     x: 0,
     y: 0,
     yPan: 0,
     yScale: 1.0,
+    xPan: 0,
+    xScale: 1.0,
+    dividerRatio: 0.76,
   });
   const [hoverCursor, setHoverCursor] = useState<{ x: number; y: number } | null>(null);
 
@@ -532,11 +644,14 @@ export function GaiaView() {
   const [canvasWidth, setCanvasWidth] = useState<number>(1016);
 
   const fetchLiveGaia = useCallback(
-    async (tickerSymbol: string, sessionIso?: string) => {
+    async (tickerSymbol: string, sessionIso?: string, sHour: number = startHour) => {
       setIsLoading(true);
       setErrorMsg(null);
       try {
-        const qs = new URLSearchParams({ ticker: tickerSymbol });
+        const qs = new URLSearchParams({
+          ticker: tickerSymbol,
+          start: String(sHour),
+        });
         if (sessionIso) qs.set("session", sessionIso);
         const res = await fetch(`/api/gaia?${qs.toString()}`, {
           cache: "no-store",
@@ -560,7 +675,7 @@ export function GaiaView() {
         setIsLoading(false);
       }
     },
-    []
+    [startHour]
   );
 
   // Initial load and sync when global store ticker changes externally
@@ -569,12 +684,12 @@ export function GaiaView() {
       setTickerInput(storeTicker);
       setLoadedTicker(storeTicker);
       setSelectedSessionIso("");
-      fetchLiveGaia(storeTicker, "");
+      fetchLiveGaia(storeTicker, "", startHour);
     }
-  }, [storeTicker, loadedTicker, fetchLiveGaia]);
+  }, [storeTicker, loadedTicker, fetchLiveGaia, startHour]);
 
   useEffect(() => {
-    fetchLiveGaia(loadedTicker, selectedSessionIso);
+    fetchLiveGaia(loadedTicker, selectedSessionIso, startHour);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -638,6 +753,16 @@ export function GaiaView() {
     if (!livePayload) return null;
     return buildLiveGaiaDataset(livePayload, exposureMode, expFilter);
   }, [livePayload, exposureMode, expFilter]);
+
+  const flowVwapPoints = useMemo<FlowGammaVwapSnapshot[]>(() => {
+    if (!dataset?.candles || dataset.candles.length === 0) return [];
+    const optionsBook = (livePayload?.optionBuckets || []).map((b) => ({
+      strike: b.strike,
+      gamma: (b.callGamma || 0) + (b.putGamma || 0),
+      volume: (b.callOI || 0) * 0.1 + (b.putOI || 0) * 0.1,
+    }));
+    return computeBarFlowGammaVwapSeries(dataset.candles, optionsBook);
+  }, [dataset?.candles, livePayload?.optionBuckets]);
 
   // Dynamic Price Domain Bounds based on Scope Preset, Zoom (yScale) and Pan (yPanOffset)
   const priceBounds = useMemo(() => {
@@ -751,25 +876,85 @@ export function GaiaView() {
     }
   };
 
-  // Canvas Mouse & Interaction Handlers for Zooming and Panning
+  // Canvas Mouse & Interaction Handlers for Zooming, Resizing and Panning
   const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas || !dataset) return;
     const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
+    const scaleX = rect.width > 0 ? canvasWidth / rect.width : 1;
+    const scaleY = rect.height > 0 ? chartHeight / rect.height : 1;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
 
-    const rightAxisWidth = 64;
+    const padLeft = CHART_PAD_LEFT;
+    const rightAxisWidth = CHART_RIGHT_AXIS_WIDTH;
+    const padTop = CHART_PAD_TOP;
+    const padBottom = CHART_PAD_BOTTOM;
     const outlookRightX = canvasWidth - rightAxisWidth;
+    const totalPlotWidth = outlookRightX - padLeft;
+    const dividerX = Math.round(padLeft + totalPlotWidth * dividerRatio);
 
+    // Check if user clicked on the Outlook Divider (horizontal divider resizing)
+    if (Math.abs(x - dividerX) <= 8 && y >= padTop && y <= chartHeight - padBottom) {
+      setIsDragging(true);
+      setDragMode("divider");
+      setDragStart({
+        x,
+        y,
+        yPan: yPanOffset,
+        yScale,
+        xPan: xPanOffset,
+        xScale,
+        dividerRatio,
+      });
+      return;
+    }
+
+    // Check if user clicked on the Right Price Axis (vertical Y-axis scaling)
     if (x >= outlookRightX) {
       setIsDragging(true);
       setDragMode("scaleY");
-      setDragStart({ x, y, yPan: yPanOffset, yScale });
-    } else {
+      setDragStart({
+        x,
+        y,
+        yPan: yPanOffset,
+        yScale,
+        xPan: xPanOffset,
+        xScale,
+        dividerRatio,
+      });
+      return;
+    }
+
+    // Check if user clicked on the Bottom Time Axis (horizontal time-axis scaling)
+    if (y >= chartHeight - padBottom && x >= padLeft && x <= dividerX) {
+      setIsDragging(true);
+      setDragMode("scaleX");
+      setDragStart({
+        x,
+        y,
+        yPan: yPanOffset,
+        yScale,
+        xPan: xPanOffset,
+        xScale,
+        dividerRatio,
+      });
+      return;
+    }
+
+    // Default: Clicked inside chart plot area -> Pan view
+    if (x >= padLeft && x <= dividerX && y >= padTop && y <= chartHeight - padBottom) {
       setIsDragging(true);
       setDragMode("pan");
-      setDragStart({ x, y, yPan: yPanOffset, yScale });
+      setDragStart({
+        x,
+        y,
+        yPan: yPanOffset,
+        yScale,
+        xPan: xPanOffset,
+        xScale,
+        dividerRatio,
+      });
     }
   };
 
@@ -778,21 +963,34 @@ export function GaiaView() {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    const mouseY = e.clientY - rect.top;
+    const scaleX = rect.width > 0 ? canvasWidth / rect.width : 1;
+    const scaleY = rect.height > 0 ? chartHeight / rect.height : 1;
+    const mouseX = (e.clientX - rect.left) * scaleX;
+    const mouseY = (e.clientY - rect.top) * scaleY;
 
     setHoverCursor({ x: mouseX, y: mouseY });
 
-    const padLeft = 18;
-    const rightAxisWidth = 64;
-    const padTop = 18;
-    const padBottom = 32;
+    const padLeft = CHART_PAD_LEFT;
+    const rightAxisWidth = CHART_RIGHT_AXIS_WIDTH;
+    const padTop = CHART_PAD_TOP;
+    const padBottom = CHART_PAD_BOTTOM;
     const plotHeight = chartHeight - padTop - padBottom;
-    const totalPlotWidth = rect.width - padLeft - rightAxisWidth;
-    const dividerX = padLeft + totalPlotWidth * 0.76;
+    const outlookRightX = canvasWidth - rightAxisWidth;
+    const totalPlotWidth = outlookRightX - padLeft;
+    const dividerX = Math.round(padLeft + totalPlotWidth * dividerRatio);
+    const sessionWidth = dividerX - padLeft;
 
     if (isDragging && dragMode) {
-      if (dragMode === "scaleY") {
+      if (dragMode === "divider") {
+        // Dragging divider moves boundary between candlesticks and outlook cone
+        const newRatio = (mouseX - padLeft) / Math.max(1, totalPlotWidth);
+        setDividerRatio(Math.max(0.35, Math.min(0.90, newRatio)));
+      } else if (dragMode === "scaleX") {
+        // Dragging horizontally on time axis stretches / compresses candle spacing
+        const dx = mouseX - dragStart.x;
+        const multiplier = Math.exp(dx * 0.005);
+        setXScale(Math.min(4.0, Math.max(0.5, dragStart.xScale * multiplier)));
+      } else if (dragMode === "scaleY") {
         // Dragging up zooms in, dragging down zooms out
         const dy = dragStart.y - mouseY;
         const multiplier = Math.exp(dy * 0.008);
@@ -803,6 +1001,11 @@ export function GaiaView() {
         const { yMin, yMax } = priceBounds;
         const pricePerPx = (yMax - yMin) / Math.max(1, plotHeight);
         setYPanOffset(dragStart.yPan + dy * pricePerPx);
+
+        if (xScale > 1.0) {
+          const dx = mouseX - dragStart.x;
+          setXPanOffset(dragStart.xPan + dx);
+        }
       }
       return;
     }
@@ -812,12 +1015,16 @@ export function GaiaView() {
       return;
     }
 
-    const totalSlots = Math.max(78, dataset.candles.length);
-    const ratio = (mouseX - padLeft) / Math.max(1, dividerX - padLeft);
-    const barIdx = Math.max(
-      0,
-      Math.min(safeActiveIdx, Math.floor(ratio * totalSlots))
+    const totalSessionSlots = Math.max(
+      startHour === 7 ? 108 : startHour === 8 ? 96 : 78,
+      dataset.candles.length
     );
+    const stepX = (sessionWidth / totalSessionSlots) * xScale;
+    const relX = mouseX - padLeft - xPanOffset;
+    // Map coordinate to nearest candlestick center with entry/exit boundaries switching cleanly at the exact bar midpoint
+    const floatIdx = (relX - 0.5 * stepX) / Math.max(0.001, stepX);
+    const rawBarIdx = Math.round(floatIdx);
+    const barIdx = Math.max(0, Math.min(safeActiveIdx, rawBarIdx));
     setHoverBarIndex(barIdx);
   };
 
@@ -833,23 +1040,95 @@ export function GaiaView() {
 
   const handleCanvasWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     e.preventDefault();
-    const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
-    setYScale((prev) => Math.min(10.0, Math.max(0.2, prev * zoomFactor)));
+    if (e.shiftKey) {
+      // Shift + Wheel zooms horizontally
+      const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
+      setXScale((prev) => Math.min(4.0, Math.max(0.5, prev * zoomFactor)));
+    } else {
+      // Normal Wheel zooms price vertically
+      const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
+      setYScale((prev) => Math.min(10.0, Math.max(0.2, prev * zoomFactor)));
+    }
   };
 
   const handleCanvasDoubleClick = () => {
     setYScale(1.0);
     setYPanOffset(0);
+    setXScale(1.0);
+    setXPanOffset(0);
+    setDividerRatio(0.76);
     setScopePreset("cone");
   };
 
+  const handleCanvasKeyDown = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
+    if (!dataset || dataset.candles.length === 0) return;
+    const maxIdx = dataset.candles.length - 1;
+
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setIsReplaying(false);
+      setActiveBarIndex((prev) => Math.max(0, prev - 1));
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setIsReplaying(false);
+      setActiveBarIndex((prev) => Math.min(maxIdx, prev + 1));
+    } else if (e.key === "Home") {
+      e.preventDefault();
+      setIsReplaying(false);
+      setActiveBarIndex(0);
+    } else if (e.key === "End") {
+      e.preventDefault();
+      setIsReplaying(false);
+      setActiveBarIndex(maxIdx);
+    } else if (e.key === " " || e.key === "Spacebar") {
+      e.preventDefault();
+      setIsReplaying((prev) => !prev);
+    } else if (e.key === "+" || e.key === "=") {
+      e.preventDefault();
+      setYScale((s) => Math.min(10.0, s * 1.22));
+    } else if (e.key === "-" || e.key === "_") {
+      e.preventDefault();
+      setYScale((s) => Math.max(0.2, s * 0.82));
+    } else if (e.key === "0") {
+      e.preventDefault();
+      setYScale(1.0);
+      setYPanOffset(0);
+      setXScale(1.0);
+      setXPanOffset(0);
+      setDividerRatio(0.76);
+      setScopePreset("cone");
+    }
+  };
+
+  const currentTotalPlotWidth = canvasWidth - CHART_PAD_LEFT - CHART_RIGHT_AXIS_WIDTH;
+  const currentDividerX = Math.round(CHART_PAD_LEFT + currentTotalPlotWidth * dividerRatio);
+  const isNearDivider =
+    hoverCursor &&
+    Math.abs(hoverCursor.x - currentDividerX) <= 8 &&
+    hoverCursor.y >= CHART_PAD_TOP &&
+    hoverCursor.y <= chartHeight - CHART_PAD_BOTTOM;
+
+  const isBottomTimeAxis =
+    hoverCursor &&
+    hoverCursor.y >= chartHeight - CHART_PAD_BOTTOM &&
+    hoverCursor.x >= CHART_PAD_LEFT &&
+    hoverCursor.x < currentDividerX;
+
   const cursorStyle = isDragging
-    ? dragMode === "scaleY"
-      ? "ns-resize"
-      : "grabbing"
-    : hoverCursor && hoverCursor.x >= canvasWidth - 64
-      ? "ns-resize"
-      : "crosshair";
+    ? dragMode === "divider"
+      ? "col-resize"
+      : dragMode === "scaleX"
+        ? "ew-resize"
+        : dragMode === "scaleY"
+          ? "ns-resize"
+          : "grabbing"
+    : isNearDivider
+      ? "col-resize"
+      : hoverCursor && hoverCursor.x >= canvasWidth - CHART_RIGHT_AXIS_WIDTH
+        ? "ns-resize"
+        : isBottomTimeAxis
+          ? "ew-resize"
+          : "crosshair";
 
   const safeActiveIdx = dataset
     ? Math.min(activeBarIndex, dataset.candles.length - 1)
@@ -877,15 +1156,13 @@ export function GaiaView() {
   const nextExpShortDate = expirationOptions[0]?.dateLabel ?? "";
 
   const canvasFilterBadgePrefix =
-    expFilter === "ALL"
-      ? "All-exp"
-      : expFilter === "NEXT"
-        ? has0DteActive
-          ? "0DTE"
-          : "Next exp"
-        : expFilter === "WEEK"
-          ? "Week"
-          : `${expFilter}`;
+    expFilter === "ALL" || expFilter === "NEXT"
+      ? has0DteActive
+        ? "0DTE"
+        : "Next exp"
+      : expFilter === "WEEK"
+        ? "Week"
+        : `${expFilter}`;
 
   // High-DPI 5-Layer Canvas Rendering Engine
   useEffect(() => {
@@ -920,10 +1197,13 @@ export function GaiaView() {
     const plotHeight = height - padTop - padBottom;
     const totalPlotWidth = outlookRightX - padLeft;
 
-    // Left Zone (76% width — Intraday Session) & Right Zone (24% width — outlook Zone)
-    const dividerX = Math.round(padLeft + totalPlotWidth * 0.76);
+    // Left Zone (custom width via dividerRatio) & Right Zone (outlook Zone)
+    const dividerX = Math.round(padLeft + totalPlotWidth * dividerRatio);
     const sessionWidth = dividerX - padLeft;
-    const totalSessionSlots = Math.max(78, dataset.candles.length);
+    const totalSessionSlots = Math.max(
+      startHour === 7 ? 108 : startHour === 8 ? 96 : 78,
+      dataset.candles.length
+    );
 
     const { yMin, yMax, yAxisTicks } = priceBounds;
     const priceToY = (price: number): number => {
@@ -932,8 +1212,8 @@ export function GaiaView() {
     };
 
     const barToX = (barIdx: number): number => {
-      const stepX = sessionWidth / totalSessionSlots;
-      return padLeft + (barIdx + 0.5) * stepX;
+      const stepX = (sessionWidth / totalSessionSlots) * xScale;
+      return padLeft + xPanOffset + (barIdx + 0.5) * stepX;
     };
 
     // Subtle horizontal grid lines at the price axis ticks
@@ -949,12 +1229,29 @@ export function GaiaView() {
       }
     });
 
-    // Vertical outlook divider line (1px solid #1e2638) and right boundary border at outlookRightX
-    ctx.strokeStyle = "#1e2638";
-    ctx.lineWidth = 1;
+    // Vertical outlook divider line and right boundary border at outlookRightX
+    const isDividerActive = isDragging && dragMode === "divider";
+    ctx.strokeStyle = isDividerActive || isNearDivider ? "#38bdf8" : "#1e2638";
+    ctx.lineWidth = isDividerActive || isNearDivider ? 1.75 : 1;
     ctx.beginPath();
     ctx.moveTo(dividerX + 0.5, padTop);
     ctx.lineTo(dividerX + 0.5, height - padBottom);
+    ctx.stroke();
+
+    // 3 subtle vertical grip dots at the center of the divider for clear drag affordance
+    ctx.save();
+    ctx.fillStyle = isDividerActive || isNearDivider ? "#38bdf8" : "rgba(148, 163, 184, 0.4)";
+    const midY = (padTop + height - padBottom) / 2;
+    for (let dot = -1; dot <= 1; dot++) {
+      ctx.beginPath();
+      ctx.arc(dividerX + 0.5, midY + dot * 7, 1.75, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    ctx.strokeStyle = "#1e2638";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
     ctx.moveTo(outlookRightX + 0.5, padTop);
     ctx.lineTo(outlookRightX + 0.5, height - padBottom);
     ctx.stroke();
@@ -1004,17 +1301,29 @@ export function GaiaView() {
     }
 
     // 1. Key Level Continuous Horizontal Lines:
-    // King Line: Continuous radiant line across session
+    // All-Exp King Line: Solid gold horizontal line (#eab308, width: 1.5px) spanning from candle area across outlook zone
     ctx.save();
-    ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.45)" : "#eab308";
-    ctx.lineWidth = 1.25;
+    ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.55)" : "#eab308";
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.moveTo(padLeft, yAllExpKing);
     ctx.lineTo(outlookEndX, yAllExpKing);
     ctx.stroke();
 
+    // Filtered / 0DTE King Line: Dashed cyan horizontal line (#38bdf8, [5, 4], width: 1.5px) when different
+    if (filteredKingStrike !== allExpKingStrike && Number.isFinite(filteredKingStrike)) {
+      ctx.strokeStyle = atlasPalette === "ice" ? "rgba(56, 189, 248, 0.75)" : "#38bdf8";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.moveTo(padLeft, yFilteredKing);
+      ctx.lineTo(outlookEndX, yFilteredKing);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
     // Call Wall line (subtle dashed line)
-    if (callWallStrike !== allExpKingStrike) {
+    if (callWallStrike !== allExpKingStrike && callWallStrike !== filteredKingStrike) {
       const yCall = priceToY(callWallStrike);
       ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.22)" : "rgba(34, 211, 238, 0.35)";
       ctx.lineWidth = 1;
@@ -1026,7 +1335,11 @@ export function GaiaView() {
     }
 
     // Put Wall line (subtle dashed line)
-    if (putWallStrike !== allExpKingStrike && putWallStrike !== callWallStrike) {
+    if (
+      putWallStrike !== allExpKingStrike &&
+      putWallStrike !== filteredKingStrike &&
+      putWallStrike !== callWallStrike
+    ) {
       const yPut = priceToY(putWallStrike);
       ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.22)" : "rgba(192, 132, 252, 0.35)";
       ctx.lineWidth = 1;
@@ -1070,7 +1383,11 @@ export function GaiaView() {
           Math.max(0.0, Math.pow(conc, 0.72) * (0.28 + 0.72 * prox) * 1.25)
         );
 
-        const isKing = strike === colKingStrike || (strike === allExpKingStrike && conc >= 0.75);
+        const isKing =
+          strike === filteredKingStrike ||
+          strike === allExpKingStrike ||
+          strike === colKingStrike ||
+          (strike === allExpKingStrike && conc >= 0.75);
         const isCallWall = !isKing && (strike === callWallStrike);
         const isPutWall = !isKing && (strike === putWallStrike);
 
@@ -1335,6 +1652,34 @@ export function GaiaView() {
       );
     }
 
+    // Flow VWAP x Gamma & Dynamic Dispersion Bands Overlay
+    if (flowVwapPoints.length > 0) {
+      const curKingStrike = dataset.columnsByBar[safeActiveIdx]?.allExpKingStrike ?? 0;
+      const confluenceLevels: ConfluenceLevel[] = [];
+      if (curKingStrike > 0) {
+        confluenceLevels.push({ name: "King Node", strike: curKingStrike });
+      }
+      drawFlowGammaVwapOverlay({
+        ctx,
+        points: flowVwapPoints,
+        safeActiveIdx,
+        barToX,
+        priceToY,
+        padLeft: 18,
+        plotRightX: dividerX,
+        padTop: 36,
+        padBottom: 24,
+        chartHeight: height,
+        rightAxisWidth: 64,
+        confluenceLevels,
+        showCenterline: true,
+        showBands: true,
+        showShading: true,
+        showConfluenceMarkers: true,
+        showRightAxisBadge: false,
+      });
+    }
+
     // Non-Repainting 3-Left / 3-Right Pivot Divergence Lines & Triangles
     const drawTriangle = (tx: number, ty: number, isBull: boolean, isNearLevel: boolean = false) => {
       ctx.fillStyle = isBull ? "#22c55e" : "#ef4444";
@@ -1524,22 +1869,6 @@ export function GaiaView() {
     const spotX = barToX(safeActiveIdx);
     const spotY = priceToY(curSpot);
 
-    // Draw active spot crosshair ring on current candle
-    ctx.save();
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
-    ctx.lineWidth = 1.25;
-    ctx.beginPath();
-    ctx.arc(spotX, spotY, 4.5, 0, Math.PI * 2);
-    ctx.stroke();
-    // Crosshair reticle
-    ctx.beginPath();
-    ctx.moveTo(spotX - 6.5, spotY);
-    ctx.lineTo(spotX + 6.5, spotY);
-    ctx.moveTo(spotX, spotY - 6.5);
-    ctx.lineTo(spotX, spotY + 6.5);
-    ctx.stroke();
-    ctx.restore();
-
     // Volumetric Light Beams expanding to key strikes at outlookRightX
     const keyStrikesToBeam = dataset.visibleStrikes
       .map((s) => {
@@ -1585,39 +1914,84 @@ export function GaiaView() {
       ctx.restore();
     });
 
-    // Path to King Projection (dashed gold curve #eab308, stroke-dasharray: 4 4, anchored to All-exp King)
+    // Path to King Projection:
+    // - When a specific expiration filter is selected (e.g. NEXT / WEEK), project to yFilteredKing.
+    // - When expFilter === "ALL", if All-exp King is a weak/distant multi-day tail (<15% share or >1.05σ away)
+    //   while Tactical 0DTE/Next-Exp King is dominant (>=20% share), project primary intraday path to Tactical King
+    //   and render the distant All-exp King path as a secondary muted reference curve.
     if (pathToKing && dataset.candles[safeActiveIdx]) {
       const startX = barToX(safeActiveIdx);
       const startY = priceToY(dataset.candles[safeActiveIdx].close);
       const endX = outlookEndX;
-      const endY = yAllExpKing;
 
-      ctx.save();
-      ctx.strokeStyle = "#eab308";
-      ctx.lineWidth = 1.4;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.moveTo(startX, startY);
+      const isAllExpWeakOrDistant =
+        filteredKingStrike !== allExpKingStrike &&
+        Number.isFinite(filteredKingStrike) &&
+        ((activeBookCol.allExpKingConcPct < 15 && activeBookCol.filteredKingConcPct >= 20) ||
+          Math.abs(allExpKingStrike - curSpot) > dataset.sigma1Move * 1.05);
 
-      const steps = 16;
-      for (let s = 1; s <= steps; s++) {
-        const u = s / steps;
-        const px = startX + (endX - startX) * u;
-        const ease = 1 - Math.pow(1 - u, 1.65);
-        const waveOffset =
-          s === steps ? 0 : Math.sin(u * Math.PI * 3) * 2.5 * (1 - u);
-        const py = startY + (endY - startY) * ease + waveOffset;
-        ctx.lineTo(px, py);
+      const useTacticalPrimary =
+        (expFilter !== "ALL" && Number.isFinite(filteredKingStrike)) ||
+        isAllExpWeakOrDistant;
+
+      const primaryEndY = useTacticalPrimary ? yFilteredKing : yAllExpKing;
+      const primaryColor =
+        useTacticalPrimary && filteredKingStrike !== allExpKingStrike
+          ? "#38bdf8"
+          : "#eab308";
+
+      const drawKingCurve = (
+        targetY: number,
+        strokeColor: string,
+        dotColor: string,
+        lineWidth: number,
+        dash: number[]
+      ) => {
+        ctx.save();
+        ctx.strokeStyle = strokeColor;
+        ctx.lineWidth = lineWidth;
+        ctx.setLineDash(dash);
+        ctx.beginPath();
+        ctx.moveTo(startX, startY);
+
+        const steps = 16;
+        for (let s = 1; s <= steps; s++) {
+          const u = s / steps;
+          const px = startX + (endX - startX) * u;
+          const ease = 1 - Math.pow(1 - u, 1.65);
+          const waveOffset =
+            s === steps ? 0 : Math.sin(u * Math.PI * 3) * 2.5 * (1 - u);
+          const py = startY + (targetY - startY) * ease + waveOffset;
+          ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = dotColor;
+        ctx.beginPath();
+        ctx.arc(endX, targetY, 2.6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      };
+
+      // If All-Exp King is distant/weak on ALL view, draw muted multi-day reference curve first
+      if (expFilter === "ALL" && isAllExpWeakOrDistant) {
+        drawKingCurve(
+          yAllExpKing,
+          "rgba(234, 179, 8, 0.35)",
+          "rgba(250, 204, 21, 0.45)",
+          1.1,
+          [2, 5]
+        );
       }
-      ctx.stroke();
-      ctx.setLineDash([]);
 
-      // Gold terminal dot (#facc15) at (endX, yAllExpKing)
-      ctx.fillStyle = "#facc15";
-      ctx.beginPath();
-      ctx.arc(endX, endY, 2.6, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
+      drawKingCurve(
+        primaryEndY,
+        primaryColor,
+        useTacticalPrimary && filteredKingStrike !== allExpKingStrike ? "#38bdf8" : "#facc15",
+        1.5,
+        [4, 4]
+      );
     }
 
     // Dark pill badges for 1σ, 2σ, and King {Strike}
@@ -1702,16 +2076,16 @@ export function GaiaView() {
       yAllExpKing,
       {
         bgColor: "#101520",
-        borderColor: "rgba(202, 138, 4, 0.5)",
+        borderColor: "rgba(234, 179, 8, 0.8)",
         textColor: "#facc15",
         maskBehind: true,
         align: "left",
       }
     );
 
-    // Filtered King {Strike} callout badge immediately inside the left edge of the outlook column (outlookStartX + 6px)
-    if (isFiltered && Number.isFinite(filteredKingStrike)) {
-      const isCloseToAllExpKing = Math.abs(yFilteredKing - yAllExpKing) < 20;
+    // Filtered / 0DTE King {Strike} callout badge immediately inside the left edge of the outlook column (outlookStartX + 6px)
+    if (filteredKingStrike !== allExpKingStrike && Number.isFinite(filteredKingStrike)) {
+      const isCloseToAllExpKing = Math.abs(yFilteredKing - yAllExpKing) < 22;
       const filteredBadgeLeftX = isCloseToAllExpKing
         ? dividerX + 6 + kingBadgeW + 6
         : dividerX + 6;
@@ -1721,8 +2095,8 @@ export function GaiaView() {
         yFilteredKing,
         {
           bgColor: "#151b28",
-          borderColor: "#232d42",
-          textColor: "#ffffff",
+          borderColor: "rgba(56, 189, 248, 0.6)",
+          textColor: "#38bdf8",
           maskBehind: true,
           align: "left",
         }
@@ -1751,9 +2125,9 @@ export function GaiaView() {
       const val = activeBookCol.strikeValues[strike] ?? 0;
       const absVal = Math.abs(val);
       const concPct = Math.round((absVal / maxActiveExp) * 100);
-      const isKing =
-        strike === activeBookCol.allExpKingStrike ||
-        strike === activeBookCol.filteredKingStrike;
+      const isAllExpKing = strike === activeBookCol.allExpKingStrike;
+      const isFilteredKing = strike === activeBookCol.filteredKingStrike;
+      const isKing = isAllExpKing || isFilteredKing;
 
       // Show if concPct >= 10% or is King
       if (concPct >= 10 || isKing) {
@@ -1761,8 +2135,10 @@ export function GaiaView() {
           ? "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace"
           : "10px ui-monospace, SFMono-Regular, Menlo, monospace";
 
-        if (isKing) {
+        if (isAllExpKing) {
           ctx.fillStyle = atlasPalette === "ice" ? "#ffffff" : "#facc15";
+        } else if (isFilteredKing) {
+          ctx.fillStyle = "#38bdf8";
         } else if (concPct >= 50) {
           ctx.fillStyle =
             atlasPalette === "ice"
@@ -1774,7 +2150,14 @@ export function GaiaView() {
           ctx.fillStyle = "#94a3b8";
         }
 
-        const label = `${strike} — ${concPct}%`;
+        const label =
+          isAllExpKing && isFilteredKing
+            ? `${strike} — King · ${concPct}%`
+            : isAllExpKing
+              ? `${strike} — King · ${concPct}%`
+              : isFilteredKing
+                ? `${strike} — ${canvasFilterBadgePrefix} · ${concPct}%`
+                : `${strike} — ${concPct}%`;
         ctx.fillText(label, outlookRightX + 6, y);
 
         // Subtle tick dash on axis edge
@@ -1875,52 +2258,205 @@ export function GaiaView() {
       ctx.restore();
     }
 
-    // Bottom X-Axis Labels: 9:30 AM, 12:45 PM, 3:55 PM, and outlook
+    // -------------------------------------------------------------------------
+    // Bottom X-Axis: Hourly Timeline (1 per hour like TradingView/Robinhood)
+    // -------------------------------------------------------------------------
     ctx.save();
+
+    // 1. Bottom Axis Horizontal Divider Line
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.25)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padLeft, height - padBottom);
+    ctx.lineTo(dividerX, height - padBottom);
+    ctx.stroke();
+
+    // 2. Identify Hourly Ticks across the Dataset (1 per hour, plus 09:30 Market Open)
+    interface TimeAxisTick {
+      barIndex: number;
+      label: string;
+      isHourMark: boolean;
+      isMarketOpen: boolean;
+    }
+
+    const axisTicks: TimeAxisTick[] = [];
+    const candles = dataset.candles;
+
+    if (candles && candles.length > 0) {
+      candles.forEach((c, i) => {
+        let hhStr = "";
+        let mmStr = "";
+        if (c.timestamp && c.timestamp > 0) {
+          try {
+            const dObj = new Date(c.timestamp * 1000);
+            const etStr = dObj.toLocaleTimeString("en-US", {
+              timeZone: "America/New_York",
+              hour12: false,
+            });
+            const parts = etStr.split(":");
+            hhStr = parts[0].padStart(2, "0");
+            mmStr = parts[1];
+          } catch {
+            // fallback below
+          }
+        }
+        if (!hhStr && c.timeLabel) {
+          const match = c.timeLabel.match(/(\d+):(\d+)\s*(AM|PM)?/i);
+          if (match) {
+            let h = parseInt(match[1], 10);
+            const m = match[2];
+            const ampm = (match[3] || "").toUpperCase();
+            if (ampm === "PM" && h < 12) h += 12;
+            if (ampm === "AM" && h === 12) h = 0;
+            hhStr = String(h).padStart(2, "0");
+            mmStr = m;
+          }
+        }
+
+        const isExactHour = mmStr === "00";
+        const isMarketOpen = hhStr === "09" && mmStr === "30";
+        const isSessionStart = i === 0;
+        const isSessionEnd = i === candles.length - 1;
+
+        if (isExactHour || isMarketOpen || isSessionStart || isSessionEnd) {
+          const label = `${hhStr}:${mmStr}`;
+          axisTicks.push({
+            barIndex: i,
+            label,
+            isHourMark: isExactHour || isMarketOpen,
+            isMarketOpen,
+          });
+        }
+      });
+    }
+
+    // 3. Render Each Tick Mark, Subtle Vertical Grid Line & High-Contrast Time Label
     ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
-    ctx.fillStyle = "#94a3b8";
-    ctx.textBaseline = "bottom";
+    ctx.textBaseline = "middle";
+    const labelY = height - padBottom / 2 + 1;
 
-    ctx.textAlign = "left";
-    ctx.fillText(dataset.candles[0]?.timeLabel ?? "9:30 AM", padLeft, height - 8);
+    let lastDrawnX = -999;
+    const minSpacing = 36; // minimum pixels between adjacent labels to prevent overlap
 
-    const midIdx = Math.min(39, Math.floor(dataset.candles.length / 2));
-    ctx.textAlign = "center";
-    ctx.fillText(
-      dataset.candles[midIdx]?.timeLabel ?? "12:45 PM",
-      barToX(midIdx),
-      height - 8
-    );
+    axisTicks.forEach((tick) => {
+      const x = barToX(tick.barIndex);
+      if (x < padLeft - 6 || x > dividerX - 6) return;
 
-    ctx.textAlign = "right";
-    ctx.fillText(
-      dataset.candles[dataset.candles.length - 1]?.timeLabel ?? "3:55 PM",
-      dividerX - 6,
-      height - 8
-    );
+      const isStart = tick.barIndex === 0;
+      const isEnd = tick.barIndex === candles.length - 1;
+      if (!isStart && !isEnd && Math.abs(x - lastDrawnX) < minSpacing) {
+        return;
+      }
+      if (isEnd && Math.abs(x - lastDrawnX) < 28) {
+        return;
+      }
 
+      lastDrawnX = x;
+
+      // Subtle Vertical Grid Line for Hour Marks or Market Open
+      if (tick.isHourMark) {
+        ctx.save();
+        if (tick.isMarketOpen) {
+          ctx.strokeStyle = "rgba(56, 189, 248, 0.28)";
+          ctx.setLineDash([4, 4]);
+        } else {
+          ctx.strokeStyle = "rgba(148, 163, 184, 0.08)";
+        }
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, padTop);
+        ctx.lineTo(x, height - padBottom);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Tick Dash extending down from axis baseline
+      ctx.strokeStyle = tick.isMarketOpen
+        ? "rgba(56, 189, 248, 0.85)"
+        : tick.isHourMark
+          ? "rgba(255, 255, 255, 0.5)"
+          : "rgba(148, 163, 184, 0.35)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, height - padBottom);
+      ctx.lineTo(x, height - padBottom + (tick.isHourMark ? 5 : 3));
+      ctx.stroke();
+
+      // Time Text Label (Market Open in cyan, Hour marks in bright silver)
+      ctx.fillStyle = tick.isMarketOpen
+        ? "#38bdf8"
+        : tick.isHourMark
+          ? "#f8fafc"
+          : "#94a3b8";
+      ctx.textAlign = isStart ? "left" : isEnd ? "right" : "center";
+      const drawX = isStart ? x + 2 : isEnd ? x - 2 : x;
+      ctx.fillText(tick.label, drawX, labelY);
+    });
+
+    // 4. Outlook Column Label
     ctx.textAlign = "center";
     ctx.fillStyle = "#64748b";
+    ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.fillText(
       "outlook",
       dividerX + (outlookRightX - dividerX) / 2,
-      height - 8
+      labelY
     );
-    ctx.restore();
 
-    // Subtle crosshair on hover
+    // 5. Crosshair and interactive time badge on hover
     if (hoverBarIndex !== null && hoverBarIndex <= safeActiveIdx) {
       const hx = barToX(hoverBarIndex);
       ctx.save();
-      ctx.strokeStyle = "rgba(148, 163, 184, 0.35)";
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.4)";
       ctx.lineWidth = 1;
       ctx.setLineDash([3, 3]);
+
+      // Vertical line snapped strictly to candle center
       ctx.beginPath();
       ctx.moveTo(hx, padTop);
       ctx.lineTo(hx, height - padBottom);
       ctx.stroke();
+
+      // Horizontal line across the plot to the price axis
+      if (
+        hoverCursor &&
+        hoverCursor.y >= padTop &&
+        hoverCursor.y <= height - padBottom
+      ) {
+        ctx.beginPath();
+        ctx.moveTo(padLeft, hoverCursor.y);
+        ctx.lineTo(outlookRightX, hoverCursor.y);
+        ctx.stroke();
+      }
+
+      // Bottom axis hover time pill badge
+      const hoverCandle = dataset.candles[hoverBarIndex];
+      if (hoverCandle) {
+        const timeText = hoverCandle.timeLabel;
+        ctx.font = "bold 9px ui-monospace, SFMono-Regular, Menlo, monospace";
+        const textW = ctx.measureText(timeText).width;
+        const pillW = textW + 10;
+        const pillH = 16;
+        const pillX = Math.max(padLeft, Math.min(dividerX - pillW, hx - pillW / 2));
+        const pillY = height - padBottom + 2;
+
+        ctx.fillStyle = "#1e293b";
+        ctx.strokeStyle = "#38bdf8";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.roundRect(pillX, pillY, pillW, pillH, 3);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = "#38bdf8";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(timeText, pillX + pillW / 2, pillY + pillH / 2);
+      }
       ctx.restore();
     }
+    ctx.restore();
 
     ctx.restore();
   }, [
@@ -1929,12 +2465,18 @@ export function GaiaView() {
     hoverBarIndex,
     pathToKing,
     canvasWidth,
+    chartWidth,
+    dividerRatio,
+    xScale,
+    xPanOffset,
+    startHour,
     activeBookCol,
     exposureMode,
     expFilter,
     canvasFilterBadgePrefix,
     priceBounds,
     chartHeight,
+    flowVwapPoints,
     hoverCursor,
     atlasPalette,
     countdownSec,
@@ -2168,7 +2710,59 @@ export function GaiaView() {
           Path to King
         </button>
 
-        {/* 5. Reset View Pill */}
+        {/* 5. Session Start Time Filter: 7:00 AM Premkt (default) | 8:00 AM Premkt | 9:30 AM RTH */}
+        <div className="bg-[#151b28] border border-[#232d42] rounded-full p-1 flex items-center gap-1 font-mono text-xs">
+          <button
+            type="button"
+            onClick={() => {
+              setStartHour(7);
+              fetchLiveGaia(loadedTicker, selectedSessionIso, 7);
+            }}
+            title="Start session at 7:00 AM ET (Early pre-market volume & catalyst discovery)"
+            className={cn(
+              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
+              startHour === 7
+                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
+                : "text-slate-300 hover:text-white"
+            )}
+          >
+            7:00 AM Premkt
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setStartHour(8);
+              fetchLiveGaia(loadedTicker, selectedSessionIso, 8);
+            }}
+            title="Start session at 8:00 AM ET (Regular pre-market session)"
+            className={cn(
+              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
+              startHour === 8
+                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
+                : "text-slate-300 hover:text-white"
+            )}
+          >
+            8:00 AM Premkt
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setStartHour(9);
+              fetchLiveGaia(loadedTicker, selectedSessionIso, 9);
+            }}
+            title="Start session at 9:30 AM ET (Regular Trading Hours only)"
+            className={cn(
+              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
+              startHour === 9
+                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
+                : "text-slate-300 hover:text-white"
+            )}
+          >
+            9:30 AM RTH
+          </button>
+        </div>
+
+        {/* 6. Reset View Pill */}
         <button
           type="button"
           onClick={handleResetView}
@@ -2177,7 +2771,24 @@ export function GaiaView() {
           Reset view
         </button>
 
-        {/* 6. Window Scope Presets (Focus | Tactical | Cone 2σ) */}
+        {/* Auto Width Reset Pill (appears when width or divider is customized) */}
+        {(chartWidth !== null || dividerRatio !== 0.76 || xScale !== 1.0) && (
+          <button
+            type="button"
+            onClick={() => {
+              setChartWidth(null);
+              setDividerRatio(0.76);
+              setXScale(1.0);
+              setXPanOffset(0);
+            }}
+            title="Reset horizontal width and divider back to default"
+            className="bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 hover:bg-cyan-500/30 rounded-full px-3.5 py-1.5 text-xs font-bold transition cursor-pointer"
+          >
+            Auto Width (100%)
+          </button>
+        )}
+
+        {/* 7. Window Scope Presets (Focus | Tactical | Cone 2σ) */}
         <div className="bg-[#151b28] border border-[#232d42] rounded-full p-1 flex items-center gap-1 font-mono text-xs">
           <button
             type="button"
@@ -2285,7 +2896,7 @@ export function GaiaView() {
         <div className="space-y-2 pt-0.5">
           {/* 1. Dual Pre-Chart King Pill Badges */}
           <div className="flex flex-wrap items-center gap-2">
-            <span className="bg-yellow-500/12 border border-yellow-500/80 text-[#fde047] rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
+            <span className="bg-yellow-500/15 border border-yellow-500/80 text-[#fde047] rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
               All-exp King {activeBookCol.allExpKingStrike} ·{" "}
               {formatPct(activeBookCol.allExpKingConcPct)}%
             </span>
@@ -2294,9 +2905,9 @@ export function GaiaView() {
                 VEX King (multi-day) {activeBookCol.allExpKingStrike}
               </span>
             )}
-            {expFilter !== "ALL" && (
-              <span className="bg-[#151b28] border border-slate-500/60 text-white rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
-                {expFilter === "NEXT"
+            {(expFilter !== "ALL" || activeBookCol.allExpKingStrike !== activeBookCol.filteredKingStrike) && (
+              <span className="bg-[#151b28] border border-cyan-500/60 text-[#38bdf8] rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
+                {expFilter === "ALL" || expFilter === "NEXT"
                   ? has0DteActive
                     ? `0DTE King ${activeBookCol.filteredKingStrike} · ${formatPct(activeBookCol.filteredKingConcPct)}%`
                     : `Next exp King ${activeBookCol.filteredKingStrike}${nextExpShortDate ? ` (${nextExpShortDate})` : ""} · ${formatPct(activeBookCol.filteredKingConcPct)}%`
@@ -2305,6 +2916,22 @@ export function GaiaView() {
                     : `${expFilter} King ${activeBookCol.filteredKingStrike} · ${formatPct(activeBookCol.filteredKingConcPct)}%`}
               </span>
             )}
+            {activeBookCol.allExpKingStrike !== activeBookCol.filteredKingStrike &&
+              ((activeBookCol.allExpKingConcPct < 15 && activeBookCol.filteredKingConcPct >= 20) ||
+                Math.abs(activeBookCol.allExpKingStrike - activeCandle.close) > dataset.sigma1Move * 1.05) && (
+                <span className="bg-amber-950/50 border border-amber-500/50 text-amber-200 rounded-full px-3.5 py-1 text-[11px] font-semibold inline-flex items-center gap-1.5">
+                  <span className="text-amber-400 font-bold">⚠️ King Trap Guardrail:</span>
+                  <span>
+                    All-exp {activeBookCol.allExpKingStrike} is distant ({formatPct(activeBookCol.allExpKingConcPct)}% share) · Active Intraday Pin is{" "}
+                    <strong className="text-cyan-300">
+                      ${activeBookCol.filteredKingStrike} ({formatPct(activeBookCol.filteredKingConcPct)}%)
+                    </strong>
+                    {activeCandle.close >= activeCandle.sma34 && activeBookCol.allExpKingStrike < activeCandle.close
+                      ? " — Avoid shorting HOD / deep OTM Puts above SMA34"
+                      : ""}
+                  </span>
+                </span>
+              )}
           </div>
 
           {/* 2. Moving Average Readout Row */}
@@ -2425,8 +3052,99 @@ export function GaiaView() {
       {/* 3 & 4A. Core Chart Canvas Card + Interactive Session Replay Bar */}
       <div
         ref={containerRef}
-        className="bg-[#0d111a] border border-[#1e2638] rounded-2xl p-4 space-y-3"
+        className="bg-[#0d111a] border border-[#1e2638] rounded-2xl p-4 space-y-3 relative transition-all"
+        style={{
+          width: chartWidth ? `${chartWidth}px` : "100%",
+          maxWidth: "100%",
+          minWidth: "640px",
+        }}
       >
+        {/* Right Edge Horizontal Resize Handle */}
+        <div
+          onMouseDown={(e) => {
+            e.preventDefault();
+            const startX = e.clientX;
+            const startW = containerRef.current?.getBoundingClientRect().width ?? 1000;
+            const onMove = (moveEvt: MouseEvent) => {
+              const delta = moveEvt.clientX - startX;
+              setChartWidth(Math.max(640, Math.min(2600, Math.round(startW + delta))));
+            };
+            const onUp = () => {
+              window.removeEventListener("mousemove", onMove);
+              window.removeEventListener("mouseup", onUp);
+            };
+            window.addEventListener("mousemove", onMove);
+            window.addEventListener("mouseup", onUp);
+          }}
+          onDoubleClick={() => setChartWidth(null)}
+          title="Drag horizontally to resize chart width (Double-click to reset to 100%)"
+          role="separator"
+          tabIndex={0}
+          aria-orientation="vertical"
+          aria-label="Chart horizontal width resize handle. Use Left and Right arrow keys to adjust width."
+          onKeyDown={(e) => {
+            if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              setChartWidth((w) =>
+                Math.max(640, (w ?? (containerRef.current?.getBoundingClientRect().width || 1000)) - 30)
+              );
+            } else if (e.key === "ArrowRight") {
+              e.preventDefault();
+              setChartWidth((w) =>
+                Math.min(2600, (w ?? (containerRef.current?.getBoundingClientRect().width || 1000)) + 30)
+              );
+            }
+          }}
+          className="absolute right-0 top-0 bottom-0 w-3 cursor-ew-resize hover:bg-cyan-500/10 active:bg-cyan-500/20 transition-colors flex items-center justify-center group z-30 select-none rounded-r-2xl"
+        >
+          <div className="w-1 h-12 bg-white/20 group-hover:bg-cyan-400 group-active:bg-cyan-400 rounded-full transition-colors" />
+        </div>
+
+        {/* Dual Width + Height Corner Grip */}
+        <div
+          onMouseDown={(e) => {
+            e.preventDefault();
+            const startX = e.clientX;
+            const startY = e.clientY;
+            const startW = containerRef.current?.getBoundingClientRect().width ?? 1000;
+            const startH = chartHeight;
+            const onMove = (moveEvt: MouseEvent) => {
+              const deltaX = moveEvt.clientX - startX;
+              const deltaY = moveEvt.clientY - startY;
+              setChartWidth(Math.max(640, Math.min(2600, Math.round(startW + deltaX))));
+              setChartHeight(Math.max(380, Math.min(950, Math.round(startH + deltaY))));
+            };
+            const onUp = () => {
+              window.removeEventListener("mousemove", onMove);
+              window.removeEventListener("mouseup", onUp);
+            };
+            window.addEventListener("mousemove", onMove);
+            window.addEventListener("mouseup", onUp);
+          }}
+          onDoubleClick={() => {
+            setChartWidth(null);
+            setChartHeight(540);
+          }}
+          title="Drag corner to resize both chart width & height simultaneously (Double-click to reset)"
+          className="absolute right-1 bottom-1 w-5 h-5 cursor-nwse-resize text-slate-500 hover:text-cyan-400 flex items-center justify-center z-30 select-none"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="rotate-90">
+            <path
+              d="M11 1L1 11M11 6L6 11M11 11H11.01"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+            />
+          </svg>
+        </div>
+
+        {/* Screen Reader Live Region for Accessibility */}
+        <div className="sr-only" aria-live="polite" aria-atomic="true">
+          {activeCandle
+            ? `${dataset?.ticker} candle at ${activeCandle.timeLabel}: Close $${activeCandle.close.toFixed(2)}, High $${activeCandle.high.toFixed(2)}, Low $${activeCandle.low.toFixed(2)}, SMA34 $${activeCandle.sma34.toFixed(2)}, RSI ${activeCandle.rsi14.toFixed(1)}.`
+            : ""}
+        </div>
+
         <div
           className="relative w-full overflow-hidden flex items-center justify-center rounded-xl"
           style={{ minHeight: `${chartHeight}px` }}
@@ -2439,6 +3157,10 @@ export function GaiaView() {
 
           <canvas
             ref={canvasRef}
+            role="img"
+            tabIndex={0}
+            aria-label={`Interactive intraday chart for ${dataset?.ticker || loadedTicker} on ${dataset?.sessionDate || "current session"}. Showing 5-minute candles starting at ${startHour === 7 ? "7:00 AM" : startHour === 8 ? "8:00 AM" : "9:30 AM"} to 4:00 PM ET with hourly time ticks. Use Left/Right Arrow keys to step through candles, Home/End to jump to open and close, Space to toggle replay, and Plus/Minus to zoom.`}
+            onKeyDown={handleCanvasKeyDown}
             onMouseDown={handleCanvasMouseDown}
             onMouseMove={handleCanvasMouseMove}
             onMouseLeave={handleCanvasMouseLeave}
@@ -2446,7 +3168,7 @@ export function GaiaView() {
             onWheel={handleCanvasWheel}
             onDoubleClick={handleCanvasDoubleClick}
             className={cn(
-              "block w-full select-none",
+              "block w-full select-none focus:outline-none focus-visible:ring-2 focus-visible:ring-[#38bdf8] focus-visible:ring-offset-2 focus-visible:ring-offset-[#0d111a] rounded-xl",
               !dataset && "hidden"
             )}
             style={{ height: `${chartHeight}px`, cursor: cursorStyle }}
@@ -2568,8 +3290,24 @@ export function GaiaView() {
             window.addEventListener("mousemove", onMove);
             window.addEventListener("mouseup", onUp);
           }}
-          title="Drag up or down to adjust chart window height"
-          className="w-full h-3 -my-1 flex items-center justify-center cursor-row-resize hover:bg-cyan-500/10 active:bg-cyan-500/20 rounded transition-colors group z-20 select-none"
+          title="Drag up or down to adjust chart window height (or use Up/Down arrow keys)"
+          role="separator"
+          tabIndex={0}
+          aria-orientation="horizontal"
+          aria-valuenow={chartHeight}
+          aria-valuemin={380}
+          aria-valuemax={950}
+          aria-label="Chart height resize handle. Use Up and Down arrow keys to adjust height."
+          onKeyDown={(e) => {
+            if (e.key === "ArrowUp") {
+              e.preventDefault();
+              setChartHeight((h) => Math.max(380, h - 25));
+            } else if (e.key === "ArrowDown") {
+              e.preventDefault();
+              setChartHeight((h) => Math.min(950, h + 25));
+            }
+          }}
+          className="w-full h-3 -my-1 flex items-center justify-center cursor-row-resize hover:bg-cyan-500/10 active:bg-cyan-500/20 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#38bdf8] rounded transition-colors group z-20 select-none"
         >
           <div className="w-16 h-1 rounded-full bg-white/15 group-hover:bg-cyan-400/60 group-active:bg-cyan-400 transition-colors" />
         </div>
@@ -2580,7 +3318,8 @@ export function GaiaView() {
             <button
               type="button"
               onClick={handleToggleReplay}
-              className="bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold text-xs px-4 py-1.5 rounded-full hover:opacity-95 transition cursor-pointer shrink-0"
+              aria-label={isReplaying ? "Pause session replay" : "Start session replay"}
+              className="bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold text-xs px-4 py-1.5 rounded-full hover:opacity-95 transition cursor-pointer shrink-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-white"
             >
               {isReplaying ? "Pause" : "Replay"}
             </button>
@@ -2603,11 +3342,15 @@ export function GaiaView() {
                 max={maxBarIdx}
                 value={safeActiveIdx}
                 aria-label="Session replay scrubber"
+                aria-valuemin={0}
+                aria-valuemax={maxBarIdx}
+                aria-valuenow={safeActiveIdx}
+                aria-valuetext={`Time ${dataset.candles[safeActiveIdx]?.timeLabel ?? ""}, Price $${activeCandle?.close.toFixed(2) ?? ""}`}
                 onChange={(e) => {
                   setIsReplaying(false);
                   setActiveBarIndex(Number(e.target.value));
                 }}
-                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer focus:outline-none focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-[#38bdf8]"
               />
             </div>
 

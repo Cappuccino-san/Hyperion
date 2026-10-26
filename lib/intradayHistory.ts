@@ -12,6 +12,7 @@ export interface IntradayHistoryPoint {
   callWall: number;
   putWall: number;
   zeroGamma: number;
+  king?: number;
 }
 
 export interface IntradayAlert {
@@ -264,6 +265,7 @@ export async function recordIntradaySnapshot(params: {
   callWall: number;
   putWall: number;
   zeroGamma: number;
+  allExpKing?: number;
 }): Promise<{
   history: IntradayHistoryPoint[];
   alerts: IntradayAlert[];
@@ -276,7 +278,7 @@ export async function recordIntradaySnapshot(params: {
     hasZeroGammaFlip?: boolean;
   };
 }> {
-  const { ticker, spotPrice, callWall, putWall, zeroGamma } = params;
+  const { ticker, spotPrice, callWall, putWall, zeroGamma, allExpKing } = params;
   const sym = ticker.trim().toUpperCase();
   const store = loadStore();
 
@@ -304,6 +306,28 @@ export async function recordIntradaySnapshot(params: {
 
   // 1. Detect transition alerts
   if (prev) {
+    if (
+      prev.king &&
+      prev.king > 0 &&
+      allExpKing &&
+      allExpKing > 0 &&
+      prev.king !== allExpKing
+    ) {
+      const msg = `${sym} King moved ${prev.king.toFixed(0)} → ${allExpKing.toFixed(0)}`;
+      if (!tickerData.alerts.some((a) => a.message === msg)) {
+        tickerData.alerts.push({
+          id: `${sym}-king-${nowSec}`,
+          ts: nowSec,
+          timestamp: timeStr,
+          time: timeStr,
+          symbol: sym,
+          message: msg,
+          msg,
+          type: "king",
+        });
+      }
+    }
+
     if (prev.cw > 0 && callWall > 0 && prev.cw !== callWall) {
       const msg = `${sym} Call wall moved ${prev.cw.toFixed(0)} → ${callWall.toFixed(0)}`;
       if (!tickerData.alerts.some((a) => a.message === msg)) {
@@ -373,7 +397,8 @@ export async function recordIntradaySnapshot(params: {
     nowSec - prev.ts >= 15 ||
     Math.abs(prev.spot - spotPrice) >= 0.05 ||
     prev.cw !== callWall ||
-    prev.pw !== putWall;
+    prev.pw !== putWall ||
+    (allExpKing !== undefined && prev.king !== allExpKing);
 
   if (shouldAppend) {
     const newPoint: IntradayHistoryPoint = {
@@ -387,6 +412,7 @@ export async function recordIntradaySnapshot(params: {
       callWall,
       putWall,
       zeroGamma: Number(zeroGamma.toFixed(2)),
+      king: allExpKing,
     };
     tickerData.history.push(newPoint);
 

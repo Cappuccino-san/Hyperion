@@ -173,11 +173,13 @@ function formatBookLabel(isoDate: string): string {
 async function fetchYahooSeries(
   yahooSymbol: string,
   interval: string,
-  range: string
+  range: string,
+  includePrePost: boolean = false,
+  startHour: number = 7
 ): Promise<RawYahooBar[]> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
     yahooSymbol
-  )}?interval=${interval}&range=${range}&includePrePost=false`;
+  )}?interval=${interval}&range=${range}&includePrePost=${includePrePost}`;
 
   const res = await fetch(url, {
     headers: {
@@ -220,8 +222,26 @@ async function fetchYahooSeries(
     }
     const ts = timestamps[i];
     const etTime = formatEtTime(ts);
-    if (interval === "5m" && etTime === "4:00 PM") {
-      continue;
+    if (interval === "5m") {
+      const d = new Date(ts * 1000);
+      const etTime24 = d.toLocaleTimeString("en-US", {
+        timeZone: "America/New_York",
+        hour12: false,
+      });
+      const [hNum, mNum] = etTime24.split(":").map(Number);
+      if (startHour === 9) {
+        if (hNum < 9 || (hNum === 9 && mNum < 30) || hNum > 16 || (hNum === 16 && mNum > 0)) {
+          continue;
+        }
+      } else {
+        if (hNum < startHour || hNum > 16 || (hNum === 16 && mNum > 0)) {
+          continue;
+        }
+      }
+      if (hNum === 16 && mNum === 0) {
+        // Skip 4:00 PM settlement cross bar to preserve true 3:55 PM regular session close
+        continue;
+      }
     }
     bars.push({
       ts,
@@ -691,20 +711,28 @@ async function fetchLiveOptionsBuckets(
       bucketMap.set(key, b);
     }
 
-    const T = Math.max(1 / 365, (b.dteDays + 0.5) / 365);
-    const bsFallback =
-      opt.gamma > 0 && opt.delta !== 0
-        ? null
-        : computeBlackScholesGreeks(liveSpot, opt.strike, T, opt.iv);
+    const days = b.dteDays;
+    const T = Math.max(1 / 365, days / 365);
+    const contractIv =
+      opt.iv > 0.02
+        ? opt.iv > 4
+          ? opt.iv / 100
+          : opt.iv
+        : iv30Decimal;
 
-    const contractGamma =
-      opt.gamma > 0 ? opt.gamma : (bsFallback?.gamma ?? 0);
+    // Harmonized calibrated Black-Scholes Greeks (matching lib/optionsExposure.ts exactly)
+    const bs = computeBlackScholesGreeks(
+      liveSpot,
+      opt.strike,
+      T,
+      contractIv,
+      0.046,
+      0.0
+    );
+
+    const contractGamma = bs.gamma;
     const contractDelta =
-      opt.delta !== 0
-        ? opt.delta
-        : opt.optionType === "C"
-          ? (bsFallback?.deltaCall ?? 0)
-          : (bsFallback?.deltaPut ?? 0);
+      opt.optionType === "C" ? bs.deltaCall : bs.deltaPut;
 
     if (opt.optionType === "C") {
       b.callOI += oi;
@@ -768,15 +796,23 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const rawTicker = (searchParams.get("ticker") ?? "SPY").trim().toUpperCase();
   const requestedSession = (searchParams.get("session") ?? "").trim();
+  const rawStart = (searchParams.get("start") ?? searchParams.get("startHour") ?? "7").trim().toLowerCase();
+  const startHour =
+    rawStart === "9:30" || rawStart === "9.5" || rawStart === "9"
+      ? 9
+      : rawStart === "8"
+        ? 8
+        : 7;
 
   const ticker = /^[A-Z0-9._-]{1,10}$/.test(rawTicker) ? rawTicker : "SPY";
   const yahooSymbol = mapYahooSymbol(ticker);
 
   try {
     // Fetch live multi-timeframe candle series from Yahoo Finance in parallel
+    // 5m series includes pre-market starting from 7:00 AM ET (or 8:00 AM / 9:30 AM if requested)
     const [bars5mRaw, bars30mRaw, bars60mRaw, bars1dRaw, bars1wkRaw] =
       await Promise.all([
-        fetchYahooSeries(yahooSymbol, "5m", "1mo"),
+        fetchYahooSeries(yahooSymbol, "5m", "1mo", true, startHour),
         fetchYahooSeries(yahooSymbol, "30m", "1mo"),
         fetchYahooSeries(yahooSymbol, "60m", "3mo"),
         fetchYahooSeries(yahooSymbol, "1d", "6mo"),

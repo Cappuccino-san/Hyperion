@@ -396,6 +396,9 @@ export function RecapView() {
 
         {data?.days && data.days.length > 0 && (
           <select
+            id="recap-session-day"
+            name="recapSessionDay"
+            aria-label="Select completed session date"
             value={selectedDay}
             onChange={(e) => setSelectedDay(e.target.value)}
             className="bg-[#0f172a] text-slate-200 border border-slate-700 rounded-full px-3 py-1 text-xs font-mono focus:outline-none focus:border-cyan-400 cursor-pointer"
