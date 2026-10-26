@@ -28,3 +28,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# agents session memory & bridge tooling
+.agents/
+argon.bat
+*argon_bridge*
