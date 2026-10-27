@@ -736,12 +736,12 @@ async function fetchLiveOptionsBuckets(
 
     if (opt.optionType === "C") {
       b.callOI += oi;
-      b.callIvWeighted += oi * opt.iv;
+      b.callIvWeighted += oi * contractIv;
       b.callGammaWeighted += oi * contractGamma;
       b.callDeltaWeighted += oi * contractDelta;
     } else {
       b.putOI += oi;
-      b.putIvWeighted += oi * opt.iv;
+      b.putIvWeighted += oi * contractIv;
       b.putGammaWeighted += oi * contractGamma;
       b.putDeltaWeighted += oi * contractDelta;
     }

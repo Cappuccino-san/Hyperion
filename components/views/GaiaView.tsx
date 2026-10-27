@@ -301,10 +301,14 @@ function buildLiveGaiaDataset(
     new Set(optionBuckets.map((b) => b.strike))
   ).sort((a, b) => b - a);
 
+  const mustIncludeStrikes = new Set<number>(
+    [preScanAllKing, preScanFilteredKing].filter((s) => s > 0)
+  );
   const inWindowStrikes = allUniqueStrikesDesc.filter(
     (s) =>
-      s >= chartBoundMin - sigma1Move * 0.35 &&
-      s <= chartBoundMax + sigma1Move * 0.35
+      (s >= chartBoundMin - sigma1Move * 0.35 &&
+        s <= chartBoundMax + sigma1Move * 0.35) ||
+      mustIncludeStrikes.has(s)
   );
 
   const baseVisibleStrikes =
@@ -774,9 +778,14 @@ export function GaiaView() {
     const spot =
       dataset.candles[dataset.candles.length - 1]?.close ?? dataset.priorClose;
 
+    const lastCol = dataset.columnsByBar[dataset.columnsByBar.length - 1];
+    const allExpKingStrike = lastCol?.allExpKingStrike ?? 0;
+    const filteredKingStrike = lastCol?.filteredKingStrike ?? 0;
+
     if (scopePreset === "focus") {
       // Focus: tightly around candle action and spot (Image 2)
       anchorPrices = [
+        ...(expFilter === "ALL" && allExpKingStrike > 0 ? [allExpKingStrike] : []),
         ...candleHighs,
         ...candleLows,
         spot,
@@ -787,6 +796,7 @@ export function GaiaView() {
     } else if (scopePreset === "tactical") {
       // Tactical: candles + 1σ expected move
       anchorPrices = [
+        ...(expFilter === "ALL" && allExpKingStrike > 0 ? [allExpKingStrike] : []),
         ...candleHighs,
         ...candleLows,
         spot,
@@ -796,15 +806,13 @@ export function GaiaView() {
     } else {
       // Cone: full ±2σ cone bounds + Kings (Image 1)
       anchorPrices = [
+        ...(allExpKingStrike > 0 ? [allExpKingStrike] : []),
+        ...(filteredKingStrike > 0 ? [filteredKingStrike] : []),
         ...dataset.visibleStrikes,
         ...candleHighs,
         ...candleLows,
         dataset.priorClose - dataset.sigma2Move,
         dataset.priorClose + dataset.sigma2Move,
-        dataset.columnsByBar[dataset.columnsByBar.length - 1]?.allExpKingStrike ??
-          dataset.priorClose,
-        dataset.columnsByBar[dataset.columnsByBar.length - 1]?.filteredKingStrike ??
-          dataset.priorClose,
       ];
     }
 
@@ -812,8 +820,8 @@ export function GaiaView() {
     const maxP = Math.max(...anchorPrices);
     const rawSpan = Math.max(2.0, maxP - minP);
     const pad = Math.max(
-      1.0,
-      rawSpan * (scopePreset === "focus" ? 0.14 : 0.06)
+      2.5,
+      rawSpan * (scopePreset === "focus" ? 0.14 : 0.09)
     );
 
     const baseCenter = (minP + maxP) / 2;
@@ -1302,13 +1310,16 @@ export function GaiaView() {
 
     // 1. Key Level Continuous Horizontal Lines:
     // All-Exp King Line: Solid gold horizontal line (#eab308, width: 1.5px) spanning from candle area across outlook zone
-    ctx.save();
-    ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.55)" : "#eab308";
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(padLeft, yAllExpKing);
-    ctx.lineTo(outlookEndX, yAllExpKing);
-    ctx.stroke();
+    if (yAllExpKing >= padTop && yAllExpKing <= height - padBottom) {
+      ctx.save();
+      ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.55)" : "#eab308";
+      ctx.lineWidth = 1.75;
+      ctx.beginPath();
+      ctx.moveTo(padLeft, yAllExpKing);
+      ctx.lineTo(outlookEndX, yAllExpKing);
+      ctx.stroke();
+      ctx.restore();
+    }
 
     // Filtered / 0DTE King Line: Dashed cyan horizontal line (#38bdf8, [5, 4], width: 1.5px) when different
     if (filteredKingStrike !== allExpKingStrike && Number.isFinite(filteredKingStrike)) {
@@ -1976,11 +1987,12 @@ export function GaiaView() {
 
       // If All-Exp King is distant/weak on ALL view, draw muted multi-day reference curve first
       if (expFilter === "ALL" && isAllExpWeakOrDistant) {
+        const clampedYAllExpKing = Math.max(padTop + 14, Math.min(height - padBottom - 14, yAllExpKing));
         drawKingCurve(
-          yAllExpKing,
-          "rgba(234, 179, 8, 0.35)",
-          "rgba(250, 204, 21, 0.45)",
-          1.1,
+          clampedYAllExpKing,
+          "rgba(234, 179, 8, 0.65)",
+          "rgba(250, 204, 21, 0.85)",
+          1.4,
           [2, 5]
         );
       }
@@ -2070,14 +2082,21 @@ export function GaiaView() {
     });
 
     // Global All-exp King {Strike} callout badge immediately inside the left edge of the outlook column (outlookStartX + 6px)
+    const isMacroKingOffscreen = yAllExpKing < padTop + 6 || yAllExpKing > height - padBottom - 6;
+    const distPts = allExpKingStrike - curSpot;
+    const distSign = distPts >= 0 ? "+" : "";
+    const macroKingText = isMacroKingOffscreen
+      ? `${yAllExpKing > height - padBottom ? "▼ " : "▲ "}Macro King ${allExpKingStrike} (${distSign}${distPts.toFixed(1)})`
+      : `King ${allExpKingStrike}`;
+
     const kingBadgeW = drawBadge(
-      `King ${allExpKingStrike}`,
+      macroKingText,
       dividerX + 6,
       yAllExpKing,
       {
-        bgColor: "#101520",
-        borderColor: "rgba(234, 179, 8, 0.8)",
-        textColor: "#facc15",
+        bgColor: isMacroKingOffscreen ? "#1c1404" : "#101520",
+        borderColor: "rgba(234, 179, 8, 0.9)",
+        textColor: isMacroKingOffscreen ? "#fde047" : "#facc15",
         maskBehind: true,
         align: "left",
       }
@@ -2169,6 +2188,19 @@ export function GaiaView() {
         ctx.stroke();
       }
     });
+
+    // Pinned right-axis indicator if All-Exp King is outside vertical price bounds
+    if (allExpKingStrike > 0 && expFilter === "ALL") {
+      const yMacro = priceToY(allExpKingStrike);
+      if (yMacro < padTop + 6 || yMacro > height - padBottom - 6) {
+        const isBelow = yMacro > height - padBottom - 6;
+        const pinY = isBelow ? height - padBottom - 10 : padTop + 10;
+        const arrow = isBelow ? "▼ " : "▲ ";
+        ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
+        ctx.fillStyle = atlasPalette === "ice" ? "#ffffff" : "#facc15";
+        ctx.fillText(`${arrow}${allExpKingStrike} — King · ${activeBookCol.allExpKingConcPct}%`, outlookRightX + 6, pinY);
+      }
+    }
 
     // Also ensure standard price ticks without levels are shown if no strike was drawn nearby
     yAxisTicks.forEach((tickPrice) => {
