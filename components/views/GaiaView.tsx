@@ -722,9 +722,10 @@ export function GaiaView() {
     const el = containerRef.current;
     if (!el) return;
     const updateWidth = () => {
-      const rect = el.getBoundingClientRect();
-      if (rect.width > 200) {
-        setCanvasWidth(Math.floor(rect.width));
+      const parentEl = canvasRef.current?.parentElement;
+      const innerW = parentEl ? parentEl.clientWidth : (el.clientWidth - 32);
+      if (innerW > 200) {
+        setCanvasWidth(Math.floor(innerW));
       }
     };
     updateWidth();
@@ -832,7 +833,7 @@ export function GaiaView() {
 
     const yMin = Number((effectiveCenter - effectiveSpan / 2).toFixed(2));
     const yMax = Number((effectiveCenter + effectiveSpan / 2).toFixed(2));
-    const yAxisTicks = computeNicePriceTicks(yMin, yMax, 5);
+    const yAxisTicks = computeNicePriceTicks(yMin, yMax, 6);
 
     return { yMin, yMax, yAxisTicks };
   }, [dataset, scopePreset, yScale, yPanOffset]);
@@ -1361,7 +1362,6 @@ export function GaiaView() {
       ctx.stroke();
     }
     ctx.setLineDash([]);
-    ctx.restore();
 
     // Strike step and Proximity scale for moneyflow calculation
     const strikeStep = dataset.visibleStrikes.length > 1
@@ -2125,12 +2125,25 @@ export function GaiaView() {
     // Restore plot clip before drawing axis labels
     ctx.restore();
 
-    // Right Price Axis Ticks & Concentration Badges inside the [outlookRightX + 6, width] gutter
+    // Right Price Axis: Dedicated Gutter, Clear Price Scale & Strike Badges
     ctx.save();
     ctx.textBaseline = "middle";
     ctx.textAlign = "left";
 
-    // Build a strike concentration map for activeBookCol
+    // 1. Fill dedicated dark high-contrast right price axis gutter
+    ctx.fillStyle = "#080c14";
+    ctx.fillRect(outlookRightX, 0, rightAxisWidth, height);
+
+    // 2. Crisp vertical boundary line between chart and price axis
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.35)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(outlookRightX + 0.5, padTop);
+    ctx.lineTo(outlookRightX + 0.5, height - padBottom);
+    ctx.stroke();
+
+    // 3. Render prominent strike labels and track rendered Y positions
+    const drawnStrikeYs: { y: number; strike: number }[] = [];
     const maxActiveExp = Math.max(
       1,
       ...Object.values(activeBookCol.strikeValues).map((v) => Math.abs(v))
@@ -2148,8 +2161,8 @@ export function GaiaView() {
       const isFilteredKing = strike === activeBookCol.filteredKingStrike;
       const isKing = isAllExpKing || isFilteredKing;
 
-      // Show if concPct >= 10% or is King
-      if (concPct >= 10 || isKing) {
+      // Show if concPct >= 15% or is King
+      if (concPct >= 15 || isKing) {
         ctx.font = isKing
           ? "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace"
           : "10px ui-monospace, SFMono-Regular, Menlo, monospace";
@@ -2171,21 +2184,27 @@ export function GaiaView() {
 
         const label =
           isAllExpKing && isFilteredKing
-            ? `${strike} — King · ${concPct}%`
+            ? `${strike} · King ${concPct}%`
             : isAllExpKing
-              ? `${strike} — King · ${concPct}%`
+              ? `${strike} · King ${concPct}%`
               : isFilteredKing
-                ? `${strike} — ${canvasFilterBadgePrefix} · ${concPct}%`
-                : `${strike} — ${concPct}%`;
-        ctx.fillText(label, outlookRightX + 6, y);
+                ? `${strike} · ${canvasFilterBadgePrefix} ${concPct}%`
+                : `${strike} · ${concPct}%`;
+        ctx.fillText(label, outlookRightX + 7, y);
 
-        // Subtle tick dash on axis edge
-        ctx.strokeStyle = "rgba(255, 255, 255, 0.12)";
-        ctx.lineWidth = 1;
+        // Tick dash on axis edge
+        ctx.strokeStyle = isKing
+          ? isAllExpKing
+            ? "#facc15"
+            : "#38bdf8"
+          : "rgba(255, 255, 255, 0.25)";
+        ctx.lineWidth = isKing ? 1.5 : 1;
         ctx.beginPath();
         ctx.moveTo(outlookRightX + 1, y);
-        ctx.lineTo(outlookRightX + 4, y);
+        ctx.lineTo(outlookRightX + 5, y);
         ctx.stroke();
+
+        drawnStrikeYs.push({ y, strike });
       }
     });
 
@@ -2198,21 +2217,29 @@ export function GaiaView() {
         const arrow = isBelow ? "▼ " : "▲ ";
         ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
         ctx.fillStyle = atlasPalette === "ice" ? "#ffffff" : "#facc15";
-        ctx.fillText(`${arrow}${allExpKingStrike} — King · ${activeBookCol.allExpKingConcPct}%`, outlookRightX + 6, pinY);
+        ctx.fillText(`${arrow}${allExpKingStrike} · King ${activeBookCol.allExpKingConcPct}%`, outlookRightX + 7, pinY);
       }
     }
 
-    // Also ensure standard price ticks without levels are shown if no strike was drawn nearby
+    // 4. Always render standard price scale ticks (every round increment) with high contrast!
     yAxisTicks.forEach((tickPrice) => {
       const y = priceToY(tickPrice);
-      if (y >= padTop && y <= height - padBottom) {
-        const hasNearby = dataset.visibleStrikes.some(
-          (s) => Math.abs(priceToY(s) - y) < 9
+      if (y >= padTop + 4 && y <= height - padBottom - 4) {
+        const hasDrawnNearby = drawnStrikeYs.some(
+          (item) => Math.abs(item.y - y) < 8
         );
-        if (!hasNearby) {
+        if (!hasDrawnNearby) {
           ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
-          ctx.fillStyle = "#64748b";
-          ctx.fillText(tickPrice.toFixed(2), outlookRightX + 6, y);
+          ctx.fillStyle = "#cbd5e1"; // Bright high-contrast silver
+          ctx.fillText(tickPrice.toFixed(2), outlookRightX + 7, y);
+
+          // Subtle tick notch on axis line
+          ctx.strokeStyle = "rgba(148, 163, 184, 0.4)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(outlookRightX + 1, y);
+          ctx.lineTo(outlookRightX + 4, y);
+          ctx.stroke();
         }
       }
     });
@@ -2291,48 +2318,50 @@ export function GaiaView() {
     }
 
     // -------------------------------------------------------------------------
-    // Bottom X-Axis: Hourly Timeline (1 per hour like TradingView/Robinhood)
+    // Bottom X-Axis: Full-Session Timeline (from startHour to 16:00 Close)
     // -------------------------------------------------------------------------
     ctx.save();
 
-    // 1. Bottom Axis Horizontal Divider Line
-    ctx.strokeStyle = "rgba(148, 163, 184, 0.25)";
+    // 1. Fill high-contrast bottom time axis background gutter
+    ctx.fillStyle = "#080c14";
+    ctx.fillRect(0, height - padBottom, width, padBottom);
+
+    // 2. Bottom Axis Horizontal Divider Line
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.35)";
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(padLeft, height - padBottom);
-    ctx.lineTo(dividerX, height - padBottom);
+    ctx.moveTo(padLeft, height - padBottom + 0.5);
+    ctx.lineTo(outlookRightX, height - padBottom + 0.5);
     ctx.stroke();
 
-    // 2. Identify Hourly Ticks across the Dataset (1 per hour, plus 09:30 Market Open)
+    // 3. Identify Milestone Ticks across Full Session (Past & Future)
     interface TimeAxisTick {
-      barIndex: number;
+      x: number;
       label: string;
       isHourMark: boolean;
       isMarketOpen: boolean;
+      isMarketClose: boolean;
     }
 
     const axisTicks: TimeAxisTick[] = [];
     const candles = dataset.candles;
 
+    // Map past candles to hour marks if present
+    const candleHourIndices = new Map<string, number>();
     if (candles && candles.length > 0) {
       candles.forEach((c, i) => {
-        let hhStr = "";
-        let mmStr = "";
+        let timeKey = "";
         if (c.timestamp && c.timestamp > 0) {
           try {
-            const dObj = new Date(c.timestamp * 1000);
-            const etStr = dObj.toLocaleTimeString("en-US", {
-              timeZone: "America/New_York",
-              hour12: false,
-            });
-            const parts = etStr.split(":");
-            hhStr = parts[0].padStart(2, "0");
-            mmStr = parts[1];
-          } catch {
-            // fallback below
-          }
+            const d = new Date(c.timestamp * 1000);
+            const et = d.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false });
+            const [h, m] = et.split(":");
+            if (m === "00" || (h === "09" && m === "30")) {
+              timeKey = `${h}:${m}`;
+            }
+          } catch {}
         }
-        if (!hhStr && c.timeLabel) {
+        if (!timeKey && c.timeLabel) {
           const match = c.timeLabel.match(/(\d+):(\d+)\s*(AM|PM)?/i);
           if (match) {
             let h = parseInt(match[1], 10);
@@ -2340,29 +2369,63 @@ export function GaiaView() {
             const ampm = (match[3] || "").toUpperCase();
             if (ampm === "PM" && h < 12) h += 12;
             if (ampm === "AM" && h === 12) h = 0;
-            hhStr = String(h).padStart(2, "0");
-            mmStr = m;
+            const hh = String(h).padStart(2, "0");
+            if (m === "00" || (hh === "09" && m === "30")) {
+              timeKey = `${hh}:${m}`;
+            }
           }
         }
-
-        const isExactHour = mmStr === "00";
-        const isMarketOpen = hhStr === "09" && mmStr === "30";
-        const isSessionStart = i === 0;
-        const isSessionEnd = i === candles.length - 1;
-
-        if (isExactHour || isMarketOpen || isSessionStart || isSessionEnd) {
-          const label = `${hhStr}:${mmStr}`;
-          axisTicks.push({
-            barIndex: i,
-            label,
-            isHourMark: isExactHour || isMarketOpen,
-            isMarketOpen,
-          });
+        if (timeKey && !candleHourIndices.has(timeKey)) {
+          candleHourIndices.set(timeKey, i);
         }
       });
     }
 
-    // 3. Render Each Tick Mark, Subtle Vertical Grid Line & High-Contrast Time Label
+    // Generate standard milestone schedule across the trading day (7:00 AM to 4:00 PM)
+    const milestoneSchedule: { h: number; m: number; label: string; isMarketOpen?: boolean; isMarketClose?: boolean }[] = [];
+    for (let h = startHour; h <= 16; h++) {
+      if (h === 9) {
+        milestoneSchedule.push({ h: 9, m: 30, label: "9:30", isMarketOpen: true });
+        continue;
+      }
+      if (h === 16) {
+        milestoneSchedule.push({ h: 16, m: 0, label: "4:00", isMarketClose: true });
+        continue;
+      }
+      const displayH = h > 12 ? h - 12 : h;
+      milestoneSchedule.push({ h, m: 0, label: `${displayH}:00` });
+    }
+
+    milestoneSchedule.forEach((ms) => {
+      const timeKey = `${String(ms.h).padStart(2, "0")}:${String(ms.m).padStart(2, "0")}`;
+      let x = -1;
+      if (candleHourIndices.has(timeKey)) {
+        x = barToX(candleHourIndices.get(timeKey)!);
+      } else {
+        let totalMinsFromStart = 0;
+        if (startHour === 9) {
+          totalMinsFromStart = (ms.h - 9) * 60 + (ms.m - 30);
+        } else {
+          totalMinsFromStart = (ms.h - startHour) * 60 + ms.m;
+        }
+        const theoreticalSlot = Math.round(totalMinsFromStart / 5);
+        if (theoreticalSlot >= 0 && theoreticalSlot < totalSessionSlots) {
+          x = barToX(theoreticalSlot);
+        }
+      }
+
+      if (x >= padLeft - 4 && x <= dividerX - 8) {
+        axisTicks.push({
+          x,
+          label: ms.label,
+          isHourMark: true,
+          isMarketOpen: Boolean(ms.isMarketOpen),
+          isMarketClose: Boolean(ms.isMarketClose),
+        });
+      }
+    });
+
+    // 4. Render Each Tick Mark, Subtle Vertical Grid Line & High-Contrast Time Label
     ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textBaseline = "middle";
     const labelY = height - padBottom / 2 + 1;
@@ -2371,58 +2434,47 @@ export function GaiaView() {
     const minSpacing = 36; // minimum pixels between adjacent labels to prevent overlap
 
     axisTicks.forEach((tick) => {
-      const x = barToX(tick.barIndex);
-      if (x < padLeft - 6 || x > dividerX - 6) return;
-
-      const isStart = tick.barIndex === 0;
-      const isEnd = tick.barIndex === candles.length - 1;
-      if (!isStart && !isEnd && Math.abs(x - lastDrawnX) < minSpacing) {
-        return;
-      }
-      if (isEnd && Math.abs(x - lastDrawnX) < 28) {
-        return;
+      if (Math.abs(tick.x - lastDrawnX) < minSpacing) {
+        if (!tick.isMarketOpen) return;
       }
 
-      lastDrawnX = x;
+      lastDrawnX = tick.x;
 
       // Subtle Vertical Grid Line for Hour Marks or Market Open
-      if (tick.isHourMark) {
-        ctx.save();
-        if (tick.isMarketOpen) {
-          ctx.strokeStyle = "rgba(56, 189, 248, 0.28)";
-          ctx.setLineDash([4, 4]);
-        } else {
-          ctx.strokeStyle = "rgba(148, 163, 184, 0.08)";
-        }
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(x, padTop);
-        ctx.lineTo(x, height - padBottom);
-        ctx.stroke();
-        ctx.restore();
+      ctx.save();
+      if (tick.isMarketOpen) {
+        ctx.strokeStyle = "rgba(56, 189, 248, 0.35)";
+        ctx.setLineDash([4, 4]);
+      } else {
+        ctx.strokeStyle = "rgba(148, 163, 184, 0.08)";
       }
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(tick.x, padTop);
+      ctx.lineTo(tick.x, height - padBottom);
+      ctx.stroke();
+      ctx.restore();
 
       // Tick Dash extending down from axis baseline
       ctx.strokeStyle = tick.isMarketOpen
         ? "rgba(56, 189, 248, 0.85)"
-        : tick.isHourMark
-          ? "rgba(255, 255, 255, 0.5)"
-          : "rgba(148, 163, 184, 0.35)";
+        : tick.isMarketClose
+          ? "rgba(255, 255, 255, 0.85)"
+          : "rgba(148, 163, 184, 0.5)";
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(x, height - padBottom);
-      ctx.lineTo(x, height - padBottom + (tick.isHourMark ? 5 : 3));
+      ctx.moveTo(tick.x, height - padBottom);
+      ctx.lineTo(tick.x, height - padBottom + (tick.isMarketOpen ? 5 : 4));
       ctx.stroke();
 
-      // Time Text Label (Market Open in cyan, Hour marks in bright silver)
+      // Time Text Label (Market Open in cyan, Close in white, Hour marks in bright silver)
       ctx.fillStyle = tick.isMarketOpen
         ? "#38bdf8"
-        : tick.isHourMark
-          ? "#f8fafc"
-          : "#94a3b8";
-      ctx.textAlign = isStart ? "left" : isEnd ? "right" : "center";
-      const drawX = isStart ? x + 2 : isEnd ? x - 2 : x;
-      ctx.fillText(tick.label, drawX, labelY);
+        : tick.isMarketClose
+          ? "#ffffff"
+          : "#e2e8f0";
+      ctx.textAlign = "center";
+      ctx.fillText(tick.label, tick.x, labelY);
     });
 
     // 4. Outlook Column Label

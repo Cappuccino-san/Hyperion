@@ -85,37 +85,46 @@ async function runLiveBotTick(): Promise<void> {
   botState.lastStatus = "POLLING_RTH";
 
   try {
-    const todayStr = getEtDateString();
-    if (botState.sessionDateEt !== todayStr) {
-      botState.sessionDateEt = todayStr;
-      botState.dispatchedCount = 0;
-    }
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("Live bot tick timed out after 15s")), 15_000)
+    );
 
-    const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+    await Promise.race([
+      (async () => {
+        const todayStr = getEtDateString();
+        if (botState.sessionDateEt !== todayStr) {
+          botState.sessionDateEt = todayStr;
+          botState.dispatchedCount = 0;
+        }
 
-    // 1. Evaluate all active positions first (STC target/stop/MOC checks)
-    const activeAlerts = await evaluateAllActivePositions({ webhookUrl });
-    if (activeAlerts && activeAlerts.length > 0) {
-      botState.dispatchedCount += activeAlerts.length;
-    }
+        const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
 
-    // 2. Poll watchlist tickers for new BTO setups
-    for (const ticker of WATCH_TICKERS) {
-      const res = await evaluateTradeSignals({
-        ticker,
-        spotPrice: 0, // Auto-fetches live spot
-        callWall: 0,
-        putWall: 0,
-        zeroGamma: 0,
-        webhookUrl,
-      });
+        // 1. Evaluate all active positions first (STC target/stop/MOC checks)
+        const activeAlerts = await evaluateAllActivePositions({ webhookUrl });
+        if (activeAlerts && activeAlerts.length > 0) {
+          botState.dispatchedCount += activeAlerts.length;
+        }
 
-      if (res.emittedAlerts && res.emittedAlerts.length > 0) {
-        botState.dispatchedCount += res.emittedAlerts.length;
-      }
-    }
+        // 2. Poll watchlist tickers for new BTO setups
+        for (const ticker of WATCH_TICKERS) {
+          const res = await evaluateTradeSignals({
+            ticker,
+            spotPrice: 0, // Auto-fetches live spot
+            callWall: 0,
+            putWall: 0,
+            zeroGamma: 0,
+            webhookUrl,
+          });
 
-    botState.lastStatus = "ACTIVE_OK";
+          if (res.emittedAlerts && res.emittedAlerts.length > 0) {
+            botState.dispatchedCount += res.emittedAlerts.length;
+          }
+        }
+
+        botState.lastStatus = "ACTIVE_OK";
+      })(),
+      timeoutPromise,
+    ]);
   } catch (err) {
     botState.lastStatus = `ERROR: ${err instanceof Error ? err.message : "unknown"}`;
   } finally {

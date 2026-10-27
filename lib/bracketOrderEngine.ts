@@ -128,6 +128,19 @@ export function evaluateOcoBrackets(params: {
   const liveBid = Math.max(0.01, currentNbbo.bid);
   const pnlPct = Number((((liveBid - config.entryPrice) / Math.max(0.01, config.entryPrice)) * 100).toFixed(2));
 
+  // Sanity check: Ensure valid bid and underlying spot price
+  if (!Number.isFinite(currentNbbo.bid) || currentNbbo.bid <= 0 || !Number.isFinite(underlyingSpot) || underlyingSpot <= 0) {
+    return {
+      action: "HOLD",
+      triggered: false,
+      reason: "MARKET_DATA_WAIT · Awaiting valid bid and spot quote",
+      exitPrice: liveBid,
+      pnlPct: 0,
+      contractsToClose: 0,
+      updatedBracket: bracket,
+    };
+  }
+
   const isCall = config.contractType === "CALL";
   const updatedBracket = { ...bracket };
 
