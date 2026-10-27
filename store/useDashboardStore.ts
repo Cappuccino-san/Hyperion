@@ -634,6 +634,9 @@ export interface DashboardState {
   discordConfig: DiscordConfig;
   isSetupModalOpen: boolean;
   gaiaMode: "classic" | "atlas";
+  uiMode: "signal" | "quant";
+  toggleUiMode: () => void;
+  setUiMode: (mode: "signal" | "quant") => void;
   connectionStatus: "LIVE" | "SYNCING" | "RECONNECTING" | "OFFLINE";
   isStaleSnapshot: boolean;
   playbookPayload: PlaybookPayload | null;
@@ -714,6 +717,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   discordConfig: getInitialDiscordConfig(),
   isSetupModalOpen: false,
   gaiaMode: "classic",
+  uiMode: "signal",
+  toggleUiMode: () =>
+    set((state) => ({ uiMode: state.uiMode === "signal" ? "quant" : "signal" })),
+  setUiMode: (mode) => set({ uiMode: mode }),
   playbookPayload: null,
 
   setPlaybookPayload: (payload) => {

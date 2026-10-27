@@ -4,6 +4,7 @@ import React, { useEffect } from "react";
 import { TopNavBar } from "@/components/header/TopNavBar";
 import { TickerNav } from "@/components/header/TickerNav";
 import { SpotDisplay } from "@/components/header/SpotDisplay";
+import { SignalClarityBanner } from "@/components/SignalClarityBanner";
 import { MetricsRow } from "@/components/metrics/MetricsRow";
 import { IntradayChart } from "@/components/intraday/IntradayChart";
 import { AlertsFeed } from "@/components/intraday/AlertsFeed";
@@ -58,6 +59,9 @@ export default function DashboardPage() {
 
             {/* 2. Hero Spot & Expected Moves Card */}
             <SpotDisplay />
+
+            {/* 2.5 Calm Executive Signal Banner & Density Switcher */}
+            <SignalClarityBanner />
 
             {/* 3. 3-Card Summary Row & Unified Walls + Slider Card */}
             <MetricsRow />

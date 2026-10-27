@@ -7,6 +7,7 @@ import { ActiveView, useDashboardStore } from "@/store/useDashboardStore";
 import { GuideModal } from "@/components/modals/GuideModal";
 import { CheatCodesModal } from "@/components/modals/CheatCodesModal";
 import { SetupModal } from "@/components/modals/SetupModal";
+import { CommandPalette } from "@/components/CommandPalette";
 import { cn } from "@/lib/utils";
 
 const VIEW_TABS: ActiveView[] = ["Heatmap", "Quad", "Gaia", "Scanner", "Recap"];
@@ -159,6 +160,7 @@ export function TopNavBar() {
   const setSetupModalOpen = useDashboardStore((state) => state.setSetupModalOpen);
   const [guideOpen, setGuideOpen] = useState(false);
   const [cheatCodesOpen, setCheatCodesOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
   const [mktStatus, setMktStatus] = useState<MarketStatusInfo>(() =>
     computeMarketStatus()
@@ -351,6 +353,17 @@ export function TopNavBar() {
               >
                 ? Guide
               </button>
+
+              {/* 7. ⌘K Omnibar */}
+              <button
+                type="button"
+                onClick={() => setPaletteOpen(true)}
+                className="px-3 py-1.5 rounded-full text-xs font-bold border border-cyan-500/40 bg-cyan-950/40 text-cyan-300 hover:bg-cyan-500/20 transition flex items-center gap-1.5 cursor-pointer font-mono"
+                title="Open Omnibar (Cmd+K / Ctrl+K)"
+              >
+                <span>⌘K</span>
+                <span className="hidden sm:inline font-sans text-slate-300 font-semibold">Search</span>
+              </button>
             </div>
           </div>
 
@@ -420,6 +433,10 @@ export function TopNavBar() {
       <GuideModal open={guideOpen} onOpenChange={setGuideOpen} />
       <CheatCodesModal open={cheatCodesOpen} onOpenChange={setCheatCodesOpen} />
       <SetupModal open={isSetupModalOpen} onOpenChange={setSetupModalOpen} />
+      <CommandPalette
+        externalOpen={paletteOpen}
+        onExternalClose={() => setPaletteOpen(false)}
+      />
     </>
   );
 }
