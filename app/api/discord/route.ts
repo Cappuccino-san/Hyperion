@@ -3,10 +3,17 @@ import { NextRequest, NextResponse } from "next/server";
 const DEFAULT_DISCORD_WEBHOOK_URL =
   "https://discord.com/api/webhooks/1562857850676449411/Qza12VWuPoBlek12-6o7V6fc2EscYDjIQrKw7KJyfB8Y3i9VAMvU7OJH0m7joqUH5arx";
 
+interface CachedEvent {
+  timestamp: number;
+}
+const dispatchedAlertsCache = new Map<string, CachedEvent>();
+
 export interface DiscordAlertRequestBody {
   webhookUrl?: string;
   action?: "BUY_TO_OPEN" | "SELL_TO_CLOSE";
   eventType?: string; // 'bto' | 'stc' | 'buy_to_open' | 'sell_to_close' | 'call' | 'put' | 'zero' | 'king' | 'test'
+  isHistoricalBackfill?: boolean;
+  eventId?: string;
 
   // Sub-$1.00 Small Account BTO / STC Fields
   ticker?: string;
@@ -55,6 +62,31 @@ export interface DiscordAlertRequestBody {
 export async function POST(req: NextRequest) {
   try {
     const body: DiscordAlertRequestBody = await req.json();
+
+    // 1. Strict Backfill Firewall: NEVER dispatch historical replay/backfill signals to Discord
+    if (body.isHistoricalBackfill) {
+      return NextResponse.json({
+        ignored: true,
+        reason: "Historical backfill signals are strictly silenced from live Discord dispatch.",
+      });
+    }
+
+    // 2. Webhook Idempotency & Deduplication Guard
+    if (body.eventId) {
+      const nowMs = Date.now();
+      const existing = dispatchedAlertsCache.get(body.eventId);
+      if (existing && nowMs - existing.timestamp < 3600_000) {
+        return NextResponse.json({
+          ignored: true,
+          reason: "Duplicate eventId already dispatched.",
+        });
+      }
+      dispatchedAlertsCache.set(body.eventId, { timestamp: nowMs });
+      if (dispatchedAlertsCache.size > 2000) {
+        const oldestKey = dispatchedAlertsCache.keys().next().value;
+        if (oldestKey) dispatchedAlertsCache.delete(oldestKey);
+      }
+    }
     const webhookUrl =
       (body.webhookUrl && body.webhookUrl.trim().length > 0
         ? body.webhookUrl.trim()
@@ -188,7 +220,7 @@ export async function POST(req: NextRequest) {
       };
     } else if (action === "SELL_TO_CLOSE") {
       // ----------------------------------------------------------------------
-      // 2. SELL TO CLOSE (STC) Execution Embed (Smart 1 vs. 2 Contract Sizing)
+      // 2. SELL TO CLOSE (STC) Execution Embed (Canonical Taxonomy & Correct Math)
       // ----------------------------------------------------------------------
       const contractType = body.contractType || "CALL";
       const isCalls = contractType === "CALL";
@@ -197,47 +229,8 @@ export async function POST(req: NextRequest) {
       const reason = body.reason || "Exit Triggered";
       const reasonUpper = reason.toUpperCase();
       const btoSpot = body.btoSpotPrice ?? spot;
-      const status = body.status || "CLOSED";
-      const contractsQty = body.contractsQty ?? 2;
-      const remainingQty = body.remainingQty ?? 0;
+      const contractsQty = body.contractsQty ?? 1;
 
-      const isTrim = reasonUpper.includes("1 OF 2") || reasonUpper.includes("RAISE STOP") || status === "PARTIAL_TP1";
-
-      let embedColor: number;
-      let title: string;
-
-      if (isTrim) {
-        embedColor = 0xf59e0b; // Amber / Gold = 16096779
-        if (contractsQty === 2) {
-          title = `💰 SELL TO CLOSE 1 OF 2 CONTRACTS (LOCK PROFIT) · ${ticker} ${contractType}S`;
-        } else {
-          title = `🛡️ RAISE STOP TO PROFIT / SCALP (1 CONTRACT) · ${ticker} ${contractType}S`;
-        }
-      } else if (reasonUpper.includes("TARGET 2") || reasonUpper.includes("FULL")) {
-        embedColor = 0x10b981; // Emerald Green = 1096065
-        title = `🎯 SELL TO CLOSE FINAL 1 CONTRACT (FULL TARGET) · ${ticker} ${contractType}S`;
-      } else if (reasonUpper.includes("REVERSAL")) {
-        embedColor = 0x3b82f6; // Royal Blue = 3899894
-        title = `🔄 SELL TO CLOSE (REVERSAL PROTECT) · ${ticker} ${contractType}S`;
-      } else if (reasonUpper.includes("BREAKEVEN")) {
-        embedColor = 0x94a3b8; // Slate Gray = 9741240
-        title = `⚪ SELL TO CLOSE (BREAKEVEN STOP) · ${ticker} ${contractType}S`;
-      } else if (reasonUpper.includes("3:50") || reasonUpper.includes("EOD")) {
-        embedColor = 0xf97316; // Orange = 16347926
-        title = `⏰ SELL TO CLOSE (3:50 PM ET EOD EXIT) · ${ticker} ${contractType}S`;
-      } else {
-        embedColor = 0xef4444; // Crimson Red = 15680580 (Stop Loss)
-        title = `🛑 SELL TO CLOSE (STOP LOSS) · ${ticker} ${contractType}S`;
-      }
-
-      const spotMovePct =
-        body.pnlSpotPct != null
-          ? body.pnlSpotPct
-          : isCalls
-            ? ((spot - btoSpot) / Math.max(0.01, btoSpot)) * 100
-            : ((btoSpot - spot) / Math.max(0.01, btoSpot)) * 100;
-
-      let optionPnlStr = "N/A";
       let pnlOptionPct = body.pnlOptionPct ?? 0;
       if (body.btoOptionMid != null && body.optionMid != null) {
         if (body.pnlOptionPct == null) {
@@ -245,30 +238,86 @@ export async function POST(req: NextRequest) {
             (((body.optionMid - body.btoOptionMid) / Math.max(0.01, body.btoOptionMid)) * 100).toFixed(1)
           );
         }
-        optionPnlStr = `$${body.btoOptionMid.toFixed(2)} → $${body.optionMid.toFixed(2)} (${
-          pnlOptionPct >= 0 ? "+" : ""
-        }${pnlOptionPct}%)`;
+      }
+      const isWin = pnlOptionPct >= 0;
+
+      let embedColor = isWin ? 0x10b981 : 0xef4444; // Green for win, Red for loss
+      let exitBadge = "🏁 POSITION CLOSED";
+      let resultWord = isWin ? "CLOSED IN PROFIT" : "CLOSED AT LOSS";
+      let resultEmoji = isWin ? "💰" : "🛑";
+
+      if (reasonUpper.includes("TARGET 2") || reasonUpper.includes("FULL")) {
+        exitBadge = "🎯 TARGET 2 SMASHED";
+        resultWord = "TAKE PROFIT HIT";
+        resultEmoji = "💰";
+        embedColor = 0x10b981;
+      } else if (reasonUpper.includes("TARGET 1") || reasonUpper.includes("TP1") || reasonUpper.includes("TAKE PROFIT")) {
+        exitBadge = "🎯 TARGET 1 HIT";
+        resultWord = "TAKE PROFIT HIT";
+        resultEmoji = "💰";
+        embedColor = 0x10b981;
+      } else if (reasonUpper.includes("TRAIL") || reasonUpper.includes("PROFIT LOCK") || reasonUpper.includes("RATCHET") || reasonUpper.includes("LOCK PROFIT")) {
+        exitBadge = "🛡️ TRAILING PROFIT LOCKED";
+        resultWord = "TRAILING PROFIT LOCKED";
+        resultEmoji = "💰";
+        embedColor = 0x10b981;
+      } else if (
+        reasonUpper.includes("15:55") ||
+        reasonUpper.includes("3:55") ||
+        reasonUpper.includes("3:50") ||
+        reasonUpper.includes("EOD") ||
+        reasonUpper.includes("CUTOFF") ||
+        reasonUpper.includes("MARKET CLOSE")
+      ) {
+        exitBadge = "⏰ 3:55 PM EOD MARKET CLOSE CUTOFF";
+        resultWord = isWin ? "3:55 PM EOD PROFIT EXIT" : "3:55 PM EOD CUTOFF";
+        resultEmoji = isWin ? "💰" : "⏰";
+        embedColor = isWin ? 0x10b981 : 0xf59e0b;
+      } else if (reasonUpper.includes("REVERSAL") || reasonUpper.includes("FLIP")) {
+        exitBadge = "🔄 REGIME FLIP EXIT";
+        resultWord = isWin ? "REGIME PROFIT EXIT" : "REGIME PROTECT EXIT";
+        resultEmoji = isWin ? "💰" : "🔄";
+        embedColor = isWin ? 0x10b981 : 0x3b82f6;
+      } else if (reasonUpper.includes("BREAKEVEN")) {
+        exitBadge = "⚪ BREAKEVEN STOP";
+        resultWord = "BREAKEVEN STOP";
+        resultEmoji = "⚪";
+        embedColor = 0x94a3b8;
+      } else {
+        exitBadge = "🛑 STOP LOSS HIT";
+        resultWord = isWin ? "TRAILING STOP EXIT" : "STOP LOSS HIT";
+        resultEmoji = isWin ? "💰" : "🛑";
+        embedColor = isWin ? 0x10b981 : 0xef4444;
       }
 
-      let positionActionStr: string;
-      if (contractsQty === 2 && remainingQty === 1) {
-        const gainDollars =
-          body.optionMid && body.btoOptionMid
-            ? Number(((body.optionMid - body.btoOptionMid) * 100).toFixed(0))
-            : 35;
-        positionActionStr = `💰 Sold 1 Contract (+$${gainDollars} Gain) · 1 Runner Active with BE Stop ($${btoSpot.toFixed(2)})`;
-      } else if (contractsQty === 1 && status === "PARTIAL_TP1") {
-        positionActionStr = `🛡️ Stop Raised to Profit (+25% Min Locked) · 1 Runner Active`;
-      } else {
-        positionActionStr = `100% Position Closed (${contractsQty} Contract${contractsQty > 1 ? "s" : ""})`;
+      const title = `${resultEmoji} SELL TO CLOSE (${resultWord}) - ${ticker} ${contractType}S`;
+
+      // Directional Underlying Math
+      const rawSpotDiff = spot - btoSpot;
+      const spotMovePct = ((spot - btoSpot) / Math.max(0.01, btoSpot)) * 100;
+      const directionalPts = isCalls ? rawSpotDiff : -rawSpotDiff;
+      const directionalLabel =
+        directionalPts >= 0
+          ? `+${directionalPts.toFixed(2)} pts favorable to ${contractType}`
+          : `${directionalPts.toFixed(2)} pts adverse to ${contractType}`;
+      const spotMoveStr = `${spotMovePct >= 0 ? "+" : ""}${spotMovePct.toFixed(2)}% (${rawSpotDiff >= 0 ? "+" : ""}${rawSpotDiff.toFixed(2)} pts | ${directionalLabel})`;
+
+      let optionPnlStr = "N/A";
+      if (body.btoOptionMid != null && body.optionMid != null) {
+        optionPnlStr = `$${body.btoOptionMid.toFixed(2)} → $${body.optionMid.toFixed(2)} (${
+          pnlOptionPct >= 0 ? "+" : ""
+        }${pnlOptionPct.toFixed(1)}%)`;
       }
+
+      const positionActionStr = `100% Position Closed (${contractsQty} Contract)`;
+      const execTime = body.timestamp || body.openedAt || "Now";
 
       payload = {
         username: "Hyperion Terminal",
         embeds: [
           {
             author: {
-              name: "Hyperion Sub-$1.00 Options Engine (1-2 Contracts Max)",
+              name: "Hyperion 1-Contract Sniper Execution Engine",
             },
             title,
             description: `**Contract:** \`${contractLabel}\` · **Setup:** ${setupName}\n**Exit Action:** ${reason}`,
@@ -285,9 +334,9 @@ export async function POST(req: NextRequest) {
                 inline: true,
               },
               {
-                name: "📈 Spot Move",
-                value: `${spotMovePct >= 0 ? "+" : ""}${spotMovePct.toFixed(2)}%`,
-                inline: true,
+                name: "📉 Spot Move",
+                value: spotMoveStr,
+                inline: false,
               },
               {
                 name: "💵 Option Premium",
@@ -300,14 +349,14 @@ export async function POST(req: NextRequest) {
                 inline: true,
               },
               {
-                name: "⏰ Timestamp",
-                value: `${body.timestamp || body.openedAt || "Now"} ET`,
+                name: "⏰ Execution Time",
+                value: `${execTime} ET`,
                 inline: true,
               },
             ],
             timestamp: new Date().toISOString(),
             footer: {
-              text: "Hyperion · STC Small Account Options Engine",
+              text: `Hyperion · 1-Contract Sniper Engine · Exec ${execTime} ET`,
             },
           },
         ],

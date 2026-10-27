@@ -15,6 +15,7 @@ import {
   evaluateAllActivePositions,
   getDailyTradeAlerts,
 } from "@/lib/tradeSignalEngine";
+import { ensureLiveBotRunning } from "@/lib/liveBotDaemon";
 import { globalTelemetry } from "@/lib/telemetry";
 
 import { optionsMemoryCache as memoryCache } from "@/lib/marketCache";
@@ -591,6 +592,7 @@ async function attachIntraday(
 }
 
 export async function GET(request: NextRequest) {
+  ensureLiveBotRunning();
   const { searchParams } = new URL(request.url);
   const rawTicker = (searchParams.get("ticker") ?? "SPY").trim().toUpperCase();
   const forceRefresh = searchParams.get("force") === "true";

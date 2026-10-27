@@ -17,8 +17,8 @@ Before writing or modifying any file in the workspace, **Flash 3.8 MUST ALWAYS p
 
 ### 3. Token & Cost Telemetry on Every Response
 Every call across the bridge to Argon reports exact token counts and estimated costs:
-- Prompt Tokens vs. Context Budget (default: 32,000 tokens)
-- Output Tokens (including High Reasoning tokens)
+- Prompt Tokens vs. Context Budget (default: 8,000 tokens)
+- Output Tokens (including Reasoning tokens)
 - Estimated Cost in USD ($2.00/M input, $10.00/M output)
 
 ### 4. Dynamic Project & Repository Context

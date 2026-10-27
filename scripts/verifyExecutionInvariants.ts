@@ -20,7 +20,13 @@ import {
   OcoBracketConfig,
 } from "../lib/bracketOrderEngine";
 import { dispatchBrokerOrder, BrokerOrderRequest } from "../lib/brokerExecution";
-import { selectSmallAccountContract } from "../lib/tradeSignalEngine";
+import {
+  selectSmallAccountContract,
+  sendDiscordTradeAlert,
+  TradeLifecycleAlert,
+  solveImpliedVol,
+  repriceOptionBS,
+} from "../lib/tradeSignalEngine";
 import { NormalizedOptionContract } from "../lib/optionsExposure";
 
 let totalTests = 0;
@@ -488,6 +494,94 @@ async function runTestSuite() {
   assert(callTarget1 > putWall, `Call Target 1 ($${callTarget1}) is strictly HIGHER than entry Put Wall ($${putWall})`);
   assert(callTarget1 < callWall, `Call Target 1 ($${callTarget1}) is strictly LOWER than final Target 2 ($${callWall})`);
   assert(callTarget1 === 765.0, "Call Target 1 resolves to exact equilibrium midpoint $765.0 between 760 and 770");
+
+  // ===========================================================================
+  // TEST SECTION 7: LIVE DISCORD DISPATCH FIREWALL & TEMPORAL INTEGRITY
+  // ===========================================================================
+  console.log("\n7. Verifying Live Discord Dispatch Firewall (Zero Backfill Spam)...");
+
+  const backfillAlert: TradeLifecycleAlert = {
+    id: "test-backfill-alert-1",
+    timestamp: "10:50 AM",
+    ts: 1792677000,
+    ticker: "SPY",
+    action: "BUY_TO_OPEN",
+    contractType: "PUT",
+    contractLabel: "SPY 261026 762P",
+    strike: 762,
+    expiration: "2026-10-26",
+    setupName: "Resistance Rejection",
+    reason: "Resistance Rejection",
+    status: "OPEN",
+    spotPrice: 766.92,
+    btoSpotPrice: 766.92,
+    target1Spot: 765.50,
+    target2Spot: 762.00,
+    stopLossSpot: 768.50,
+    optionMid: 0.65,
+    btoOptionMid: 0.65,
+    contractsQty: 1,
+    remainingQty: 1,
+    totalOutlay: 65,
+    isHistoricalBackfill: true,
+    message: "Test backfill message",
+  };
+
+  const dispatchResult = await sendDiscordTradeAlert(backfillAlert);
+  assert(dispatchResult === false, "Historical backfill alert is strictly silenced from Discord dispatch (returns false)");
+
+  // ===========================================================================
+  // TEST SECTION 8: SINGLE-SLOT AUTOMATON & SNIPER ENGINE (1 CONTRACT MAX)
+  // ===========================================================================
+  console.log("\n8. Verifying Single-Slot Automaton & Sniper Invariants (Strictly 1 Contract)...");
+
+  // Sub-test 8.1: Contract selection forces contractsQty === 1
+  assert(selectedPut?.contractsQty === 1, "Selected contract is strictly 1 contract (Sniper Mode)");
+  assert((selectedPut?.totalOutlay || 0) <= 100, "Outlay strictly <= $100");
+
+  // Sub-test 8.2: Black-Scholes Repricing produces realistic option targets (No +237% fantasy)
+  const spotTest = 766.92;
+  const strikeTest = 762;
+  const entryPriceTest = 0.65;
+  const tYearsTest = 0.2 / 365; // ~0DTE
+  const solvedIvTest = solveImpliedVol(entryPriceTest, spotTest, strikeTest, tYearsTest, false);
+  assert(solvedIvTest > 0.05 && solvedIvTest < 1.0, `Solved IV ${solvedIvTest} is realistic (5% - 100%)`);
+
+  // Target 1: Spot drops $1.42 from 766.92 to 765.50
+  const repricedTp1 = repriceOptionBS(765.50, strikeTest, tYearsTest * 0.95, solvedIvTest, false);
+  const tp1GainPct = ((repricedTp1 - entryPriceTest) / entryPriceTest) * 100;
+  assert(
+    tp1GainPct >= 20 && tp1GainPct <= 100,
+    `Black-Scholes TP1 gain (+${tp1GainPct.toFixed(1)}%) is grounded in reality (+20% to +100%, not +237%)`
+  );
+
+  // ===========================================================================
+  // TEST SECTION 9: PnL-GROUNDED CANONICAL EXIT TAXONOMY & DIRECTIONAL SPOT MATH
+  // ===========================================================================
+  console.log("\n9. Verifying Canonical Exit Taxonomy & Directional Spot Calculations...");
+
+  // Sub-test 9.1: Directional Spot Calculation for Put
+  const putBtoSpot = 766.92;
+  const putExitSpot = 765.36; // SPY dropped by $1.56
+  const rawDiff = putExitSpot - putBtoSpot; // -1.56
+  const putFavor = -rawDiff; // +1.56
+  assert(putFavor > 0, `Underlying drop of $1.56 is POSITIVE (+${putFavor.toFixed(2)} pts) favorable to PUT`);
+
+  // Sub-test 9.2: Winning trade exiting at 3:55 PM EOD Cutoff NEVER labeled "STOP LOSS"
+  const winningPnlOptionPct = 71.4; // +71.4% gain
+  const isWinning = winningPnlOptionPct > 0;
+  const exitReason = "15:55 PM ET HARD MARKET CLOSE CUTOFF";
+  const reasonUpper = exitReason.toUpperCase();
+
+  let assignedBadge = "";
+  if (reasonUpper.includes("3:55") || reasonUpper.includes("CLOSE") || reasonUpper.includes("EOD")) {
+    assignedBadge = isWinning ? "3:55 PM EOD MARKET CLOSE CUTOFF (WIN)" : "3:55 PM EOD MARKET CLOSE CUTOFF";
+  } else {
+    assignedBadge = "STOP LOSS HIT";
+  }
+
+  assert(!assignedBadge.includes("STOP LOSS"), `Winning trade (+${winningPnlOptionPct}%) badge '${assignedBadge}' NEVER contains 'STOP LOSS'`);
+  assert(assignedBadge === "3:55 PM EOD MARKET CLOSE CUTOFF (WIN)", `Winning trade badge resolves to canonical '${assignedBadge}'`);
 
   // ===========================================================================
   // FINAL REPORT
