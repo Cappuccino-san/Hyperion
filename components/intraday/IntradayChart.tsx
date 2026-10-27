@@ -1,312 +1,869 @@
 "use client";
 
-import React, { useRef, useState } from "react";
-import { useDashboardStore } from "@/store/useDashboardStore";
-import { cn } from "@/lib/utils";
+import React, { useState, useMemo, useRef, useEffect } from "react";
+import { IntradayPoint, useDashboardStore } from "@/store/useDashboardStore";
 
-const SERIES_CONFIG = [
-  { key: "spot", color: "#ffffff", strokeWidth: 2.0, dashed: false, label: "Spot" },
-  { key: "flowVwap", color: "#eab308", strokeWidth: 1.6, dashed: false, label: "Flow VWAP" },
-  { key: "callWall", color: "#22d3ee", strokeWidth: 1.4, dashed: false, label: "Call wall" },
-  { key: "putWall", color: "#e879f9", strokeWidth: 1.4, dashed: false, label: "Put wall" },
-  { key: "zeroGamma", color: "#94a3b8", strokeWidth: 1.2, dashed: true, label: "Zero γ" },
-] as const;
+interface IntradayChartProps {
+  points?: IntradayPoint[];
+  height?: number;
+  selectedExpiration?: string | null;
+}
 
-type SeriesKey = (typeof SERIES_CONFIG)[number]["key"];
+type ScaleMode = "focus" | "full";
 
-export function IntradayChart() {
-  const intradayData = useDashboardStore((state) => state.intradayData);
-  const flowGammaVwapData = useDashboardStore((state) => state.flowGammaVwapData);
+interface RightBadgeItem {
+  id: string;
+  label: string;
+  price: number;
+  idealY: number;
+  y: number;
+  color: string;
+  bgFill: string;
+  borderColor: string;
+  isPrimary?: boolean;
+}
 
+/**
+ * 3-Sample Causal Median Filter:
+ * Eliminates 1-tick bimodal wall oscillation (e.g. 765 -> 750 -> 765 square-wave teeth)
+ * while preserving genuine structural wall migrations (>= 2 consecutive samples).
+ */
+function medianSmoothSeries(values: (number | undefined | null)[]): number[] {
+  const n = values.length;
+  if (n === 0) return [];
+  const clean: number[] = [];
+  let lastValid = values.find((v) => typeof v === "number" && Number.isFinite(v) && v > 0) ?? 0;
+
+  for (let i = 0; i < n; i++) {
+    const v = values[i];
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+      lastValid = v;
+    }
+    clean.push(lastValid);
+  }
+
+  if (n < 3) return clean;
+  const smoothed = new Array<number>(n);
+  smoothed[0] = clean[0];
+  for (let i = 1; i < n - 1; i++) {
+    const a = clean[i - 1];
+    const b = clean[i];
+    const c = clean[i + 1];
+    smoothed[i] = a + b + c - Math.min(a, b, c) - Math.max(a, b, c);
+  }
+  smoothed[n - 1] = smoothed[n - 2];
+  return smoothed;
+}
+
+/**
+ * Single-pass greedy vertical label de-collision solver.
+ * Guarantees right-axis badges never overlap inside [minY, maxY].
+ */
+function decollideLabels(
+  items: RightBadgeItem[],
+  minY: number,
+  maxY: number,
+  minGap: number = 22
+): RightBadgeItem[] {
+  if (items.length === 0) return [];
+  const sorted = [...items].sort((a, b) => a.idealY - b.idealY);
+
+  // Forward pass: push down overlapping items
+  sorted[0].y = Math.max(minY, Math.min(maxY, sorted[0].idealY));
+  for (let i = 1; i < sorted.length; i++) {
+    const prevY = sorted[i - 1].y;
+    sorted[i].y = Math.max(sorted[i].idealY, prevY + minGap);
+  }
+
+  // Backward pass: if bottom item overflowed maxY, pull upward
+  if (sorted[sorted.length - 1].y > maxY) {
+    sorted[sorted.length - 1].y = maxY;
+    for (let i = sorted.length - 2; i >= 0; i--) {
+      sorted[i].y = Math.min(sorted[i].y, sorted[i + 1].y - minGap);
+    }
+  }
+
+  // Final clamp safety
+  for (let i = 0; i < sorted.length; i++) {
+    sorted[i].y = Math.max(minY, Math.min(maxY, sorted[i].y));
+  }
+
+  return sorted;
+}
+
+export function IntradayChart({
+  points: propPoints,
+  height = 210,
+  selectedExpiration,
+}: IntradayChartProps) {
+  const storePoints = useDashboardStore((s) => s.intradayData);
+  const gammaLevels = useDashboardStore((s) => s.gammaLevels);
+  const flowGammaVwapData = useDashboardStore((s) => s.flowGammaVwapData);
+
+  const [scaleMode, setScaleMode] = useState<ScaleMode>("focus");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const [showVwapBand, setShowVwapBand] = useState<boolean>(true);
-  const [hiddenSeries, setHiddenSeries] = useState<Record<string, boolean>>({});
-  const svgRef = useRef<SVGSVGElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [containerWidth, setContainerWidth] = useState<number>(1060);
 
+  // 1:1 Responsive width observer so SVG fills 100% of container with zero lateral gray space
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const updateWidth = () => {
+      const w = el.clientWidth;
+      if (w && w > 240) {
+        setContainerWidth(Math.round(w));
+      }
+    };
+
+    updateWidth();
+
+    const observer = new ResizeObserver(() => {
+      updateWidth();
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const rawPoints = propPoints ?? storePoints ?? [];
   const sigma = flowGammaVwapData?.sigma ?? 0;
 
-  const displayData = intradayData.map((d) => {
-    const fw = d.flowVwap ?? flowGammaVwapData?.flowVwap;
+  const displayData = useMemo(() => {
+    if (!rawPoints || rawPoints.length === 0) return [];
+    const valid = rawPoints.filter(
+      (d) => typeof d.spot === "number" && Number.isFinite(d.spot) && d.spot > 0
+    );
+    return valid.map((d) => {
+      const fw = d.flowVwap ?? flowGammaVwapData?.flowVwap;
+      return {
+        ...d,
+        flowVwap: fw,
+        upper1s: d.upper1s ?? (fw && sigma > 0 ? Number((fw + sigma).toFixed(2)) : undefined),
+        lower1s: d.lower1s ?? (fw && sigma > 0 ? Number((fw - sigma).toFixed(2)) : undefined),
+      };
+    });
+  }, [rawPoints, flowGammaVwapData?.flowVwap, sigma]);
+
+  const stabilizedSeries = useMemo(() => {
+    if (displayData.length < 2) return null;
+    const callWalls = medianSmoothSeries(displayData.map((d) => d.callWall));
+    const putWalls = medianSmoothSeries(displayData.map((d) => d.putWall));
+    const zeroGammas = medianSmoothSeries(displayData.map((d) => d.zeroGamma));
+    return { callWalls, putWalls, zeroGammas };
+  }, [displayData]);
+
+  const chartModel = useMemo(() => {
+    if (!displayData || displayData.length < 2 || !stabilizedSeries) return null;
+
+    const spots = displayData.map((d) => d.spot).filter((v) => Number.isFinite(v) && v > 0);
+    if (spots.length === 0) return null;
+
+    const vwaps = displayData
+      .map((d) => d.flowVwap)
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0);
+    const upper1s = displayData
+      .map((d) => d.upper1s)
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0);
+    const lower1s = displayData
+      .map((d) => d.lower1s)
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v > 0);
+
+    const lastIdx = displayData.length - 1;
+    const latestSpot = displayData[lastIdx].spot;
+    const latestVwap = displayData[lastIdx].flowVwap;
+    const latestCallWall = gammaLevels?.callWall || stabilizedSeries.callWalls[lastIdx] || 0;
+    const latestPutWall = gammaLevels?.putWall || stabilizedSeries.putWalls[lastIdx] || 0;
+    const latestZeroGamma = gammaLevels?.zeroGamma || stabilizedSeries.zeroGammas[lastIdx] || 0;
+
+    // 1. Compute Core Price-Action Domain (Spot + Flow VWAP + ±1sigma envelope)
+    const coreValues = [...spots, ...vwaps, ...upper1s, ...lower1s];
+    const coreMin = Math.min(...coreValues);
+    const coreMax = Math.max(...coreValues);
+    const minCoreSpan = Math.max(latestSpot * 0.0022, 1.2); // Minimum 0.22% or $1.20 span
+    const rawCoreSpan = Math.max(coreMax - coreMin, minCoreSpan);
+
+    let yMin: number;
+    let yMax: number;
+
+    if (scaleMode === "focus") {
+      // Price-First Adaptive Scaling:
+      // Frame Spot, Flow VWAP, and ±1s bands comfortably.
+      // Pull in any structural level that lies within 1.65x of the core span.
+      const proximityThreshold = rawCoreSpan * 1.65;
+      const nearbyWalls = [latestCallWall, latestPutWall, latestZeroGamma].filter(
+        (w) => w > 0 && Math.abs(w - latestSpot) <= proximityThreshold
+      );
+
+      const focusPool = [...coreValues, ...nearbyWalls];
+      const fMin = Math.min(...focusPool);
+      const fMax = Math.max(...focusPool);
+      const fSpan = Math.max(fMax - fMin, minCoreSpan);
+      const fMid = (fMin + fMax) / 2;
+      const paddedHalf = (fSpan * 1.26) / 2;
+
+      yMin = fMid - paddedHalf;
+      yMax = fMid + paddedHalf;
+    } else {
+      // Full Macro Range: include all structural walls
+      const allPool = [
+        ...coreValues,
+        ...stabilizedSeries.callWalls.filter((w) => w > 0),
+        ...stabilizedSeries.putWalls.filter((w) => w > 0),
+        ...stabilizedSeries.zeroGammas.filter((w) => w > 0),
+        latestCallWall,
+        latestPutWall,
+        latestZeroGamma,
+      ].filter((v) => v > 0);
+      const aMin = Math.min(...allPool);
+      const aMax = Math.max(...allPool);
+      const aSpan = Math.max(aMax - aMin, minCoreSpan);
+      const pad = aSpan * 0.1;
+      yMin = aMin - pad;
+      yMax = aMax + pad;
+    }
+
     return {
-      ...d,
-      flowVwap: fw,
-      upper1s: d.upper1s ?? (fw && sigma > 0 ? Number((fw + sigma).toFixed(2)) : undefined),
-      lower1s: d.lower1s ?? (fw && sigma > 0 ? Number((fw - sigma).toFixed(2)) : undefined),
+      yMin,
+      yMax,
+      yRange: Math.max(yMax - yMin, 0.01),
+      latestSpot,
+      latestVwap,
+      latestCallWall,
+      latestPutWall,
+      latestZeroGamma,
     };
+  }, [displayData, stabilizedSeries, scaleMode, gammaLevels]);
+
+  if (!displayData || displayData.length < 2 || !chartModel || !stabilizedSeries) {
+    return (
+      <div
+        ref={containerRef}
+        className="w-full argon-card rounded-xl p-4 mb-3 flex items-center justify-between"
+      >
+        <div className="flex items-center gap-2.5">
+          <span className="h-2 w-2 rounded-full bg-cyan-400 animate-pulse" />
+          <span className="text-xs font-mono uppercase tracking-wider text-slate-300 font-semibold">
+            Intraday Price &amp; Flow VWAP
+          </span>
+        </div>
+        <span className="text-xs text-slate-400 font-mono">
+          Collecting intraday telemetry ({displayData?.length || 0}/2 pts)...
+        </span>
+      </div>
+    );
+  }
+
+  const svgW = containerWidth;
+  const svgH = height;
+  const padL = 54;
+  const padR = 138;
+  const padT = 18;
+  const padB = 26;
+  const innerW = Math.max(120, svgW - padL - padR);
+  const innerH = Math.max(80, svgH - padT - padB);
+
+  const {
+    yMin,
+    yMax,
+    yRange,
+    latestSpot,
+    latestVwap,
+    latestCallWall,
+    latestPutWall,
+    latestZeroGamma,
+  } = chartModel;
+
+  const toX = (i: number) => padL + (i / (displayData.length - 1)) * innerW;
+  const toY = (val: number) => padT + innerH - ((val - yMin) / yRange) * innerH;
+  const isInViewport = (val: number) => val >= yMin && val <= yMax;
+
+  // Build SVG points for Spot and Flow VWAP
+  const spotPoints = displayData.map((d, i) => `${toX(i).toFixed(1)},${toY(d.spot).toFixed(1)}`).join(" ");
+  const spotAreaPoints = `${toX(0).toFixed(1)},${(padT + innerH).toFixed(1)} ${spotPoints} ${toX(
+    displayData.length - 1
+  ).toFixed(1)},${(padT + innerH).toFixed(1)}`;
+
+  const hasFlowVwap = displayData.some((d) => typeof d.flowVwap === "number" && d.flowVwap > 0);
+  const vwapPoints = hasFlowVwap
+    ? displayData
+        .map((d, i) =>
+          typeof d.flowVwap === "number" && d.flowVwap > 0
+            ? `${toX(i).toFixed(1)},${toY(d.flowVwap).toFixed(1)}`
+            : null
+        )
+        .filter(Boolean)
+        .join(" ")
+    : "";
+
+  // ±1 Sigma Volatility Envelope Polygon
+  const hasBands = displayData.some(
+    (d) => typeof d.upper1s === "number" && typeof d.lower1s === "number"
+  );
+  const bandPolygon = hasBands
+    ? [
+        ...displayData.map((d, i) =>
+          typeof d.upper1s === "number"
+            ? `${toX(i).toFixed(1)},${Math.max(padT, Math.min(padT + innerH, toY(d.upper1s))).toFixed(1)}`
+            : null
+        ),
+        ...displayData
+          .slice()
+          .reverse()
+          .map((d, idx) => {
+            const i = displayData.length - 1 - idx;
+            return typeof d.lower1s === "number"
+              ? `${toX(i).toFixed(1)},${Math.max(padT, Math.min(padT + innerH, toY(d.lower1s))).toFixed(1)}`
+              : null;
+          }),
+      ]
+        .filter(Boolean)
+        .join(" ")
+    : "";
+
+  // Check if a wall shifted during the session and remains visible
+  const buildWallTrace = (series: number[]) => {
+    const valid = series.filter((v) => v > 0);
+    if (valid.length === 0) return { points: "", shifted: false };
+    const uniqueCount = new Set(valid.map((v) => v.toFixed(1))).size;
+    const allInside = valid.every((v) => isInViewport(v));
+    if (uniqueCount <= 1 || !allInside) return { points: "", shifted: false };
+    const pts = series
+      .map((v, i) => (v > 0 ? `${toX(i).toFixed(1)},${toY(v).toFixed(1)}` : null))
+      .filter(Boolean)
+      .join(" ");
+    return { points: pts, shifted: true };
+  };
+
+  const callWallTrace = buildWallTrace(stabilizedSeries.callWalls);
+  const putWallTrace = buildWallTrace(stabilizedSeries.putWalls);
+
+  // Assemble Right-Axis Badges for visible levels & de-collide
+  const rawBadges: RightBadgeItem[] = [
+    {
+      id: "spot",
+      label: `SPOT ${latestSpot.toFixed(2)}`,
+      price: latestSpot,
+      idealY: toY(latestSpot),
+      y: toY(latestSpot),
+      color: "#f8fafc",
+      bgFill: "#0284c7",
+      borderColor: "#38bdf8",
+      isPrimary: true,
+    },
+  ];
+
+  if (typeof latestVwap === "number" && latestVwap > 0 && isInViewport(latestVwap)) {
+    rawBadges.push({
+      id: "vwap",
+      label: `VWAP ${latestVwap.toFixed(2)}`,
+      price: latestVwap,
+      idealY: toY(latestVwap),
+      y: toY(latestVwap),
+      color: "#fde68a",
+      bgFill: "#451a03",
+      borderColor: "#f59e0b",
+    });
+  }
+
+  if (latestCallWall > 0 && isInViewport(latestCallWall)) {
+    rawBadges.push({
+      id: "call",
+      label: `CALL ${latestCallWall.toFixed(1)}`,
+      price: latestCallWall,
+      idealY: toY(latestCallWall),
+      y: toY(latestCallWall),
+      color: "#5eead4",
+      bgFill: "#042f2e",
+      borderColor: "#14b8a6",
+    });
+  }
+
+  if (latestPutWall > 0 && isInViewport(latestPutWall)) {
+    rawBadges.push({
+      id: "put",
+      label: `PUT ${latestPutWall.toFixed(1)}`,
+      price: latestPutWall,
+      idealY: toY(latestPutWall),
+      y: toY(latestPutWall),
+      color: "#f0abfc",
+      bgFill: "#3b0764",
+      borderColor: "#d946ef",
+    });
+  }
+
+  if (latestZeroGamma > 0 && isInViewport(latestZeroGamma)) {
+    rawBadges.push({
+      id: "zg",
+      label: `0G ${latestZeroGamma.toFixed(1)}`,
+      price: latestZeroGamma,
+      idealY: toY(latestZeroGamma),
+      y: toY(latestZeroGamma),
+      color: "#fdba74",
+      bgFill: "#431407",
+      borderColor: "#f97316",
+    });
+  }
+
+  const rightBadges = decollideLabels(rawBadges, padT + 10, padT + innerH - 10, 22);
+
+  // Left Y-Axis ticks (5 levels for enlarged height)
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map((pct) => {
+    const val = yMin + pct * yRange;
+    return { val, y: toY(val) };
   });
 
-  const visibleSeries = SERIES_CONFIG.filter((s) => !hiddenSeries[s.key]);
+  // Dynamic X-Axis Time Labels based on container width
+  const numTimeTicks = svgW >= 850 ? 6 : 4;
+  const timeIndices = Array.from({ length: numTimeTicks }, (_, idx) =>
+    Math.round((idx / (numTimeTicks - 1)) * (displayData.length - 1))
+  ).filter((v, i, a) => a.indexOf(v) === i);
 
-  const allValues = displayData
-    .flatMap((d) => {
-      const vals: (number | undefined)[] = [];
-      for (const s of visibleSeries) {
-        vals.push(d[s.key]);
-      }
-      if (showVwapBand && !hiddenSeries.flowVwap) {
-        vals.push(d.upper1s, d.lower1s);
-      }
-      return vals;
-    })
-    .filter((v): v is number => typeof v === "number" && !isNaN(v) && v > 0);
-
-  const mn = allValues.length ? Math.min(...allValues) : 0;
-  const mx = allValues.length ? Math.max(...allValues) : 100;
-  const mid = (mn + mx) / 2;
-  const pad = (mx - mn) * 0.08 || 1;
-
-  const W = 640;
-  const Ht = 128;
-  const padRight = 46;
-  const plotW = W - padRight;
-
-  const x = (i: number) => (i / Math.max(1, displayData.length - 1)) * plotW;
-  const y = (v: number) => Ht - ((v - mn + pad) / (mx - mn + 2 * pad)) * Ht;
-
-  const firstTime = displayData[0]?.time ?? "";
-  const lastTime = displayData[displayData.length - 1]?.time ?? "";
-
-  const activeIndex =
-    hoverIdx !== null && hoverIdx >= 0 && hoverIdx < displayData.length
-      ? hoverIdx
-      : Math.max(0, displayData.length - 1);
-  const activePoint = displayData[activeIndex];
-
-  const handlePointerMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    const svg = svgRef.current;
-    if (!svg || displayData.length < 2) return;
-    const rect = svg.getBoundingClientRect();
-    const relX = Math.max(0, Math.min(1, (e.clientX - rect.left) / (rect.width * (plotW / W))));
-    const idx = Math.round(relX * (displayData.length - 1));
-    setHoverIdx(Math.max(0, Math.min(displayData.length - 1, idx)));
-  };
-
-  const toggleSeries = (key: SeriesKey) => {
-    setHiddenSeries((prev) => ({ ...prev, [key]: !prev[key] }));
-  };
-
-  // Build polygon points for ±1σ Flow VWAP corridor
-  const bandPolygonPoints = (() => {
-    if (!showVwapBand || hiddenSeries.flowVwap || displayData.length < 2) return null;
-    const upperPts: string[] = [];
-    const lowerPts: string[] = [];
-    displayData.forEach((d, i) => {
-      if (d.upper1s != null && d.lower1s != null && !isNaN(d.upper1s) && !isNaN(d.lower1s)) {
-        upperPts.push(`${x(i).toFixed(1)},${y(d.upper1s).toFixed(1)}`);
-        lowerPts.unshift(`${x(i).toFixed(1)},${y(d.lower1s).toFixed(1)}`);
-      }
-    });
-    if (upperPts.length < 2) return null;
-    return [...upperPts, ...lowerPts].join(" ");
-  })();
-
-  const vwapSpread =
-    activePoint?.spot && activePoint?.flowVwap
-      ? activePoint.spot - activePoint.flowVwap
+  // Active point for hover crosshair or latest state
+  const activeIdx = hoverIdx !== null && hoverIdx < displayData.length ? hoverIdx : displayData.length - 1;
+  const activePt = displayData[activeIdx];
+  const activeCall = stabilizedSeries.callWalls[activeIdx] || latestCallWall;
+  const activePut = stabilizedSeries.putWalls[activeIdx] || latestPutWall;
+  const activeZG = stabilizedSeries.zeroGammas[activeIdx] || latestZeroGamma;
+  const vwapDelta =
+    typeof activePt.flowVwap === "number" && activePt.flowVwap > 0
+      ? activePt.spot - activePt.flowVwap
       : null;
 
+  const formatDist = (level: number) => {
+    if (!level || level <= 0) return "—";
+    const diff = level - activePt.spot;
+    return `${diff >= 0 ? "+" : ""}${diff.toFixed(1)}`;
+  };
+
   return (
-    <div className="argon-card rounded-xl p-4">
-      {/* Header: INTRADAY LEVELS on left, interactive telemetry & controls on right */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 pb-2 mb-2">
+    <div
+      ref={containerRef}
+      className="w-full argon-card rounded-xl px-4 py-3.5 mb-3 select-none"
+    >
+      {/* Top Header: Title, Live Telemetry Pill Strip, and Viewport Mode Toggle */}
+      <div className="flex flex-wrap items-center justify-between gap-2.5 mb-2.5">
         <div className="flex items-center gap-2.5">
-          <h4 className="text-[10px] font-mono font-bold uppercase tracking-widest text-slate-400">
-            INTRADAY LEVELS
-          </h4>
-          {activePoint && (
-            <span className="text-[10.5px] font-mono text-slate-300 tabular-nums bg-white/5 px-2 py-0.5 rounded border border-white/10">
-              {hoverIdx !== null ? (
-                <span className="text-cyan-300 font-semibold">{activePoint.time}</span>
-              ) : (
-                <span className="text-emerald-400 font-semibold">Latest ({activePoint.time})</span>
-              )}
-              {" · "}
-              Spot <b className="text-white">${activePoint.spot.toFixed(2)}</b>
-              {vwapSpread !== null && (
-                <span
-                  className={cn(
-                    "ml-1.5",
-                    vwapSpread >= 0 ? "text-emerald-400" : "text-rose-400"
-                  )}
-                >
-                  ({vwapSpread >= 0 ? "+" : ""}
-                  {vwapSpread.toFixed(2)} vs VWAP)
-                </span>
-              )}
+          <span className="h-2 w-2 rounded-full bg-sky-400 shadow-[0_0_8px_#38bdf8]" />
+          <span className="text-xs font-mono uppercase tracking-wider text-slate-100 font-bold">
+            Intraday Price &amp; Flow VWAP
+          </span>
+          {selectedExpiration && (
+            <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30">
+              {selectedExpiration}
+            </span>
+          )}
+          {hoverIdx !== null && (
+            <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-sky-300 border border-sky-500/30">
+              {activePt.time}
             </span>
           )}
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setShowVwapBand((v) => !v)}
-            className={cn(
-              "px-2 py-0.5 rounded text-[10px] font-mono font-semibold border transition-colors cursor-pointer",
-              showVwapBand
-                ? "bg-amber-500/15 border-amber-400/40 text-amber-300"
-                : "bg-white/5 border-white/10 text-slate-500 hover:text-slate-300"
+        {/* Structural Level Status Pills (Always visible even when off-chart in Focus Mode) */}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-900/95 border border-slate-800 text-[11px] font-mono">
+            <span className="text-slate-400">SPOT</span>
+            <span className="text-white font-bold">${activePt.spot.toFixed(2)}</span>
+            {vwapDelta !== null && (
+              <span
+                className={`text-[10px] px-1.5 py-0.5 rounded font-semibold ${
+                  vwapDelta >= 0
+                    ? "bg-emerald-500/15 text-emerald-300"
+                    : "bg-rose-500/15 text-rose-300"
+                }`}
+              >
+                {vwapDelta >= 0 ? "+" : ""}
+                {vwapDelta.toFixed(2)} vs VWAP
+              </span>
             )}
-            title="Toggle Flow VWAP ±1σ volatility band"
-          >
-            ±1σ VWAP Band
-          </button>
-          <span className="text-[11px] font-mono text-slate-500 font-normal">
-            today
-          </span>
+          </div>
+
+          {activeCall > 0 && (
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[11px] font-mono transition-opacity ${
+                isInViewport(activeCall)
+                  ? "bg-teal-950/40 border-teal-500/40 text-teal-200"
+                  : "bg-slate-900/70 border-slate-800 text-slate-300"
+              }`}
+              title={
+                isInViewport(activeCall)
+                  ? "Call Wall visible on chart"
+                  : "Call Wall outside focus band (switch to All Levels to view on axis)"
+              }
+            >
+              <span className="h-2 w-2 rounded-full bg-teal-400" />
+              <span className="text-slate-400">CALL</span>
+              <span className="font-semibold text-teal-300">{activeCall.toFixed(0)}</span>
+              <span className="text-[10px] text-slate-400">({formatDist(activeCall)})</span>
+              {!isInViewport(activeCall) && (
+                <span className="text-[10px] text-teal-400 font-bold">▲</span>
+              )}
+            </div>
+          )}
+
+          {activePut > 0 && (
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[11px] font-mono transition-opacity ${
+                isInViewport(activePut)
+                  ? "bg-fuchsia-950/40 border-fuchsia-500/40 text-fuchsia-200"
+                  : "bg-slate-900/70 border-slate-800 text-slate-300"
+              }`}
+              title={
+                isInViewport(activePut)
+                  ? "Put Wall visible on chart"
+                  : "Put Wall outside focus band (switch to All Levels to view on axis)"
+              }
+            >
+              <span className="h-2 w-2 rounded-full bg-fuchsia-400" />
+              <span className="text-slate-400">PUT</span>
+              <span className="font-semibold text-fuchsia-300">{activePut.toFixed(0)}</span>
+              <span className="text-[10px] text-slate-400">({formatDist(activePut)})</span>
+              {!isInViewport(activePut) && (
+                <span className="text-[10px] text-fuchsia-400 font-bold">▼</span>
+              )}
+            </div>
+          )}
+
+          {activeZG > 0 && (
+            <div
+              className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[11px] font-mono ${
+                isInViewport(activeZG)
+                  ? "bg-orange-950/40 border-orange-500/40 text-orange-200"
+                  : "bg-slate-900/70 border-slate-800 text-slate-300"
+              }`}
+            >
+              <span className="h-2 w-2 rounded-full bg-orange-400" />
+              <span className="text-slate-400">0γ</span>
+              <span className="font-semibold text-orange-300">{activeZG.toFixed(0)}</span>
+              <span className="text-[10px] text-slate-400">({formatDist(activeZG)})</span>
+            </div>
+          )}
+
+          {/* Viewport Scale Mode Toggle: Price Focus vs Full Range */}
+          <div className="flex items-center bg-slate-900 border border-slate-800 rounded-lg p-0.5 ml-1">
+            <button
+              type="button"
+              onClick={() => setScaleMode("focus")}
+              className={`px-2.5 py-1 rounded-md text-[11px] font-mono uppercase tracking-wider transition-all cursor-pointer ${
+                scaleMode === "focus"
+                  ? "bg-sky-500/20 text-sky-300 border border-sky-500/40 font-semibold shadow-sm"
+                  : "text-slate-400 hover:text-slate-200 border border-transparent"
+              }`}
+              title="Zoom Y-axis to intraday Spot, Flow VWAP & ±1 Sigma action"
+            >
+              Price Focus
+            </button>
+            <button
+              type="button"
+              onClick={() => setScaleMode("full")}
+              className={`px-2.5 py-1 rounded-md text-[11px] font-mono uppercase tracking-wider transition-all cursor-pointer ${
+                scaleMode === "full"
+                  ? "bg-sky-500/20 text-sky-300 border border-sky-500/40 font-semibold shadow-sm"
+                  : "text-slate-400 hover:text-slate-200 border border-transparent"
+              }`}
+              title="Fit all distant Call/Put walls inside Y-axis"
+            >
+              All Levels
+            </button>
+          </div>
         </div>
       </div>
 
-      {displayData.length < 2 ? (
-        <div className="py-4 text-xs font-mono text-slate-500">
-          Collecting — {displayData.length} snapshot{displayData.length === 1 ? "" : "s"} so far today; the chart appears after the next refresh.
-        </div>
-      ) : (
-        <div className="w-full">
-          <div className="relative">
-            <svg
-              ref={svgRef}
-              viewBox={`0 0 ${W} ${Ht}`}
-              onMouseMove={handlePointerMove}
-              onMouseLeave={() => setHoverIdx(null)}
-              className="w-full h-[128px] block cursor-crosshair select-none"
-            >
-              {/* Horizontal Reference Grid Lines & Right Axis Price Labels */}
-              {[mx, mid, mn].map((val, idx) => {
-                const py = y(val);
-                return (
-                  <g key={idx}>
-                    <line
-                      x1={0}
-                      y1={py}
-                      x2={plotW}
-                      y2={py}
-                      stroke="rgba(148, 163, 184, 0.12)"
-                      strokeWidth="1"
-                      strokeDasharray="2 3"
-                    />
-                    <text
-                      x={W - 2}
-                      y={Math.max(10, Math.min(Ht - 4, py + 3))}
-                      textAnchor="end"
-                      fill="#64748b"
-                      fontSize="9.5"
-                      fontFamily="monospace"
-                    >
-                      ${val.toFixed(1)}
-                    </text>
-                  </g>
-                );
-              })}
+      {/* Main Responsive 1:1 Pixel-Exact SVG Canvas */}
+      <div className="relative w-full select-none">
+        <svg
+          viewBox={`0 0 ${svgW} ${svgH}`}
+          style={{ width: "100%", height: `${svgH}px` }}
+          className="block w-full overflow-visible cursor-crosshair"
+          onMouseMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            const relX = e.clientX - rect.left;
+            const plotLeft = padL;
+            const plotWidth = innerW;
+            const ratio = Math.max(0, Math.min(1, (relX - plotLeft) / Math.max(1, plotWidth)));
+            const idx = Math.round(ratio * (displayData.length - 1));
+            setHoverIdx(idx);
+          }}
+          onMouseLeave={() => setHoverIdx(null)}
+        >
+          <defs>
+            <linearGradient id="intradaySpotGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.26" />
+              <stop offset="75%" stopColor="#38bdf8" stopOpacity="0.05" />
+              <stop offset="100%" stopColor="#38bdf8" stopOpacity="0.0" />
+            </linearGradient>
+            <clipPath id="intradayPlotClip">
+              <rect x={padL} y={padT} width={innerW} height={innerH} rx="3" />
+            </clipPath>
+          </defs>
 
-              {/* Flow VWAP ±1σ Shaded Band */}
-              {bandPolygonPoints && (
-                <polygon
-                  points={bandPolygonPoints}
-                  fill="rgba(234, 179, 8, 0.10)"
-                  stroke="rgba(234, 179, 8, 0.25)"
-                  strokeWidth="0.6"
+          {/* Subtle Plot Background */}
+          <rect
+            x={padL}
+            y={padT}
+            width={innerW}
+            height={innerH}
+            fill="#090d16"
+            rx="4"
+            stroke="#1e293b"
+            strokeWidth="1"
+          />
+
+          {/* Horizontal Price Grid Lines & Left Y-Axis Labels */}
+          {yTicks.map((t, i) => (
+            <g key={i}>
+              <line
+                x1={padL}
+                x2={padL + innerW}
+                y1={t.y}
+                y2={t.y}
+                stroke="#1e293b"
+                strokeDasharray={i === 0 || i === yTicks.length - 1 ? "none" : "3,3"}
+                strokeWidth="1"
+              />
+              <text
+                x={padL - 8}
+                y={t.y + 3.5}
+                textAnchor="end"
+                fontSize="10.5"
+                fill="#94a3b8"
+                fontFamily="monospace"
+                fontWeight="500"
+              >
+                {t.val.toFixed(1)}
+              </text>
+            </g>
+          ))}
+
+          {/* Clipped Plot Area so off-scale walls never overflow */}
+          <g clipPath="url(#intradayPlotClip)">
+            {/* ±1 Sigma Dealer Flow VWAP Shaded Band */}
+            {bandPolygon && (
+              <polygon
+                points={bandPolygon}
+                fill="#f59e0b"
+                fillOpacity="0.09"
+                stroke="#f59e0b"
+                strokeOpacity="0.22"
+                strokeWidth="0.9"
+                strokeDasharray="3,3"
+              />
+            )}
+
+            {/* Historical Wall Step Traces (only if wall genuinely migrated in-bounds) */}
+            {callWallTrace.shifted && (
+              <polyline
+                fill="none"
+                stroke="#14b8a6"
+                strokeWidth="1.3"
+                strokeOpacity="0.38"
+                strokeDasharray="3,3"
+                points={callWallTrace.points}
+              />
+            )}
+            {putWallTrace.shifted && (
+              <polyline
+                fill="none"
+                stroke="#d946ef"
+                strokeWidth="1.3"
+                strokeOpacity="0.38"
+                strokeDasharray="3,3"
+                points={putWallTrace.points}
+              />
+            )}
+
+            {/* Clean Horizontal Structural Reference Rays for Active Session Levels */}
+            {latestZeroGamma > 0 && isInViewport(latestZeroGamma) && (
+              <line
+                x1={padL}
+                x2={padL + innerW}
+                y1={toY(latestZeroGamma)}
+                y2={toY(latestZeroGamma)}
+                stroke="#f97316"
+                strokeWidth="1.4"
+                strokeDasharray="5,4"
+                strokeOpacity="0.8"
+              />
+            )}
+
+            {latestCallWall > 0 && isInViewport(latestCallWall) && (
+              <line
+                x1={padL}
+                x2={padL + innerW}
+                y1={toY(latestCallWall)}
+                y2={toY(latestCallWall)}
+                stroke="#14b8a6"
+                strokeWidth="1.6"
+                strokeDasharray="6,3"
+                strokeOpacity="0.9"
+              />
+            )}
+
+            {latestPutWall > 0 && isInViewport(latestPutWall) && (
+              <line
+                x1={padL}
+                x2={padL + innerW}
+                y1={toY(latestPutWall)}
+                y2={toY(latestPutWall)}
+                stroke="#d946ef"
+                strokeWidth="1.6"
+                strokeDasharray="6,3"
+                strokeOpacity="0.9"
+              />
+            )}
+
+            {/* Spot Price Gradient Area & Primary Line */}
+            <polygon points={spotAreaPoints} fill="url(#intradaySpotGrad)" />
+
+            {/* Flow Gamma VWAP Curve */}
+            {vwapPoints && (
+              <polyline
+                fill="none"
+                stroke="#f59e0b"
+                strokeWidth="2.0"
+                strokeLinejoin="round"
+                strokeLinecap="round"
+                points={vwapPoints}
+              />
+            )}
+
+            {/* Bold Primary Spot Curve */}
+            <polyline
+              fill="none"
+              stroke="#38bdf8"
+              strokeWidth="2.5"
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              points={spotPoints}
+            />
+
+            {/* Hover Scrub Crosshair */}
+            {hoverIdx !== null && (
+              <g>
+                <line
+                  x1={toX(hoverIdx)}
+                  x2={toX(hoverIdx)}
+                  y1={padT}
+                  y2={padT + innerH}
+                  stroke="#94a3b8"
+                  strokeWidth="1.1"
+                  strokeDasharray="3,3"
                 />
-              )}
-
-              {/* Polylines for each active series */}
-              {visibleSeries.map((s) => {
-                const pts = displayData
-                  .map((d, i) => {
-                    const val = d[s.key];
-                    if (val == null || isNaN(val)) return null;
-                    return `${x(i).toFixed(1)},${y(val).toFixed(1)}`;
-                  })
-                  .filter(Boolean);
-
-                if (pts.length < 2) return null;
-
-                return (
-                  <polyline
-                    key={s.key}
-                    points={pts.join(" ")}
-                    fill="none"
-                    stroke={s.color}
-                    strokeWidth={s.strokeWidth}
-                    vectorEffect="non-scaling-stroke"
-                    strokeDasharray={s.dashed ? "4 3" : undefined}
+                <circle
+                  cx={toX(hoverIdx)}
+                  cy={toY(activePt.spot)}
+                  r="4.5"
+                  fill="#38bdf8"
+                  stroke="#0f172a"
+                  strokeWidth="1.8"
+                />
+                {typeof activePt.flowVwap === "number" && activePt.flowVwap > 0 && (
+                  <circle
+                    cx={toX(hoverIdx)}
+                    cy={toY(activePt.flowVwap)}
+                    r="3.5"
+                    fill="#f59e0b"
+                    stroke="#0f172a"
+                    strokeWidth="1.4"
                   />
-                );
-              })}
+                )}
+              </g>
+            )}
 
-              {/* Interactive Hover Crosshair & Active Dots */}
-              {hoverIdx !== null && activePoint && (
-                <g>
-                  <line
-                    x1={x(hoverIdx)}
-                    y1={0}
-                    x2={x(hoverIdx)}
-                    y2={Ht}
-                    stroke="rgba(56, 189, 248, 0.55)"
-                    strokeWidth="1"
-                    strokeDasharray="3 2"
-                  />
-                  {visibleSeries.map((s) => {
-                    const val = activePoint[s.key];
-                    if (val == null || isNaN(val)) return null;
-                    return (
-                      <circle
-                        key={s.key}
-                        cx={x(hoverIdx)}
-                        cy={y(val)}
-                        r={3.2}
-                        fill={s.color}
-                        stroke="#0b0d17"
-                        strokeWidth="1.2"
-                      />
-                    );
-                  })}
-                </g>
-              )}
-            </svg>
-          </div>
+            {/* Latest Live Pulse Dot on Spot */}
+            <circle
+              cx={toX(displayData.length - 1)}
+              cy={toY(latestSpot)}
+              r="4"
+              fill="#38bdf8"
+              stroke="#0f172a"
+              strokeWidth="1.6"
+            />
+          </g>
 
-          {/* Footer: Interactive Toggleable Legend on left, summary on right */}
-          <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono text-slate-400 pt-2 border-t border-white/5 mt-2">
-            <div className="flex flex-wrap items-center gap-2">
-              {SERIES_CONFIG.map((s) => {
-                const isHidden = Boolean(hiddenSeries[s.key]);
-                const val = activePoint?.[s.key];
-                return (
-                  <button
-                    key={s.key}
-                    type="button"
-                    onClick={() => toggleSeries(s.key)}
-                    style={{ color: isHidden ? "#64748b" : s.color }}
-                    className={cn(
-                      "inline-flex items-center gap-1.5 px-2 py-0.5 rounded border transition-all cursor-pointer",
-                      isHidden
-                        ? "border-white/5 bg-transparent opacity-45 line-through"
-                        : "border-white/10 bg-white/[0.03] hover:bg-white/[0.07]"
-                    )}
-                    title={`Click to ${isHidden ? "show" : "hide"} ${s.label}`}
-                  >
-                    <i
-                      style={{ backgroundColor: isHidden ? "#64748b" : s.color }}
-                      className="inline-block w-2.5 h-[2px] align-middle"
-                    />
-                    <span>{s.label}</span>
-                    {val != null && !isNaN(val) && !isHidden && (
-                      <b className="font-bold tabular-nums opacity-95">
-                        {val.toFixed(s.key === "spot" || s.key === "flowVwap" ? 2 : 1)}
-                      </b>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-            <div className="text-slate-500 tabular-nums ml-auto">
-              {firstTime}–{lastTime} · {displayData.length} pts · {mn.toFixed(1)}–{mx.toFixed(1)}
-            </div>
-          </div>
+          {/* Right-Gutter De-Collided Level Pills */}
+          {rightBadges.map((b) => (
+            <g key={b.id}>
+              {/* Leader line from plot edge to de-collided badge */}
+              <line
+                x1={padL + innerW}
+                y1={Math.max(padT, Math.min(padT + innerH, b.idealY))}
+                x2={padL + innerW + 8}
+                y2={b.y}
+                stroke={b.borderColor}
+                strokeWidth="1.2"
+                strokeOpacity="0.75"
+              />
+              <rect
+                x={padL + innerW + 8}
+                y={b.y - 10}
+                width={padR - 12}
+                height={20}
+                rx="4"
+                fill={b.bgFill}
+                stroke={b.borderColor}
+                strokeWidth={b.isPrimary ? "1.4" : "1"}
+              />
+              <text
+                x={padL + innerW + 14}
+                y={b.y + 3.8}
+                fontSize="10.5"
+                fontFamily="monospace"
+                fontWeight={b.isPrimary ? "700" : "600"}
+                fill={b.color}
+              >
+                {b.label}
+              </text>
+            </g>
+          ))}
+
+          {/* X-Axis Time Labels */}
+          {timeIndices.map((idx) => (
+            <text
+              key={idx}
+              x={toX(idx)}
+              y={svgH - 6}
+              textAnchor="middle"
+              fontSize="10.5"
+              fill="#94a3b8"
+              fontFamily="monospace"
+              fontWeight="500"
+            >
+              {displayData[idx].time}
+            </text>
+          ))}
+        </svg>
+      </div>
+
+      {/* Clean Minimalist Legend & Off-Chart Beacon Footer */}
+      <div className="flex flex-wrap items-center justify-between gap-2 mt-2 pt-2 border-t border-slate-800/60 text-[11px] font-mono text-slate-400">
+        <div className="flex flex-wrap items-center gap-4">
+          <span className="inline-flex items-center gap-1.5 text-slate-200">
+            <span className="w-3.5 h-0.5 bg-sky-400 inline-block rounded" /> Spot Price
+          </span>
+          {hasFlowVwap && (
+            <span className="inline-flex items-center gap-1.5 text-amber-300/90">
+              <span className="w-3.5 h-0.5 bg-amber-400 inline-block rounded" /> Flow VWAP (±1σ Band)
+            </span>
+          )}
+          <span className="inline-flex items-center gap-1.5 text-teal-300/90">
+            <span className="w-3.5 h-0 border-t-2 border-dashed border-teal-400 inline-block" /> Call Wall
+          </span>
+          <span className="inline-flex items-center gap-1.5 text-fuchsia-300/90">
+            <span className="w-3.5 h-0 border-t-2 border-dashed border-fuchsia-400 inline-block" /> Put Wall
+          </span>
+          <span className="inline-flex items-center gap-1.5 text-orange-300/90">
+            <span className="w-3.5 h-0 border-t-2 border-dashed border-orange-400 inline-block" /> Zero Gamma
+          </span>
         </div>
-      )}
+
+        <span className="text-[10.5px] text-slate-400">
+          {scaleMode === "focus"
+            ? "3-pt median stabilized · Price Focus active"
+            : "3-pt median stabilized · Full Wall Range"}
+        </span>
+      </div>
     </div>
   );
 }
-
