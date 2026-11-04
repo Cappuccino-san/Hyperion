@@ -483,7 +483,30 @@ async function fetchLiveOptionsBuckets(
     throw new Error("Live CBOE options feed returned empty option chain");
   }
 
-  const liveSpot = Number(data.current_price ?? data.close ?? referenceSpot);
+  let liveSpot = Number(data.current_price ?? data.close ?? referenceSpot);
+
+  // Synchronize live spot with sub-second Robinhood exchange quote
+  try {
+    const sym = ticker.trim().toUpperCase();
+    const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym === "NDX" || sym === "NDXP" ? "QQQ" : sym;
+    const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
+      },
+      cache: "no-store",
+    });
+    if (rhRes.ok) {
+      const rhJson = await rhRes.json();
+      const p = Number(rhJson?.results?.[0]?.last_trade_price ?? rhJson?.results?.[0]?.bid_price ?? 0);
+      if (p > 0 && Number.isFinite(p)) {
+        const mult = sym === "SPX" || sym === "SPXW" ? 10 : 1;
+        liveSpot = Number((p * mult).toFixed(2));
+      }
+    }
+  } catch {
+    // Non-fatal
+  }
   const rawIv30 = Number(data.iv30 ?? 15);
   const iv30Decimal = rawIv30 > 2 ? rawIv30 / 100 : rawIv30;
 

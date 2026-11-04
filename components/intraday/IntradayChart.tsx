@@ -2,6 +2,7 @@
 
 import React, { useState, useMemo, useRef, useEffect } from "react";
 import { IntradayPoint, useDashboardStore } from "@/store/useDashboardStore";
+import { computeCeilingShareChi } from "@/lib/flowGammaVwap";
 
 interface IntradayChartProps {
   points?: IntradayPoint[];
@@ -136,11 +137,17 @@ export function IntradayChart({
     );
     return valid.map((d) => {
       const fw = d.flowVwap ?? flowGammaVwapData?.flowVwap;
+      const u1 = d.upper1s ?? (fw && sigma > 0 ? Number((fw + sigma).toFixed(2)) : undefined);
+      const l1 = d.lower1s ?? (fw && sigma > 0 ? Number((fw - sigma).toFixed(2)) : undefined);
+      const u2 = d.upper2s ?? (fw && sigma > 0 ? Number((fw + 2 * sigma).toFixed(2)) : undefined);
+      const l2 = d.lower2s ?? (fw && sigma > 0 ? Number((fw - 2 * sigma).toFixed(2)) : undefined);
       return {
         ...d,
         flowVwap: fw,
-        upper1s: d.upper1s ?? (fw && sigma > 0 ? Number((fw + sigma).toFixed(2)) : undefined),
-        lower1s: d.lower1s ?? (fw && sigma > 0 ? Number((fw - sigma).toFixed(2)) : undefined),
+        upper1s: u1,
+        lower1s: l1,
+        upper2s: u2,
+        lower2s: l2,
       };
     });
   }, [rawPoints, flowGammaVwapData?.flowVwap, sigma]);
@@ -296,7 +303,7 @@ export function IntradayChart({
         .join(" ")
     : "";
 
-  // ±1 Sigma Volatility Envelope Polygon
+  // ±1 Sigma & ±2 Sigma Volatility Envelope Polygons
   const hasBands = displayData.some(
     (d) => typeof d.upper1s === "number" && typeof d.lower1s === "number"
   );
@@ -320,6 +327,45 @@ export function IntradayChart({
         .filter(Boolean)
         .join(" ")
     : "";
+
+  const upper2Points = hasBands
+    ? displayData
+        .map((d, i) =>
+          typeof d.upper2s === "number"
+            ? `${toX(i).toFixed(1)},${Math.max(padT, Math.min(padT + innerH, toY(d.upper2s))).toFixed(1)}`
+            : null
+        )
+        .filter(Boolean)
+        .join(" ")
+    : "";
+
+  const lower2Points = hasBands
+    ? displayData
+        .map((d, i) =>
+          typeof d.lower2s === "number"
+            ? `${toX(i).toFixed(1)},${Math.max(padT, Math.min(padT + innerH, toY(d.lower2s))).toFixed(1)}`
+            : null
+        )
+        .filter(Boolean)
+        .join(" ")
+    : "";
+
+  // Flux Field PDE Péclet number & Ceiling Share chi
+  const corridorWidth = Math.max(1.0, Math.abs(latestCallWall - latestPutWall) || yRange);
+  const driftEst =
+    displayData.length >= 2
+      ? (displayData[displayData.length - 1].spot - displayData[0].spot) /
+        Math.max(1, displayData.length)
+      : 0;
+  const gammaDiffEst = Math.max(0.05, (corridorWidth * corridorWidth) / 140);
+  const pecletNumber = Number(
+    Math.max(-15, Math.min(15, (driftEst * 2.5 * corridorWidth) / gammaDiffEst)).toFixed(2)
+  );
+  const ceilingShareChi = computeCeilingShareChi(pecletNumber);
+  const nodeMidpoint =
+    latestCallWall > 0 && latestPutWall > 0
+      ? Number(((latestCallWall + latestPutWall) / 2).toFixed(2))
+      : 0;
 
   // Check if a wall shifted during the session and remains visible
   const buildWallTrace = (series: number[]) => {
@@ -540,6 +586,21 @@ export function IntradayChart({
             </div>
           )}
 
+          {/* Flux Field PDE Telemetry Badge (Ceiling Share Chi & Péclet Drift) */}
+          <div
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-950/35 border border-amber-500/35 text-[11px] font-mono text-amber-200"
+            title="Flux Field PDE Ceiling Share χ(Pe) and Péclet Drift Number Pe = μ_Δ W / Γ"
+          >
+            <span className="text-amber-400 font-bold">FLUX χ</span>
+            <span className="font-semibold text-white">
+              {(ceilingShareChi * 100).toFixed(0)}%
+            </span>
+            <span className="text-[10px] text-amber-300/80">
+              (Pe {pecletNumber >= 0 ? "+" : ""}
+              {pecletNumber.toFixed(1)})
+            </span>
+          </div>
+
           {/* Viewport Scale Mode Toggle: Price Focus vs Full Range */}
           <div className="flex items-center bg-slate-900 border border-slate-800 rounded-lg p-0.5 ml-1">
             <button
@@ -645,9 +706,45 @@ export function IntradayChart({
                 fill="#f59e0b"
                 fillOpacity="0.09"
                 stroke="#f59e0b"
-                strokeOpacity="0.22"
+                strokeOpacity="0.32"
                 strokeWidth="0.9"
-                strokeDasharray="3,3"
+                strokeDasharray="2,2.5"
+              />
+            )}
+
+            {/* ±2 Sigma Outer Dispersion Dotted Bands */}
+            {upper2Points && (
+              <polyline
+                fill="none"
+                stroke="#cbd5e1"
+                strokeOpacity="0.45"
+                strokeWidth="1.0"
+                strokeDasharray="2,2.5"
+                points={upper2Points}
+              />
+            )}
+            {lower2Points && (
+              <polyline
+                fill="none"
+                stroke="#cbd5e1"
+                strokeOpacity="0.45"
+                strokeWidth="1.0"
+                strokeDasharray="2,2.5"
+                points={lower2Points}
+              />
+            )}
+
+            {/* Equilibrium Midpoint Ray (lim_{t->inf} VWAP_flow = P/2) */}
+            {nodeMidpoint > 0 && isInViewport(nodeMidpoint) && (
+              <line
+                x1={padL}
+                x2={padL + innerW}
+                y1={toY(nodeMidpoint)}
+                y2={toY(nodeMidpoint)}
+                stroke="#e2e8f0"
+                strokeWidth="1.0"
+                strokeDasharray="1.5,2.5"
+                strokeOpacity="0.45"
               />
             )}
 

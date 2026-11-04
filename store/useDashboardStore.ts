@@ -639,6 +639,11 @@ export interface DashboardState {
   setUiMode: (mode: "signal" | "quant") => void;
   connectionStatus: "LIVE" | "SYNCING" | "RECONNECTING" | "OFFLINE";
   isStaleSnapshot: boolean;
+  liveTickPrice: number | null;
+  liveTickTimestamp: number;
+  liveTickDirection: "up" | "down" | "flat";
+  liveTickCount: number;
+  setLiveTick: (ticker: string, price: number, timestamp?: number) => void;
   playbookPayload: PlaybookPayload | null;
   setPlaybookPayload: (payload: PlaybookPayload) => void;
   fetchPlaybook: () => Promise<void>;
@@ -675,6 +680,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   connectionStatus: "LIVE",
   isStaleSnapshot: false,
   isLoadingChain: false,
+  liveTickPrice: null,
+  liveTickTimestamp: 0,
+  liveTickDirection: "flat",
+  liveTickCount: 0,
   toastMessage: null,
   lastUpdated: "19:04 UTC",
   bookTimestamp: null,
@@ -836,6 +845,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         activeTicker: preset.ticker,
         isLoadingChain: true,
         spotPrice: preset.spotPrice,
+        liveTickPrice: null,
+        liveTickTimestamp: 0,
+        liveTickDirection: "flat",
         previousClose: preset.previousClose,
         impliedVolatility: preset.impliedVolatility,
         strikeStep: preset.strikeStep,
@@ -875,6 +887,22 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     });
     get().fetchFlowGammaVwap(preset.ticker).catch(() => {});
   },
+
+  setLiveTick: (ticker, price, timestamp = Date.now()) =>
+    set((state) => {
+      if (ticker.toUpperCase() !== state.activeTicker.toUpperCase()) return state;
+      if (!Number.isFinite(price) || price <= 0) return state;
+      const prev = state.liveTickPrice ?? state.spotPrice;
+      const direction: "up" | "down" | "flat" =
+        price > prev + 0.001 ? "up" : price < prev - 0.001 ? "down" : state.liveTickDirection;
+      return {
+        spotPrice: price,
+        liveTickPrice: price,
+        liveTickTimestamp: timestamp,
+        liveTickDirection: direction,
+        liveTickCount: state.liveTickCount + 1,
+      };
+    }),
 
   updateSpot: (newSpot, timeLabel) => {
     const roundedSpot = Number(newSpot.toFixed(2));

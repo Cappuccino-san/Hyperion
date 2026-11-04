@@ -13,6 +13,9 @@ import {
   FlowGammaVwapEngine,
   calculateDollarGammaWeight,
   computeBarFlowGammaVwapSeries,
+  computeCeilingShareChi,
+  computeSpectralModes,
+  evaluateSpectralFlowAndFluxAtTau,
 } from "../flowGammaVwap";
 
 console.log("\n=======================================================");
@@ -175,6 +178,62 @@ runTest("computeBarFlowGammaVwapSeries generates valid sequential trajectory", (
     assert.ok(pt.lower1s > pt.lower2s, `Point ${i} Lower 1s > Lower 2s`);
     assert.ok(!Number.isNaN(pt.sigma), `Point ${i} Sigma must not be NaN`);
   });
+});
+
+// -------------------------------------------------------------
+// Test 6: Spectral Diffusion Flow VWAP & Flux Field PDEs (Pe, chi, J_c, A(T))
+// -------------------------------------------------------------
+runTest("Spectral Flow VWAP & Flux Field PDEs satisfy boundary conditions and chi in (0, 1)", () => {
+  // Verify chi = 1 / (1 - e^{-Pe}) - 1 / Pe sits strictly inside (0, 1)
+  const chiZero = computeCeilingShareChi(0);
+  assert.strictEqual(chiZero, 0.5, "At Pe = 0, ceiling share chi must equal 0.5");
+
+  const chiPos = computeCeilingShareChi(3.0);
+  const chiNeg = computeCeilingShareChi(-3.0);
+  assert.ok(chiPos > 0.5 && chiPos < 1.0, `chi(3.0) = ${chiPos} must sit strictly in (0.5, 1)`);
+  assert.ok(chiNeg > 0.0 && chiNeg < 0.5, `chi(-3.0) = ${chiNeg} must sit strictly in (0, 0.5)`);
+  assert.ok(Math.abs(chiPos + chiNeg - 1.0) < 1e-3, "chi(Pe) + chi(-Pe) === 1 symmetry");
+
+  // Verify Spectral Flow VWAP converges to midpoint p_F + W/2 as tau -> infinity
+  const pF = 700;
+  const pC = 720;
+  const W = pC - pF;
+  const modes = computeSpectralModes({
+    openingProfile: (x) => 5000 * Math.exp(-Math.pow((x - 16) / 1.5, 2)),
+    W,
+    sigmaC: 100,
+    muDelta: 0.2,
+    gammaDiff: 2.0,
+  });
+  const early = evaluateSpectralFlowAndFluxAtTau({
+    tauMinutes: 1,
+    floorNode: pF,
+    ceilingNode: pC,
+    A: modes.A,
+    B: modes.B,
+    kappa: 0.4,
+    gammaDiff: 2.0,
+    muDelta: 0.2,
+    sigmaC: 100,
+  });
+  const late = evaluateSpectralFlowAndFluxAtTau({
+    tauMinutes: 5000,
+    floorNode: pF,
+    ceilingNode: pC,
+    A: modes.A,
+    B: modes.B,
+    kappa: 0.4,
+    gammaDiff: 2.0,
+    muDelta: 0.2,
+    sigmaC: 100,
+  });
+
+  assert.ok(early.spectralFlowVwap > 710, "Early spectral Flow VWAP reflects upper opening flow (> 710)");
+  assert.ok(
+    Math.abs(late.spectralFlowVwap - 710) < 0.05,
+    `As t -> infinity, spectral Flow VWAP (${late.spectralFlowVwap}) reverts to midpoint P/2 (710)`
+  );
+  assert.ok(late.fluxAlpha > early.fluxAlpha, "Flux Alpha A(T) grows monotonically as T increases");
 });
 
 console.log(`\n=======================================================`);

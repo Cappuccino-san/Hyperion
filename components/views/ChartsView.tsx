@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { getTickerPreset, useDashboardStore } from "@/store/useDashboardStore";
 import { OptionsAnalyticsPayload } from "@/lib/optionsExposure";
+import { computeBarFlowGammaVwapSeries } from "@/lib/flowGammaVwap";
 import { cn } from "@/lib/utils";
 
 const TIMEFRAMES = [
@@ -167,10 +168,33 @@ function InstitutionalChartCard({
     [symbol, spot, prevClose, callWall, putWall, timeframe]
   );
 
+  // Compute Flow VWAP & Flux Field PDE series across session candles
+  const flowSeries = useMemo(
+    () =>
+      computeBarFlowGammaVwapSeries(
+        candles.map((c, idx) => ({
+          timestamp: idx * 300,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          volume: 1500,
+        })),
+        undefined,
+        {
+          floorNode: putWall,
+          ceilingNode: callWall,
+        }
+      ),
+    [candles, putWall, callWall]
+  );
+
   const latestBar = candles[candles.length - 1];
+  const latestFlow = flowSeries[flowSeries.length - 1];
 
   const allPrices = [
     ...candles.flatMap((c) => [c.high, c.low, c.sma34, c.sma5d]),
+    ...flowSeries.flatMap((f) => [f.flowVwap, f.upper2Sigma, f.lower2Sigma]),
     callWall,
     putWall,
     zeroGamma,
@@ -209,6 +233,32 @@ function InstitutionalChartCard({
   const sma5dPoints = candles
     .map((c, i) => `${idxToX(i).toFixed(1)},${priceToY(c.sma5d).toFixed(1)}`)
     .join(" ");
+
+  const flowVwapPoints = flowSeries
+    .map((f, i) => `${idxToX(i).toFixed(1)},${priceToY(f.flowVwap).toFixed(1)}`)
+    .join(" ");
+  const upper1Points = flowSeries
+    .map((f, i) => `${idxToX(i).toFixed(1)},${priceToY(f.upper1Sigma).toFixed(1)}`)
+    .join(" ");
+  const lower1Points = flowSeries
+    .map((f, i) => `${idxToX(i).toFixed(1)},${priceToY(f.lower1Sigma).toFixed(1)}`)
+    .join(" ");
+  const upper2Points = flowSeries
+    .map((f, i) => `${idxToX(i).toFixed(1)},${priceToY(f.upper2Sigma).toFixed(1)}`)
+    .join(" ");
+  const lower2Points = flowSeries
+    .map((f, i) => `${idxToX(i).toFixed(1)},${priceToY(f.lower2Sigma).toFixed(1)}`)
+    .join(" ");
+  const flowBandPolygon = [
+    ...flowSeries.map((f, i) => `${idxToX(i).toFixed(1)},${priceToY(f.upper2Sigma).toFixed(1)}`),
+    ...flowSeries
+      .slice()
+      .reverse()
+      .map((f, revIdx) => {
+        const i = flowSeries.length - 1 - revIdx;
+        return `${idxToX(i).toFixed(1)},${priceToY(f.lower2Sigma).toFixed(1)}`;
+      }),
+  ].join(" ");
 
   const structuralLevels = [
     {
@@ -323,6 +373,15 @@ function InstitutionalChartCard({
             </span>
           </div>
 
+          <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 border border-amber-400/35 px-2.5 py-0.5 text-amber-300">
+            <span className="h-2 w-2 rounded-full bg-amber-400" />
+            Flow VWAP: ${latestFlow?.flowVwap.toFixed(1)}
+          </span>
+          <span className="inline-flex items-center gap-1 rounded-full bg-cyan-500/10 border border-cyan-400/30 px-2.5 py-0.5 text-cyan-300">
+            Flux χ: {((latestFlow?.ceilingShareChi ?? 0.5) * 100).toFixed(0)}% (Pe{" "}
+            {(latestFlow?.pecletNumber ?? 0) >= 0 ? "+" : ""}
+            {(latestFlow?.pecletNumber ?? 0).toFixed(1)})
+          </span>
           <span className="inline-flex items-center gap-1 rounded-full bg-rose-500/10 border border-rose-400/30 px-2.5 py-0.5 text-rose-300">
             <span className="h-2 w-2 rounded-full bg-rose-400" />
             SMA 34: ${latestBar.sma34.toFixed(1)}
@@ -360,6 +419,11 @@ function InstitutionalChartCard({
             <span className="text-[#f5365c]">PW ${putWall.toFixed(0)}</span>
             <span>·</span>
             <span className="text-slate-300">0γ ${zeroGamma.toFixed(1)}</span>
+            <span>·</span>
+            <span className="text-amber-300 font-semibold">
+              FVWAP ${latestFlow?.flowVwap.toFixed(1)} (χ{" "}
+              {((latestFlow?.ceilingShareChi ?? 0.5) * 100).toFixed(0)}%)
+            </span>
           </div>
         </div>
 
@@ -465,6 +529,49 @@ function InstitutionalChartCard({
             );
           })}
 
+          {/* Flow VWAP ±2σ / ±1σ Dispersion Cloud & Centerline */}
+          {flowBandPolygon && (
+            <polygon
+              points={flowBandPolygon}
+              fill="rgba(245, 158, 11, 0.045)"
+            />
+          )}
+          <polyline
+            fill="none"
+            stroke="rgba(203, 213, 225, 0.5)"
+            strokeWidth="1.1"
+            strokeDasharray="2 2.5"
+            points={upper2Points}
+          />
+          <polyline
+            fill="none"
+            stroke="rgba(203, 213, 225, 0.5)"
+            strokeWidth="1.1"
+            strokeDasharray="2 2.5"
+            points={lower2Points}
+          />
+          <polyline
+            fill="none"
+            stroke="rgba(148, 163, 184, 0.38)"
+            strokeWidth="1.0"
+            strokeDasharray="1.5 2.5"
+            points={upper1Points}
+          />
+          <polyline
+            fill="none"
+            stroke="rgba(148, 163, 184, 0.38)"
+            strokeWidth="1.0"
+            strokeDasharray="1.5 2.5"
+            points={lower1Points}
+          />
+          <polyline
+            fill="none"
+            stroke="#f59e0b"
+            strokeWidth="2.2"
+            points={flowVwapPoints}
+            opacity={0.96}
+          />
+
           {/* SMA 5D (Purple) & SMA 34 (Coral) Polylines */}
           <polyline
             fill="none"
@@ -515,6 +622,59 @@ function InstitutionalChartCard({
             );
           })}
 
+          {/* Tick-Level Accuracy Wick Markers on ±1σ / ±2σ Flow Bands */}
+          {flowSeries.map((f, idx) => {
+            if (!f.bandSignal) return null;
+            const x = idxToX(idx);
+            const isUpper =
+              f.bandSignal === "UPPER_2S_REJECT" ||
+              f.bandSignal === "UPPER_1S_REJECT";
+            const y = priceToY(
+              isUpper
+                ? candles[idx]?.high ?? f.upper1Sigma
+                : candles[idx]?.low ?? f.lower1Sigma
+            );
+            const color = isUpper ? "#f43f5e" : "#10b981";
+            return (
+              <g key={`band-sig-${idx}`}>
+                <circle
+                  cx={x}
+                  cy={y}
+                  r={5.5}
+                  fill="none"
+                  stroke="#facc15"
+                  strokeWidth="1.2"
+                  strokeDasharray="2 2"
+                />
+                <circle cx={x} cy={y} r={2.5} fill={color} />
+              </g>
+            );
+          })}
+
+          {/* Flow VWAP Tag on Right Y-Axis */}
+          {latestFlow && (
+            <g>
+              <rect
+                x={plotRight + 4}
+                y={priceToY(latestFlow.flowVwap) - 8}
+                width={84}
+                height={16}
+                rx={3}
+                fill="#f59e0b"
+              />
+              <text
+                x={plotRight + 8}
+                y={priceToY(latestFlow.flowVwap) + 3}
+                fill="#000000"
+                fontSize="9"
+                fontFamily="monospace"
+                fontWeight="bold"
+              >
+                FVWAP {latestFlow.flowVwap.toFixed(1)}
+              </text>
+            </g>
+          )}
+
           {/* Live Spot Tag on Right Y-Axis */}
           <g>
             <rect
@@ -557,6 +717,10 @@ function InstitutionalChartCard({
           <span className="inline-flex items-center gap-1 text-slate-300">
             <span className="h-0.5 w-3.5 border-b border-dashed border-slate-400 inline-block" />
             Zero γ
+          </span>
+          <span className="inline-flex items-center gap-1 text-amber-300">
+            <span className="h-0.5 w-3.5 bg-amber-400 inline-block" />
+            Flow VWAP (±1σ/±2σ)
           </span>
           <span className="inline-flex items-center gap-1 text-rose-300">
             <span className="h-0.5 w-3.5 bg-rose-400 inline-block" />

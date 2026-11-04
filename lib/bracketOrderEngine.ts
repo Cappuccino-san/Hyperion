@@ -83,12 +83,8 @@ export function initializeOcoBrackets(config: OcoBracketConfig): OcoBracketState
   // Staged momentum time stop is active if position was opened before 10:15 AM
   const openedBefore1015 =
     openedAtEt.includes("9:") ||
-    openedAtEt.includes("10:0") ||
-    openedAtEt.includes("10:10") ||
-    openedAtEt.includes("10:11") ||
-    openedAtEt.includes("10:12") ||
-    openedAtEt.includes("10:13") ||
-    openedAtEt.includes("10:14");
+    openedAtEt.includes("09:") ||
+    (openedAtEt.includes("10:") && parseInt(openedAtEt.split(":")[1] || "99", 10) < 15);
 
   return {
     tp1LimitPrice,
@@ -120,8 +116,10 @@ export function evaluateOcoBrackets(params: {
   const etString = now.toLocaleTimeString("en-US", {
     timeZone: "America/New_York",
     hour12: false,
+    hourCycle: "h23",
   });
-  const [hours, minutes] = etString.split(":").map(Number);
+  const [rawHours, minutes] = etString.split(":").map(Number);
+  const hours = rawHours % 24;
   const totalMins = hours * 60 + minutes;
 
   // Real-time PnL calculated from current BID (hitting the bid on exit) vs entry ASK

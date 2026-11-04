@@ -11,6 +11,10 @@ import {
   drawFlowGammaVwapOverlay,
   ConfluenceLevel,
 } from "@/components/chart/FlowGammaVwapOverlay";
+import {
+  GaiaCallPutBiasHud,
+  type GaiaHudTradeSignal,
+} from "@/components/gaia/GaiaCallPutBiasHud";
 import type {
   GaiaExpirationInfo,
   GaiaIntradayCandle,
@@ -551,8 +555,11 @@ function buildLiveGaiaDataset(
 
 export function GaiaView() {
   const storeTicker = useDashboardStore((state) => state.activeTicker);
+  const storeSpotPrice = useDashboardStore((state) => state.spotPrice);
   const gammaLevels = useDashboardStore((state) => state.gammaLevels);
   const setStoreTicker = useDashboardStore((state) => state.setTicker);
+  const liveTickPrice = useDashboardStore((state) => state.liveTickPrice);
+  const liveTickCount = useDashboardStore((state) => state.liveTickCount);
   const fetchOptionsChain = useDashboardStore(
     (state) => state.fetchOptionsChain
   );
@@ -578,6 +585,47 @@ export function GaiaView() {
   const [loadedTicker, setLoadedTicker] = useState<string>(storeTicker || "SPY");
   const [guideExpanded, setGuideExpanded] = useState<boolean>(false);
   const [selectedSessionIso, setSelectedSessionIso] = useState<string>("");
+  const [hudTradeSignals, setHudTradeSignals] = useState<GaiaHudTradeSignal[]>([]);
+
+  // Dynamic Trade Signals Engine Hook for Gaia HUD
+  useEffect(() => {
+    let isMounted = true;
+    async function fetchSignals() {
+      try {
+        const res = await fetch(`/api/signals?ticker=${loadedTicker}`, {
+          cache: "no-store",
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (isMounted && Array.isArray(data?.alerts)) {
+          const mapped: GaiaHudTradeSignal[] = data.alerts
+            .filter(
+              (a: any) =>
+                a.action === "BUY_TO_OPEN" &&
+                !a.setupName?.includes("Gaia Tactical HUD") &&
+                !a.id?.startsWith("gaia-spy-")
+            )
+            .map((a: any) => ({
+              timestamp: (a.ts || 0) * 1000,
+              action: a.action,
+              contractType: a.contractType,
+              spotPrice: a.btoSpotPrice || a.spotPrice,
+              setupName: a.setupName,
+              isWin: a.status === "TARGET_HIT" || (a.pnlOptionPct && a.pnlOptionPct > 0),
+            }));
+          setHudTradeSignals(mapped);
+        }
+      } catch {
+        // Silent fallback
+      }
+    }
+    fetchSignals();
+    const interval = setInterval(fetchSignals, 15000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [loadedTicker]);
 
   const [livePayload, setLivePayload] = useState<GaiaLivePayload | null>(
     null
@@ -648,8 +696,10 @@ export function GaiaView() {
   const [canvasWidth, setCanvasWidth] = useState<number>(1016);
 
   const fetchLiveGaia = useCallback(
-    async (tickerSymbol: string, sessionIso?: string, sHour: number = startHour) => {
-      setIsLoading(true);
+    async (tickerSymbol: string, sessionIso?: string, sHour: number = startHour, silent: boolean = false) => {
+      if (!silent) {
+        setIsLoading(true);
+      }
       setErrorMsg(null);
       try {
         const qs = new URLSearchParams({
@@ -670,13 +720,17 @@ export function GaiaView() {
         setActiveBarIndex(Math.max(0, payload.candles.length - 1));
         setHoverBarIndex(null);
       } catch (err) {
-        const msg =
-          err instanceof Error
-            ? err.message
-            : "Live market feed unavailable";
-        setErrorMsg(msg);
+        if (!silent) {
+          const msg =
+            err instanceof Error
+              ? err.message
+              : "Live market feed unavailable";
+          setErrorMsg(msg);
+        }
       } finally {
-        setIsLoading(false);
+        if (!silent) {
+          setIsLoading(false);
+        }
       }
     },
     [startHour]
@@ -688,14 +742,46 @@ export function GaiaView() {
       setTickerInput(storeTicker);
       setLoadedTicker(storeTicker);
       setSelectedSessionIso("");
-      fetchLiveGaia(storeTicker, "", startHour);
+      fetchLiveGaia(storeTicker, "", startHour, false);
     }
   }, [storeTicker, loadedTicker, fetchLiveGaia, startHour]);
 
   useEffect(() => {
-    fetchLiveGaia(loadedTicker, selectedSessionIso, startHour);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    fetchLiveGaia(loadedTicker, selectedSessionIso, startHour, false);
+    if (!isReplaying && !selectedSessionIso) {
+      const liveInterval = setInterval(() => {
+        if (typeof document === "undefined" || document.visibilityState === "visible") {
+          fetchLiveGaia(loadedTicker, "", startHour, true);
+        }
+      }, 2500);
+      return () => clearInterval(liveInterval);
+    }
+  }, [loadedTicker, selectedSessionIso, startHour, isReplaying, fetchLiveGaia]);
+
+  // Instant 800ms tick reactivity for GaiaView livePayload spot & candle tip
+  useEffect(() => {
+    if (!liveTickPrice || liveTickPrice <= 0) return;
+    setLivePayload((prev) => {
+      if (!prev) return prev;
+      const candles = prev.candles;
+      if (!candles || candles.length === 0) return prev;
+      const lastCandle = candles[candles.length - 1];
+      const relDiff = Math.abs(liveTickPrice - lastCandle.close) / Math.max(1, lastCandle.close);
+      if (relDiff > 0.005) return prev;
+
+      const updatedCandles = [...candles];
+      const last = { ...updatedCandles[updatedCandles.length - 1] };
+      last.close = liveTickPrice;
+      last.high = Math.max(last.high, liveTickPrice);
+      last.low = Math.min(last.low, liveTickPrice);
+      updatedCandles[updatedCandles.length - 1] = last;
+
+      return {
+        ...prev,
+        candles: updatedCandles,
+      };
+    });
+  }, [liveTickPrice, liveTickCount]);
 
   useEffect(() => {
     const sym = loadedTicker.toUpperCase();
@@ -3132,6 +3218,27 @@ export function GaiaView() {
           </div>
         </div>
       )}
+
+      {/* 2E. Live Gaia Call/Put Bias & Every Call Today HUD */}
+      <GaiaCallPutBiasHud
+        symbol={loadedTicker}
+        candles={dataset?.candles?.map((c) => ({
+          timestamp: c.timestamp,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          timeLabel: c.timeLabel,
+        }))}
+        liveSpot={activeCandle ? activeCandle.close : null}
+        tradeSignals={hudTradeSignals}
+        onSymbolChange={(sym) => {
+          setTickerInput(sym);
+          setLoadedTicker(sym);
+          setStoreTicker(sym);
+          void fetchLiveGaia(sym, selectedSessionIso, startHour);
+        }}
+      />
 
       {/* 3 & 4A. Core Chart Canvas Card + Interactive Session Replay Bar */}
       <div

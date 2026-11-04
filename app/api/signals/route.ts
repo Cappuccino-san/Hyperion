@@ -11,6 +11,7 @@ import {
   generateDailyPerformanceReport,
   checkAndSendMarketCloseRecap,
   TradeLifecycleAlert,
+  syncGaiaSpySignalsToDiscord,
 } from "@/lib/tradeSignalEngine";
 import {
   getPreTradeRadarData,
@@ -261,6 +262,18 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+
+    if (body.action === "SYNC_GAIA_SPY_SIGNALS") {
+      const res = await syncGaiaSpySignalsToDiscord({
+        ticker: body.ticker || "SPY",
+        signals: Array.isArray(body.signals) ? body.signals : [],
+        spotPrice: Number(body.spotPrice) || 0,
+        sessionDate: body.sessionDate,
+        webhookUrl: body.webhookUrl,
+      });
+      return NextResponse.json({ success: true, ...res });
+    }
+
     if (body.action === "clear") {
       clearDailyTrades();
       return NextResponse.json({ success: true, message: "Daily trades reset." });

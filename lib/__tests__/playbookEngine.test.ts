@@ -170,6 +170,10 @@ runTest("ATM Straddle formula: EM_daily = 0.85 * (Call_ATM + Put_ATM)", () => {
   const fallbackEm = calculateExpectedMove(100, 0.2);
   assert.ok(fallbackEm > 0, "Fallback EM must be positive");
   assert.ok(Math.abs(fallbackEm - 100 * (0.2 / Math.sqrt(252))) <= 0.02);
+
+  // Corrupted off-hours straddle quotes (>8% of spot) safely fall back to IV Rule-of-16
+  const blownOutStraddleEm = calculateExpectedMove(100, 0.2, 8.0, 8.0); // 0.85 * 16 = 13.6 > 8% of 100
+  assert.strictEqual(blownOutStraddleEm, fallbackEm, "Blown-out straddle (>8% spot) must fall back to Rule of 16");
 });
 
 runTest("Real-time execution status evaluator transitions correctly", () => {

@@ -26,18 +26,16 @@ export default function DashboardPage() {
     (state) => state.fetchOptionsChain
   );
 
-  // Poll /api/options?ticker=${activeTicker} immediately on ticker change & every 15 seconds while on Heatmap
+  // Poll /api/options?ticker=${activeTicker} immediately & constantly every 5 seconds so Heatmap/Gaia stream live prices
   useEffect(() => {
-    if (activeView !== "Heatmap") return;
-
     fetchOptionsChain(activeTicker);
 
     const pollInterval = setInterval(() => {
       fetchOptionsChain(activeTicker);
-    }, 15_000);
+    }, 5_000);
 
     return () => clearInterval(pollInterval);
-  }, [activeTicker, activeView, fetchOptionsChain]);
+  }, [activeTicker, fetchOptionsChain]);
 
   return (
     <div className="min-h-screen bg-[#0b0d17] text-argon-text flex flex-col">

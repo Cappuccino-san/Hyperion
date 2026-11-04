@@ -5,7 +5,7 @@ import {
 } from "@/lib/tradeSignalEngine";
 
 const POLL_INTERVAL_MS = 20_000; // 20 seconds during RTH
-const WATCH_TICKERS = ["SPY", "QQQ", "SPXW", "IWM"];
+const WATCH_TICKERS = ["SPY"];
 
 interface LiveBotGlobalState {
   intervalId: ReturnType<typeof setInterval> | null;

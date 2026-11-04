@@ -98,6 +98,29 @@ async function fetchIntradayCandles(
     }
 
     if (bars.length >= 2) {
+      // Synchronize latest bar close with sub-second Robinhood live tick
+      try {
+        const sym = ticker.trim().toUpperCase();
+        const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym === "NDX" || sym === "NDXP" ? "QQQ" : sym;
+        const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
+          headers: { "User-Agent": "Mozilla/5.0" },
+          cache: "no-store",
+        });
+        if (rhRes.ok) {
+          const rhJson = await rhRes.json();
+          const p = Number(rhJson?.results?.[0]?.last_trade_price ?? rhJson?.results?.[0]?.bid_price ?? 0);
+          if (p > 0 && Number.isFinite(p)) {
+            const mult = sym === "SPX" || sym === "SPXW" ? 10 : 1;
+            const liveP = Number((p * mult).toFixed(2));
+            const lastBar = bars[bars.length - 1];
+            lastBar.close = liveP;
+            lastBar.high = Math.max(lastBar.high, liveP);
+            lastBar.low = Math.min(lastBar.low, liveP);
+          }
+        }
+      } catch {
+        // Non-fatal
+      }
       return bars;
     }
   } catch (err) {

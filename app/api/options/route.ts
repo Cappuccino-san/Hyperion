@@ -96,6 +96,44 @@ async function fetchRealtimeSpotQuote(
   ticker: string
 ): Promise<{ spotPrice: number; previousClose?: number } | null> {
   const sym = ticker.toUpperCase();
+
+  // 1. Primary: Sub-second live exchange quote via Robinhood public feed
+  const rhSym =
+    sym === "SPXW" || sym === "SPX"
+      ? "SPY"
+      : sym === "NDXP" || sym === "NDX"
+        ? "QQQ"
+        : sym;
+
+  try {
+    const rhRes = await fetch(
+      `https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`,
+      {
+        headers: {
+          Accept: "application/json",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
+        },
+        cache: "no-store",
+      }
+    );
+    if (rhRes.ok) {
+      const rhJson = await rhRes.json();
+      const q = rhJson?.results?.[0];
+      const p = Number(q?.last_trade_price ?? q?.bid_price ?? 0);
+      const prevClose = Number(q?.previous_close ?? 0);
+      if (p > 0 && Number.isFinite(p)) {
+        const mult = sym === "SPXW" || sym === "SPX" ? 10 : 1;
+        return {
+          spotPrice: Number((p * mult).toFixed(2)),
+          previousClose: prevClose > 0 ? Number((prevClose * mult).toFixed(2)) : undefined,
+        };
+      }
+    }
+  } catch {
+    // Non-fatal fallback to Yahoo
+  }
+
+  // 2. Secondary: Yahoo Finance fallback
   const yahooSym =
     sym === "SPXW" || sym === "SPX"
       ? "^GSPC"

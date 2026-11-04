@@ -153,6 +153,11 @@ export function TopNavBar() {
   const pathname = usePathname();
   const activeView = useDashboardStore((state) => state.activeView);
   const activeTicker = useDashboardStore((state) => state.activeTicker);
+  const spotPrice = useDashboardStore((state) => state.spotPrice);
+  const liveTickPrice = useDashboardStore((state) => state.liveTickPrice);
+  const liveTickDirection = useDashboardStore((state) => state.liveTickDirection);
+  const liveTickCount = useDashboardStore((state) => state.liveTickCount);
+  const setLiveTick = useDashboardStore((state) => state.setLiveTick);
   const setActiveView = useDashboardStore((state) => state.setActiveView);
   const setFilters = useDashboardStore((state) => state.setFilters);
   const fetchOptionsChain = useDashboardStore((state) => state.fetchOptionsChain);
@@ -162,9 +167,53 @@ export function TopNavBar() {
   const [cheatCodesOpen, setCheatCodesOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [tickFlash, setTickFlash] = useState(false);
   const [mktStatus, setMktStatus] = useState<MarketStatusInfo>(() =>
     computeMarketStatus()
   );
+
+  // Global 800ms High-Frequency Tick Streamer (runs across every page on the site)
+  useEffect(() => {
+    let isCancelled = false;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+
+    const pollTick = async () => {
+      if (isCancelled) return;
+      try {
+        if (typeof document === "undefined" || document.visibilityState === "visible") {
+          const res = await fetch(`/api/tick?ticker=${encodeURIComponent(activeTicker)}`, {
+            cache: "no-store",
+          });
+          if (res.ok && !isCancelled) {
+            const data = await res.json();
+            if (typeof data.spot === "number" && data.spot > 0) {
+              setLiveTick(activeTicker, data.spot, data.timestamp || Date.now());
+            }
+          }
+        }
+      } catch {
+        // Silent retry on next 800ms cycle
+      } finally {
+        if (!isCancelled) {
+          timerId = setTimeout(pollTick, 800);
+        }
+      }
+    };
+
+    pollTick();
+    return () => {
+      isCancelled = true;
+      if (timerId) clearTimeout(timerId);
+    };
+  }, [activeTicker, setLiveTick]);
+
+  // Brief 250ms visual pulse on incoming tick change
+  useEffect(() => {
+    if (liveTickCount === 0) return;
+    setTickFlash(true);
+    const t = setTimeout(() => setTickFlash(false), 250);
+    return () => clearTimeout(t);
+  }, [liveTickPrice, liveTickCount]);
 
   const handleTabClick = (tab: ActiveView) => {
     setActiveView(tab);
@@ -353,6 +402,37 @@ export function TopNavBar() {
               >
                 ? Guide
               </button>
+
+              {/* 6B. Real-Time Tick Stream Telemetry Badge */}
+              <div
+                className={`hidden sm:flex items-center gap-2 px-2.5 py-1 rounded-md border text-[11px] font-mono transition-colors duration-200 ${
+                  tickFlash
+                    ? liveTickDirection === "up"
+                      ? "bg-emerald-500/20 border-emerald-500/50 text-emerald-300"
+                      : liveTickDirection === "down"
+                        ? "bg-rose-500/20 border-rose-500/50 text-rose-300"
+                        : "bg-cyan-500/15 border-cyan-500/40 text-cyan-200"
+                    : "bg-[#111520] border-white/10 text-slate-200"
+                }`}
+                title="Sub-second real-time market tick stream (800ms cadence)"
+              >
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                </span>
+                <span className="font-bold text-white">{activeTicker}</span>
+                <span
+                  className={`font-extrabold ${
+                    liveTickDirection === "up"
+                      ? "text-emerald-400"
+                      : liveTickDirection === "down"
+                        ? "text-rose-400"
+                        : "text-cyan-300"
+                  }`}
+                >
+                  ${(liveTickPrice ?? spotPrice).toFixed(2)}
+                </span>
+              </div>
 
               {/* 7. ⌘K Omnibar */}
               <button

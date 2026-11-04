@@ -1,5 +1,6 @@
 import { PlaybookPick, PlaybookPayload, PlaybookExecutionStatus } from "./types/playbook";
 import { getTickerPreset, TickerPreset } from "@/lib/tickerPresets";
+import { computeCeilingShareChi } from "@/lib/flowGammaVwap";
 
 export const PLAYBOOK_TICKER_UNIVERSE = [
   "SPY",
@@ -41,7 +42,11 @@ export function calculateExpectedMove(
   atmPutMid?: number
 ): number {
   if (atmCallMid != null && atmPutMid != null && atmCallMid > 0 && atmPutMid > 0) {
-    return f2(0.85 * (atmCallMid + atmPutMid));
+    const straddleEm = 0.85 * (atmCallMid + atmPutMid);
+    // Sanity-cap: Guard against corrupt after-hours quotes producing unphysical 0DTE expected move (>8% of spot)
+    if (straddleEm > 0 && straddleEm <= spotPrice * 0.08) {
+      return f2(straddleEm);
+    }
   }
   // IV-based rule-of-16 daily move: Spot * IV / sqrt(252)
   const ruleOf16 = spotPrice * (iv / Math.sqrt(252));
@@ -125,12 +130,19 @@ export function generateCallPick(telemetry: LiveTickerTelemetry): PlaybookPick {
   // Determine if King node sits between Entry and Target 2
   const kingBetween = gexKing >= entryPrice && gexKing <= target2;
 
+  // Compute Flux Field Péclet number Pe = mu_delta * W / Gamma and Ceiling Share chi
+  const channelW = Math.max(0.5, edgeHigh - edgeLow);
+  const driftNorm = (spotPrice - previousClose) / Math.max(0.25, expectedMoveDaily);
+  const pecletNumber = f2(Math.max(-12, Math.min(12, driftNorm * 2.4 + (netGex >= 0 ? 0.55 : -0.35))));
+  const ceilingShareChi = computeCeilingShareChi(pecletNumber);
+
   // Score bullish conviction
   let score = 50;
   if (netGex > 0) score += 20; // Positive gamma pin acceleration
   if (kingBetween) score += 15;
   score += Math.min(15, Math.round(kingStrength * 0.15));
   if (spotPrice > previousClose) score += 10;
+  if (ceilingShareChi >= 0.55) score += 8;
 
   let why = `Scanner top bull pick. Coiling within ${(
     ((entryPrice - spotPrice) / expectedMoveDaily) *
@@ -149,6 +161,7 @@ export function generateCallPick(telemetry: LiveTickerTelemetry): PlaybookPick {
       2
     )}).`;
   }
+  why += ` Flux Field ceiling share χ=${(ceilingShareChi * 100).toFixed(1)}% (Pe=${pecletNumber >= 0 ? "+" : ""}${pecletNumber.toFixed(2)}, W=$${channelW.toFixed(2)}) confirms upward advection toward ceiling node.`;
 
   const pick: PlaybookPick = {
     id: `call-${ticker.toLowerCase()}-0dte`,
@@ -210,12 +223,20 @@ export function generatePutPick(telemetry: LiveTickerTelemetry): PlaybookPick {
   // Determine if King node sits between Entry and Target 2 (below entry)
   const kingBetween = gexKing <= entryPrice && gexKing >= target2;
 
+  // Compute Flux Field Péclet number Pe and Ceiling Share chi
+  const channelW = Math.max(0.5, edgeHigh - edgeLow);
+  const driftNorm = (spotPrice - previousClose) / Math.max(0.25, expectedMoveDaily);
+  const pecletNumber = f2(Math.max(-12, Math.min(12, driftNorm * 2.4 + (netGex < 0 ? -0.65 : 0.25))));
+  const ceilingShareChi = computeCeilingShareChi(pecletNumber);
+  const floorShare = f2(1 - ceilingShareChi);
+
   // Score bearish conviction
   let score = 50;
   if (netGex < 0) score += 20; // Negative gamma dealer shorting accelerator
   if (kingBetween) score += 15;
   score += Math.min(15, Math.round(kingStrength * 0.15));
   if (spotPrice < previousClose) score += 10;
+  if (ceilingShareChi <= 0.45) score += 8;
 
   let why = `Deep breakdown setup coiling within ${(
     ((spotPrice - entryPrice) / expectedMoveDaily) *
@@ -234,6 +255,7 @@ export function generatePutPick(telemetry: LiveTickerTelemetry): PlaybookPick {
       2
     )}).`;
   }
+  why += ` Flux Field floor absorption (1-χ)=${(floorShare * 100).toFixed(1)}% (Pe=${pecletNumber >= 0 ? "+" : ""}${pecletNumber.toFixed(2)}, W=$${channelW.toFixed(2)}) confirms downward hedging drift toward floor node.`;
 
   const pick: PlaybookPick = {
     id: `put-${ticker.toLowerCase()}-0dte`,

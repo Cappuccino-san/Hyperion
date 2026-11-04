@@ -186,8 +186,8 @@ export const TICKER_PRESETS: Record<string, TickerPreset> = {
   SPY: {
     ticker: "SPY",
     name: "SPDR S&P 500 ETF Trust",
-    spotPrice: 774.25,
-    previousClose: 769.05,
+    spotPrice: 759.75,
+    previousClose: 759.5,
     impliedVolatility: 0.146,
     netMetrics: { netGex: 1.66, netVex: 7220.0 },
     gammaLevels: { putWall: 760.0, putWallGex: -2074.07, zeroGamma: 772.9, callWall: 780.0, callWallGex: 1987.75, hasZeroGammaFlip: true },
