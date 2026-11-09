@@ -276,8 +276,12 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
       const isUpper1Reject = pt.bandSignal === "UPPER_1S_REJECT";
       const isLower1Bounce = pt.bandSignal === "LOWER_1S_BOUNCE";
 
-      const isUpperSignal = isUpper2Pierce || isUpper1Reject;
-      const isLowerSignal = isLower2Pierce || isLower1Bounce;
+      const isUpperSignal =
+        !((pt.ceilingShareChi ?? 0.5) >= 0.58 && (pt.pecletNumber ?? 0) >= 0.85 && spot >= pt.flowVwap) &&
+        (isUpper2Pierce || isUpper1Reject);
+      const isLowerSignal =
+        !((pt.ceilingShareChi ?? 0.5) <= 0.42 && (pt.pecletNumber ?? 0) <= -0.85 && spot <= pt.flowVwap) &&
+        (isLower2Pierce || isLower1Bounce);
 
       if (!isUpperSignal && !isLowerSignal) continue;
 

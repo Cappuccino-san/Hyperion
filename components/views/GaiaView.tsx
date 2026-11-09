@@ -1828,6 +1828,91 @@ export function GaiaView() {
     }
 
     // =========================================================================
+    // LAYER 3B: Tactical Trade Signals Overlay (Aligned with Top HUD & Discord Engine)
+    // =========================================================================
+    if (hudTradeSignals && hudTradeSignals.length > 0 && dataset.candles.length > 0) {
+      hudTradeSignals.forEach((sig) => {
+        const sigTsSec = sig.timestamp > 1e11 ? Math.floor(sig.timestamp / 1000) : sig.timestamp;
+        let matchedBarIdx = -1;
+        let minDiff = Infinity;
+
+        dataset.candles.forEach((c, cIdx) => {
+          if (!c.timestamp) return;
+          const diff = Math.abs(c.timestamp - sigTsSec);
+          if (diff < minDiff) {
+            minDiff = diff;
+            matchedBarIdx = cIdx;
+          }
+        });
+
+        if (matchedBarIdx < 0 || matchedBarIdx > safeActiveIdx || minDiff > 15 * 60) return;
+
+        const candle = dataset.candles[matchedBarIdx];
+        const cx = barToX(matchedBarIdx);
+        const isCall = sig.contractType === "CALL";
+        const sigColor = isCall ? "#10b981" : "#f43f5e";
+        const entryY = priceToY(sig.spotPrice || candle.close);
+        const candleY = isCall ? priceToY(candle.low) : priceToY(candle.high);
+
+        ctx.save();
+        // 1. Entry price glowing core dot and reticle ring
+        ctx.shadowBlur = 8;
+        ctx.shadowColor = sigColor;
+        ctx.strokeStyle = isCall ? "#34d399" : "#fb7185";
+        ctx.lineWidth = 1.3;
+        ctx.setLineDash([2, 2]);
+        ctx.beginPath();
+        ctx.arc(cx, entryY, 7.5, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.setLineDash([]);
+        ctx.fillStyle = sigColor;
+        ctx.beginPath();
+        ctx.arc(cx, entryY, 3.2, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 2. Directional Triangle (▲ pointing up under candle for Call, ▼ above candle for Put)
+        const arrowY = isCall ? candleY + 12 : candleY - 12;
+        ctx.fillStyle = sigColor;
+        ctx.beginPath();
+        if (isCall) {
+          ctx.moveTo(cx, arrowY - 5);
+          ctx.lineTo(cx - 4.5, arrowY + 4);
+          ctx.lineTo(cx + 4.5, arrowY + 4);
+        } else {
+          ctx.moveTo(cx, arrowY + 5);
+          ctx.lineTo(cx - 4.5, arrowY - 4);
+          ctx.lineTo(cx + 4.5, arrowY - 4);
+        }
+        ctx.closePath();
+        ctx.fill();
+
+        // 3. Compact Tactical Badge Pill
+        const badgeText = isCall ? "▲ LONG BUY" : "▼ PUT BUY";
+        ctx.font = "bold 8.5px ui-monospace, SFMono-Regular, Menlo, monospace";
+        const textW = ctx.measureText(badgeText).width;
+        const pillW = Math.max(textW + 10, 58);
+        const pillH = 15;
+        const pillY = isCall ? arrowY + 6 : arrowY - 6 - pillH;
+
+        ctx.fillStyle = "rgba(10, 14, 23, 0.92)";
+        ctx.strokeStyle = sigColor;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.roundRect(cx - pillW / 2, pillY, pillW, pillH, 3);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = sigColor;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(badgeText, cx, pillY + pillH / 2);
+
+        ctx.restore();
+      });
+    }
+
+    // =========================================================================
     // LAYER 5: Outlook Zone (Expected-Move Cone, Plateau Fills & Path to King)
     // =========================================================================
     const yPriorClose = priceToY(dataset.priorClose);
@@ -2650,6 +2735,7 @@ export function GaiaView() {
     hoverCursor,
     atlasPalette,
     countdownSec,
+    hudTradeSignals,
   ]);
 
   const isSma34Bullish = activeCandle
