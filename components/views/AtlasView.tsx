@@ -17,6 +17,10 @@ import {
   drawFlowGammaVwapOverlay,
   ConfluenceLevel,
 } from "@/components/chart/FlowGammaVwapOverlay";
+import {
+  drawTradeExecutionMarkers,
+  ServerTradesState,
+} from "@/components/chart/TradeExecutionMarkersOverlay";
 import type {
   AntaeusExpirationInfo,
   AntaeusIntradayCandle,
@@ -313,10 +317,23 @@ export function AtlasView() {
   const fetchOptionsChain = useDashboardStore(
     (state) => state.fetchOptionsChain
   );
+  const storeActivePositions = useDashboardStore(
+    (state) => state.serverActivePositions
+  );
+  const storeClosedTrades = useDashboardStore(
+    (state) => state.serverClosedTrades
+  );
+  const storeTradeAlerts = useDashboardStore(
+    (state) => state.serverTradeAlerts
+  );
+  const setStoreServerTrades = useDashboardStore(
+    (state) => state.setServerTrades
+  );
 
   const [activeTicker, setActiveTicker] = useState<string>(
     storeTicker || "SPY"
   );
+  const [serverTrades, setServerTrades] = useState<ServerTradesState>({});
   const [livePayload, setLivePayload] = useState<AntaeusLivePayload | null>(
     null
   );
@@ -474,6 +491,36 @@ export function AtlasView() {
       clearInterval(interval);
     };
   }, [activeTicker, timeframe]);
+
+  // Fetch active & closed server trades from /api/signals?ticker=${activeTicker}
+  useEffect(() => {
+    let active = true;
+    const loadSignals = async () => {
+      try {
+        const res = await fetch(
+          `/api/signals?ticker=${encodeURIComponent(activeTicker)}`,
+          { cache: "no-store" }
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        if (active && data) {
+          const payload: ServerTradesState = {
+            activePositions: data?.activePositions ?? {},
+            closedPositions: data?.closedPositions ?? [],
+            alerts: data?.alerts ?? [],
+          };
+          setServerTrades(payload);
+          setStoreServerTrades(payload);
+        }
+      } catch {}
+    };
+    loadSignals();
+    const interval = setInterval(loadSignals, 5000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [activeTicker, setStoreServerTrades]);
 
   // Handle countdown timer tick (1s interval)
   useEffect(() => {
@@ -1171,6 +1218,36 @@ export function AtlasView() {
       ctx.restore();
     }
 
+    // 5.5. FINAL OVERLAY: On-Chart Trade Execution Markers (BTO / STC + PnL Badges + Trajectory)
+    const effectiveServerTrades: ServerTradesState = {
+      activePositions:
+        serverTrades.activePositions &&
+        Object.keys(serverTrades.activePositions).length > 0
+          ? serverTrades.activePositions
+          : storeActivePositions,
+      closedPositions:
+        serverTrades.closedPositions && serverTrades.closedPositions.length > 0
+          ? serverTrades.closedPositions
+          : storeClosedTrades,
+      alerts:
+        serverTrades.alerts && serverTrades.alerts.length > 0
+          ? serverTrades.alerts
+          : storeTradeAlerts,
+    };
+    drawTradeExecutionMarkers({
+      ctx,
+      ticker: activeTicker,
+      candles,
+      safeActiveIdx,
+      barToX,
+      priceToY,
+      serverTrades: effectiveServerTrades,
+      padLeft,
+      plotRightX,
+      padTop,
+      plotBottomY: height - padBottom,
+    });
+
     // 6. Crosshair on Hover
     if (hoverCursor) {
       const hx =
@@ -1363,6 +1440,11 @@ export function AtlasView() {
     xPanOffset,
     showFlowVwap,
     flowVwapPoints,
+    activeTicker,
+    serverTrades,
+    storeActivePositions,
+    storeClosedTrades,
+    storeTradeAlerts,
   ]);
 
   // Window mouseup listener to end any active drag even outside canvas

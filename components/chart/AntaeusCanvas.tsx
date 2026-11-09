@@ -1,11 +1,16 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
+import { useDashboardStore } from "@/store/useDashboardStore";
 import { FlowGammaVwapSnapshot } from "@/lib/flowGammaVwap";
 import {
   drawFlowGammaVwapOverlay,
   ConfluenceLevel,
 } from "./FlowGammaVwapOverlay";
+import {
+  drawTradeExecutionMarkers,
+  ServerTradesState,
+} from "./TradeExecutionMarkersOverlay";
 
 export interface AntaeusCanvasCandle {
   timestamp: number;
@@ -17,6 +22,7 @@ export interface AntaeusCanvasCandle {
 }
 
 export interface AntaeusCanvasProps {
+  ticker?: string;
   candles: AntaeusCanvasCandle[];
   flowVwapPoints: FlowGammaVwapSnapshot[];
   safeActiveIdx?: number;
@@ -27,10 +33,12 @@ export interface AntaeusCanvasProps {
   callWallStrike?: number;
   putWallStrike?: number;
   showFlowVwap?: boolean;
+  serverTrades?: ServerTradesState;
   className?: string;
 }
 
 export function AntaeusCanvas({
+  ticker,
   candles,
   flowVwapPoints,
   safeActiveIdx,
@@ -41,8 +49,20 @@ export function AntaeusCanvas({
   callWallStrike,
   putWallStrike,
   showFlowVwap = true,
+  serverTrades,
   className,
 }: AntaeusCanvasProps) {
+  const storeTicker = useDashboardStore((state) => state.activeTicker);
+  const storeActivePositions = useDashboardStore(
+    (state) => state.serverActivePositions
+  );
+  const storeClosedTrades = useDashboardStore(
+    (state) => state.serverClosedTrades
+  );
+  const storeTradeAlerts = useDashboardStore(
+    (state) => state.serverTradeAlerts
+  );
+  const resolvedTicker = ticker || storeTicker || "SPY";
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [canvasWidth, setCanvasWidth] = useState<number>(1040);
@@ -157,6 +177,26 @@ export function AntaeusCanvas({
       });
     }
 
+    // 3.5. On-Chart Trade Execution Markers (BTO / STC + PnL Badges + Trajectory)
+    const effectiveTrades: ServerTradesState = serverTrades ?? {
+      activePositions: storeActivePositions,
+      closedPositions: storeClosedTrades,
+      alerts: storeTradeAlerts,
+    };
+    drawTradeExecutionMarkers({
+      ctx,
+      ticker: resolvedTicker,
+      candles,
+      safeActiveIdx: activeIdx,
+      barToX,
+      priceToY,
+      serverTrades: effectiveTrades,
+      padLeft,
+      plotRightX,
+      padTop,
+      plotBottomY: height - padBottom,
+    });
+
     // 4. Right Price Axis Gutter
     ctx.fillStyle = "#000000";
     ctx.fillRect(plotRightX, 0, rightAxisWidth, height);
@@ -179,6 +219,11 @@ export function AntaeusCanvas({
     callWallStrike,
     putWallStrike,
     showFlowVwap,
+    resolvedTicker,
+    serverTrades,
+    storeActivePositions,
+    storeClosedTrades,
+    storeTradeAlerts,
   ]);
 
   return (

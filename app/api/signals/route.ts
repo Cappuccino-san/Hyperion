@@ -195,13 +195,15 @@ export async function GET(req: NextRequest) {
     if (searchParams.get("scan") === "true" || searchParams.get("poll") === "all") {
       const baseUrl = req.nextUrl.origin || "http://localhost:3000";
       const tickers = ["SPY", "QQQ", "IWM"];
-      await Promise.allSettled(
-        tickers.map((sym) =>
-          fetch(`${baseUrl}/api/options?ticker=${sym}&force=true`, {
+      for (const sym of tickers) {
+        try {
+          await fetch(`${baseUrl}/api/options?ticker=${sym}&force=true`, {
             cache: "no-store",
-          }).then((r) => r.json())
-        )
-      );
+          }).then((r) => r.json());
+        } catch {
+          // Non-fatal
+        }
+      }
       const activePositions = getActivePositions();
       const closedPositions = getClosedPositions();
       const alerts = getDailyTradeAlerts();
@@ -268,6 +270,10 @@ export async function POST(req: NextRequest) {
         ticker: body.ticker || "SPY",
         signals: Array.isArray(body.signals) ? body.signals : [],
         spotPrice: Number(body.spotPrice) || 0,
+        activeFsmState: body.activeFsmState,
+        macroRegime: body.macroRegime,
+        chiPct: body.chiPct,
+        zeroGamma: typeof body.zeroGamma === "number" ? body.zeroGamma : undefined,
         sessionDate: body.sessionDate,
         webhookUrl: body.webhookUrl,
       });

@@ -757,15 +757,29 @@ export function computeBarFlowGammaVwapSeries(
     const tauMinutes = Math.max(
       1,
       c.timestamp > candles[0].timestamp
-        ? (c.timestamp - candles[0].timestamp) / 60
+        ? (c.timestamp - candles[0].timestamp) / (c.timestamp > 1e11 ? 60000 : 60)
         : (i + 1) * 5
     );
 
-    // Delta hedging drift velocity mu_Delta estimated from recent price velocity & signed gamma flow
-    const lookbackIdx = Math.max(0, i - 4);
-    const dtMin = Math.max(1, (i - lookbackIdx) * 5);
-    const priceDriftPerMin = (c.close - candles[lookbackIdx].open) / dtMin;
-    const muDelta = priceDriftPerMin * 3.2;
+    // Multi-Horizon Structural Advection Velocity (Session Open + VWAP + Momentum)
+    const open930 = candles.find((b) => ((b as any).etMins ?? 0) >= 570)?.open ?? candles[0].open;
+    const currentVwap = baseSnap.flowVwap || c.close;
+    const atrEst = Math.max(0.40, (c.high - c.low) * 1.5);
+
+    // 1. Session Macro Horizon: Distance from 9:30 AM Open
+    const macroDrive = (c.close - open930) / (2.2 * atrEst);
+    // 2. Structural Horizon: Distance from Flow VWAP
+    const vwapDrive = (c.close - currentVwap) / (1.2 * atrEst);
+    // 3. Short-Term Impulse Horizon (12-bar & 4-bar)
+    const lb12 = Math.max(0, i - 12);
+    const lb4 = Math.max(0, i - 4);
+    const impulseDrive = (
+      0.6 * ((c.close - candles[lb12].close) / atrEst) +
+      0.4 * ((c.close - candles[lb4].close) / atrEst)
+    );
+
+    const combinedDrive = 0.45 * macroDrive + 0.35 * vwapDrive + 0.20 * impulseDrive;
+    const muDelta = Math.max(-8.0, Math.min(8.0, combinedDrive * 2.8));
     const sigmaC = Math.max(0.1, Math.log1p(barWeight) * 0.25);
 
     const pdeState = evaluateSpectralFlowAndFluxAtTau({

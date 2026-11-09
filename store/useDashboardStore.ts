@@ -644,6 +644,15 @@ export interface DashboardState {
   liveTickDirection: "up" | "down" | "flat";
   liveTickCount: number;
   setLiveTick: (ticker: string, price: number, timestamp?: number) => void;
+  serverActivePositions: Record<string, any>;
+  serverClosedTrades: any[];
+  serverTradeAlerts: any[];
+  setServerTrades: (payload: {
+    activePositions?: Record<string, any>;
+    closedPositions?: any[];
+    alerts?: any[];
+  }) => void;
+  fetchServerTrades: (ticker?: string) => Promise<void>;
   playbookPayload: PlaybookPayload | null;
   setPlaybookPayload: (payload: PlaybookPayload) => void;
   fetchPlaybook: () => Promise<void>;
@@ -730,6 +739,34 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   toggleUiMode: () =>
     set((state) => ({ uiMode: state.uiMode === "signal" ? "quant" : "signal" })),
   setUiMode: (mode) => set({ uiMode: mode }),
+  serverActivePositions: {},
+  serverClosedTrades: [],
+  serverTradeAlerts: [],
+  setServerTrades: (payload) =>
+    set({
+      serverActivePositions: payload.activePositions ?? {},
+      serverClosedTrades: payload.closedPositions ?? [],
+      serverTradeAlerts: payload.alerts ?? [],
+    }),
+  fetchServerTrades: async (ticker) => {
+    const targetTicker = (ticker || get().activeTicker || "SPY").toUpperCase();
+    try {
+      const res = await fetch(
+        `/api/signals?ticker=${encodeURIComponent(targetTicker)}`,
+        { cache: "no-store" }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        set({
+          serverActivePositions: data?.activePositions ?? {},
+          serverClosedTrades: data?.closedPositions ?? [],
+          serverTradeAlerts: data?.alerts ?? [],
+        });
+      }
+    } catch {
+      // silent fallback
+    }
+  },
   playbookPayload: null,
 
   setPlaybookPayload: (payload) => {

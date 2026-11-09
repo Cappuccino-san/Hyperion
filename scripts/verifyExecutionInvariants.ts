@@ -26,7 +26,17 @@ import {
   TradeLifecycleAlert,
   solveImpliedVol,
   repriceOptionBS,
+  evaluateTradeSignals,
+  loadTradeStore,
+  saveTradeStore,
+  DailyTradeStore,
+  OptionTradePosition,
 } from "../lib/tradeSignalEngine";
+import {
+  acquireBarEvaluationLock,
+  releaseBarEvaluationLock,
+  isEvaluatingLiveBar,
+} from "../lib/liveBotDaemon";
 import { NormalizedOptionContract } from "../lib/optionsExposure";
 
 let totalTests = 0;
@@ -582,6 +592,333 @@ async function runTestSuite() {
 
   assert(!assignedBadge.includes("STOP LOSS"), `Winning trade (+${winningPnlOptionPct}%) badge '${assignedBadge}' NEVER contains 'STOP LOSS'`);
   assert(assignedBadge === "3:55 PM EOD MARKET CLOSE CUTOFF (WIN)", `Winning trade badge resolves to canonical '${assignedBadge}'`);
+
+  // ===========================================================================
+  // TEST SECTION 10: 500-SCENARIO MONTE CARLO INVARIANT VERIFICATION SUITE
+  // ===========================================================================
+  console.log("\n10. Running 500-Scenario Monte Carlo Execution Invariant Verification Suite...");
+
+  // Seeded Mulberry32 PRNG for deterministic, reproducible Monte Carlo simulations
+  function createPrng(seed: number) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // --- PART 10A: 500 Scenarios Verifying ZERO Calls Below Zero Gamma or in Negative Opening Range ---
+  console.log("  10A: Evaluating 500 Open-Range & Negative Gamma Scenarios (Zero Calls Guarantee)...");
+  const rng10A = createPrng(2026110501);
+  let callsBelowZeroGammaViolations = 0;
+  let callsInNegativeOpeningViolations = 0;
+  let totalEvaluatedScenarios10A = 0;
+
+  for (let s = 1; s <= 500; s++) {
+    totalEvaluatedScenarios10A++;
+    // Spot price in [$740.00, $780.00]
+    const spotPrice = Number((740 + rng10A() * 40).toFixed(2));
+    // Zero Gamma in [$750.00, $770.00]
+    const zeroGamma = Number((750 + rng10A() * 20).toFixed(2));
+    // Prior Close in [$755.00, $775.00]
+    const priorClose = Number((755 + rng10A() * 20).toFixed(2));
+    // Premarket Flow VWAP in [$755.00, $775.00]
+    const premarketFlowVwap = Number((755 + rng10A() * 20).toFixed(2));
+    // Minute in session open: 9:30 AM to 9:44 AM (minutes 570 - 584, totalMinutes < 585)
+    const minute = Math.floor(570 + rng10A() * 15);
+    const dateObj = new Date("2026-11-05T09:30:00-05:00");
+    dateObj.setMinutes(minute - 570 + 30);
+    // χ in [0.05, 0.95] (with varying degrees of put/call dominance)
+    const rawChi = Number((0.05 + rng10A() * 0.90).toFixed(2));
+    // Half the scenarios simulate unpopulated indicators (first 15 min gap)
+    const isUnpopulated = rng10A() < 0.5;
+
+    // Evaluate opening range condition:
+    const isOpeningRange = minute < 585;
+    const isNegativeGamma = zeroGamma > 0 && spotPrice < zeroGamma;
+    const isBelowPriorClose = priorClose > 0 && spotPrice < priorClose;
+    const isBelowPremarketVwap = premarketFlowVwap > 0 && spotPrice < premarketFlowVwap;
+
+    // Under R1 Invariant: If spot is below Zero Gamma, below prior close, below premarket VWAP,
+    // or rawChi < 0.50 during opening range, any CALL candidate is strictly blocked.
+    const shouldBlockCall = isNegativeGamma || (isOpeningRange && (rawChi < 0.50 || isBelowPriorClose || isBelowPremarketVwap || isUnpopulated && (isNegativeGamma || isBelowPriorClose || isBelowPremarketVwap)));
+
+    // Inject a clean FLAT test store
+    const testStore: DailyTradeStore = {
+      date: "2026-11-05",
+      activePositions: {},
+      closedPositions: [],
+      alerts: [],
+      prevSpotPrices: { SPY: priorClose, QQQ: priorClose },
+    };
+    saveTradeStore(testStore);
+
+    const evalRes = await evaluateTradeSignals({
+      ticker: "QQQ", // non-SPY so candidateBto flow evaluates directly
+      spotPrice,
+      callWall: 780,
+      putWall: 740,
+      zeroGamma,
+      priorClose,
+      premarketFlowVwap,
+      nowEt: dateObj,
+      latest5mCandle: isUnpopulated
+        ? null
+        : {
+            open: spotPrice,
+            high: spotPrice + 0.5,
+            low: spotPrice - 0.5,
+            close: spotPrice,
+            sma34: spotPrice,
+            flowSnapshot: {
+              timestamp: Math.floor(dateObj.getTime() / 1000),
+              spot: spotPrice,
+              flowVwap: premarketFlowVwap,
+              ceilingShareChi: rawChi,
+              pecletNumber: 0.1,
+              netFluxJ: 0.05,
+              upper1s: spotPrice + 1,
+              lower1s: spotPrice - 1,
+              upper2s: spotPrice + 2,
+              lower2s: spotPrice - 2,
+              upper1Sigma: spotPrice + 1,
+              lower1Sigma: spotPrice - 1,
+              upper2Sigma: spotPrice + 2,
+              lower2Sigma: spotPrice - 2,
+              sigma: 1,
+              variance: 1,
+              cumGammaWeight: 100,
+              totalWeight: 100,
+              signedGammaAcceleration: 0,
+              count: 10,
+              bandSignal: "LOWER_2S_BOUNCE",
+            },
+          },
+    });
+
+    const activeOrEmitted = evalRes.emittedAlerts.find((a) => a.action === "BUY_TO_OPEN" && a.contractType === "CALL") ||
+                            (evalRes.activePosition?.contractType === "CALL" ? evalRes.activePosition : null);
+
+    if (activeOrEmitted) {
+      if (spotPrice < zeroGamma) {
+        callsBelowZeroGammaViolations++;
+      }
+      if (shouldBlockCall) {
+        callsInNegativeOpeningViolations++;
+      }
+    }
+  }
+
+  assert(
+    callsBelowZeroGammaViolations === 0,
+    `500-Scenario Monte Carlo 10A: EXACTLY ZERO Calls taken below Zero Gamma (${totalEvaluatedScenarios10A} scenarios evaluated)`
+  );
+  assert(
+    callsInNegativeOpeningViolations === 0,
+    "500-Scenario Monte Carlo 10A: EXACTLY ZERO Calls taken during negative opening range (< 09:45 AM ET)"
+  );
+
+  // --- PART 10B: 500 Async Invocations Verifying Zero Concurrency Leaks under isEvaluatingLiveBar ---
+  console.log("  10B: Running 500 Parallel Async Invocations (Mutex & Memory Lock Guarantee)...");
+  const rng10B = createPrng(2026110502);
+  let concurrencyLeaks = 0;
+  let activeConcurrentExecutions = 0;
+  let peakObservedConcurrency = 0;
+  let successfullyProcessedTicks = 0;
+  let lockedOutInvocations = 0;
+
+  // Release any leftover lock before starting test
+  releaseBarEvaluationLock();
+
+  const parallelInvocations: Promise<void>[] = [];
+  for (let i = 0; i < 500; i++) {
+    parallelInvocations.push(
+      (async () => {
+        // Microtask jitter to interleave async yields
+        await new Promise((resolve) => setTimeout(resolve, Math.floor(rng10B() * 4)));
+
+        const lockAcquired = acquireBarEvaluationLock();
+        if (!lockAcquired) {
+          lockedOutInvocations++;
+          return;
+        }
+
+        try {
+          activeConcurrentExecutions++;
+          peakObservedConcurrency = Math.max(peakObservedConcurrency, activeConcurrentExecutions);
+          if (activeConcurrentExecutions > 1) {
+            concurrencyLeaks++;
+          }
+
+          // Simulate asynchronous I/O (e.g. options chain fetch)
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          successfullyProcessedTicks++;
+        } finally {
+          activeConcurrentExecutions--;
+          releaseBarEvaluationLock();
+        }
+      })()
+    );
+  }
+
+  await Promise.all(parallelInvocations);
+
+  assert(
+    concurrencyLeaks === 0,
+    `500-Invocation Monte Carlo 10B: EXACTLY ZERO concurrency leaks (Peak concurrency = ${peakObservedConcurrency}, strictly <= 1)`
+  );
+  assert(
+    peakObservedConcurrency === 1,
+    `500-Invocation Monte Carlo 10B: Atomic memory lock successfully acquired and held by 1 caller at a time`
+  );
+  assert(
+    successfullyProcessedTicks + lockedOutInvocations === 500,
+    `500-Invocation Monte Carlo 10B: All 500 invocations deterministically accounted for (${successfullyProcessedTicks} processed, ${lockedOutInvocations} locked out)`
+  );
+
+  // --- PART 10C: 500 State Machine Transitions Verifying contractsQty === 1 & Linear State Machine ---
+  console.log("  10C: Testing 500 State Machine Transitions (contractsQty === 1 & FLAT -> ACTIVE -> LOCKED_FOR_DAY)...");
+  const originalStoreBackup = loadTradeStore();
+  const rng10C = createPrng(2026110503);
+  let positionSizeViolations = 0;
+  let overlappingPositionViolations = 0;
+  let postClosedTradeReentryViolations = 0;
+
+  try {
+    for (let t = 1; t <= 500; t++) {
+    // Random initial session state
+    const rollState = rng10C();
+    const isFlat = rollState < 0.33;
+    const isActive = rollState >= 0.33 && rollState < 0.66;
+    const isLockedForDay = rollState >= 0.66;
+
+    const mockClosedTrades: OptionTradePosition[] = isLockedForDay
+      ? [
+          {
+            id: `test-closed-${t}`,
+            ticker: "SPY",
+            contractType: "PUT",
+            contractLabel: "SPY 261105 765P",
+            strike: 765,
+            expiration: "2026-11-05",
+            setupName: "Resistance Rejection",
+            status: "CLOSED",
+            btoSpotPrice: 765.0,
+            btoOptionMid: 0.65,
+            contractsQty: 1,
+            remainingQty: 0,
+            totalOutlay: 65,
+            target1Spot: 763.5,
+            target2Spot: 760.0,
+            stopLossSpot: 766.5,
+            openedAt: "09:35 AM",
+            openedTs: 1793889300,
+            closedAt: "10:05 AM",
+            closedTs: 1793891100,
+            exitReason: "TARGET 1 PROFIT SECURED",
+          },
+        ]
+      : [];
+
+    const mockActivePosition: OptionTradePosition | null = isActive
+      ? {
+          id: `test-active-${t}`,
+          ticker: "SPY",
+          contractType: "PUT",
+          contractLabel: "SPY 261105 765P",
+          strike: 765,
+          expiration: "2026-11-05",
+          setupName: "Resistance Rejection",
+          status: "OPEN",
+          btoSpotPrice: 765.0,
+          btoOptionMid: 0.65,
+          contractsQty: 1,
+          remainingQty: 1,
+          totalOutlay: 65,
+          target1Spot: 763.5,
+          target2Spot: 760.0,
+          stopLossSpot: 766.5,
+          openedAt: "09:35 AM",
+          openedTs: 1793889300,
+        }
+      : null;
+
+    const storeInstance: DailyTradeStore = {
+      date: "2026-11-05",
+      activePositions: mockActivePosition ? { SPY: mockActivePosition } : {},
+      closedPositions: mockClosedTrades,
+      alerts: [],
+      prevSpotPrices: { SPY: 765.0 },
+    };
+    saveTradeStore(storeInstance);
+
+    // If active position size was > 1, that would be a violation
+    if (mockActivePosition && (mockActivePosition.contractsQty !== 1 || mockActivePosition.remainingQty !== 1)) {
+      positionSizeViolations++;
+    }
+
+    // Now attempt BTO evaluation on SPY via syncGaiaSpySignalsToDiscord
+    const { syncGaiaSpySignalsToDiscord } = await import("../lib/tradeSignalEngine");
+    const syncRes = await syncGaiaSpySignalsToDiscord({
+      ticker: "SPY",
+      spotPrice: 764.5,
+      sessionDate: "2026-11-05",
+      signals: [
+        {
+          id: `mc-short-${t}`,
+          type: "SHORT",
+          price: 764.5,
+          timestamp: 1793889400,
+          label: "SHORT · OPEN",
+        },
+      ],
+      zeroGamma: 767.16,
+      activeFsmState: "SHORT",
+    });
+
+    const refreshedStore = loadTradeStore();
+    const activeCount = Object.keys(refreshedStore.activePositions || {}).length;
+
+    // Check Invariants:
+    // 1. If we were already ACTIVE, no second trade should have been opened (max 1 active position)
+    if (isActive && syncRes.dispatchedCount > 0) {
+      overlappingPositionViolations++;
+    }
+    if (activeCount > 1) {
+      overlappingPositionViolations++;
+    }
+
+    // 2. If we were LOCKED_FOR_DAY, no new trade should ever be opened
+    if (isLockedForDay && (syncRes.dispatchedCount > 0 || activeCount > 0)) {
+      postClosedTradeReentryViolations++;
+    }
+
+      // 3. Any newly created active position must strictly enforce contractsQty === 1
+      const newSpyPos = refreshedStore.activePositions["SPY"];
+      if (newSpyPos) {
+        if (newSpyPos.contractsQty !== 1 || newSpyPos.remainingQty > 1) {
+          positionSizeViolations++;
+        }
+      }
+    }
+  } finally {
+    saveTradeStore(originalStoreBackup);
+  }
+
+  assert(
+    overlappingPositionViolations === 0,
+    "500-Transition Monte Carlo 10C: EXACTLY ZERO overlapping positions (Single-Slot Automaton strictly holds max 1 trade)"
+  );
+  assert(
+    positionSizeViolations === 0,
+    "500-Transition Monte Carlo 10C: EXACTLY ZERO position size violations (contractsQty === 1 strictly enforced)"
+  );
+  assert(
+    postClosedTradeReentryViolations === 0,
+    "500-Transition Monte Carlo 10C: EXACTLY ZERO re-entries after closed trade (LOCKED_FOR_DAY strictly terminal)"
+  );
 
   // ===========================================================================
   // FINAL REPORT

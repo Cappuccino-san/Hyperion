@@ -279,4 +279,66 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
 
     assert.strictEqual(badge, "TARGET 1 FULL PROFIT HIT", "1-contract full exit at Target 1 must NOT trigger Target 2 title");
   });
+
+  it("Realized P&L Accounting Invariant: LONG entered at $768.02 with +7.62 peak MFE exiting at $765.82 evaluates strictly to WRONG -2.20, NEVER RIGHT +7.62", () => {
+    const mockSeries: PrzmCandlePoint[] = [
+      {
+        time: "10:00am",
+        timestamp: 1730732400000,
+        open: 768.00,
+        high: 768.50,
+        low: 767.80,
+        close: 768.02,
+        volume: 50000,
+        vwap: 768.00,
+        flowVwap: 768.00,
+      },
+      {
+        time: "10:30am",
+        timestamp: 1730734200000,
+        open: 770.00,
+        high: 775.64, // Peak intraday excursion (+7.62 MFE above 768.02)
+        low: 769.50,
+        close: 774.20,
+        volume: 50000,
+        vwap: 770.00,
+        flowVwap: 770.00,
+      },
+      {
+        time: "11:35am",
+        timestamp: 1730738100000,
+        open: 766.50,
+        high: 767.00,
+        low: 765.50,
+        close: 765.82, // Actual exit price
+        volume: 50000,
+        vwap: 768.50,
+        flowVwap: 768.50,
+      },
+    ];
+
+    const mockSignals: PrzmSignalPoint[] = [
+      {
+        id: "sig-1",
+        index: 0,
+        time: "10:00am",
+        price: 768.02,
+        type: "LONG",
+        tag: "OPEN",
+        label: "LONG",
+        exitPrice: 765.82,
+        isClosed: true,
+      },
+    ];
+
+    const summary = evaluatePrzmCallLedger(mockSignals, mockSeries, 765.82, "STAND_ASIDE");
+    assert.strictEqual(summary.entries.length, 1);
+    const entry = summary.entries[0];
+
+    assert.strictEqual(entry.delta, -2.20, "Delta must be strictly -$2.20, NEVER +$7.62!");
+    assert.strictEqual(entry.status, "WRONG", "Closed drawdown trade must evaluate strictly to WRONG!");
+    assert.strictEqual(summary.winRatePct, 0, "Win rate for a single losing trade must be 0%, NOT 100%!");
+    assert.strictEqual(summary.rightCount, 0);
+    assert.strictEqual(summary.wrongCount, 1);
+  });
 });

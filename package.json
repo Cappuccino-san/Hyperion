@@ -7,11 +7,13 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "npm run test:flow-vwap && npm run test:playbook && npm run test:invariants && npm run test:viewport",
+    "test": "npm run test:flow-vwap && npm run test:playbook && npm run test:invariants && npm run test:viewport && npm run test:fsm",
     "test:flow-vwap": "npx tsx lib/__tests__/flowGammaVwap.test.ts",
     "test:playbook": "npx tsx lib/__tests__/playbookEngine.test.ts",
     "test:invariants": "npx tsx scripts/verifyExecutionInvariants.ts",
-    "test:viewport": "npx tsx --test lib/__tests__/viewportAndDurationInvariants.test.ts"
+    "test:viewport": "npx tsx --test lib/__tests__/viewportAndDurationInvariants.test.ts",
+    "test:fsm": "npx tsx --test lib/__tests__/gaiaSignalFsm.test.ts",
+    "test:fsm-optimize": "npx tsx scripts/validateFsmAdaptiveParams.ts"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.3.1",

@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
+import { useDashboardStore } from "@/store/useDashboardStore";
 
 export interface PrzmCandlePoint {
   time: string;
@@ -24,22 +25,43 @@ export interface PrzmSignalPoint {
   price: number;
   type: "LONG" | "SHORT";
   timestamp?: number;
+  barTimestamp?: number;
+  barCloseTimestamp?: number;
+  barSpanSeconds?: number;
   tag?: "OPEN" | "PEAK" | "LOW" | "CONT" | "BREAK" | "RECLAIM";
   label?: string;
   excursion?: number;
   reason?: string;
+  exitPrice?: number;
+  exitTimestamp?: number;
+  exitIndex?: number;
+  exitReason?: string;
+  isClosed?: boolean;
 }
 
 export interface EvaluatedCallEntry {
   id: string;
   timeFormatted: string;
   type: "LONG" | "SHORT";
+  contractType?: "CALL" | "PUT";
   entryPrice: number;
+  closedPrice?: number;
+  closedTimeFormatted?: string;
+  pnlOptionPct?: number;
   status: "OPEN" | "RIGHT" | "FLAT" | "WRONG";
   delta: number;
   heldMinutes: number;
   heldLabel: string;
   index: number;
+  contractLabel?: string;
+  exitReason?: string;
+  isServerTrade?: boolean;
+}
+
+export interface ServerTradeData {
+  activePositions?: Record<string, any>;
+  closedPositions?: any[];
+  alerts?: any[];
 }
 
 export interface PrzmLedgerSummary {
@@ -56,7 +78,7 @@ export interface PrzmLedgerSummary {
 /**
  * Formats 24h "HH:MM" or timestamp into PRZM compact "11:38am" / "10:06am" notation
  */
-function formatPrzmTime(rawTime: string, timestamp?: number): string {
+function formatPrzmTime(rawTime: string = "", timestamp?: number): string {
   if (timestamp && Number.isFinite(timestamp) && timestamp > 1_000_000_000) {
     try {
       const ms = timestamp < 1e12 ? timestamp * 1000 : timestamp;
@@ -72,6 +94,7 @@ function formatPrzmTime(rawTime: string, timestamp?: number): string {
       // Fallback to string parser below
     }
   }
+  if (!rawTime) return "";
   const m = rawTime.match(/^(\d{1,2}):(\d{2})/);
   if (!m) return rawTime.toLowerCase();
   const hh = parseInt(m[1], 10);
@@ -100,9 +123,145 @@ function formatHeldDuration(minutes: number): string {
 export function evaluatePrzmCallLedger(
   signals: PrzmSignalPoint[],
   series: PrzmCandlePoint[],
-  liveSpot: number
+  liveSpot: number,
+  activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE",
+  serverTrades?: ServerTradeData
 ): PrzmLedgerSummary {
-  if (!signals.length || !series.length) {
+  const storeState = useDashboardStore.getState();
+  const rawClosed =
+    Array.isArray(serverTrades?.closedPositions) && serverTrades!.closedPositions.length > 0
+      ? serverTrades!.closedPositions
+      : Array.isArray(storeState.serverClosedTrades)
+        ? storeState.serverClosedTrades
+        : [];
+  const rawActiveObj =
+    serverTrades?.activePositions && Object.keys(serverTrades.activePositions).length > 0
+      ? serverTrades.activePositions
+      : storeState.serverActivePositions || {};
+  const rawAlerts =
+    Array.isArray(serverTrades?.alerts) && serverTrades!.alerts.length > 0
+      ? serverTrades!.alerts
+      : Array.isArray(storeState.serverTradeAlerts)
+        ? storeState.serverTradeAlerts
+        : [];
+
+  // Reconstruct closed trades from alerts if closedPositions is empty but a SELL_TO_CLOSE alert exists
+  const serverClosed = [...rawClosed];
+  if (serverClosed.length === 0 && rawAlerts.length > 0) {
+    const stcAlerts = rawAlerts.filter((a: any) => a && a.action === "SELL_TO_CLOSE");
+    for (const stc of stcAlerts) {
+      const baseId = String(stc.id || "").replace(/-stc.*$/, "");
+      const bto = rawAlerts.find(
+        (a: any) => a && a.action === "BUY_TO_OPEN" && String(a.id || "").startsWith(baseId)
+      );
+      serverClosed.push({
+        id: baseId || stc.id,
+        ticker: stc.ticker || bto?.ticker || "SPY",
+        contractType: stc.contractType || bto?.contractType || "PUT",
+        contractLabel: stc.contractLabel || bto?.contractLabel,
+        status: "CLOSED",
+        btoSpotPrice: bto?.btoSpotPrice ?? stc.btoSpotPrice ?? bto?.spotPrice ?? 0,
+        closedSpotPrice: stc.closedSpotPrice ?? stc.spotPrice ?? 0,
+        openedAt: bto?.timestamp ?? "9:35 AM",
+        openedTs: bto?.ts,
+        closedAt: stc.timestamp,
+        closedTs: stc.ts,
+        pnlOptionPct: stc.pnlOptionPct,
+        pnlSpotPct: stc.pnlSpotPct,
+        exitReason: stc.reason || stc.setupName,
+      });
+    }
+  }
+
+  const closedIds = new Set(serverClosed.map((c: any) => c?.id).filter(Boolean));
+  const serverActive = Object.values(rawActiveObj).filter(
+    (pos: any) =>
+      pos &&
+      pos.id &&
+      !closedIds.has(pos.id) &&
+      pos.status !== "CLOSED" &&
+      !pos.closedTs &&
+      !pos.stcTimestamp &&
+      !String(pos.id).startsWith("test-")
+  );
+
+  const serverEntries: EvaluatedCallEntry[] = [];
+
+  for (const pos of serverClosed) {
+    if (!pos || !pos.id || String(pos.id).startsWith("test-")) continue;
+    const isCall = pos.contractType === "CALL";
+    const type: "LONG" | "SHORT" = isCall ? "LONG" : "SHORT";
+    const btoSpot = typeof pos.btoSpotPrice === "number" && pos.btoSpotPrice > 0 ? pos.btoSpotPrice : 0;
+    const closedSpot = typeof pos.closedSpotPrice === "number" && pos.closedSpotPrice > 0 ? pos.closedSpotPrice : btoSpot;
+    const delta = Number((isCall ? closedSpot - btoSpot : btoSpot - closedSpot).toFixed(2));
+    const isWin =
+      pos.pnlOptionPct > 0 ||
+      delta > 0.05 ||
+      pos.exitReason?.includes("TARGET") ||
+      pos.exitReason?.includes("TP1") ||
+      pos.exitReason?.includes("TP2") ||
+      pos.exitReason?.includes("COVER") ||
+      (pos.pnlSpotPct && pos.pnlSpotPct > 0);
+    const isLoss =
+      pos.pnlOptionPct < -5 ||
+      pos.exitReason?.includes("STOP") ||
+      (pos.pnlSpotPct && pos.pnlSpotPct < 0);
+    const status: "RIGHT" | "WRONG" | "FLAT" = isWin ? "RIGHT" : isLoss ? "WRONG" : "FLAT";
+    const heldMin =
+      pos.openedTs && pos.closedTs && pos.closedTs > pos.openedTs
+        ? Math.max(1, Math.round((pos.closedTs - pos.openedTs) / 60))
+        : 5;
+
+    serverEntries.push({
+      id: pos.id,
+      timeFormatted: pos.openedAt || formatPrzmTime(undefined, pos.openedTs),
+      type,
+      contractType: isCall ? "CALL" : "PUT",
+      entryPrice: btoSpot,
+      closedPrice: closedSpot,
+      closedTimeFormatted: pos.closedAt || (pos.closedTs ? formatPrzmTime(undefined, pos.closedTs) : undefined),
+      pnlOptionPct: typeof pos.pnlOptionPct === "number" ? pos.pnlOptionPct : undefined,
+      status,
+      delta,
+      heldMinutes: heldMin,
+      heldLabel: formatHeldDuration(heldMin),
+      index: 0,
+      contractLabel: pos.contractLabel,
+      exitReason: pos.exitReason,
+      isServerTrade: true,
+    });
+  }
+
+  for (const pos of serverActive) {
+    if (!pos || !pos.id) continue;
+    const isCall = pos.contractType === "CALL";
+    const type: "LONG" | "SHORT" = isCall ? "LONG" : "SHORT";
+    const btoSpot = typeof pos.btoSpotPrice === "number" && pos.btoSpotPrice > 0 ? pos.btoSpotPrice : 0;
+    const currentSpot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : btoSpot;
+    const delta = Number((isCall ? currentSpot - btoSpot : btoSpot - currentSpot).toFixed(2));
+    const nowTs = Math.floor(Date.now() / 1000);
+    const heldMin =
+      pos.openedTs && nowTs > pos.openedTs
+        ? Math.max(1, Math.round((nowTs - pos.openedTs) / 60))
+        : 5;
+
+    serverEntries.push({
+      id: pos.id,
+      timeFormatted: pos.openedAt || formatPrzmTime(undefined, pos.openedTs),
+      type,
+      contractType: isCall ? "CALL" : "PUT",
+      entryPrice: btoSpot,
+      status: "OPEN",
+      delta,
+      heldMinutes: heldMin,
+      heldLabel: formatHeldDuration(heldMin),
+      index: 0,
+      contractLabel: pos.contractLabel,
+      isServerTrade: true,
+    });
+  }
+
+  if (!signals.length && !serverEntries.length) {
     return {
       entries: [],
       activeCall: null,
@@ -116,23 +275,34 @@ export function evaluatePrzmCallLedger(
   }
 
   const sorted = [...signals].sort((a, b) => a.index - b.index);
-  const lastBarIdx = series.length - 1;
-  const lastBarTsSec = toEpochSeconds(series[lastBarIdx]?.timestamp);
+  const lastBarIdx = series.length > 0 ? series.length - 1 : 0;
+  const lastBarTsSec = series.length > 0 ? toEpochSeconds(series[lastBarIdx]?.timestamp) : 0;
   const nowSec = Math.floor(Date.now() / 1000);
 
   const chronologicalEntries: EvaluatedCallEntry[] = sorted.map((sig, idx) => {
     const isNewest = idx === sorted.length - 1;
     const nextSig = idx < sorted.length - 1 ? sorted[idx + 1] : null;
-    const endIdx = nextSig ? Math.max(sig.index, nextSig.index) : lastBarIdx;
 
+    let exitBarIdx = lastBarIdx;
+    if (sig.exitIndex !== undefined) {
+      exitBarIdx = Math.min(lastBarIdx, sig.exitIndex);
+    } else if (sig.exitTimestamp) {
+      const matchIdx = series.findIndex((b) => toEpochSeconds(b.timestamp) === sig.exitTimestamp);
+      if (matchIdx >= 0) exitBarIdx = matchIdx;
+    } else if (nextSig) {
+      exitBarIdx = Math.max(sig.index, nextSig.index);
+    }
+
+    const endIdx = exitBarIdx;
     const entryBar = series[sig.index];
     const endBar = series[endIdx] ?? series[lastBarIdx];
     const entryTsSec = toEpochSeconds(entryBar?.timestamp);
+    const endTsSec = toEpochSeconds(endBar?.timestamp);
     const barSpanMinutes = Math.max(1, (endIdx - sig.index) * 5);
 
     let heldMinutes = barSpanMinutes;
     if (entryTsSec > 0) {
-      let refEndSec = toEpochSeconds(endBar?.timestamp);
+      let refEndSec = endTsSec;
       if (isNewest && lastBarTsSec > 0) {
         // Advance to nowSec if stream is within 15 mins of last candle
         refEndSec =
@@ -146,50 +316,28 @@ export function evaluatePrzmCallLedger(
       }
     }
 
-    // Calculate best excursion and exit delta across the holding window [sig.index .. endIdx]
-    let maxFavorable = 0;
-    let maxAdverse = 0;
-    for (let k = sig.index; k <= endIdx && k < series.length; k++) {
-      const b = series[k];
-      const priceAtK = k === lastBarIdx && Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : b.close;
-      const favHigh = sig.type === "LONG" ? b.high - sig.price : sig.price - b.low;
-      const favClose = sig.type === "LONG" ? priceAtK - sig.price : sig.price - priceAtK;
-      const advLow = sig.type === "LONG" ? b.low - sig.price : sig.price - b.high;
-      if (favHigh > maxFavorable) maxFavorable = favHigh;
-      if (favClose > maxFavorable) maxFavorable = favClose;
-      if (advLow < maxAdverse) maxAdverse = advLow;
-    }
+    const isCurrentlyOpen =
+      sig.isClosed === false ||
+      (isNewest && activeFsmState !== undefined && activeFsmState === sig.type);
 
-    const markPrice =
-      isNewest && Number.isFinite(liveSpot) && liveSpot > 0
-        ? liveSpot
-        : endBar?.close ?? sig.price;
-    const rawMarkDelta = sig.type === "LONG" ? markPrice - sig.price : sig.price - markPrice;
+    const exitPrice = sig.exitPrice ?? endBar?.close ?? sig.price;
+    const finalMarkPrice = isCurrentlyOpen
+      ? (Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : endBar?.close ?? sig.price)
+      : exitPrice;
 
-    // Best realized/favorable excursion
-    const effectiveExcursion = Math.max(sig.excursion ?? 0, maxFavorable);
+    // Strict Realized P&L Math: (Exit - Entry) * (LONG ? 1 : -1)
+    const realizedDelta =
+      sig.type === "LONG" ? finalMarkPrice - sig.price : sig.price - finalMarkPrice;
 
-    // Determine status:
-    // If newest signal & occurred within last 16 bars (80m), mark as OPEN if still active
-    const barsSinceNewest = lastBarIdx - sig.index;
-    let status: "OPEN" | "RIGHT" | "FLAT" | "WRONG" = "OPEN";
-    let displayDelta = rawMarkDelta;
-
-    if (isNewest && barsSinceNewest <= 8) {
+    let status: "OPEN" | "RIGHT" | "FLAT" | "WRONG";
+    if (isCurrentlyOpen) {
       status = "OPEN";
-      displayDelta = rawMarkDelta;
-    } else if (effectiveExcursion >= 0.30) {
+    } else if (realizedDelta > 0.05) {
       status = "RIGHT";
-      displayDelta = Math.max(effectiveExcursion, rawMarkDelta);
-    } else if (Math.abs(rawMarkDelta) < 0.25 && effectiveExcursion < 0.30) {
-      status = "FLAT";
-      displayDelta = rawMarkDelta;
-    } else if (rawMarkDelta <= -0.25) {
+    } else if (realizedDelta < -0.05) {
       status = "WRONG";
-      displayDelta = rawMarkDelta;
     } else {
-      status = rawMarkDelta >= 0 ? "RIGHT" : "FLAT";
-      displayDelta = rawMarkDelta;
+      status = "FLAT";
     }
 
     return {
@@ -198,30 +346,48 @@ export function evaluatePrzmCallLedger(
       type: sig.type,
       entryPrice: sig.price,
       status,
-      delta: Number(displayDelta.toFixed(2)),
+      delta: Number(realizedDelta.toFixed(2)),
       heldMinutes,
       heldLabel: formatHeldDuration(heldMinutes),
       index: sig.index,
     };
   });
 
-  let rightCount = chronologicalEntries.filter((e) => e.status === "RIGHT").length;
-  const wrongCount = chronologicalEntries.filter((e) => e.status === "WRONG").length;
-  const flatCount = chronologicalEntries.filter((e) => e.status === "FLAT").length;
+  // When authoritative server trades exist, lock the ledger to the Single-Slot Sniper Automaton
+  // so unexecuted FSM transitions do not dilute the 1-Trade-Max scoreboard.
+  const mergedEntries: EvaluatedCallEntry[] =
+    serverEntries.length > 0 ? [...serverEntries] : [...chronologicalEntries];
 
-  // If only an OPEN call exists so far and it is in profit (>= +$0.10), credit 1 of 1 RIGHT
-  const newest = chronologicalEntries[chronologicalEntries.length - 1] ?? null;
-  if (rightCount === 0 && wrongCount === 0 && newest && newest.delta >= 0) {
-    rightCount = 1;
+  let rightCount = mergedEntries.filter((e) => e.status === "RIGHT").length;
+  const wrongCount = mergedEntries.filter((e) => e.status === "WRONG").length;
+  const flatCount = mergedEntries.filter((e) => e.status === "FLAT").length;
+
+  const completedDecisive = rightCount + wrongCount;
+  let decisiveCount = completedDecisive;
+  let winRatePct = 100;
+
+  if (completedDecisive > 0) {
+    winRatePct = Math.round((rightCount / completedDecisive) * 100);
+  } else {
+    const openEntry = mergedEntries.find((e) => e.status === "OPEN");
+    if (openEntry) {
+      decisiveCount = 1;
+      rightCount = openEntry.delta >= 0 ? 1 : 0;
+      winRatePct = openEntry.delta >= 0 ? 100 : 0;
+    } else {
+      decisiveCount = 0;
+      winRatePct = 100;
+    }
   }
 
-  const decisiveCount = Math.max(1, rightCount + wrongCount);
-  const winRatePct = Math.round((rightCount / decisiveCount) * 100);
+  const newest = mergedEntries[mergedEntries.length - 1] ?? null;
+  const openEntry = mergedEntries.find((e) => e.status === "OPEN") ?? null;
+  const activeCall = activeFsmState === "STAND_ASIDE" ? null : (openEntry || newest);
 
   return {
-    entries: [...chronologicalEntries].reverse(),
-    activeCall: newest,
-    totalCalls: chronologicalEntries.length,
+    entries: [...mergedEntries].reverse(),
+    activeCall,
+    totalCalls: mergedEntries.length,
     rightCount,
     wrongCount,
     flatCount,
@@ -265,10 +431,12 @@ export const PrzmTopDeck: React.FC<{
   signals: PrzmSignalPoint[];
   open930?: number;
   straddleEm?: number;
-}> = ({ ticker, liveSpot, series, signals, open930, straddleEm }) => {
+  activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
+  serverTrades?: ServerTradeData;
+}> = ({ ticker, liveSpot, series, signals, open930, straddleEm, activeFsmState, serverTrades }) => {
   const ledger = useMemo(
-    () => evaluatePrzmCallLedger(signals, series, liveSpot),
-    [signals, series, liveSpot]
+    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades),
+    [signals, series, liveSpot, activeFsmState, serverTrades]
   );
 
   // Live 1-second clock for "TO THE BELL" radial dial
@@ -437,23 +605,20 @@ export const PrzmTopDeck: React.FC<{
         <PrzmAsciiHeader title="CALL" />
 
         <div className="my-3">
-          <div className="flex items-baseline gap-2.5">
+          <div className="flex items-baseline justify-between gap-2.5">
             <span
               className={`font-mono text-2xl sm:text-[28px] font-black tracking-tight flex items-center gap-2 ${
                 activeType === "LONG"
                   ? "text-[#00F5D4] drop-shadow-[0_0_12px_rgba(0,245,212,0.35)]"
-                  : "text-[#FF3B5C] drop-shadow-[0_0_12px_rgba(255,59,92,0.35)]"
+                  : "text-[#FF2A55] drop-shadow-[0_0_12px_rgba(255,42,85,0.35)]"
               }`}
             >
               <span>{activeType === "LONG" ? "↗" : "↘"}</span>
               <span>{activeType}</span>
             </span>
-          </div>
-
-          <div className="mt-1 font-mono text-[11px] tracking-[0.14em] text-slate-400 uppercase">
-            {activeCall
-              ? `HELD ${activeCall.heldLabel} · FROM ${activeCall.entryPrice.toFixed(2)}`
-              : `SCANNING · SPOT ${liveSpot.toFixed(2)}`}
+            <span className="font-mono text-xl sm:text-2xl font-bold tabular-nums text-slate-100 tracking-tight">
+              ${liveSpot.toFixed(2)}
+            </span>
           </div>
 
           {/* 24-Segment Horizontal LED Conviction Bar */}
@@ -464,7 +629,7 @@ export const PrzmTopDeck: React.FC<{
                 const activeColor =
                   activeType === "LONG"
                     ? "bg-[#00F5D4] shadow-[0_0_6px_rgba(0,245,212,0.55)]"
-                    : "bg-[#FF3B5C] shadow-[0_0_6px_rgba(255,59,92,0.55)]";
+                    : "bg-[#FF2A55] shadow-[0_0_6px_rgba(255,42,85,0.55)]";
                 return (
                   <div
                     key={idx}
@@ -477,7 +642,7 @@ export const PrzmTopDeck: React.FC<{
             </div>
             <span
               className={`font-mono text-xs font-bold tabular-nums min-w-[34px] text-right ${
-                activeType === "LONG" ? "text-[#00F5D4]" : "text-[#FF3B5C]"
+                activeType === "LONG" ? "text-[#00F5D4]" : "text-[#FF2A55]"
               }`}
             >
               {convictionScore >= 0 ? `+${convictionScore}` : convictionScore}
@@ -574,7 +739,7 @@ export const PrzmTopDeck: React.FC<{
               : drv.value > 0
               ? "text-[#00F5D4]"
               : drv.value < -15
-              ? "text-[#FF3B5C]"
+              ? "text-[#FF2A55]"
               : "text-[#A78BFA]";
 
             const segColor = drv.isPct
@@ -582,7 +747,7 @@ export const PrzmTopDeck: React.FC<{
               : drv.value > 0
               ? "bg-[#00F5D4] shadow-[0_0_6px_rgba(0,245,212,0.45)]"
               : drv.value < -15
-              ? "bg-[#FF3B5C] shadow-[0_0_6px_rgba(255,59,92,0.45)]"
+              ? "bg-[#FF2A55] shadow-[0_0_6px_rgba(255,42,85,0.45)]"
               : "bg-[#8B5CF6] shadow-[0_0_6px_rgba(139,92,246,0.4)]";
 
             return (
@@ -641,7 +806,7 @@ export const PrzmTheCallStrip: React.FC<{
           if (spread > bandSpan * 0.35) {
             bg = "bg-[#00F5D4] shadow-[0_0_4px_rgba(0,245,212,0.35)]";
           } else if (spread < -bandSpan * 0.35) {
-            bg = "bg-[#FF3B5C] shadow-[0_0_4px_rgba(255,59,92,0.35)]";
+            bg = "bg-[#FF2A55] shadow-[0_0_4px_rgba(255,42,85,0.35)]";
           }
           return (
             <div
@@ -663,10 +828,12 @@ export const PrzmCallLogDeck: React.FC<{
   signals: PrzmSignalPoint[];
   series: PrzmCandlePoint[];
   liveSpot: number;
-}> = ({ signals, series, liveSpot }) => {
+  activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
+  serverTrades?: ServerTradeData;
+}> = ({ signals, series, liveSpot, activeFsmState, serverTrades }) => {
   const ledger = useMemo(
-    () => evaluatePrzmCallLedger(signals, series, liveSpot),
-    [signals, series, liveSpot]
+    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades),
+    [signals, series, liveSpot, activeFsmState, serverTrades]
   );
 
   return (
@@ -683,7 +850,13 @@ export const PrzmCallLogDeck: React.FC<{
           ) : (
             ledger.entries.map((entry) => {
               const sideColor =
-                entry.type === "LONG" ? "text-[#00F5D4]" : "text-[#FF3B5C]";
+                entry.type === "LONG" ? "text-[#00F5D4]" : "text-[#FF2A55]";
+              const dirLabel = entry.contractType
+                ? `${entry.type} · ${entry.contractType}`
+                : entry.type;
+              const shortContract = entry.contractLabel
+                ? entry.contractLabel.replace(/\s*\(.*\)/, "")
+                : null;
 
               let statusBadge = "";
               let statusColor = "text-slate-300";
@@ -693,37 +866,59 @@ export const PrzmCallLogDeck: React.FC<{
                   entry.delta >= 0
                     ? `+${entry.delta.toFixed(2)}`
                     : entry.delta.toFixed(2);
-                statusBadge = `OPEN ${signed}`;
+                statusBadge = `OPEN ${signed} pts`;
                 statusColor = "text-[#A78BFA] font-bold";
               } else if (entry.status === "RIGHT") {
-                statusBadge = `RIGHT +${Math.abs(entry.delta).toFixed(2)}`;
-                statusColor = "text-[#00F5D4] font-bold";
+                const optPctStr =
+                  typeof entry.pnlOptionPct === "number"
+                    ? `STC +${entry.pnlOptionPct.toFixed(1)}% · `
+                    : "STC · ";
+                statusBadge = `${optPctStr}+${Math.abs(entry.delta).toFixed(2)} pts · RIGHT`;
+                statusColor = "text-[#10b981] font-bold";
               } else if (entry.status === "FLAT") {
                 const signed =
                   entry.delta >= 0
                     ? `+${entry.delta.toFixed(2)}`
                     : entry.delta.toFixed(2);
-                statusBadge = `FLAT ${signed}`;
+                statusBadge = `FLAT ${signed} pts`;
                 statusColor = "text-slate-400";
               } else {
-                statusBadge = `WRONG -${Math.abs(entry.delta).toFixed(2)}`;
-                statusColor = "text-[#FF3B5C] font-bold";
+                const optPctStr =
+                  typeof entry.pnlOptionPct === "number"
+                    ? `STC ${entry.pnlOptionPct.toFixed(1)}% · `
+                    : "STC · ";
+                statusBadge = `${optPctStr}-${Math.abs(entry.delta).toFixed(2)} pts · WRONG`;
+                statusColor = "text-[#FF2A55] font-bold";
               }
 
               return (
                 <div
                   key={entry.id}
-                  className="py-2.5 flex items-center justify-between gap-4 hover:bg-slate-800/20 px-2 rounded transition-colors"
+                  className="py-2.5 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-800/20 px-2 rounded transition-colors"
                 >
-                  <span className="text-slate-400 tabular-nums w-20 shrink-0">
+                  <span className="text-slate-300 font-semibold tabular-nums min-w-[72px] shrink-0">
                     {entry.timeFormatted}
                   </span>
-                  <span className={`font-bold tracking-wider w-20 shrink-0 ${sideColor}`}>
-                    {entry.type}
+                  <span className={`font-bold tracking-wider min-w-[88px] shrink-0 ${sideColor}`}>
+                    {dirLabel}
                   </span>
-                  <span className="text-slate-200 tabular-nums font-semibold w-24 shrink-0">
+                  <span className="text-slate-200 tabular-nums font-semibold shrink-0">
                     ${entry.entryPrice.toFixed(2)}
+                    {entry.closedPrice && entry.status !== "OPEN" && (
+                      <span className="text-slate-400 font-normal">
+                        {" → "}${entry.closedPrice.toFixed(2)}
+                        {entry.closedTimeFormatted ? ` (${entry.closedTimeFormatted})` : ""}
+                      </span>
+                    )}
                   </span>
+                  {shortContract && (
+                    <span
+                      className="px-2 py-0.5 rounded bg-slate-800/80 border border-slate-700/70 text-amber-300 font-mono text-[10.5px] font-semibold truncate max-w-[210px]"
+                      title={entry.contractLabel}
+                    >
+                      {shortContract}
+                    </span>
+                  )}
                   <span className={`tabular-nums tracking-wide text-right flex-1 ${statusColor}`}>
                     {statusBadge}
                   </span>
@@ -735,10 +930,16 @@ export const PrzmCallLogDeck: React.FC<{
 
         {/* Right: Giant Win-Rate Scoreboard (4 cols) */}
         <div className="lg:col-span-4 lg:border-l lg:border-slate-800/80 lg:pl-6 flex flex-col items-center lg:items-end justify-center py-2">
-          <div className="font-mono text-4xl sm:text-5xl font-black tracking-tight text-slate-100 tabular-nums drop-shadow-[0_0_18px_rgba(0,245,212,0.2)]">
+          <div
+            className={`font-mono text-4xl sm:text-5xl font-black tracking-tight text-slate-100 tabular-nums transition-all duration-200 ease-out ${
+              ledger.winRatePct >= 50
+                ? "drop-shadow-[0_0_18px_rgba(0,245,212,0.25)]"
+                : "drop-shadow-[0_0_18px_rgba(255,42,85,0.25)]"
+            }`}
+          >
             {ledger.winRatePct}%
           </div>
-          <div className="mt-1 font-mono text-[11px] tracking-[0.16em] text-slate-400 uppercase">
+          <div className="mt-1 font-mono text-[11px] tracking-[0.16em] text-slate-400 uppercase transition-colors duration-200 ease-out">
             {ledger.rightCount} OF {ledger.decisiveCount} RIGHT
           </div>
         </div>

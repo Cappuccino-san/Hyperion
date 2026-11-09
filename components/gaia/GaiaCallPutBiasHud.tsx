@@ -13,7 +13,17 @@ import {
   PrzmCallLogDeck,
   PrzmCandlePoint,
   PrzmSignalPoint,
+  ServerTradeData,
 } from "./PrzmTacticalHud";
+import {
+  GaiaSignalFsm,
+  GaiaBarData,
+  GaiaCommittedSignal,
+} from "@/lib/gaiaSignalFsm";
+import {
+  extractNormalizedTradesForTicker,
+  matchTradeToCandleIndex,
+} from "@/components/chart/TradeExecutionMarkersOverlay";
 
 export interface GaiaHudCandle {
   timestamp?: number;
@@ -43,6 +53,7 @@ export interface GaiaCallPutBiasHudProps {
   liveSpot?: number | null;
   spot?: number | null;
   tradeSignals?: GaiaHudTradeSignal[];
+  serverTrades?: ServerTradeData;
   onSymbolChange?: (symbol: string) => void;
   className?: string;
 }
@@ -230,6 +241,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   liveSpot,
   spot,
   tradeSignals = [],
+  serverTrades: serverTradesProp,
   onSymbolChange,
   className = "",
 }) => {
@@ -237,7 +249,47 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const activeSymbol = (symbol || ticker || "SPY").trim().toUpperCase() === "QQQ" ? "QQQ" : "SPY";
   const liveTickPrice = useDashboardStore((s) => s.liveTickPrice);
   const liveTickCount = useDashboardStore((s) => s.liveTickCount);
+  const gammaLevels = useDashboardStore((s) => s.gammaLevels);
   const rawLiveSpot = typeof liveSpot === "number" && liveSpot > 0 ? liveSpot : typeof spot === "number" && spot > 0 ? spot : null;
+
+  const [internalServerTrades, setInternalServerTrades] = useState<ServerTradeData>(
+    serverTradesProp || {}
+  );
+
+  useEffect(() => {
+    if (serverTradesProp && (serverTradesProp.closedPositions?.length || Object.keys(serverTradesProp.activePositions || {}).length)) {
+      setInternalServerTrades(serverTradesProp);
+    }
+  }, [serverTradesProp]);
+
+  // Dynamic Trade Signals Engine Hook: Polls /api/signals every 5s to guarantee client is in lockstep with server daemon
+  useEffect(() => {
+    let isMounted = true;
+    async function syncServerTrades() {
+      try {
+        const res = await fetch(`/api/signals?ticker=${encodeURIComponent(activeSymbol)}`, {
+          cache: "no-store",
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (isMounted) {
+          setInternalServerTrades({
+            activePositions: data?.activePositions || {},
+            closedPositions: data?.closedPositions || [],
+            alerts: data?.alerts || [],
+          });
+        }
+      } catch {
+        // Silent fallback
+      }
+    }
+    void syncServerTrades();
+    const interval = setInterval(syncServerTrades, 5000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [activeSymbol]);
 
   // Chart Container & Dynamic Axis Scaling / Pan State
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -531,8 +583,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   }, [effectiveCandles, pdeSeries, xFromEtMins, yForPrice]);
 
   const latestPt = enrichedPoints[enrichedPoints.length - 1];
-  const activeRegime = latestPt?.regime ?? "CALL";
   const activeChiPct = Math.round((latestPt?.chi ?? 0.5) * 100);
+  const activeRegime: "CALL" | "PUT" = activeChiPct >= 50 ? "CALL" : "PUT";
   const activePt = hoverIndex !== null && enrichedPoints[hoverIndex] ? enrichedPoints[hoverIndex] : latestPt;
 
   // SVG Paths
@@ -601,9 +653,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
   // STAGE 1: Pure Data-Space Signal Engine (Strictly Viewport-Invariant: S ⊥ V)
   // Never recomputes when the user zooms or pans the X/Y axes.
-  const intrinsicSignals = useMemo(() => {
+  const fsmEvaluation = useMemo(() => {
     if (!enrichedPoints || enrichedPoints.length < 3) {
-      return [];
+      return { signals: [], committedState: "STAND_ASIDE" as const };
     }
 
     // 1. Identify 9:30 AM Session Open Anchor & Expected Move Multiples
@@ -617,22 +669,68 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     const expectedMove = intrinsicExpectedMove;
     const putTrigger = Number((open930 - 0.25 * expectedMove).toFixed(2));
 
-    // 2. Compute EMA8 and EMA21 across session closes
-    const closes = enrichedPoints.map((b) => b.close);
-    const ema8 = computeEmaSeries(closes, 8);
-    const ema21 = computeEmaSeries(closes, 21);
+    if (!enrichedPoints || enrichedPoints.length === 0) {
+      return { signals: [], committedState: "STAND_ASIDE" as const };
+    }
 
-    // 3. Global Session High
-    let sessionHighIdx = 0;
-    let sessionHighPrice = -Infinity;
-    enrichedPoints.forEach((b, i) => {
-      if (b.high > sessionHighPrice) {
-        sessionHighPrice = b.high;
-        sessionHighIdx = i;
-      }
+    // STRICT NON-REPAINTING FINITE STATE MACHINE (Causal Equilibrium Dispersion, Closed-Bar Append-Only)
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = enrichedPoints.map((pt, i) => {
+      const tsSec = pt.timestamp > 1e11 ? Math.floor(pt.timestamp / 1000) : pt.timestamp;
+      const prevPt = i > 0 ? enrichedPoints[i - 1] : undefined;
+      const vwapSlope =
+        prevPt && typeof pt.flowVwap === "number" && typeof prevPt.flowVwap === "number"
+          ? pt.flowVwap - prevPt.flowVwap
+          : 0;
+      return {
+        barTimestamp: tsSec,
+        open: pt.open,
+        high: pt.high,
+        low: pt.low,
+        close: pt.close,
+        chi: pt.chi,
+        bias: pt.bias,
+        netFlux: pt.netFlux,
+        peclet: pt.pe,
+        flowVwap: pt.flowVwap,
+        prevFlowVwap: prevPt?.flowVwap,
+        vwapSlope,
+        etMins: pt.etMins,
+        isClosed: i < enrichedPoints.length - 1, // Only closed bars are committed
+      };
     });
 
-    const rawSignals: Array<{
+    const { snapshot } = fsm.commitSeries(bars, {
+      macroRegime: activeRegime,
+      callDominancePct: activeChiPct,
+    });
+
+    // Pair directional entries with their subsequent exit signals from snapshot.committedCallLog
+    const committedLog = snapshot.committedCallLog;
+    const directionalSignals = committedLog
+      .map((entrySig, j) => {
+        if (entrySig.toState !== "LONG" && entrySig.toState !== "SHORT") {
+          return null;
+        }
+        const exitSig = committedLog
+          .slice(j + 1)
+          .find((s) => s.fromState === entrySig.toState);
+        const isClosed =
+          exitSig !== undefined ||
+          (j < committedLog.length - 1 && snapshot.committedState !== entrySig.toState);
+        return { entry: entrySig, exit: exitSig, isClosed };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null);
+
+    const openSignalId =
+      snapshot.committedState !== "STAND_ASIDE" &&
+      directionalSignals.length > 0 &&
+      !directionalSignals[directionalSignals.length - 1].isClosed
+        ? directionalSignals[directionalSignals.length - 1].entry.id
+        : null;
+
+    // Map committed signals to intrinsic markers
+    const signals: Array<{
       id: string;
       barIndex: number;
       isCall: boolean;
@@ -640,229 +738,68 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       label: string;
       price: number;
       mfePoints: number;
-    }> = [];
-
-    // SIGNAL A: Opening Drive (09:30 - 09:45 ET)
-    if (
-      sessionHighIdx > anchorIdx + 2 &&
-      sessionHighPrice >= open930 + 0.45 * expectedMove
-    ) {
-      let openEntryIdx = anchorIdx;
-      for (
-        let i = anchorIdx;
-        i <= Math.min(anchorIdx + 3, sessionHighIdx - 1);
-        i++
-      ) {
-        if (enrichedPoints[i].close >= open930 * 0.9995) {
-          openEntryIdx = i;
-          break;
-        }
-      }
-      const entryBar = enrichedPoints[openEntryIdx];
-      const maxFutureHigh = Math.max(
-        ...enrichedPoints
-          .slice(openEntryIdx, sessionHighIdx + 1)
-          .map((c) => c.high)
-      );
-      rawSignals.push({
-        id: "sig-open",
-        barIndex: openEntryIdx,
-        isCall: true,
-        isWin: true,
-        label: "LONG · OPEN",
-        price: entryBar.close,
-        mfePoints: Math.max(0, maxFutureHigh - entryBar.close),
+      isOpen: boolean;
+      isPending?: boolean;
+      barSpanSeconds?: number;
+      barCloseTimestamp?: number;
+      exitPrice?: number;
+      exitTimestamp?: number;
+      exitIndex?: number;
+      exitReason?: string;
+      isClosed?: boolean;
+    }> = directionalSignals.map(({ entry: s, exit: exitSig, isClosed }) => {
+      let matchIdx = enrichedPoints.findIndex((b) => {
+        const bSec = b.timestamp > 1e11 ? Math.floor(b.timestamp / 1000) : b.timestamp;
+        return bSec === s.barTimestamp;
       });
-    }
-
-    // SIGNAL B: Session Peak Exhaustion Short (Strictly 1 canonical peak badge at the true session high wick)
-    const postPeakBars = enrichedPoints.slice(sessionHighIdx + 1);
-    const postPeakLow =
-      postPeakBars.length > 0
-        ? Math.min(...postPeakBars.map((b) => b.low))
-        : sessionHighPrice;
-    if (
-      sessionHighIdx >= anchorIdx + 2 &&
-      sessionHighIdx < enrichedPoints.length - 2 &&
-      sessionHighPrice >= open930 + 0.45 * expectedMove &&
-      sessionHighPrice - postPeakLow >= 0.4 * expectedMove
-    ) {
-      const peakBar = enrichedPoints[sessionHighIdx];
-      const peakPrice = Math.max(peakBar.high ?? peakBar.close, peakBar.close);
-      rawSignals.push({
-        id: "sig-peak",
-        barIndex: sessionHighIdx,
-        isCall: false,
-        isWin: true,
-        label: "SHORT · PEAK",
-        price: peakPrice,
-        mfePoints: Math.max(0, peakPrice - postPeakLow),
-      });
-    }
-
-    // SIGNAL C: Afternoon Breakdown vs. Strict Counter-Trend Veto
-    let breakdownFired = false;
-    for (let i = sessionHighIdx + 4; i < enrichedPoints.length; i++) {
-      const b = enrichedPoints[i];
-      const prev = enrichedPoints[i - 1];
-      const isBearTrend =
-        b.close < open930 && b.close < b.flowVwap && ema8[i] < ema21[i];
-
-      // Structural Breakdown Short Trigger
-      if (
-        !breakdownFired &&
-        isBearTrend &&
-        prev.close >= putTrigger &&
-        b.close < putTrigger
-      ) {
-        const futureLows = enrichedPoints.slice(i + 1).map((x) => x.low);
-        const minLow = futureLows.length > 0 ? Math.min(...futureLows) : b.low;
-        const excursion = Math.max(0, b.close - minLow);
-        if (i - sessionHighIdx >= 6 && excursion >= 0.25 * expectedMove) {
-          rawSignals.push({
-            id: "sig-break",
-            barIndex: i,
-            isCall: false,
-            isWin: true,
-            label: "SHORT · BREAK",
-            price: b.close,
-            mfePoints: excursion,
-          });
-          breakdownFired = true;
-        }
-      }
-
-      // COUNTER-TREND VETO:
-      // Zero LONG signals while in Bear Trend (b.close < open930 && b.close < b.flowVwap && ema8 < ema21)!
-      // A post-waterfall long requires a confirmed Structural Character Change (CHoCH):
-      if (
-        !isBearTrend &&
-        b.close > ema21[i] &&
-        prev.close <= ema21[i - 1] &&
-        ema8[i] > ema8[i - 1]
-      ) {
-        const futureHighs = enrichedPoints.slice(i + 1).map((x) => x.high);
-        const maxHigh =
-          futureHighs.length > 0 ? Math.max(...futureHighs) : b.high;
-        if (maxHigh - b.close >= 0.4 * expectedMove) {
-          rawSignals.push({
-            id: `sig-reclaim-${i}`,
-            barIndex: i,
-            isCall: true,
-            isWin: true,
-            label: "LONG · RECLAIM",
-            price: b.close,
-            mfePoints: maxHigh - b.close,
-          });
-          break;
-        }
-      }
-    }
-
-    // 4. Strict Non-Maximum Suppression (NMS) & Session-Wide Role Uniqueness
-    // Guarantees zero duplicate PEAK badges across both internal and external signal sources
-    rawSignals.sort((a, b) => a.barIndex - b.barIndex);
-    const dedupedSignals: typeof rawSignals = [];
-    const seenRoles = new Set<string>();
-
-    for (const s of rawSignals) {
-      const role = s.label.startsWith("SHORT · PEAK")
-        ? "PEAK"
-        : s.label.startsWith("LONG · OPEN")
-        ? "OPEN"
-        : s.label.startsWith("SHORT · BREAK")
-        ? "BREAK"
-        : s.label;
-
-      if (seenRoles.has(role)) {
-        if (role === "PEAK") {
-          const exIdx = dedupedSignals.findIndex((x) => x.label.startsWith("SHORT · PEAK"));
-          if (exIdx >= 0 && s.price > dedupedSignals[exIdx].price) {
-            dedupedSignals[exIdx] = s;
-          }
-        }
-        continue;
-      }
-
-      const prev = dedupedSignals[dedupedSignals.length - 1];
-      if (
-        prev &&
-        prev.isCall === s.isCall &&
-        Math.abs(s.barIndex - prev.barIndex) < 12
-      ) {
-        const sBetter = s.isCall ? s.price < prev.price : s.price > prev.price;
-        if (sBetter) {
-          const prevRole = prev.label.startsWith("SHORT · PEAK")
-            ? "PEAK"
-            : prev.label.startsWith("LONG · OPEN")
-            ? "OPEN"
-            : prev.label.startsWith("SHORT · BREAK")
-            ? "BREAK"
-            : prev.label;
-          seenRoles.delete(prevRole);
-          dedupedSignals[dedupedSignals.length - 1] = s;
-          seenRoles.add(role);
-        }
-        continue;
-      }
-      dedupedSignals.push(s);
-      seenRoles.add(role);
-    }
-
-    // 5. Merge external live signals only if they do not conflict with internal structural marks or bear trend
-    if (tradeSignals && tradeSignals.length > 0) {
-      tradeSignals.forEach((tsig, sIdx) => {
-        const sigTs =
-          tsig.timestamp > 1e11 ? tsig.timestamp : tsig.timestamp * 1000;
-        let bestIdx = 0;
-        let minDiff = Infinity;
-        enrichedPoints.forEach((pt, cIdx) => {
-          const diff = Math.abs(pt.timestamp - sigTs);
-          if (diff < minDiff) {
-            minDiff = diff;
-            bestIdx = cIdx;
+      if (matchIdx < 0) {
+        let bestDiff = Infinity;
+        enrichedPoints.forEach((b, idx) => {
+          const bSec = b.timestamp > 1e11 ? Math.floor(b.timestamp / 1000) : b.timestamp;
+          const diff = Math.abs(bSec - s.barTimestamp);
+          if (diff < bestDiff) {
+            bestDiff = diff;
+            matchIdx = idx;
           }
         });
+      }
 
-        // Suppress if an internal structural signal already occupies this 12-bar window
-        const alreadyHasSignal = dedupedSignals.some(
-          (g) => Math.abs(g.barIndex - bestIdx) <= 12
-        );
-        // Also veto counter-trend longs during active bear trend
-        const pt = enrichedPoints[bestIdx];
-        const isBearTrend =
-          pt &&
-          pt.close < open930 &&
-          pt.close < pt.flowVwap &&
-          ema8[bestIdx] < ema21[bestIdx];
-        const isVetoed = isBearTrend && tsig.contractType === "CALL";
+      let exitIdx: number | undefined;
+      if (exitSig) {
+        exitIdx = enrichedPoints.findIndex((b) => {
+          const bSec = b.timestamp > 1e11 ? Math.floor(b.timestamp / 1000) : b.timestamp;
+          return bSec === exitSig.barTimestamp;
+        });
+        if (exitIdx < 0) exitIdx = undefined;
+      }
 
-        // Never duplicate PEAK role from external signal
-        const isPeakConflict = tsig.setupName?.includes("PEAK") && seenRoles.has("PEAK");
+      const isCall = s.toState === "LONG";
+      const isOpen = s.id === openSignalId;
+      return {
+        id: s.id,
+        barIndex: Math.max(0, matchIdx),
+        isCall,
+        isWin: exitSig ? (isCall ? exitSig.price > s.price : s.price > exitSig.price) : true,
+        label: isCall ? (isOpen ? "LONG · OPEN" : "LONG") : (isOpen ? "SHORT · OPEN" : "SHORT"),
+        price: s.price,
+        mfePoints: 0,
+        isOpen,
+        isPending: false,
+        barSpanSeconds: s.barSpanSeconds,
+        barCloseTimestamp: s.barCloseTimestamp,
+        exitPrice: exitSig?.price,
+        exitTimestamp: exitSig?.barTimestamp,
+        exitIndex: exitIdx,
+        exitReason: exitSig?.reason,
+        isClosed,
+      };
+    });
 
-        // Coordinate Manifold Check: price must fall within the matched candle's envelope
-        const candlePriceRange = Math.max(pt ? pt.high - pt.low : 0, 0.5);
-        const maxTolerance = Math.max(candlePriceRange * 1.5, 1.2);
-        const isManifoldTear = pt && Math.abs(tsig.spotPrice - pt.close) > maxTolerance;
+    signals.sort((a, b) => a.barIndex - b.barIndex);
+    return { signals, committedState: snapshot.committedState };
+  }, [enrichedPoints, activeRegime, activeChiPct]);
 
-        if (!alreadyHasSignal && !isVetoed && !isPeakConflict && !isManifoldTear && minDiff <= 15 * 60 * 1000) {
-          const isCall = tsig.contractType === "CALL";
-          dedupedSignals.push({
-            id: `store-sig-${sIdx}`,
-            barIndex: bestIdx,
-            isCall,
-            isWin: tsig.isWin ?? true,
-            label: tsig.setupName || (isCall ? "CALL BUY" : "PUT BUY"),
-            price: tsig.spotPrice,
-            mfePoints: 0,
-          });
-        }
-      });
-      dedupedSignals.sort((a, b) => a.barIndex - b.barIndex);
-    }
-
-    return dedupedSignals;
-  }, [enrichedPoints, tradeSignals, intrinsicExpectedMove]);
+  const { signals: intrinsicSignals, committedState: fsmCommittedState } = fsmEvaluation;
 
   // STAGE 2: Affine Viewport Coordinate Projection (Maps invariant signals to SVG [x, y] pixels)
   const markers = useMemo(() => {
@@ -872,6 +809,69 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       y: yForPrice(m.price),
     }));
   }, [intrinsicSignals, xForIdx, yForPrice]);
+
+  // Project authoritative server trades (BTO / STC + PnL badges + trajectory) onto SVG coordinates
+  const svgServerTradeMarkers = useMemo(() => {
+    const trades = extractNormalizedTradesForTicker(activeSymbol, internalServerTrades).filter(
+      (t) => !String(t.id).startsWith("test-")
+    );
+    if (trades.length === 0 || enrichedPoints.length === 0) return [];
+    return trades
+      .map((trade) => {
+        // Align with initial FSM signal if present to eliminate advection poll latency
+        const isCall = trade.contractType === "CALL";
+        const matchedFsmSig = intrinsicSignals.find(
+          (s) => s.isCall === isCall && (s.isOpen || s.isClosed)
+        );
+
+        let entryIdx = matchedFsmSig ? matchedFsmSig.barIndex : -1;
+        if (entryIdx < 0) {
+          entryIdx = matchTradeToCandleIndex(
+            enrichedPoints,
+            trade.openedTs,
+            trade.openedAt
+          );
+        }
+        if (entryIdx < 0) return null;
+        const exitIdx =
+          trade.status === "CLOSED"
+            ? matchTradeToCandleIndex(enrichedPoints, trade.closedTs, trade.closedAt)
+            : -1;
+        const entryBar = enrichedPoints[entryIdx];
+        const entrySpot = trade.btoSpotPrice > 0 ? trade.btoSpotPrice : entryBar.close;
+        const entryX = xForIdx(entryIdx);
+        const entryY = yForPrice(entrySpot);
+        const entryHighY = yForPrice(entryBar.high);
+        const entryLowY = yForPrice(entryBar.low);
+
+        const isClosed = trade.status === "CLOSED" && exitIdx >= 0;
+        const exitBar = isClosed ? enrichedPoints[exitIdx] : enrichedPoints[enrichedPoints.length - 1];
+        const exitSpot =
+          isClosed && trade.closedSpotPrice && trade.closedSpotPrice > 0
+            ? trade.closedSpotPrice
+            : exitBar.close;
+        const exitX = isClosed ? xForIdx(exitIdx) : xForIdx(enrichedPoints.length - 1);
+        const exitY = yForPrice(exitSpot);
+        const exitHighY = yForPrice(exitBar.high);
+        const exitLowY = yForPrice(exitBar.low);
+
+        return {
+          ...trade,
+          entryIdx,
+          exitIdx,
+          entryX,
+          entryY,
+          entryHighY,
+          entryLowY,
+          isClosed,
+          exitX,
+          exitY,
+          exitHighY,
+          exitLowY,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null);
+  }, [activeSymbol, internalServerTrades, enrichedPoints, xForIdx, yForPrice]);
 
   // Structural Metrics (Open 9:30 & Straddle Expected Move) - Strictly Viewport-Invariant
   const structuralMetrics = useMemo(() => {
@@ -914,7 +914,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   }, [enrichedPoints]);
 
   const przmSignals: PrzmSignalPoint[] = useMemo(() => {
-    return intrinsicSignals.map((m) => ({
+    return intrinsicSignals
+      .filter((m) => !(m as any).isPending)
+      .map((m) => ({
       id: m.id,
       index: m.barIndex,
       time: enrichedPoints[m.barIndex]?.timeLabel ?? "",
@@ -931,6 +933,13 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       label: m.label,
       excursion: m.mfePoints,
       reason: m.label,
+      barSpanSeconds: (m as any).barSpanSeconds,
+      barCloseTimestamp: (m as any).barCloseTimestamp,
+      exitPrice: (m as any).exitPrice,
+      exitTimestamp: (m as any).exitTimestamp,
+      exitIndex: (m as any).exitIndex,
+      exitReason: (m as any).exitReason,
+      isClosed: (m as any).isClosed,
     }));
   }, [intrinsicSignals, enrichedPoints]);
 
@@ -952,9 +961,13 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         ticker: "SPY",
         signals: przmSignals,
         spotPrice: activeSpotPrice,
+        activeFsmState: fsmCommittedState,
+        macroRegime: activeRegime,
+        chiPct: activeChiPct,
+        zeroGamma: typeof gammaLevels?.zeroGamma === "number" && gammaLevels.zeroGamma > 0 ? gammaLevels.zeroGamma : undefined,
       }),
     }).catch(() => {});
-  }, [activeSymbol, przmSignals, activeSpotPrice]);
+  }, [activeSymbol, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, gammaLevels?.zeroGamma]);
 
   // Screen Pixel to SVG ViewBox Coordinate Conversion
   const getSvgCoordinates = useCallback(
@@ -1091,6 +1104,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         signals={przmSignals}
         open930={structuralMetrics.open930}
         straddleEm={structuralMetrics.expectedMove}
+        activeFsmState={fsmCommittedState}
+        serverTrades={internalServerTrades}
       />
 
       {/* Background Micro-Grid */}
@@ -1373,15 +1388,18 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           {markers.map((m) => {
             if (m.x < padLeft - 20 || m.x > svgWidth - padRight + 20) return null;
             const isCall = m.isCall;
+            const isPending = (m as any).isPending ?? false;
+            const isOpen = (m as any).isOpen ?? false;
+            const showBadgeCallout = isOpen || isPending;
             const markerColor = isCall ? "#00F5D4" : "#FF2A55";
             const excursionText = m.mfePoints >= 0.2 ? ` +$${m.mfePoints.toFixed(1)}` : "";
             const badgeY = isCall
               ? Math.min(chartBottom - 12, m.y + 26)
               : Math.max(padTop + 14, m.y - 28);
-            const badgeWidth = m.mfePoints >= 0.2 ? 104 : 88;
+            const badgeWidth = isPending ? 116 : m.mfePoints >= 0.2 ? 104 : 88;
 
             return (
-              <g key={m.id} className="cursor-pointer">
+              <g key={m.id} className="cursor-pointer" opacity={isPending ? 0.8 : 1.0}>
                 {/* Visual Icon (Triangle + Status Glyph) */}
                 <g transform={`translate(${m.x.toFixed(1)}, ${m.y.toFixed(1)})`}>
                   {isCall ? (
@@ -1418,46 +1436,191 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                   )}
                 </g>
 
-                {/* Tactical Trade Badge Callout */}
-                <g transform={`translate(${m.x.toFixed(1)}, ${badgeY.toFixed(1)})`}>
-                  <rect
-                    x={-badgeWidth / 2}
-                    y={-10}
-                    width={badgeWidth}
-                    height={20}
-                    rx={4}
-                    fill="rgba(9, 13, 22, 0.92)"
-                    stroke={markerColor}
-                    strokeWidth={1.2}
-                    filter={`url(#white-glow-${uid})`}
-                  />
-                  <text
-                    x={0}
-                    y={-0.5}
-                    textAnchor="middle"
-                    fill={markerColor}
-                    fontSize="8.5"
-                    fontWeight="800"
-                    fontFamily="monospace"
-                  >
-                    {isCall ? "▲ " : "▼ "}
-                    {m.label}
-                  </text>
-                  <text
-                    x={0}
-                    y={7.5}
-                    textAnchor="middle"
-                    fill="#ffffff"
-                    fontSize="7.5"
-                    fontWeight="700"
-                    fontFamily="monospace"
-                  >
-                    ${m.price.toFixed(2)}
-                    {excursionText && (
-                      <tspan fill={isCall ? "#00F5D4" : "#F59E0B"}>{excursionText}</tspan>
-                    )}
-                  </text>
-                </g>
+                {/* Tactical Trade Badge Callout - Rendered strictly on the single active OPEN position */}
+                {showBadgeCallout && (
+                  <g transform={`translate(${m.x.toFixed(1)}, ${badgeY.toFixed(1)})`}>
+                    <rect
+                      x={-badgeWidth / 2}
+                      y={-10}
+                      width={badgeWidth}
+                      height={20}
+                      rx={4}
+                      fill="rgba(9, 13, 22, 0.92)"
+                      stroke={markerColor}
+                      strokeWidth={1.2}
+                      strokeDasharray={isPending ? "3 3" : undefined}
+                      filter={`url(#white-glow-${uid})`}
+                    />
+                    <text
+                      x={0}
+                      y={-0.5}
+                      textAnchor="middle"
+                      fill={markerColor}
+                      fontSize="8.5"
+                      fontWeight="800"
+                      fontFamily="monospace"
+                    >
+                      {isCall ? "▲ " : "▼ "}
+                      {m.label}
+                    </text>
+                    <text
+                      x={0}
+                      y={7.5}
+                      textAnchor="middle"
+                      fill="#ffffff"
+                      fontSize="7.5"
+                      fontWeight="700"
+                      fontFamily="monospace"
+                    >
+                      ${m.price.toFixed(2)}
+                      {excursionText && (
+                        <tspan fill={isCall ? "#00F5D4" : "#F59E0B"}>{excursionText}</tspan>
+                      )}
+                    </text>
+                  </g>
+                )}
+              </g>
+            );
+          })}
+
+          {/* Authoritative Server BTO / STC Execution Markers, Trajectory Line & PnL Pill Badges */}
+          {svgServerTradeMarkers.map((st) => {
+            const isPut = st.contractType === "PUT";
+            const btoColor = isPut ? "#ef4444" : "#10b981";
+            const btoLabel = isPut ? "BTO PUT" : "BTO CALL";
+            const pnlPct = st.pnlOptionPct ?? 0;
+            const isProfit = pnlPct >= 0;
+            const stcColor = isProfit ? "#10b981" : "#ef4444";
+            const stcFill = isProfit
+              ? "rgba(16, 185, 129, 0.22)"
+              : "rgba(239, 68, 68, 0.22)";
+            const stcText = `STC ${pnlPct >= 0 ? "+" : ""}${Math.round(pnlPct)}%`;
+            const stcBadgeW = Math.max(76, stcText.length * 6.8 + 14);
+
+            const btoTipY = isPut
+              ? Math.max(padTop + 18, st.entryHighY - 6)
+              : Math.min(chartBottom - 18, st.entryLowY + 6);
+            const btoPillY = isPut
+              ? Math.max(padTop + 2, btoTipY - 26)
+              : Math.min(chartBottom - 18, btoTipY + 12);
+
+            const stcTipY = isPut
+              ? Math.min(chartBottom - 20, st.exitLowY + 6)
+              : Math.max(padTop + 20, st.exitHighY - 6);
+            const stcBadgeY = isPut
+              ? Math.min(chartBottom - 20, stcTipY + 2)
+              : Math.max(padTop + 4, stcTipY - 20);
+
+            return (
+              <g key={`srv-trade-${st.id}`}>
+                {/* Dotted Trajectory Connector Line */}
+                <line
+                  x1={st.entryX}
+                  y1={st.entryY}
+                  x2={st.exitX}
+                  y2={st.exitY}
+                  stroke={st.isClosed ? stcColor : btoColor}
+                  strokeWidth="1.75"
+                  strokeDasharray="4 4"
+                  opacity="0.82"
+                />
+                <circle cx={st.entryX} cy={st.entryY} r="3" fill={btoColor} />
+                {st.isClosed && (
+                  <circle cx={st.exitX} cy={st.exitY} r="3" fill={stcColor} />
+                )}
+
+                {/* BTO Entry Triangle & Label */}
+                {st.entryX >= padLeft - 20 && st.entryX <= svgWidth - padRight + 20 && (
+                  <g>
+                    <polygon
+                      points={
+                        isPut
+                          ? `${st.entryX},${btoTipY} ${st.entryX - 6.5},${btoTipY - 9.5} ${st.entryX + 6.5},${btoTipY - 9.5}`
+                          : `${st.entryX},${btoTipY} ${st.entryX - 6.5},${btoTipY + 9.5} ${st.entryX + 6.5},${btoTipY + 9.5}`
+                      }
+                      fill={btoColor}
+                      stroke="#ffffff"
+                      strokeWidth="1"
+                    />
+                    <rect
+                      x={st.entryX - 30}
+                      y={btoPillY}
+                      width="60"
+                      height="15"
+                      rx="4"
+                      fill="rgba(15, 23, 42, 0.92)"
+                      stroke={btoColor}
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x={st.entryX}
+                      y={btoPillY + 10.5}
+                      textAnchor="middle"
+                      fill={isPut ? "#fca5a5" : "#6ee7b7"}
+                      fontSize="9"
+                      fontWeight="bold"
+                      fontFamily="monospace"
+                    >
+                      {btoLabel}
+                    </text>
+                  </g>
+                )}
+
+                {/* STC Cover Triangle & Glowing PnL Pill Badge */}
+                {st.isClosed &&
+                  st.exitX >= padLeft - 20 &&
+                  st.exitX <= svgWidth - padRight + 20 &&
+                  (() => {
+                    const rawBadgeX = st.exitX + 9;
+                    const stcBadgeX =
+                      rawBadgeX + stcBadgeW > svgWidth - padRight
+                        ? Math.max(padLeft + 4, st.exitX - stcBadgeW - 6)
+                        : rawBadgeX;
+
+                    return (
+                      <g>
+                        <polygon
+                          points={
+                            isPut
+                              ? `${st.exitX},${stcTipY} ${st.exitX - 6.5},${stcTipY + 9.5} ${st.exitX + 6.5},${stcTipY + 9.5}`
+                              : `${st.exitX},${stcTipY} ${st.exitX - 6.5},${stcTipY - 9.5} ${st.exitX + 6.5},${stcTipY - 9.5}`
+                          }
+                          fill={stcColor}
+                          stroke="#ffffff"
+                          strokeWidth="1"
+                        />
+                        <rect
+                          x={stcBadgeX}
+                          y={stcBadgeY}
+                          width={stcBadgeW}
+                          height="18"
+                          rx="5"
+                          fill="rgba(9, 13, 22, 0.9)"
+                        />
+                        <rect
+                          x={stcBadgeX}
+                          y={stcBadgeY}
+                          width={stcBadgeW}
+                          height="18"
+                          rx="5"
+                          fill={stcFill}
+                          stroke={stcColor}
+                          strokeWidth="1.4"
+                        />
+                        <text
+                          x={stcBadgeX + stcBadgeW / 2}
+                          y={stcBadgeY + 12.5}
+                          textAnchor="middle"
+                          fill={stcColor}
+                          fontSize="10"
+                          fontWeight="bold"
+                          fontFamily="monospace"
+                        >
+                          {stcText}
+                        </text>
+                      </g>
+                    );
+                  })()}
               </g>
             );
           })}
@@ -1677,6 +1840,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         signals={przmSignals}
         series={przmSeries}
         liveSpot={activeSpotPrice}
+        activeFsmState={fsmCommittedState}
+        serverTrades={internalServerTrades}
       />
     </div>
   );

@@ -121,6 +121,8 @@ export interface TradeLifecycleAlert {
 
 export interface DailyTradeStore {
   date: string; // YYYY-MM-DD (ET)
+  version?: number;
+  updatedAtMs?: number;
   activePositions: Record<string, OptionTradePosition>; // ticker -> active position (OPEN or PARTIAL_TP1)
   closedPositions: OptionTradePosition[];
   alerts: TradeLifecycleAlert[];
@@ -128,6 +130,10 @@ export interface DailyTradeStore {
   backfilledTickers?: Record<string, boolean>;
   dispatchedAlertIds?: Record<string, boolean>;
   dailyRecapSent?: boolean;
+  activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
+  macroRegime?: "CALL" | "PUT";
+  chiPct?: number;
+  zeroGamma?: number;
 }
 
 export interface SelectedOptionContract {
@@ -187,6 +193,8 @@ export interface TradeEvaluationParams {
   nowEt?: Date;
   webhookUrl?: string;
   isHistoricalBackfill?: boolean;
+  priorClose?: number;
+  premarketFlowVwap?: number;
 }
 
 export interface TradeEvaluationResult {
@@ -501,8 +509,8 @@ export function loadTradeStore(): DailyTradeStore {
         if (
           parsed &&
           parsed.date === today &&
-          Array.isArray(parsed.alerts) &&
-          parsed.alerts.length > inMemoryTradeStore.alerts.length
+          ((parsed.version ?? 0) > (inMemoryTradeStore.version ?? 0) ||
+           (Array.isArray(parsed.alerts) && parsed.alerts.length > inMemoryTradeStore.alerts.length))
         ) {
           inMemoryTradeStore = parsed;
         }
@@ -513,15 +521,25 @@ export function loadTradeStore(): DailyTradeStore {
     return inMemoryTradeStore;
   }
 
-  // Prune older active-trades-*.json files from previous sessions
+  // Retain the last 3 days of active-trades-*.json cache files to prevent premature midnight wipe
   try {
     const files = fs.readdirSync(cacheDir);
+    const validDates = new Set<string>();
+    for (let dayOffset = 0; dayOffset < 3; dayOffset++) {
+      const dt = new Date();
+      dt.setDate(dt.getDate() - dayOffset);
+      const dtStr = dt.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+      validDates.add(dtStr);
+    }
     for (const f of files) {
-      if (f.startsWith("active-trades-") && !f.includes(today)) {
-        try {
-          fs.unlinkSync(path.join(cacheDir, f));
-        } catch {
-          // ignore cleanup failures
+      if (f.startsWith("active-trades-") && f.endsWith(".json")) {
+        const matchesCurrentWindow = Array.from(validDates).some((d) => f.includes(d));
+        if (!matchesCurrentWindow) {
+          try {
+            fs.unlinkSync(path.join(cacheDir, f));
+          } catch {
+            // ignore cleanup failures
+          }
         }
       }
     }
@@ -544,6 +562,8 @@ export function loadTradeStore(): DailyTradeStore {
 
   inMemoryTradeStore = {
     date: today,
+    version: 1,
+    updatedAtMs: Date.now(),
     activePositions: {},
     closedPositions: [],
     alerts: [],
@@ -554,10 +574,14 @@ export function loadTradeStore(): DailyTradeStore {
 
 export function saveTradeStore(store: DailyTradeStore): void {
   try {
+    store.version = (store.version ?? 0) + 1;
+    store.updatedAtMs = Date.now();
     inMemoryTradeStore = store;
     const cacheDir = getCacheDir();
     const filePath = path.join(cacheDir, `active-trades-${store.date}.json`);
-    fs.writeFileSync(filePath, JSON.stringify(store, null, 2), "utf-8");
+    const tmpPath = path.join(cacheDir, `active-trades-${store.date}.json.tmp.${process.pid}.${Date.now()}`);
+    fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), "utf-8");
+    fs.renameSync(tmpPath, filePath);
   } catch {
     // Non-fatal if filesystem write fails (e.g. read-only environment)
   }
@@ -1305,6 +1329,33 @@ export async function sendDiscordTradeAlert(
     return false;
   }
 
+  // Strict Macro Regime & FSM Gating Firewall
+  const store = loadTradeStore();
+  if (alert.ticker === "SPY") {
+    const fsmState = store.activeFsmState;
+    const macro = store.macroRegime;
+    const chiPct = store.chiPct ?? 50;
+
+    // PUT alerts must be BLOCKED when fsmState === "LONG", fsmState === "STAND_ASIDE", macro === "CALL", or chiPct >= 50
+    if (alert.contractType === "PUT") {
+      if (fsmState === "LONG" || fsmState === "STAND_ASIDE" || macro === "CALL" || chiPct >= 50) {
+        console.warn(
+          `[DiscordTradeAlert FIREWALL REJECT] Blocked illegal SPY PUT alert (${alert.action} · ${alert.id}) while FSM is ${fsmState} / Macro ${macro} (χ=${chiPct}%).`
+        );
+        return false;
+      }
+    }
+    // CALL alerts must be BLOCKED when fsmState === "SHORT", fsmState === "STAND_ASIDE", macro === "PUT", or chiPct < 50
+    if (alert.contractType === "CALL") {
+      if (fsmState === "SHORT" || fsmState === "STAND_ASIDE" || macro === "PUT" || chiPct < 50) {
+        console.warn(
+          `[DiscordTradeAlert FIREWALL REJECT] Blocked illegal SPY CALL alert (${alert.action} · ${alert.id}) while FSM is ${fsmState} / Macro ${macro} (χ=${chiPct}%).`
+        );
+        return false;
+      }
+    }
+  }
+
   const webhookUrl =
     (customWebhookUrl || process.env.DISCORD_WEBHOOK_URL)?.trim() ||
     DEFAULT_DISCORD_WEBHOOK_URL;
@@ -1437,9 +1488,19 @@ export async function sendDiscordTradeAlert(
         badge = alert.contractsQty === 2 ? "SELL 1 OF 2 CONTRACTS (LOCK PROFIT)" : "RAISE STOP TO PROFIT";
         title = `${emoji} ${badge} · ${alert.ticker} ${alert.contractType}S`;
       } else if (reasonUpper.includes("REGIME") || reasonUpper.includes("FLIP") || reasonUpper.includes("REVERSAL")) {
-        embedColor = isProfitable ? 0x10b981 : 0x3b82f6;
-        emoji = "🔄";
-        badge = isProfitable ? "REVERSAL PROFIT LOCK" : "REGIME FLIP / REVERSAL EXIT";
+        if (pnlPct >= 10) {
+          embedColor = 0x10b981; // True Profit Lock (>= 10%)
+          emoji = "🔒";
+          badge = "REVERSAL PROFIT LOCK";
+        } else if (isProfitable || isBreakeven) {
+          embedColor = 0x94a3b8; // Divergence Scratch (< 10%)
+          emoji = "🔄";
+          badge = "MOMENTUM DIVERGENCE SCRATCH";
+        } else {
+          embedColor = 0x3b82f6;
+          emoji = "🔄";
+          badge = "REGIME FLIP / REVERSAL EXIT";
+        }
         title = `🔄 ${badge} · ${alert.ticker} ${alert.contractType}S`;
       } else if (reasonUpper.includes("TRAILING") || reasonUpper.includes("PROTECT")) {
         embedColor = 0x10b981; // Emerald Green
@@ -1562,13 +1623,47 @@ export async function sendDiscordTradeAlert(
       ],
     };
 
-    const res = await fetch(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    return res.ok;
-  } catch {
+    const targetUrl = webhookUrl.includes("?")
+      ? `${webhookUrl}&wait=true`
+      : `${webhookUrl}?wait=true`;
+
+    let lastStatus = 0;
+    let lastErrorText = "";
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const res = await fetch(targetUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      lastStatus = res.status;
+
+      if (res.status === 429) {
+        const rateData = await res.json().catch(() => null);
+        const retryAfterSec = typeof rateData?.retry_after === "number" ? rateData.retry_after : 1.5;
+        const sleepMs = Math.min(Math.round(retryAfterSec * 1000) + 100, 5000);
+        console.warn(`[DiscordTradeAlert] HTTP 429 rate limit encountered. Backing off for ${sleepMs}ms (attempt ${attempt}/3)...`);
+        await new Promise((r) => setTimeout(r, sleepMs));
+        continue;
+      }
+
+      if (!res.ok) {
+        lastErrorText = await res.text().catch(() => res.statusText);
+        console.error(`[DiscordTradeAlert] HTTP ${res.status} error dispatching to Discord: ${lastErrorText}`);
+        return false;
+      }
+
+      const bodyData = await res.json().catch(() => null);
+      const discordMsgId = bodyData?.id || "";
+      console.log(`[DiscordTradeAlert] Successfully dispatched ${alert.action} [${alert.ticker} ${alert.contractType}]. HTTP ${res.status} OK · Message ID: ${discordMsgId}`);
+      return true;
+    }
+
+    console.error(`[DiscordTradeAlert] Failed to dispatch alert after 3 attempts. Last HTTP status: ${lastStatus}`);
+    return false;
+  } catch (err) {
+    console.error("[DiscordTradeAlert] Network or unexpected exception dispatching Discord webhook:", err);
     return false;
   }
 }
@@ -1677,6 +1772,24 @@ async function backfillIntradaySessionSignals(
     );
     if (sessionBars.length < 3) return;
 
+    // Compute intraday session SMA34 so 11:00 AM intraday trend reversals/covers trigger accurately
+    for (let i = 0; i < sessionBars.length; i++) {
+      const startIdx = Math.max(0, i - 33);
+      let sum = 0;
+      let count = 0;
+      for (let k = startIdx; k <= i; k++) {
+        sum += sessionBars[k].close;
+        count++;
+      }
+      sessionBars[i].sma34 = Number((sum / Math.max(1, count)).toFixed(2));
+    }
+
+    // Track rolling intraday session floor so 5m Bull Reversal Bounce after major flush triggers Momentum Cover
+    let runningSessionLow = sessionBars[0].low;
+    for (let i = 0; i < sessionBars.length; i++) {
+      runningSessionLow = Math.min(runningSessionLow, sessionBars[i].low);
+    }
+
     // Determine morning opening support and session high resistance
     const openingSlice = sessionBars.slice(0, Math.min(6, sessionBars.length));
     const openingLow = Math.min(...openingSlice.map((b) => b.low));
@@ -1708,8 +1821,8 @@ async function backfillIntradaySessionSignals(
       baseContracts
     );
 
-    // Replay bar-by-bar chronologically through today's RTH session (starting at 9:45 AM after 15m Opening Range)
-    const replayStartIdx = Math.min(3, sessionBars.length - 1);
+    // Replay bar-by-bar chronologically through today's RTH session (starting at 9:35 AM to catch Opening Zero-Gamma Flushes)
+    const replayStartIdx = Math.min(1, sessionBars.length - 1);
     const replayEndIdx = sessionBars.length;
     for (let idx = replayStartIdx; idx < replayEndIdx; idx++) {
       const bar = sessionBars[idx];
@@ -1717,12 +1830,14 @@ async function backfillIntradaySessionSignals(
       const barDate = new Date(bar.ts * 1000);
 
       const openPos = store.activePositions[normalizedTicker];
+      const isZeroGammaFlushPos = Boolean(openPos?.setupName?.includes("Bearish Zero-Gamma Flush"));
       // Use intrabar high/low when an active position is open to capture real limit TP fills
+      // For Bearish Zero-Gamma Flush trend trades, ride the trend to Target 2 or Momentum Reversal Cover (SMA34 reclaim)
       let evalSpot = bar.close;
       if (openPos) {
         if (openPos.contractType === "CALL" && bar.high >= openPos.target1Spot) {
           evalSpot = bar.high >= openPos.target2Spot ? bar.high : Math.max(bar.close, openPos.target1Spot);
-        } else if (openPos.contractType === "PUT" && bar.low <= openPos.target1Spot) {
+        } else if (openPos.contractType === "PUT" && !isZeroGammaFlushPos && bar.low <= openPos.target1Spot) {
           evalSpot = bar.low <= openPos.target2Spot ? bar.low : Math.min(bar.close, openPos.target1Spot);
         }
       }
@@ -1781,12 +1896,22 @@ async function backfillIntradaySessionSignals(
         };
       });
 
+      // Detect 5m Bullish Momentum Reversal / Divergence after major morning flush (>= $10 drop and >= $3 bounce off session low)
+      const sliceLowSoFar = Math.min(...sessionBars.slice(0, idx + 1).map((b) => b.low));
+      const isPostFlushBullReversal =
+        Boolean(openPos && openPos.contractType === "PUT") &&
+        bar.totalMinutes >= 645 && // >= 10:45 AM ET
+        (openPos!.btoSpotPrice - sliceLowSoFar >= 8.0) &&
+        (bar.close - sliceLowSoFar >= 2.2) &&
+        bar.close > bar.open &&
+        bar.close > prevBar.close;
+
       await evaluateTradeSignals({
         ...params,
         ticker: normalizedTicker,
         spotPrice: evalSpot,
         prevSpotPrice: prevBar.close,
-        divergence5m: undefined,
+        divergence5m: isPostFlushBullReversal ? "BULL" : undefined,
         divergence30m: undefined,
         dailyExpectedMove: {
           low: effectiveDailyLow,
@@ -1946,6 +2071,17 @@ export async function evaluateTradeSignals(
   const etTime = getNowEtTime(now);
 
   let activePos: OptionTradePosition | null = store.activePositions[normalizedTicker] ?? null;
+
+  // Linear Single-Slot State Machine Invariant: FLAT (0 trades) -> ACTIVE (1 contract) -> LOCKED_FOR_DAY (1 trade completed)
+  // If 1 trade has completed today and no active position is open, terminate evaluation immediately.
+  if ((store.closedPositions?.length ?? 0) >= 1 && !activePos) {
+    return {
+      ticker: normalizedTicker,
+      activePosition: null,
+      emittedAlerts: [],
+      allAlerts: store.alerts,
+    };
+  }
 
   // Hard Market Close Boundary: Equity/ETF options halt trading at 4:00 PM ET sharp.
   // Absolutely zero new evaluations, orders, or after-hours prices allowed after 16:00 ET.
@@ -2108,81 +2244,56 @@ export async function evaluateTradeSignals(
     ) {
       closePosition("10:45 AM MOMENTUM CUTOFF (PROTECT PROFITS / AVOID MIDDAY CHOP)", "Chop Time Stop");
     }
-    // 3. STC (TARGET 2 HIT · FULL PROFIT EXIT)
-    else if (
-      (isCall && spotPrice >= activePos.target2Spot) ||
-      (!isCall && spotPrice <= activePos.target2Spot) ||
-      pnlOptionPct >= (activePos.tp2Pct || 50)
-    ) {
-      const exitTitle =
-        activePos.contractsQty === 2 && activePos.remainingQty === 1
-          ? "TARGET 2 HIT · SELL FINAL 1 CONTRACT (FULL PROFIT)"
-          : "TARGET 2 HIT · FULL PROFIT EXIT";
-      closePosition(exitTitle, "Target 2 Full Profit");
-    }
-    // 4. STC (TARGET 1 HIT · SMART SCALING)
+    // 3. STC (MOMENTUM REVERSAL / DIVERGENCE COVER — DYNAMIC TREND EXIT)
+    // Enforce minimum holding noise buffer (heldMin >= 1 bar) and substantial move confirmation
     else if (
       activePos.status === "OPEN" &&
+      heldMin >= 1 &&
+      ((!isCall &&
+        ((params.putWall > 0 &&
+          spotPrice <= params.putWall * 1.0012 &&
+          activePos.btoSpotPrice - spotPrice >= 1.25) ||
+         (divergence5m === "BULL" && activePos.btoSpotPrice - spotPrice >= 0.75) ||
+         Boolean(
+           latest5mCandle &&
+             typeof latest5mCandle.sma34 === "number" &&
+             latest5mCandle.close > latest5mCandle.sma34 &&
+             (activePos.btoSpotPrice - spotPrice >= 0.75 || pnlOptionPct >= 10)
+         ))) ||
+       (isCall &&
+        ((divergence5m === "BEAR" && spotPrice - activePos.btoSpotPrice >= 0.75) ||
+         Boolean(
+           latest5mCandle &&
+             typeof latest5mCandle.sma34 === "number" &&
+             latest5mCandle.close < latest5mCandle.sma34 &&
+             (spotPrice - activePos.btoSpotPrice >= 0.75 || pnlOptionPct >= 10)
+         ))))
+    ) {
+      const exitReason =
+        pnlOptionPct >= 10
+          ? "MOMENTUM REVERSAL PROFIT LOCK"
+          : "MOMENTUM DIVERGENCE SCRATCH";
+      closePosition(exitReason, "Momentum Reversal Cover");
+    }
+    // 4. STC (TARGET 2 HIT · FULL PROFIT EXIT — bypassed for active Bearish Zero-Gamma Flush while below SMA34 so trend runners ride until Momentum Reversal Cover)
+    else if (
+      !activePos.setupName.includes("Bearish Zero-Gamma Flush") &&
+      ((isCall && spotPrice >= activePos.target2Spot) ||
+        (!isCall && spotPrice <= activePos.target2Spot) ||
+        pnlOptionPct >= (activePos.tp2Pct || 50))
+    ) {
+      closePosition("TARGET 2 HIT · FULL PROFIT EXIT", "Target 2 Full Profit");
+    }
+    // 5. STC (TARGET 1 HIT · 1 CONTRACT SNIPER FULL EXIT — bypassed for active Bearish Zero-Gamma Flush while below SMA34)
+    else if (
+      activePos.status === "OPEN" &&
+      !activePos.setupName.includes("Bearish Zero-Gamma Flush") &&
       ((isCall && spotPrice >= activePos.target1Spot) ||
         (!isCall && spotPrice <= activePos.target1Spot) ||
         pnlOptionPct >= (activePos.tp1Pct || 25))
     ) {
-      if (activePos.contractsQty === 2) {
-        // When 2 contracts: Trim 1 of 2 contracts and move stop on runner to breakeven
-        activePos.status = "PARTIAL_TP1";
-        activePos.remainingQty = 1;
-        activePos.stopLossSpot = activePos.btoSpotPrice;
-        const msgStr = `💰 SELL TO CLOSE 1 OF 2 CONTRACTS · ${activePos.contractLabel} @ $${exitFillPrice.toFixed(
-          2
-        )} (+${pnlOptionPct}%) · 1 Runner Remaining with BE Stop ($${activePos.btoSpotPrice.toFixed(2)})`;
-
-        const alert: TradeLifecycleAlert = {
-          id: `${activePos.id}-tp1-${nowTs}`,
-          timestamp: timeStr,
-          ts: nowTs,
-          ticker: normalizedTicker,
-          action: "SELL_TO_CLOSE",
-          contractType: activePos.contractType,
-          contractLabel: activePos.contractLabel,
-          strike: activePos.strike,
-          expiration: activePos.expiration,
-          expHuman: activePos.expHuman,
-          robinhoodExp: activePos.robinhoodExp,
-          setupName: activePos.setupName,
-          reason: "TARGET 1 HIT · SELL 1 OF 2 CONTRACTS (LOCK PROFIT)",
-          status: "PARTIAL_TP1",
-          spotPrice,
-          btoSpotPrice: activePos.btoSpotPrice,
-          target1Spot: activePos.target1Spot,
-          target2Spot: activePos.target2Spot,
-          stopLossSpot: activePos.stopLossSpot,
-          optionMid: exitFillPrice,
-          optionBid: liveBid,
-          optionAsk: liveAsk,
-          btoOptionMid: activePos.btoOptionMid,
-          contractsQty: activePos.contractsQty,
-          remainingQty: 1,
-          totalOutlay: activePos.totalOutlay,
-          estTp1Mid: activePos.estTp1Mid,
-          estTp2Mid: activePos.estTp2Mid,
-          estStopMid: activePos.estStopMid,
-          tp1Pct: activePos.tp1Pct,
-          tp2Pct: activePos.tp2Pct,
-          pnlSpotPct: Number(spotMovePct.toFixed(2)),
-          pnlOptionPct,
-          rrRatio: activePos.rrRatio,
-          altContractNote: activePos.altContractNote,
-          isHistoricalBackfill: Boolean(params.isHistoricalBackfill),
-          eventId: `${activePos.id}-tp1-${nowTs}`,
-          message: msgStr,
-        };
-
-        emittedAlerts.push(alert);
-        store.alerts.push(alert);
-      } else {
-        // When 1 contract: In disciplined small-account trading, 1 contract takes 100% profit at Target 1!
-        closePosition("TARGET 1 HIT · FULL PROFIT EXIT (1 CONTRACT)", "Target 1 Hit");
-      }
+      // Strict 1-Contract Sniper Automaton: 1 BTO -> 1 STC (No multi-contract partial scaling)
+      closePosition("TARGET 1 HIT · FULL PROFIT EXIT (1 CONTRACT)", "Target 1 Hit");
     }
     // 5. STC (STOP LOSS / LEVEL INVALIDATION / OPTION HARD STOP HIT)
     else if (
@@ -2298,10 +2409,45 @@ export async function evaluateTradeSignals(
     // Enforces: Thermodynamic dealer equilibrium, Stefan boundary momentum, R:R >= 1.45
     // =========================================================================
     const flowSnap = latest5mCandle?.flowSnapshot ?? null;
-    const currentChi =
+    const priorCloseRef =
+      typeof params.priorClose === "number" && params.priorClose > 0
+        ? params.priorClose
+        : typeof store.prevSpotPrices[normalizedTicker] === "number" && store.prevSpotPrices[normalizedTicker] > 0
+          ? store.prevSpotPrices[normalizedTicker]
+          : latest5mCandle?.open || spotPrice;
+
+    const premarketFlowVwapRef =
+      typeof params.premarketFlowVwap === "number" && params.premarketFlowVwap > 0
+        ? params.premarketFlowVwap
+        : priorCloseRef;
+
+    const isOpeningRange = etTime.totalMinutes < 585; // First 15m of session before 09:45 AM ET
+    const hasPopulatedRollingIndicators = Boolean(
+      latest5mCandle &&
+      typeof latest5mCandle.sma34 === "number" &&
+      flowSnap &&
+      typeof flowSnap.flowVwap === "number" &&
+      typeof flowSnap.ceilingShareChi === "number"
+    );
+
+    let rawChi =
       typeof flowSnap?.ceilingShareChi === "number" && Number.isFinite(flowSnap.ceilingShareChi)
         ? flowSnap.ceilingShareChi
         : 0.5;
+
+    let isOpeningNegativeGamma = false;
+    if (isOpeningRange && (!hasPopulatedRollingIndicators || rawChi < 0.50)) {
+      if (
+        (zeroGamma > 0 && spotPrice < zeroGamma) ||
+        (premarketFlowVwapRef > 0 && spotPrice < premarketFlowVwapRef) ||
+        (priorCloseRef > 0 && spotPrice < priorCloseRef)
+      ) {
+        isOpeningNegativeGamma = true;
+        rawChi = 0.35; // Put regime forced during negative opening range
+      }
+    }
+
+    const currentChi = rawChi;
     const currentPe =
       typeof flowSnap?.pecletNumber === "number" && Number.isFinite(flowSnap.pecletNumber)
         ? flowSnap.pecletNumber
@@ -2311,10 +2457,65 @@ export async function evaluateTradeSignals(
         ? flowSnap.netFluxJ
         : 0.0;
 
+    // --- SETUP 1A: Bearish Zero-Gamma Flush [BTO PUT] (The Morning Short) ---
+    // Trigger Conditions:
+    // - Opening hour (09:30 AM - 10:30 AM ET -> totalMinutes >= 570 && totalMinutes <= 630)
+    // - spotPrice crosses or opens below zeroGamma
+    // - spotPrice < flowVwap AND spotPrice < sma34_5m
+    // - Gamma Regime is heavily short (currentChi < 0.45 or Boundary Flux is red: currentNetFlux < 0)
+    const effectiveFlowVwap =
+      flowSnap && typeof flowSnap.flowVwap === "number" && flowSnap.flowVwap > 0
+        ? flowSnap.flowVwap
+        : premarketFlowVwapRef;
+    const effectiveSma34 =
+      latest5mCandle && typeof latest5mCandle.sma34 === "number" && latest5mCandle.sma34 > 0
+        ? latest5mCandle.sma34
+        : priorCloseRef;
+    const isOpeningHour = etTime.totalMinutes >= 570 && etTime.totalMinutes <= 630;
+    const isShortGammaOrRedFlux =
+      currentChi < 0.45 || currentNetFlux < 0 || isOpeningNegativeGamma || store.macroRegime === "PUT";
+    const effectiveZeroGamma =
+      zeroGamma > 0
+        ? zeroGamma
+        : Math.max(effectiveFlowVwap, effectiveSma34);
+
+    if (
+      !candidateBto &&
+      isOpeningHour &&
+      effectiveZeroGamma > 0 &&
+      spotPrice < effectiveZeroGamma &&
+      spotPrice < effectiveFlowVwap &&
+      spotPrice < effectiveSma34 &&
+      isShortGammaOrRedFlux
+    ) {
+      const stopAnchor = Math.min(
+        effectiveZeroGamma,
+        Math.max(effectiveFlowVwap, latest5mCandle?.high ?? spotPrice + 1.0, spotPrice + 0.85)
+      );
+      const stopLoss = Number((Math.max(spotPrice + 0.65, stopAnchor) * 1.001).toFixed(2));
+      const risk = Math.max(0.50, stopLoss - spotPrice);
+      const target1 = Number((spotPrice - Math.max(1.50, risk * 1.65)).toFixed(2));
+      const target2 = Number(
+        Math.min(
+          target1 - 1.25,
+          tacticalPw > 0 && tacticalPw < target1 ? tacticalPw : spotPrice - Math.max(3.50, risk * 3.0)
+        ).toFixed(2)
+      );
+
+      candidateBto = {
+        contractType: "PUT",
+        setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
+        stopLossSpot: stopLoss,
+        target1Spot: target1,
+        target2Spot: target2,
+      };
+    }
+
+    // Allow SPY and watched tickers to evaluate structural setups (including Bearish Zero-Gamma Flush [BTO PUT])
     if (!candidateBto && flowSnap && latest5mCandle) {
       const bandSig = flowSnap.bandSignal;
 
-      // 1A. Gaia Call Regime: Flow VWAP -2σ or -1σ Wick Bounce (Bullish χ >= 50%)
+      // 1B. Gaia Call Regime: Flow VWAP -2σ or -1σ Wick Bounce (Bullish χ >= 50%)
       if (
         (bandSig === "LOWER_2S_BOUNCE" || (bandSig === "LOWER_1S_BOUNCE" && currentChi >= 0.52)) &&
         currentChi >= 0.48 &&
@@ -2341,7 +2542,7 @@ export async function evaluateTradeSignals(
           };
         }
       }
-      // 1B. Gaia Put Regime: Flow VWAP +2σ or +1σ Wick Rejection (Bearish χ <= 50%)
+      // 1C. Gaia Put Regime: Flow VWAP +2σ or +1σ Wick Rejection (Bearish χ <= 50%)
       else if (
         (bandSig === "UPPER_2S_REJECT" || (bandSig === "UPPER_1S_REJECT" && currentChi <= 0.48)) &&
         currentChi <= 0.52 &&
@@ -2369,7 +2570,7 @@ export async function evaluateTradeSignals(
           };
         }
       }
-      // 1C. Gaia Flux Field Advection Breakout (High Péclet Momentum)
+      // 1D. Gaia Flux Field Advection Breakout (High Péclet Momentum)
       else if (
         currentChi >= 0.58 &&
         currentPe >= 0.85 &&
@@ -2434,16 +2635,22 @@ export async function evaluateTradeSignals(
       spotPrice <= putBounceRef * 1.0025 &&
       (!latest5mCandle || latest5mCandle.low <= putBounceRef * 1.0012);
 
-    const isBearishFluxLocked = Boolean(
-      (latest5mCandle &&
-        latest5mCandle.close < latest5mCandle.sma34 &&
-        currentChi <= 0.48) ||
-      currentChi < 0.45 ||
-      (latest5mCandle && flowSnap && spotPrice < flowSnap.flowVwap && spotPrice < latest5mCandle.sma34)
+    // Strict Counter-Trend Call Block Invariant:
+    // Block Support Bounce Calls if spot is below Zero Gamma (negative gamma hedging regime),
+    // below Flow VWAP, below 5m SMA34, or market is in a Put regime (chi < 50% / macroRegime === "PUT").
+    // Enforces opening-range firewall (< 9:45 AM ET) when indicators are unpopulated or in negative gamma.
+    const isCounterTrendCallBlocked = Boolean(
+      (zeroGamma > 0 && spotPrice < zeroGamma) ||
+      (flowSnap && typeof flowSnap.flowVwap === "number" && spotPrice < flowSnap.flowVwap) ||
+      (latest5mCandle && typeof latest5mCandle.sma34 === "number" && spotPrice < latest5mCandle.sma34) ||
+      currentChi < 0.50 ||
+      store.macroRegime === "PUT" ||
+      isOpeningNegativeGamma ||
+      (isOpeningRange && (currentChi < 0.50 || isOpeningNegativeGamma))
     );
 
     const isBullConfirmation =
-      !isBearishFluxLocked &&
+      !isCounterTrendCallBlocked &&
       (divergence5m === "BULL" ||
         divergence30m === "BULL" ||
         Boolean(
@@ -2643,9 +2850,9 @@ export async function evaluateTradeSignals(
           target2Spot: callWall,
         };
       }
-      // Bearish Zero-Gamma Flush (Crosses Below zeroGamma)
+      // Bearish Zero-Gamma Flush (Crosses or Opens Below zeroGamma)
       else if (
-        prevSpotPrice >= zeroGamma &&
+        (prevSpotPrice >= zeroGamma || isOpeningHour) &&
         spotPrice < zeroGamma &&
         latest5mCandle &&
         latest5mCandle.close < latest5mCandle.sma34 &&
@@ -2663,7 +2870,7 @@ export async function evaluateTradeSignals(
 
         candidateBto = {
           contractType: "PUT",
-          setupName: "Zero-Gamma Bearish Flush Breakout",
+          setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
           stopLossSpot: stopLoss,
           target1Spot: Number(target1.toFixed(2)),
           target2Spot: tacticalPw,
@@ -2748,6 +2955,16 @@ export async function evaluateTradeSignals(
       }
     }
 
+    // --- UNIVERSAL OPEN-SESSION & COUNTER-TREND CALL FIREWALL ---
+    // If candidate is a CALL and counter-trend call is blocked, strictly nullify candidateBto across all setups.
+    if (candidateBto && candidateBto.contractType === "CALL" && isCounterTrendCallBlocked) {
+      console.warn(
+        `[FIREWALL] Universally blocked Counter-Trend CALL candidate "${candidateBto.setupName}" at $${spotPrice.toFixed(2)} ` +
+        `(OpeningRange: ${isOpeningRange}, χ: ${(currentChi * 100).toFixed(0)}%, ZG: ${zeroGamma}, PriorClose: ${priorCloseRef}).`
+      );
+      candidateBto = null;
+    }
+
     // --- GATE: Minimum R:R Ratio Check >= 1.4 ---
     if (candidateBto) {
       const risk = Math.abs(spotPrice - candidateBto.stopLossSpot);
@@ -2819,9 +3036,9 @@ export async function evaluateTradeSignals(
           btoOptionMid: optimalContract.optionMid,
           optionBid: optimalContract.optionBid,
           optionAsk: optimalContract.optionAsk,
-          contractsQty: optimalContract.contractsQty,
-          remainingQty: optimalContract.contractsQty,
-          totalOutlay: optimalContract.totalOutlay,
+          contractsQty: 1,
+          remainingQty: 1,
+          totalOutlay: Number((optimalContract.optionMid * 100).toFixed(2)),
           estTp1Mid: optimalContract.estTp1Mid,
           estTp2Mid: optimalContract.estTp2Mid,
           estStopMid: optimalContract.estStopMid,
@@ -2974,6 +3191,36 @@ export async function evaluateAllActivePositions(params?: {
   for (const ticker of activeKeys) {
     const pos = store.activePositions[ticker];
     if (!pos || (pos.status !== "OPEN" && pos.status !== "PARTIAL_TP1")) continue;
+
+    // FSM State Consistency Guard for SPY: Purge any position that contradicts canonical Call/Put Regime
+    if (ticker === "SPY") {
+      const fsmState = store.activeFsmState;
+      const isStructuralSetup = !pos.setupName.includes("Gaia Tactical HUD");
+      if (fsmState === "STAND_ASIDE" && !isStructuralSetup) {
+        delete store.activePositions["SPY"];
+        saveTradeStore(store);
+        continue;
+      }
+      if (
+        pos.contractType === "PUT" &&
+        !isStructuralSetup &&
+        (fsmState === "LONG" || store.macroRegime === "CALL" || (store.chiPct ?? 50) >= 50)
+      ) {
+        console.warn("[evaluateAllActivePositions] Purging zombie SPY PUT position while FSM is LONG/CALL.");
+        delete store.activePositions["SPY"];
+        saveTradeStore(store);
+        continue;
+      }
+      if (
+        pos.contractType === "CALL" &&
+        (fsmState === "SHORT" || store.macroRegime === "PUT" || (store.chiPct ?? 50) < 50)
+      ) {
+        console.warn("[evaluateAllActivePositions] Purging zombie SPY CALL position while FSM is SHORT/PUT.");
+        delete store.activePositions["SPY"];
+        saveTradeStore(store);
+        continue;
+      }
+    }
 
     try {
       // 1. Fetch live CBOE options chain for this ticker
@@ -3359,8 +3606,8 @@ export function evaluateUnifiedSniperSetup(
   const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
   const etMins = hour * 60 + minute;
 
-  // Allow entries from 09:35 ET (575) through 15:15 ET (915)
-  if (etMins < 9 * 60 + 35 || etMins > 15 * 60 + 15) return null;
+  // Allow entries from 09:30 ET (570) through 15:15 ET (915)
+  if (etMins < 9 * 60 + 30 || etMins > 15 * 60 + 15) return null;
 
   const features = computeUnifiedSniperFeatures(bars, idx, explicitKingStrike);
   const spot = bar.close;
@@ -3391,17 +3638,18 @@ export function evaluateUnifiedSniperSetup(
     (spot < vwap && kingStrike < spot) ||
     (spot < vwap && vwapSlope < -0.02 && isLowerLows);
 
-  const isMorningMomentumWindow = etMins >= 9 * 60 + 35 && etMins <= 11 * 60;
+  const isMorningMomentumWindow = etMins >= 9 * 60 + 30 && etMins <= 11 * 60;
+  const isOpeningHourFlushWindow = etMins >= 9 * 60 + 30 && etMins <= 10 * 60 + 30;
 
   // Opening range (first 15m)
-  const openingSlice = bars.slice(0, 3);
+  const openingSlice = bars.slice(0, Math.min(3, bars.length));
   const openingLow = Math.min(...openingSlice.map((b) => b.low));
   const openingHigh = Math.max(...openingSlice.map((b) => b.high));
 
   let direction: TradeDirection | null = null;
   let setupName = "";
 
-  // 1. Morning Bullish Trend / King Magnet Pull (09:35 - 11:00 ET)
+  // 1. Morning Bullish Trend / King Magnet Pull (09:30 - 11:00 ET)
   // Triggers when high-conviction Tactical King is overhead (e.g. 2026-10-26 with $767)
   if (
     explicitKingStrike &&
@@ -3416,7 +3664,19 @@ export function evaluateUnifiedSniperSetup(
     direction = "LONG";
     setupName = "King Magnet Trend Pull";
   }
-  // 2. Support Bounce (Blocked if locked in Bearish Regime)
+  // 2. Bearish Zero-Gamma Flush [BTO PUT] (The Morning Short: 09:30 - 10:30 ET)
+  // Triggers when spot crosses or opens below Zero Gamma / Opening High, below Flow VWAP & SMA34 in negative gamma
+  else if (
+    isOpeningHourFlushWindow &&
+    spot < vwap &&
+    spot < sma34 &&
+    features.gammaRegime < 0 &&
+    (bar.close < bar.open || bar.close < prevBar.close)
+  ) {
+    direction = "SHORT";
+    setupName = "Bearish Zero-Gamma Flush [BTO PUT]";
+  }
+  // 3. Support Bounce (Blocked if locked in Bearish Regime)
   else if (
     !isBearishRegimeLocked &&
     ((bar.low <= openingLow && bar.close > bar.open && bar.close >= sma34 && prevBar.close <= sma34) ||
@@ -3425,7 +3685,7 @@ export function evaluateUnifiedSniperSetup(
     direction = "LONG";
     setupName = "Support Bounce";
   }
-  // 3. Morning Bearish Breakdown / Downside King Magnet Pull (09:35 - 11:00 ET)
+  // 4. Morning Bearish Breakdown / Downside King Magnet Pull (09:30 - 11:00 ET)
   else if (
     explicitKingStrike &&
     isMorningMomentumWindow &&
@@ -3439,7 +3699,7 @@ export function evaluateUnifiedSniperSetup(
     direction = "SHORT";
     setupName = "King Magnet Breakdown";
   }
-  // 4. Resistance Rejection (Strictly Blocked when Bullish Regime Locked!)
+  // 5. Resistance Rejection (Strictly Blocked when Bullish Regime Locked!)
   else if (
     !isBullishRegimeLocked &&
     ((bar.high >= openingHigh && bar.close < bar.open && bar.close <= sma34 && prevBar.close >= sma34) ||
@@ -3508,6 +3768,43 @@ export function stepTradeSignalEngine(
 ): SignalSessionState {
   const bars = params.historyBars;
   const idx = bars.length - 1;
+  const features = idx >= 1 ? computeUnifiedSniperFeatures(bars, idx) : null;
+
+  // Evaluate STC exits if position is active (including Momentum Reversal / Divergence Cover)
+  if (session.activePosition && features) {
+    const pos = session.activePosition;
+    const isCall = pos.contractType === "CALL";
+    const isMomentumCover =
+      (!isCall && params.barClose > features.sma34 && params.spotPrice < pos.btoSpotPrice) ||
+      (isCall && params.barClose < features.sma34 && params.spotPrice > pos.btoSpotPrice);
+    const isStopHit =
+      (isCall && params.barLow <= pos.stopLossSpot) ||
+      (!isCall && params.barHigh >= pos.stopLossSpot);
+    const isTargetHit =
+      (isCall && params.barHigh >= pos.target1Spot) ||
+      (!isCall && params.barLow <= pos.target1Spot);
+
+    if (isMomentumCover || isStopHit || isTargetHit) {
+      pos.status = "CLOSED";
+      pos.remainingQty = 0;
+      pos.closedSpotPrice = params.spotPrice;
+      pos.exitReason = isMomentumCover
+        ? "MOMENTUM REVERSAL / DIVERGENCE COVER"
+        : isTargetHit
+          ? "TARGET 1 HIT · FULL PROFIT EXIT (1 CONTRACT)"
+          : "STOP LOSS HIT";
+      session.events.push({
+        type: "SELL_TO_CLOSE",
+        timestampMs: params.timestampMs,
+        spotPrice: params.spotPrice,
+        position: pos,
+        isHistoricalBackfill: params.isHistoricalBackfill,
+      });
+      session.activePosition = null;
+      return session;
+    }
+  }
+
   const candidate = evaluateUnifiedSniperSetup(bars, idx);
 
   if (candidate && !session.activePosition) {
@@ -3561,6 +3858,8 @@ export interface GaiaSpySignalSyncInput {
   excursion?: number;
   timestamp?: number;
   barTimestamp?: number;
+  barSpanSeconds?: number;
+  barCloseTimestamp?: number;
   index?: number;
   idx?: number;
 }
@@ -3576,49 +3875,168 @@ const globalForGaiaDiscord = globalThis as unknown as {
 
 function getCanonicalGaiaSlot(sig: GaiaSpySignalSyncInput): string {
   const lbl = (sig.label || "").toUpperCase();
-  if (lbl.includes("OPEN") || sig.id === "sig-open") return "LONG_OPEN";
-  if (lbl.includes("PEAK") || sig.id === "sig-peak") return "SHORT_PEAK";
-  if (lbl.includes("BREAK") || sig.id.includes("break")) return "SHORT_BREAK";
-  if (lbl.includes("RECLAIM") || sig.id.includes("reclaim")) return "LONG_RECLAIM";
-  return `${sig.type}_${sig.time || sig.timeLabel || "SIG"}`;
+  const baseSlot =
+    lbl.includes("OPEN") || sig.id === "sig-open" || sig.id.startsWith("sig-open")
+      ? "LONG_OPEN"
+      : lbl.includes("PEAK") || sig.id === "sig-peak" || sig.id.startsWith("sig-peak")
+      ? "SHORT_PEAK"
+      : lbl.includes("BREAK") || sig.id.includes("break")
+      ? "SHORT_BREAK"
+      : lbl.includes("RECLAIM") || sig.id.includes("reclaim")
+      ? "LONG_RECLAIM"
+      : `${sig.type}_${sig.time || sig.timeLabel || "SIG"}`;
+
+  const idxMatch = sig.id ? sig.id.match(/-(\d+)$/) : null;
+  return idxMatch ? `${baseSlot}_${idxMatch[1]}` : baseSlot;
 }
 
-export async function syncGaiaSpySignalsToDiscord(params: {
+export interface SyncGaiaSpyParams {
   ticker: string;
   signals: GaiaSpySignalSyncInput[];
   spotPrice: number;
+  activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
+  macroRegime?: "CALL" | "PUT";
+  chiPct?: number;
+  zeroGamma?: number;
   sessionDate?: string;
   webhookUrl?: string;
-}): Promise<SyncGaiaSpyResult> {
+  isHistoricalBackfill?: boolean;
+}
+
+export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Promise<SyncGaiaSpyResult> {
   const sym = (params.ticker || "").trim().toUpperCase();
   if (sym !== "SPY") {
     return { dispatchedCount: 0, keys: [] };
   }
 
+  const store = loadTradeStore();
+  if (params.activeFsmState) store.activeFsmState = params.activeFsmState;
+  if (params.macroRegime) store.macroRegime = params.macroRegime;
+  if (typeof params.chiPct === "number") store.chiPct = params.chiPct;
+  if (typeof params.zeroGamma === "number" && params.zeroGamma > 0) {
+    store.zeroGamma = params.zeroGamma;
+  }
+
+  // Consistency Guard: Purge active Gaia HUD position if FSM is STAND_ASIDE or in opposite regime
+  const spyPos = store.activePositions["SPY"];
+  const isSpyStructural = Boolean(spyPos && !spyPos.setupName.includes("Gaia Tactical HUD"));
+  if (params.activeFsmState === "STAND_ASIDE" && !isSpyStructural) {
+    delete store.activePositions["SPY"];
+    saveTradeStore(store);
+  } else if (
+    (params.activeFsmState === "LONG" || store.macroRegime === "CALL" || (store.chiPct ?? 50) >= 50) &&
+    spyPos?.contractType === "PUT" &&
+    !isSpyStructural
+  ) {
+    console.warn("[GaiaSync] Purged contradicting SPY PUT position while in Bull Macro.");
+    delete store.activePositions["SPY"];
+    saveTradeStore(store);
+  } else if (
+    (params.activeFsmState === "SHORT" || store.macroRegime === "PUT" || (store.chiPct ?? 50) < 50) &&
+    spyPos?.contractType === "CALL"
+  ) {
+    console.warn("[GaiaSync] Purged contradicting SPY CALL position while in Bear Macro.");
+    delete store.activePositions["SPY"];
+    saveTradeStore(store);
+  }
+
   const rawSignals = Array.isArray(params.signals) ? params.signals : [];
-  if (rawSignals.length === 0) {
+  if (rawSignals.length === 0 || params.activeFsmState === "STAND_ASIDE") {
     return { dispatchedCount: 0, keys: [] };
   }
 
   if (!globalForGaiaDiscord.__hyperionDispatchedGaiaKeys) {
     globalForGaiaDiscord.__hyperionDispatchedGaiaKeys = new Set<string>();
   }
-  const dispatchedSet = globalForGaiaDiscord.__hyperionDispatchedGaiaKeys;
-
   const resolvedDate = params.sessionDate || getTodayEt();
+  if ((globalForGaiaDiscord as any).__hyperionDispatchedDate !== resolvedDate) {
+    (globalForGaiaDiscord as any).__hyperionDispatchedDate = resolvedDate;
+    globalForGaiaDiscord.__hyperionDispatchedGaiaKeys.clear();
+  }
+  const dispatchedSet = globalForGaiaDiscord.__hyperionDispatchedGaiaKeys;
   const sorted = [...rawSignals].sort((a, b) => (a.index ?? a.idx ?? 0) - (b.index ?? b.idx ?? 0));
   const newlyDispatched: string[] = [];
-  const store = loadTradeStore();
 
   for (let i = 0; i < sorted.length; i++) {
     const sig = sorted[i];
     const nextSig = sorted[i + 1];
     const slot = getCanonicalGaiaSlot(sig);
-    const entryKey = `${resolvedDate}:SPY:ENTRY:${slot}`;
+    const rawSigTs = sig.timestamp || sig.barTimestamp;
+    const nowTs = Math.floor(Date.now() / 1000);
+    const eventTs =
+      typeof rawSigTs === "number" && rawSigTs > 0
+        ? rawSigTs > 1e11
+          ? Math.floor(rawSigTs / 1000)
+          : rawSigTs
+        : nowTs;
     const isCall = sig.type === "LONG";
     const direction: ContractType = isCall ? "CALL" : "PUT";
 
-    if (!dispatchedSet.has(entryKey)) {
+    // Strict Macro & FSM Firewall: Never allow SHORT/PUT when Call Dominance >= 50% (CALL regime),
+    // and never allow LONG/CALL when Call Dominance < 50% (PUT regime).
+    const effectiveMacro = store.macroRegime || (store.chiPct !== undefined ? (store.chiPct >= 50 ? "CALL" : "PUT") : undefined);
+    if (
+      direction === "PUT" &&
+      (effectiveMacro === "CALL" || store.activeFsmState === "LONG" || (store.chiPct ?? 50) >= 50)
+    ) {
+      console.warn(`[GaiaSync FIREWALL] Blocked PUT signal at $${sig.price} while regime is ${effectiveMacro} / FSM ${store.activeFsmState} (χ=${store.chiPct}%).`);
+      continue;
+    }
+    const zgRef =
+      typeof params.zeroGamma === "number" && params.zeroGamma > 0
+        ? params.zeroGamma
+        : typeof store.zeroGamma === "number" && store.zeroGamma > 0
+          ? store.zeroGamma
+          : undefined;
+    const isBelowZeroGamma = typeof zgRef === "number" && zgRef > 0 && sig.price < zgRef;
+    const isChiBearish = (store.chiPct ?? 50) < 50;
+    const isFsmShort = store.activeFsmState === "SHORT";
+    const isMacroPut = effectiveMacro === "PUT";
+
+    // Opening-range firewall check (< 9:45 AM ET, i.e. totalMinutes < 585):
+    const sigDate = new Date(eventTs * 1000);
+    const sigEt = getNowEtTime(sigDate);
+    const isOpeningRangeSig = sigEt.totalMinutes < 585;
+    const priorCloseRef =
+      typeof store.prevSpotPrices["SPY"] === "number" && store.prevSpotPrices["SPY"] > 0
+        ? store.prevSpotPrices["SPY"]
+        : Number(params.spotPrice) > 0 ? Number(params.spotPrice) : 740.0;
+    const isOpeningNegativeGamma =
+      isOpeningRangeSig &&
+      (isBelowZeroGamma ||
+        (typeof priorCloseRef === "number" && sig.price < priorCloseRef) ||
+        isChiBearish);
+
+    if (
+      direction === "CALL" &&
+      (isMacroPut || isFsmShort || isChiBearish || isBelowZeroGamma || isOpeningNegativeGamma)
+    ) {
+      console.warn(
+        `[GaiaSync FIREWALL] Blocked Counter-Trend CALL signal at $${sig.price} (below ZG: ${isBelowZeroGamma}, χ: ${store.chiPct}%, FSM: ${store.activeFsmState}, Macro: ${effectiveMacro}, OpeningRange: ${isOpeningRangeSig}, PriorClose: ${priorCloseRef}).`
+      );
+      continue;
+    }
+
+    const idempotencyKey = `SPY_${eventTs}_${direction}`;
+    const entryKey = `${resolvedDate}:SPY:ENTRY:${slot}:${idempotencyKey}`;
+
+    if (!dispatchedSet.has(entryKey) && !store.dispatchedAlertIds?.[idempotencyKey]) {
+      // Re-enforce linear single-slot state machine:
+      // FLAT (0 trades) -> ACTIVE (1 contract) -> LOCKED_FOR_DAY (1 trade completed)
+      if (store.closedPositions && store.closedPositions.length >= 1) {
+        console.warn(`[GaiaSync FIREWALL] Blocked trade dispatch: Day is LOCKED_FOR_DAY (${store.closedPositions.length} closed trades).`);
+        continue;
+      }
+      const activePos = store.activePositions["SPY"];
+      if (activePos && activePos.status === "OPEN") {
+        console.warn(`[GaiaSync FIREWALL] Blocked trade dispatch: SPY already has an ACTIVE position (${activePos.contractLabel}).`);
+        continue;
+      }
+      if (Object.keys(store.activePositions || {}).length >= 1) {
+        console.warn("[GaiaSync FIREWALL] Blocked trade dispatch: Another ticker position is already ACTIVE.");
+        continue;
+      }
+
       dispatchedSet.add(entryKey);
       newlyDispatched.push(entryKey);
 
@@ -3650,8 +4068,8 @@ export async function syncGaiaSpySignalsToDiscord(params: {
         optimal?.contractLabel ||
         `SPY ${expShort} ${strike}${isCall ? "C" : "P"} (Today, ${resolvedDate} (0 DTE · Same-Day) · $0.65)`;
       const entryAsk = optimal?.optionAsk || optimal?.optionMid || 0.65;
-      const contractsQty: 1 | 2 = (optimal?.contractsQty as 1 | 2) || 1;
-      const totalOutlay = optimal?.totalOutlay || Number((entryAsk * 100 * contractsQty).toFixed(2));
+      const contractsQty: 1 = 1;
+      const totalOutlay = Number((entryAsk * 100 * contractsQty).toFixed(2));
       const estTp1 = optimal?.estTp1Mid || Number((entryAsk * 1.30).toFixed(2));
       const estTp2 = optimal?.estTp2Mid || Number((entryAsk * 1.65).toFixed(2));
       // Hard stop loss floor: strictly clamp to max -25% loss (entryAsk * 0.75)
@@ -3660,18 +4078,16 @@ export async function syncGaiaSpySignalsToDiscord(params: {
       const tp1Pct = Math.round(((estTp1 - entryAsk) / entryAsk) * 100);
       const tp2Pct = Math.round(((estTp2 - entryAsk) / entryAsk) * 100);
       const alertTimeStr = sig.time || sig.timeLabel || formatTimeEt(new Date());
-      const nowTs = Math.floor(Date.now() / 1000);
 
-      // Event-Time Invariant: Bind `ts` strictly to the candle's epoch seconds
-      const rawSigTs = sig.timestamp || sig.barTimestamp;
-      const eventTs =
-        typeof rawSigTs === "number" && rawSigTs > 0
-          ? rawSigTs > 1e11
-            ? Math.floor(rawSigTs / 1000)
-            : rawSigTs
-          : nowTs;
-      // Freshness Gate: If signal is older than 5 minutes (300s), mark as backfill / state sync (suppress live Discord alert)
-      const isStale = nowTs - eventTs > 300;
+      // Dynamic Freshness Gate: Compute staleness relative to dynamic bar close timestamp
+      const inferredIntervalSec =
+        typeof sig.barSpanSeconds === "number" && sig.barSpanSeconds > 0
+          ? sig.barSpanSeconds
+          : 300;
+      const eventCloseTs = sig.barCloseTimestamp || (eventTs + inferredIntervalSec);
+      const isStale = nowTs - eventCloseTs > Math.round(inferredIntervalSec * 1.5);
+      const isRthWindow = sigEt.totalMinutes >= 570 && sigEt.totalMinutes <= 960;
+      const isHistoricalBackfill = isStale || !isRthWindow || Boolean(params.isHistoricalBackfill);
       const alertId = `gaia-spy-${entryKey.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
 
       const btoAlert: TradeLifecycleAlert = {
@@ -3712,7 +4128,7 @@ export async function syncGaiaSpySignalsToDiscord(params: {
         calibratedWinRate: 68,
         calibratedExpectancyR: 0.45,
         dataConvictionScore: 92,
-        isHistoricalBackfill: isStale,
+        isHistoricalBackfill,
         eventId: alertId,
         message: `${isCall ? "🟢" : "🟣"} BUY TO OPEN (${contractsQty}x @ $${entryAsk.toFixed(2)}) · SPY [Gaia ${sig.label || sig.type}] @ $${sig.price.toFixed(2)} · SL: $${stopLossSpot}, TP1: $${target1Spot}, TP2: $${target2Spot}`,
       };
@@ -3743,7 +4159,7 @@ export async function syncGaiaSpySignalsToDiscord(params: {
         target2Spot,
         stopLossSpot,
         openedAt: alertTimeStr,
-        openedTs: nowTs,
+        openedTs: eventTs,
         rrRatio: 1.5,
         calibratedWinRate: 68,
         calibratedExpectancyR: 0.45,
@@ -3754,11 +4170,14 @@ export async function syncGaiaSpySignalsToDiscord(params: {
       store.alerts.push(btoAlert);
       store.dispatchedAlertIds = store.dispatchedAlertIds || {};
       store.dispatchedAlertIds[btoAlert.id] = true;
+      store.dispatchedAlertIds[idempotencyKey] = true;
       saveTradeStore(store);
 
-      await sendDiscordTradeAlert(btoAlert, params.webhookUrl).catch((err) => {
-        console.error("[GaiaSync] Failed to dispatch BTO alert to Discord:", err);
-      });
+      if (!isHistoricalBackfill) {
+        await sendDiscordTradeAlert(btoAlert, params.webhookUrl).catch((err) => {
+          console.error("[GaiaSync] Failed to dispatch BTO alert to Discord:", err);
+        });
+      }
     }
 
     // Handle Opposing Reversal Exit
@@ -3774,6 +4193,11 @@ export async function syncGaiaSpySignalsToDiscord(params: {
         const pnlOptionPct = Number((((estExitPrice - 0.65) / 0.65) * 100).toFixed(1));
         const exitAlertId = `gaia-spy-${exitKey.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
         const exitTimeStr = nextSig.time || nextSig.timeLabel || formatTimeEt(new Date());
+
+        const nextSigDate = new Date((nextSig.timestamp || nextSig.barTimestamp || Math.floor(Date.now() / 1000)) * 1000);
+        const nextSigEt = getNowEtTime(nextSigDate);
+        const isExitRthWindow = nextSigEt.totalMinutes >= 570 && nextSigEt.totalMinutes <= 960;
+        const isExitHistorical = !isExitRthWindow || Boolean(params.isHistoricalBackfill);
 
         const exitAlert: TradeLifecycleAlert = {
           id: exitAlertId,
@@ -3802,7 +4226,7 @@ export async function syncGaiaSpySignalsToDiscord(params: {
           totalOutlay: 65,
           pnlSpotPct: spotMovePct,
           pnlOptionPct,
-          isHistoricalBackfill: false,
+          isHistoricalBackfill: isExitHistorical,
           eventId: exitAlertId,
           message: `🔴 SELL TO CLOSE · SPY [Gaia ${sig.label || sig.type}] @ $${nextSig.price.toFixed(2)} · Spot ${spotMovePct >= 0 ? "+" : ""}${spotMovePct}% (${pnlOptionPct >= 0 ? "+" : ""}${pnlOptionPct}%)`,
         };
@@ -3810,6 +4234,7 @@ export async function syncGaiaSpySignalsToDiscord(params: {
         if (store.activePositions["SPY"]) {
           const pos = store.activePositions["SPY"];
           pos.status = "CLOSED";
+          pos.remainingQty = 0;
           pos.closedAt = exitTimeStr;
           pos.closedTs = Math.floor(Date.now() / 1000);
           pos.closedSpotPrice = nextSig.price;
@@ -3825,9 +4250,11 @@ export async function syncGaiaSpySignalsToDiscord(params: {
         store.dispatchedAlertIds[exitAlert.id] = true;
         saveTradeStore(store);
 
-        await sendDiscordTradeAlert(exitAlert, params.webhookUrl).catch((err) => {
-          console.error("[GaiaSync] Failed to dispatch STC alert to Discord:", err);
-        });
+        if (!isExitHistorical) {
+          await sendDiscordTradeAlert(exitAlert, params.webhookUrl).catch((err) => {
+            console.error("[GaiaSync] Failed to dispatch STC alert to Discord:", err);
+          });
+        }
       }
     }
   }
