@@ -25,6 +25,10 @@ import type {
   GaiaStrikeExpBucket,
 } from "@/app/api/gaia/route";
 import { cn } from "@/lib/utils";
+import {
+  drawTradeExecutionMarkers,
+  type ServerTradesState,
+} from "@/components/chart/TradeExecutionMarkersOverlay";
 
 type ExposureMode = "GEX" | "VEX" | "Combined";
 type ExpFilterMode = "ALL" | "NEXT" | "WEEK" | string; // string for specific MM-DD date
@@ -563,6 +567,39 @@ export function GaiaView() {
   const fetchOptionsChain = useDashboardStore(
     (state) => state.fetchOptionsChain
   );
+  const storeActivePositions = useDashboardStore(
+    (state) => state.serverActivePositions
+  );
+  const storeClosedTrades = useDashboardStore(
+    (state) => state.serverClosedTrades
+  );
+  const storeTradeAlerts = useDashboardStore(
+    (state) => state.serverTradeAlerts
+  );
+  const setStoreServerTrades = useDashboardStore(
+    (state) => state.setServerTrades
+  );
+
+  const [serverTrades, setServerTrades] = useState<ServerTradesState>({
+    activePositions: storeActivePositions,
+    closedPositions: storeClosedTrades,
+    alerts: storeTradeAlerts,
+  });
+
+  const effectiveServerTrades: ServerTradesState = useMemo(() => ({
+    activePositions:
+      serverTrades.activePositions && Object.keys(serverTrades.activePositions).length > 0
+        ? serverTrades.activePositions
+        : storeActivePositions,
+    closedPositions:
+      serverTrades.closedPositions && serverTrades.closedPositions.length > 0
+        ? serverTrades.closedPositions
+        : storeClosedTrades,
+    alerts:
+      serverTrades.alerts && serverTrades.alerts.length > 0
+        ? serverTrades.alerts
+        : storeTradeAlerts,
+  }), [serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts]);
   const [atlasPalette, setAtlasPalette] = useState<"ice" | "polarity">("polarity");
   const [countdownSec, setCountdownSec] = useState<number>(() => {
     const now = new Date();
@@ -587,45 +624,55 @@ export function GaiaView() {
   const [selectedSessionIso, setSelectedSessionIso] = useState<string>("");
   const [hudTradeSignals, setHudTradeSignals] = useState<GaiaHudTradeSignal[]>([]);
 
-  // Dynamic Trade Signals Engine Hook for Gaia HUD
+  // Dynamic Trade Signals Engine Hook for Gaia HUD & Canvas Execution Markers
   useEffect(() => {
     let isMounted = true;
     async function fetchSignals() {
       try {
-        const res = await fetch(`/api/signals?ticker=${loadedTicker}`, {
+        const res = await fetch(`/api/signals?ticker=${encodeURIComponent(loadedTicker)}`, {
           cache: "no-store",
         });
         if (!res.ok) return;
         const data = await res.json();
-        if (isMounted && Array.isArray(data?.alerts)) {
-          const mapped: GaiaHudTradeSignal[] = data.alerts
-            .filter(
-              (a: any) =>
-                a.action === "BUY_TO_OPEN" &&
-                !a.setupName?.includes("Gaia Tactical HUD") &&
-                !a.id?.startsWith("gaia-spy-")
-            )
-            .map((a: any) => ({
-              timestamp: (a.ts || 0) * 1000,
-              action: a.action,
-              contractType: a.contractType,
-              spotPrice: a.btoSpotPrice || a.spotPrice,
-              setupName: a.setupName,
-              isWin: a.status === "TARGET_HIT" || (a.pnlOptionPct && a.pnlOptionPct > 0),
-            }));
-          setHudTradeSignals(mapped);
+        if (isMounted && data) {
+          const payload: ServerTradesState = {
+            activePositions: data.activePositions || {},
+            closedPositions: data.closedPositions || [],
+            alerts: data.alerts || [],
+          };
+          setServerTrades(payload);
+          setStoreServerTrades(payload);
+
+          if (Array.isArray(data.alerts)) {
+            const mapped: GaiaHudTradeSignal[] = data.alerts
+              .filter(
+                (a: any) =>
+                  a.action === "BUY_TO_OPEN" &&
+                  !a.setupName?.includes("Gaia Tactical HUD") &&
+                  !a.id?.startsWith("gaia-spy-")
+              )
+              .map((a: any) => ({
+                timestamp: (a.ts || 0) * 1000,
+                action: a.action,
+                contractType: a.contractType,
+                spotPrice: a.btoSpotPrice || a.spotPrice,
+                setupName: a.setupName,
+                isWin: a.status === "TARGET_HIT" || (a.pnlOptionPct && a.pnlOptionPct > 0),
+              }));
+            setHudTradeSignals(mapped);
+          }
         }
       } catch {
         // Silent fallback
       }
     }
     fetchSignals();
-    const interval = setInterval(fetchSignals, 15000);
+    const interval = setInterval(fetchSignals, 5000);
     return () => {
       isMounted = false;
       clearInterval(interval);
     };
-  }, [loadedTicker]);
+  }, [loadedTicker, setStoreServerTrades]);
 
   const [livePayload, setLivePayload] = useState<GaiaLivePayload | null>(
     null
@@ -2293,6 +2340,23 @@ export function GaiaView() {
       );
     }
 
+    // =========================================================================
+    // LAYER 5.5: Authoritative Server Trades Execution Overlay (BTO/STC Markers, Trajectory & PnL Badges)
+    // =========================================================================
+    drawTradeExecutionMarkers({
+      ctx,
+      ticker: dataset.ticker || loadedTicker,
+      candles: dataset.candles,
+      safeActiveIdx,
+      barToX,
+      priceToY,
+      serverTrades: effectiveServerTrades,
+      padLeft,
+      plotRightX: dividerX,
+      padTop,
+      plotBottomY: height - padBottom,
+    });
+
     // Restore plot clip before drawing axis labels
     ctx.restore();
 
@@ -2736,6 +2800,7 @@ export function GaiaView() {
     atlasPalette,
     countdownSec,
     hudTradeSignals,
+    effectiveServerTrades,
   ]);
 
   const isSma34Bullish = activeCandle
@@ -3318,6 +3383,7 @@ export function GaiaView() {
         }))}
         liveSpot={activeCandle ? activeCandle.close : null}
         tradeSignals={hudTradeSignals}
+        serverTrades={effectiveServerTrades}
         onSymbolChange={(sym) => {
           setTickerInput(sym);
           setLoadedTicker(sym);
