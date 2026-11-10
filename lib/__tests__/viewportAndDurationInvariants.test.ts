@@ -341,4 +341,88 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
     assert.strictEqual(summary.rightCount, 0);
     assert.strictEqual(summary.wrongCount, 1);
   });
+
+  it("Short/Put Directional Invariant: SPY dropping from $749.01 to $746.30 evaluates strictly to +2.71 pts · RIGHT", () => {
+    const mockSeries: PrzmCandlePoint[] = [
+      {
+        time: "10:00am",
+        timestamp: 1730736000000,
+        open: 749.50,
+        high: 750.00,
+        low: 748.80,
+        close: 749.01,
+        volume: 50000,
+        vwap: 749.20,
+        flowVwap: 749.20,
+      },
+      {
+        time: "10:35am",
+        timestamp: 1730738100000,
+        open: 747.00,
+        high: 747.20,
+        low: 746.10,
+        close: 746.30,
+        volume: 50000,
+        vwap: 747.50,
+        flowVwap: 747.50,
+      },
+    ];
+
+    const mockSignals: PrzmSignalPoint[] = [
+      {
+        id: "sig-short-1",
+        index: 0,
+        time: "10:00am",
+        price: 749.01,
+        type: "SHORT",
+        tag: "BREAK",
+        label: "SHORT",
+        exitPrice: 746.30,
+        isClosed: true,
+      },
+    ];
+
+    const summary = evaluatePrzmCallLedger(mockSignals, mockSeries, 746.30, "STAND_ASIDE");
+    assert.strictEqual(summary.entries.length, 1);
+    const entry = summary.entries[0];
+
+    assert.strictEqual(entry.type, "SHORT");
+    assert.strictEqual(entry.delta, 2.71, "Short delta for 749.01 -> 746.30 must be +2.71 pts, NEVER -2.71 pts!");
+    assert.strictEqual(entry.status, "RIGHT", "Winning short trade must evaluate strictly to RIGHT, NEVER WRONG!");
+    assert.strictEqual(summary.winRatePct, 100);
+    assert.strictEqual(summary.rightCount, 1);
+    assert.strictEqual(summary.wrongCount, 0);
+  });
+
+  it("Server Trade Sync Invariant: Authoritative server closed PUT trade evaluates strictly to +2.71 pts · RIGHT", () => {
+    const mockServerTrades = {
+      closedPositions: [
+        {
+          id: "SPY-PUT-1730736000",
+          ticker: "SPY",
+          contractType: "PUT" as const,
+          contractLabel: "SPY 749 P",
+          btoSpotPrice: 749.01,
+          closedSpotPrice: 746.30,
+          pnlOptionPct: 45.5,
+          pnlSpotPct: 0.36,
+          exitReason: "TARGET 1 HIT · FULL PROFIT EXIT",
+          openedTs: 1730736000,
+          closedTs: 1730738100,
+        },
+      ],
+      activePositions: {},
+      alerts: [],
+    };
+
+    const summary = evaluatePrzmCallLedger([], [], 746.30, "STAND_ASIDE", mockServerTrades);
+    assert.strictEqual(summary.entries.length, 1);
+    const entry = summary.entries[0];
+
+    assert.strictEqual(entry.type, "SHORT");
+    assert.strictEqual(entry.contractType, "PUT");
+    assert.strictEqual(entry.delta, 2.71, "Server PUT delta must be +2.71 pts!");
+    assert.strictEqual(entry.status, "RIGHT", "Server closed PUT must be RIGHT!");
+    assert.strictEqual(summary.winRatePct, 100);
+  });
 });

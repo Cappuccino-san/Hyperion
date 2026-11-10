@@ -53,7 +53,7 @@ async function fetchIntradayCandles(
     });
 
     if (!res.ok) {
-      return generateSyntheticSessionCandles(ticker);
+      return [];
     }
 
     const json = await res.json();
@@ -129,48 +129,7 @@ async function fetchIntradayCandles(
     console.error("[flow-vwap API] Failed to fetch Yahoo series:", err);
   }
 
-  return generateSyntheticSessionCandles(ticker);
-}
-
-/**
- * Fallback synthetic session candles if external Yahoo is unreachable
- */
-function generateSyntheticSessionCandles(ticker: string): RawBar[] {
-  const clean = ticker.trim().toUpperCase();
-  const cachedSpot = optionsMemoryCache.get(clean)?.payload?.spotPrice;
-  const presetSpot = getTickerPreset(clean).spotPrice;
-  const baseSpot =
-    cachedSpot && cachedSpot > 0
-      ? cachedSpot
-      : presetSpot > 0
-      ? presetSpot
-      : 100.0;
-
-  const now = Math.floor(Date.now() / 1000);
-  const bars: RawBar[] = [];
-  const barCount = 36;
-  let curr = baseSpot * 0.998;
-
-  for (let i = 0; i < barCount; i++) {
-    const ts = now - (barCount - i) * 300;
-    const delta = (Math.sin(i * 0.3) + (Math.random() - 0.48)) * (baseSpot * 0.001);
-    const open = curr;
-    const close = Number((curr + delta).toFixed(2));
-    const high = Number((Math.max(open, close) + Math.random() * (baseSpot * 0.0008)).toFixed(2));
-    const low = Number((Math.min(open, close) - Math.random() * (baseSpot * 0.0008)).toFixed(2));
-    curr = close;
-
-    bars.push({
-      timestamp: ts,
-      open,
-      high,
-      low,
-      close,
-      volume: 1500 + Math.floor(Math.random() * 2000),
-    });
-  }
-
-  return bars;
+  return [];
 }
 
 /**
@@ -262,6 +221,13 @@ export async function GET(request: NextRequest) {
       fetchIntradayCandles(ticker, timeframe),
       getOrFetchOptionContracts(ticker),
     ]);
+
+    if (candles.length === 0) {
+      return NextResponse.json(
+        { error: `Live session bars unavailable for ${ticker}` },
+        { status: 502 }
+      );
+    }
 
     const flowPoints: FlowGammaVwapSnapshot[] = computeBarFlowGammaVwapSeries(
       candles,

@@ -82,99 +82,7 @@ export interface IntradayPoint {
   lower2s?: number;
 }
 
-function seededNoise(seed: number): number {
-  const x = Math.sin(seed * 12.9898 + 78.233) * 43758.5453;
-  return x - Math.floor(x);
-}
 
-export function generateIntradayTrajectory(params: {
-  ticker: string;
-  spotPrice: number;
-  previousClose: number;
-  gammaLevels: GammaLevels;
-  strikeStep: number;
-}): IntradayPoint[] {
-  const { ticker, spotPrice, previousClose, gammaLevels, strikeStep } = params;
-  const points: IntradayPoint[] = [];
-  const totalPoints = 32;
-  const startSpot = previousClose > 0 ? previousClose : spotPrice * 0.995;
-  const endSpot = spotPrice;
-  const range = Math.max(
-    strikeStep * 4,
-    Math.abs(gammaLevels.callWall - gammaLevels.putWall)
-  );
-  const tickerSeed = ticker
-    .split("")
-    .reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
-
-  let hour = 9;
-  let minute = 30;
-
-  for (let i = 0; i < totalPoints; i++) {
-    const progress = i / (totalPoints - 1);
-    const noise = (seededNoise(tickerSeed + i * 7) - 0.5) * range * 0.1;
-    const interpolated =
-      i === totalPoints - 1
-        ? endSpot
-        : startSpot + (endSpot - startSpot) * progress + noise;
-
-    const wallShiftFactor = i < 8 ? -strikeStep : 0;
-
-    const hh = String(hour).padStart(2, "0");
-    const mm = String(minute).padStart(2, "0");
-
-    points.push({
-      time: `${hh}:${mm}:00`,
-      spot: Number(interpolated.toFixed(2)),
-      callWall: gammaLevels.callWall + wallShiftFactor,
-      putWall: gammaLevels.putWall + wallShiftFactor,
-      zeroGamma: gammaLevels.zeroGamma,
-    });
-
-    minute += 5;
-    if (minute >= 60) {
-      minute -= 60;
-      hour += 1;
-    }
-  }
-
-  return points;
-}
-
-function generateInitialAlerts(preset: TickerPreset): AlertItem[] {
-  const { ticker, gammaLevels, strikeStep } = preset;
-  const kingInfo = buildKingNodeMetrics(preset, "0DTE");
-  const prevCall = gammaLevels.callWall + strikeStep * 5;
-  const prevPut = gammaLevels.putWall + strikeStep * 3;
-  const prevKing = kingInfo.allExpKing + strikeStep * 5;
-
-  return [
-    {
-      id: `${ticker}-init-1`,
-      timestamp: "10:15 AM",
-      type: "king",
-      message: `${ticker} King moved ${prevKing.toFixed(0)} → ${kingInfo.allExpKing.toFixed(0)}`,
-    },
-    {
-      id: `${ticker}-init-2`,
-      timestamp: "11:42 AM",
-      type: "zero",
-      message: `${ticker} Zero γ flipped at ${gammaLevels.zeroGamma.toFixed(0)}`,
-    },
-    {
-      id: `${ticker}-init-3`,
-      timestamp: "1:54 PM",
-      type: "put",
-      message: `${ticker} Put wall moved ${prevPut.toFixed(0)} → ${gammaLevels.putWall.toFixed(0)}`,
-    },
-    {
-      id: `${ticker}-init-4`,
-      timestamp: "3:45 PM",
-      type: "call",
-      message: `${ticker} Call wall moved ${prevCall.toFixed(0)} → ${gammaLevels.callWall.toFixed(0)}`,
-    },
-  ];
-}
 
 export function computeFilteredSummaryMetrics(params: {
   expirationFilter: string;
@@ -694,9 +602,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   toastMessage: null,
   lastUpdated: "--:-- ET",
   bookTimestamp: null,
-  spotPrice: defaultPreset.spotPrice,
-  previousClose: defaultPreset.previousClose,
-  impliedVolatility: defaultPreset.impliedVolatility,
+  spotPrice: 0,
+  previousClose: 0,
+  impliedVolatility: 0,
   strikeStep: defaultPreset.strikeStep,
   extendedQuote: null,
   expectedMoves: null,
@@ -716,14 +624,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
   alerts: [],
   intradayData: [],
-  flowGammaVwapData: {
-    flowVwap: defaultPreset.spotPrice,
-    upper1s: Number((defaultPreset.spotPrice + 1.25).toFixed(2)),
-    lower1s: Number((defaultPreset.spotPrice - 1.25).toFixed(2)),
-    upper2s: Number((defaultPreset.spotPrice + 2.5).toFixed(2)),
-    lower2s: Number((defaultPreset.spotPrice - 2.5).toFixed(2)),
-    sigma: 1.25,
-  },
+  flowGammaVwapData: null,
   discordConfig: getInitialDiscordConfig(),
   isSetupModalOpen: false,
   gaiaMode: "classic",
@@ -897,21 +798,8 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
           expiration: safeExpFilter,
         },
         alerts: [],
-        intradayData: generateIntradayTrajectory({
-          ticker: preset.ticker,
-          spotPrice: preset.spotPrice,
-          previousClose: preset.previousClose,
-          gammaLevels: filtered.gammaLevels,
-          strikeStep: preset.strikeStep,
-        }),
-        flowGammaVwapData: {
-          flowVwap: preset.spotPrice,
-          upper1s: Number((preset.spotPrice + 1.25).toFixed(2)),
-          lower1s: Number((preset.spotPrice - 1.25).toFixed(2)),
-          upper2s: Number((preset.spotPrice + 2.5).toFixed(2)),
-          lower2s: Number((preset.spotPrice - 2.5).toFixed(2)),
-          sigma: 1.25,
-        },
+        intradayData: [],
+        flowGammaVwapData: null,
       };
     });
     get().fetchFlowGammaVwap(preset.ticker).catch(() => {});
@@ -1259,13 +1147,15 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             }))
           : isInitialChainHydration ||
             Math.abs(payload.spotPrice - state.spotPrice) > payload.strikeStep * 10
-            ? generateIntradayTrajectory({
-                ticker: payload.ticker,
-                spotPrice: payload.spotPrice,
-                previousClose: payload.previousClose,
-                gammaLevels: payload.gammaLevels,
-                strikeStep: payload.strikeStep,
-              })
+            ? [
+                {
+                  time: payload.lastUpdated,
+                  spot: payload.spotPrice,
+                  callWall: payload.gammaLevels.callWall,
+                  putWall: payload.gammaLevels.putWall,
+                  zeroGamma: payload.gammaLevels.zeroGamma,
+                },
+              ]
             : [
                 ...state.intradayData.slice(-168),
                 {

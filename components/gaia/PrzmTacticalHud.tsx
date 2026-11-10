@@ -118,6 +118,18 @@ function formatHeldDuration(minutes: number): string {
 }
 
 /**
+ * Universal direction resolver ensuring Short/Put symmetry across all server & client payload vocabularies
+ */
+export function isShortOrPutTrade(pos: any): boolean {
+  if (!pos) return false;
+  const ct = String(pos.contractType || "").toUpperCase();
+  const dir = String(pos.direction || "").toUpperCase();
+  const ty = String(pos.type || "").toUpperCase();
+  const act = String(pos.action || "").toUpperCase();
+  return ct === "PUT" || dir === "SHORT" || ty === "SHORT" || act.includes("PUT") || act === "SELL_TO_OPEN";
+}
+
+/**
  * Evaluates session signals into PRZM Call Log entries & Win-Rate Scoreboard metrics
  */
 export function evaluatePrzmCallLedger(
@@ -189,10 +201,19 @@ export function evaluatePrzmCallLedger(
 
   for (const pos of serverClosed) {
     if (!pos || !pos.id || String(pos.id).startsWith("test-")) continue;
-    const isCall = pos.contractType === "CALL";
-    const type: "LONG" | "SHORT" = isCall ? "LONG" : "SHORT";
-    const btoSpot = typeof pos.btoSpotPrice === "number" && pos.btoSpotPrice > 0 ? pos.btoSpotPrice : 0;
-    const closedSpot = typeof pos.closedSpotPrice === "number" && pos.closedSpotPrice > 0 ? pos.closedSpotPrice : btoSpot;
+    const isShort = isShortOrPutTrade(pos);
+    const isCall = !isShort;
+    const type: "LONG" | "SHORT" = isShort ? "SHORT" : "LONG";
+    const btoSpot = typeof pos.btoSpotPrice === "number" && pos.btoSpotPrice > 0
+      ? pos.btoSpotPrice
+      : typeof pos.spotPrice === "number" && pos.spotPrice > 0
+        ? pos.spotPrice
+        : 0;
+    const closedSpot = typeof pos.closedSpotPrice === "number" && pos.closedSpotPrice > 0
+      ? pos.closedSpotPrice
+      : typeof pos.spotPrice === "number" && pos.spotPrice > 0
+        ? pos.spotPrice
+        : btoSpot;
     const delta = Number((isCall ? closedSpot - btoSpot : btoSpot - closedSpot).toFixed(2));
     const isWin =
       pos.pnlOptionPct > 0 ||
@@ -201,11 +222,12 @@ export function evaluatePrzmCallLedger(
       pos.exitReason?.includes("TP1") ||
       pos.exitReason?.includes("TP2") ||
       pos.exitReason?.includes("COVER") ||
-      (pos.pnlSpotPct && pos.pnlSpotPct > 0);
+      (typeof pos.pnlSpotPct === "number" && (isCall ? pos.pnlSpotPct > 0 : pos.pnlSpotPct > 0 || delta > 0.05));
     const isLoss =
       pos.pnlOptionPct < -5 ||
       pos.exitReason?.includes("STOP") ||
-      (pos.pnlSpotPct && pos.pnlSpotPct < 0);
+      delta < -0.05 ||
+      (typeof pos.pnlSpotPct === "number" && isCall && pos.pnlSpotPct < 0);
     const status: "RIGHT" | "WRONG" | "FLAT" = isWin ? "RIGHT" : isLoss ? "WRONG" : "FLAT";
     const heldMin =
       pos.openedTs && pos.closedTs && pos.closedTs > pos.openedTs
@@ -234,9 +256,14 @@ export function evaluatePrzmCallLedger(
 
   for (const pos of serverActive) {
     if (!pos || !pos.id) continue;
-    const isCall = pos.contractType === "CALL";
-    const type: "LONG" | "SHORT" = isCall ? "LONG" : "SHORT";
-    const btoSpot = typeof pos.btoSpotPrice === "number" && pos.btoSpotPrice > 0 ? pos.btoSpotPrice : 0;
+    const isShort = isShortOrPutTrade(pos);
+    const isCall = !isShort;
+    const type: "LONG" | "SHORT" = isShort ? "SHORT" : "LONG";
+    const btoSpot = typeof pos.btoSpotPrice === "number" && pos.btoSpotPrice > 0
+      ? pos.btoSpotPrice
+      : typeof pos.spotPrice === "number" && pos.spotPrice > 0
+        ? pos.spotPrice
+        : 0;
     const currentSpot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : btoSpot;
     const delta = Number((isCall ? currentSpot - btoSpot : btoSpot - currentSpot).toFixed(2));
     const nowTs = Math.floor(Date.now() / 1000);
@@ -887,7 +914,11 @@ export const PrzmCallLogDeck: React.FC<{
                   typeof entry.pnlOptionPct === "number"
                     ? `STC ${entry.pnlOptionPct.toFixed(1)}% · `
                     : "STC · ";
-                statusBadge = `${optPctStr}-${Math.abs(entry.delta).toFixed(2)} pts · WRONG`;
+                const formattedPts =
+                  entry.delta <= 0
+                    ? entry.delta.toFixed(2)
+                    : `-${Math.abs(entry.delta).toFixed(2)}`;
+                statusBadge = `${optPctStr}${formattedPts} pts · WRONG`;
                 statusColor = "text-[#FF2A55] font-bold";
               }
 

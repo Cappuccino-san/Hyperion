@@ -3917,25 +3917,57 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
     store.zeroGamma = params.zeroGamma;
   }
 
-  // Consistency Guard: Purge active Gaia HUD position if FSM is STAND_ASIDE or in opposite regime
+  // Consistency Guard: Transition active Gaia HUD position to CLOSED if FSM is STAND_ASIDE or in opposite regime
   const spyPos = store.activePositions["SPY"];
   const isSpyStructural = Boolean(spyPos && !spyPos.setupName.includes("Gaia Tactical HUD"));
-  if (params.activeFsmState === "STAND_ASIDE" && !isSpyStructural) {
+  if (params.activeFsmState === "STAND_ASIDE" && !isSpyStructural && spyPos) {
+    const nowTs = Math.floor(Date.now() / 1000);
+    const closeSpot = Number(params.spotPrice) > 0 ? Number(params.spotPrice) : spyPos.btoSpotPrice;
+    spyPos.status = "CLOSED";
+    spyPos.closedTs = nowTs;
+    spyPos.closedAt = formatTimeEt(new Date());
+    spyPos.closedSpotPrice = closeSpot;
+    spyPos.exitReason = "Gaia FSM Neutralization to STAND_ASIDE";
+    const isCall = spyPos.contractType === "CALL";
+    const dirMove = isCall ? closeSpot - spyPos.btoSpotPrice : spyPos.btoSpotPrice - closeSpot;
+    spyPos.pnlSpotPct = Number(((dirMove / Math.max(0.01, spyPos.btoSpotPrice)) * 100).toFixed(2));
+    store.closedPositions.push(spyPos);
     delete store.activePositions["SPY"];
     saveTradeStore(store);
   } else if (
-    (params.activeFsmState === "LONG" || store.macroRegime === "CALL" || (store.chiPct ?? 50) >= 50) &&
+    (params.activeFsmState === "LONG" || (store.macroRegime === "CALL" && (store.chiPct ?? 50) > 52)) &&
     spyPos?.contractType === "PUT" &&
     !isSpyStructural
   ) {
-    console.warn("[GaiaSync] Purged contradicting SPY PUT position while in Bull Macro.");
+    console.warn("[GaiaSync] Closed contradicting SPY PUT position on rotation to Bull Regime.");
+    const nowTs = Math.floor(Date.now() / 1000);
+    const closeSpot = Number(params.spotPrice) > 0 ? Number(params.spotPrice) : spyPos.btoSpotPrice;
+    spyPos.status = "CLOSED";
+    spyPos.closedTs = nowTs;
+    spyPos.closedAt = formatTimeEt(new Date());
+    spyPos.closedSpotPrice = closeSpot;
+    spyPos.exitReason = "Macro Rotation to Bull Regime";
+    const dirMove = spyPos.btoSpotPrice - closeSpot;
+    spyPos.pnlSpotPct = Number(((dirMove / Math.max(0.01, spyPos.btoSpotPrice)) * 100).toFixed(2));
+    store.closedPositions.push(spyPos);
     delete store.activePositions["SPY"];
     saveTradeStore(store);
   } else if (
-    (params.activeFsmState === "SHORT" || store.macroRegime === "PUT" || (store.chiPct ?? 50) < 50) &&
-    spyPos?.contractType === "CALL"
+    (params.activeFsmState === "SHORT" || (store.macroRegime === "PUT" && (store.chiPct ?? 50) < 48)) &&
+    spyPos?.contractType === "CALL" &&
+    !isSpyStructural
   ) {
-    console.warn("[GaiaSync] Purged contradicting SPY CALL position while in Bear Macro.");
+    console.warn("[GaiaSync] Closed contradicting SPY CALL position on rotation to Bear Regime.");
+    const nowTs = Math.floor(Date.now() / 1000);
+    const closeSpot = Number(params.spotPrice) > 0 ? Number(params.spotPrice) : spyPos.btoSpotPrice;
+    spyPos.status = "CLOSED";
+    spyPos.closedTs = nowTs;
+    spyPos.closedAt = formatTimeEt(new Date());
+    spyPos.closedSpotPrice = closeSpot;
+    spyPos.exitReason = "Macro Rotation to Bear Regime";
+    const dirMove = closeSpot - spyPos.btoSpotPrice;
+    spyPos.pnlSpotPct = Number(((dirMove / Math.max(0.01, spyPos.btoSpotPrice)) * 100).toFixed(2));
+    store.closedPositions.push(spyPos);
     delete store.activePositions["SPY"];
     saveTradeStore(store);
   }
@@ -3972,12 +4004,12 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
     const isCall = sig.type === "LONG";
     const direction: ContractType = isCall ? "CALL" : "PUT";
 
-    // Strict Macro & FSM Firewall: Never allow SHORT/PUT when Call Dominance >= 50% (CALL regime),
-    // and never allow LONG/CALL when Call Dominance < 50% (PUT regime).
-    const effectiveMacro = store.macroRegime || (store.chiPct !== undefined ? (store.chiPct >= 50 ? "CALL" : "PUT") : undefined);
+    // Strict Macro & FSM Firewall: Never allow SHORT/PUT when FSM is LONG or strongly Bull Macro (> 52%),
+    // and never allow LONG/CALL when FSM is SHORT or strongly Bear Macro (< 48%).
+    const effectiveMacro = store.macroRegime || (store.chiPct !== undefined ? (store.chiPct > 50 ? "CALL" : "PUT") : undefined);
     if (
       direction === "PUT" &&
-      (effectiveMacro === "CALL" || store.activeFsmState === "LONG" || (store.chiPct ?? 50) >= 50)
+      (store.activeFsmState === "LONG" || (effectiveMacro === "CALL" && (store.chiPct ?? 50) > 52))
     ) {
       console.warn(`[GaiaSync FIREWALL] Blocked PUT signal at $${sig.price} while regime is ${effectiveMacro} / FSM ${store.activeFsmState} (χ=${store.chiPct}%).`);
       continue;
@@ -4240,6 +4272,7 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
           pos.closedSpotPrice = nextSig.price;
           pos.closedOptionMid = estExitPrice;
           pos.pnlOptionPct = pnlOptionPct;
+          pos.pnlSpotPct = spotMovePct;
           pos.exitReason = exitAlert.reason;
           store.closedPositions.push(pos);
           delete store.activePositions["SPY"];

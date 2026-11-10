@@ -481,181 +481,14 @@ export function HeatmapTable() {
       };
     }
 
-    // Deterministic Fallback (160 strikes)
-    const totalRows = 160;
-    const halfRows = Math.floor(totalRows / 2);
-    const effectiveSpot = spotPrice > 0 ? spotPrice : preset.spotPrice;
-    const centerStrike =
-      Math.round(effectiveSpot / strikeStep) * strikeStep;
-    const nearestAtmStrike = centerStrike;
-
-    const tickerSeed = activeTicker
-      .split("")
-      .reduce((acc, ch) => acc + ch.charCodeAt(0) * 13, 0);
-
-    const tempStrikes = Array.from({ length: totalRows }, (_, i) => ({
-      strike: centerStrike + (halfRows - i) * strikeStep,
-    }));
-    const emMap = assignEmMarkers(tempStrikes);
-
-    const rows: StrikeRowData[] = [];
-    let foundAtmIndex = halfRows;
-    let bestKingColId = activeColumns[0]?.id ?? "exp_0";
-    let bestKingColMag = -1;
-    const allCellMags: { key: string; mag: number }[] = [];
-
-    const corridorSpan = Math.max(
-      strikeStep * 8,
-      Math.abs(gammaLevels.callWall - gammaLevels.putWall)
-    );
-
-    for (let i = 0; i < totalRows; i++) {
-      const strike = tempStrikes[i].strike;
-      const isAtm = Math.abs(strike - nearestAtmStrike) < strikeStep * 0.4;
-      if (isAtm) {
-        foundAtmIndex = i;
-      }
-
-      const isKingNode =
-        Math.abs(strike - kingNode.allExpKing) < strikeStep * 0.4;
-      const isFilteredKing =
-        Math.abs(strike - targetKingStrike) < strikeStep * 0.4;
-      const isCallWall =
-        Math.abs(strike - gammaLevels.callWall) < strikeStep * 0.4;
-      const isPutWall =
-        Math.abs(strike - gammaLevels.putWall) < strikeStep * 0.4;
-      const isZeroGamma =
-        Math.abs(strike - gammaLevels.zeroGamma) < strikeStep * 0.4;
-
-      const distFromCall = (strike - gammaLevels.callWall) / corridorSpan;
-      const distFromPut = (strike - gammaLevels.putWall) / corridorSpan;
-      const distFromZero = (strike - gammaLevels.zeroGamma) / corridorSpan;
-      const distFromSpot = (strike - spotPrice) / corridorSpan;
-      const distFromKing = (strike - kingNode.allExpKing) / corridorSpan;
-
-      const values: Record<string, number> = {};
-      const openPctChange: Record<string, number> = {};
-      let kingPeakColId = activeColumns[0]?.id ?? "exp_0";
-      let rowMaxVal = -Infinity;
-
-      activeColumns.forEach((col, colIdx) => {
-        const noise =
-          0.75 +
-          0.5 * seededStrikeHash(tickerSeed + strike * 3.7 + colIdx * 101);
-
-        const callGaussian = Math.exp(-Math.pow(distFromCall * 3.4, 2));
-        const putGaussian = Math.exp(-Math.pow(distFromPut * 3.4, 2));
-        const kingGaussian = Math.exp(-Math.pow(distFromKing * 4.0, 2));
-        const atmGaussian = Math.exp(-Math.pow(distFromSpot * 2.2, 2));
-        const wideEnvelope = Math.exp(-Math.pow(distFromSpot * 0.65, 2));
-
-        let rawVal = 0;
-        const scaleBase =
-          activeTicker === "SPX" || activeTicker === "SPXW"
-            ? 42
-            : activeTicker === "SPY"
-              ? 28
-              : activeTicker === "QQQ"
-                ? 22
-                : 15;
-
-        if (metric === "GEX") {
-          const regimeSign = Math.tanh(distFromZero * 2.8);
-          const wallComponent =
-            callGaussian * 1.45 +
-            kingGaussian * 0.55 -
-            putGaussian * 1.35 +
-            regimeSign * atmGaussian * 0.55;
-          rawVal =
-            scaleBase *
-            col.dteWeight *
-            noise *
-            (wallComponent + regimeSign * wideEnvelope * 0.18);
-        } else if (metric === "VEX") {
-          const vannaWave =
-            callGaussian * 1.2 +
-            kingGaussian * 0.45 +
-            atmGaussian * 0.65 * Math.sign(distFromZero + 0.15) -
-            putGaussian * 1.1;
-          rawVal =
-            scaleBase *
-            0.82 *
-            col.dteWeight *
-            noise *
-            (vannaWave + wideEnvelope * 0.15 * Math.sin(distFromSpot * 4));
-        } else if (metric === "DEX") {
-          const dexCurve =
-            -Math.tanh(distFromSpot * 1.9) * atmGaussian * 1.4 +
-            callGaussian * 0.85 -
-            putGaussian * 0.95;
-          rawVal =
-            scaleBase *
-            1.25 *
-            col.dteWeight *
-            noise *
-            (dexCurve + wideEnvelope * 0.12);
-        } else {
-          const charmFlip =
-            -Math.sin(distFromSpot * 4.2) * atmGaussian * 1.5 +
-            (callGaussian - putGaussian) * 0.45;
-          rawVal =
-            scaleBase *
-            0.65 *
-            col.dteWeight *
-            noise *
-            (charmFlip + wideEnvelope * 0.08 * Math.sign(-distFromSpot));
-        }
-
-        const rounded = Number(rawVal.toFixed(2));
-        values[col.id] = rounded;
-
-        const pctSeed = seededStrikeHash(tickerSeed + strike * 11 + colIdx * 37);
-        openPctChange[col.id] = Math.round((pctSeed - 0.42) * 48);
-
-        if (Math.abs(rounded) > rowMaxVal) {
-          rowMaxVal = Math.abs(rounded);
-          kingPeakColId = col.id;
-        }
-        if (isFilteredKing && Math.abs(rounded) > bestKingColMag) {
-          bestKingColMag = Math.abs(rounded);
-          bestKingColId = col.id;
-        }
-
-        const absVal = Math.abs(rounded);
-        if (absVal > colMax[col.id]) {
-          colMax[col.id] = absVal;
-        }
-        allCellMags.push({ key: `${strike}_${col.id}`, mag: absVal });
-      });
-
-      const markers = emMap.get(i) ?? [];
-
-      rows.push({
-        strike,
-        isAtm,
-        isKingNode,
-        isFilteredKing,
-        isCallWall,
-        isPutWall,
-        isZeroGamma,
-        emMarker: markers.length > 0 ? markers.map((m) => m.tag).join(" ") : null,
-        emMarkers: markers,
-        kingPeakColId,
-        values,
-        openPctChange,
-      });
-    }
-
-    allCellMags.sort((a, b) => b.mag - a.mag);
-    const topSet = new Set(allCellMags.slice(0, 5).map((x) => x.key));
-
+    // Strict Live Invariant: Return honest empty state when live chain is syncing
     return {
-      rowsData: rows,
-      maxColumnValues: colMax,
-      atmRowIndex: foundAtmIndex,
-      activeKingStrike: targetKingStrike,
-      activeKingColId: bestKingColId,
-      topFiveCellKeys: topSet,
+      rowsData: [],
+      maxColumnValues: {},
+      atmRowIndex: -1,
+      activeKingStrike: kingNode.allExpKing || 0,
+      activeKingColId: "",
+      topFiveCellKeys: new Set<string>(),
     };
   }, [
     chainStrikes,
@@ -1415,15 +1248,23 @@ export function HeatmapTable() {
             )}
           </div>
 
-          {/* Virtualized Rows */}
-          <div
-            style={{
-              height: `${rowVirtualizer.getTotalSize()}px`,
-              position: "relative",
-              minWidth: `${110 + activeColumns.length * 76}px`,
-            }}
-          >
-            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+          {/* Virtualized Rows or Syncing Banner */}
+          {tableRows.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-[420px] text-zinc-400 gap-3">
+              <div className="h-6 w-6 animate-spin rounded-full border-2 border-emerald-500 border-t-transparent" />
+              <span className="font-mono text-xs uppercase tracking-wider text-emerald-400">
+                Syncing live options chain from CBOE...
+              </span>
+            </div>
+          ) : (
+            <div
+              style={{
+                height: `${rowVirtualizer.getTotalSize()}px`,
+                position: "relative",
+                minWidth: `${110 + activeColumns.length * 76}px`,
+              }}
+            >
+              {rowVirtualizer.getVirtualItems().map((virtualRow) => {
               const row = tableRows[virtualRow.index];
               const { isAtm } = row.original;
 
@@ -1467,6 +1308,7 @@ export function HeatmapTable() {
               );
             })}
           </div>
+          )}
         </div>
       )}
     </section>

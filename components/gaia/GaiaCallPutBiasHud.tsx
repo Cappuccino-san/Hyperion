@@ -820,9 +820,18 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       .map((trade) => {
         // Align with initial FSM signal if present to eliminate advection poll latency
         const isCall = trade.contractType === "CALL";
-        const matchedFsmSig = intrinsicSignals.find(
-          (s) => s.isCall === isCall && (s.isOpen || s.isClosed)
-        );
+        let matchedFsmSig = trade.openedTs
+          ? intrinsicSignals.find(
+              (s) =>
+                s.isCall === isCall &&
+                Math.abs((s.barCloseTimestamp ?? 0) - trade.openedTs!) <= 900
+            )
+          : undefined;
+        if (!matchedFsmSig) {
+          matchedFsmSig = intrinsicSignals.find(
+            (s) => s.isCall === isCall && (s.isOpen || s.isClosed)
+          );
+        }
 
         let entryIdx = matchedFsmSig ? matchedFsmSig.barIndex : -1;
         if (entryIdx < 0) {
@@ -831,6 +840,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             trade.openedTs,
             trade.openedAt
           );
+        }
+        if (entryIdx < 0 && enrichedPoints.length > 0) {
+          entryIdx = 0;
         }
         if (entryIdx < 0) return null;
         const exitIdx =
@@ -1426,11 +1438,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                         filter={`url(#white-glow-${uid})`}
                       />
                       <path
-                        d="M -4 -11 L 4 -3 M 4 -11 L -4 -3"
+                        d="M -5 -7 L -1.5 -11 L 6 -3"
                         fill="none"
                         stroke="#FF2A55"
                         strokeWidth="2.2"
                         strokeLinecap="round"
+                        strokeLinejoin="round"
                       />
                     </>
                   )}
@@ -1504,11 +1517,16 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
               ? Math.max(padTop + 2, btoTipY - 26)
               : Math.min(chartBottom - 18, btoTipY + 12);
 
+            const stcHasClearanceBelow = st.exitLowY + 22 <= chartBottom;
             const stcTipY = isPut
-              ? Math.min(chartBottom - 20, st.exitLowY + 6)
+              ? stcHasClearanceBelow
+                ? st.exitLowY + 6
+                : Math.max(padTop + 20, st.exitHighY - 6)
               : Math.max(padTop + 20, st.exitHighY - 6);
             const stcBadgeY = isPut
-              ? Math.min(chartBottom - 20, stcTipY + 2)
+              ? stcHasClearanceBelow
+                ? Math.min(chartBottom - 20, stcTipY + 2)
+                : Math.max(padTop + 4, stcTipY - 20)
               : Math.max(padTop + 4, stcTipY - 20);
 
             return (

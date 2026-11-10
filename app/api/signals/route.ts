@@ -114,19 +114,22 @@ export async function GET(req: NextRequest) {
       });
     }
 
-    if (testAction === "stc_tp1" || testAction === "stc_full") {
+    if (testAction === "stc_tp1" || testAction === "stc_full" || testAction === "stc_put") {
       const targetTicker = ticker || "SPY";
       const isTp1 = testAction === "stc_tp1";
+      const isPut = testAction === "stc_put";
       const btoSpot = targetTicker === "SPY" ? 763.5 : targetTicker === "QQQ" ? 708.0 : 274.0;
-      const spotPrice = targetTicker === "SPY" ? 766.5 : targetTicker === "QQQ" ? 711.0 : 277.0;
+      const spotPrice = isPut
+        ? (targetTicker === "SPY" ? 760.5 : targetTicker === "QQQ" ? 705.0 : 271.0)
+        : (targetTicker === "SPY" ? 766.5 : targetTicker === "QQQ" ? 711.0 : 277.0);
 
       const contract = await selectOptimalContract({
         ticker: targetTicker,
-        contractType: "CALL",
+        contractType: isPut ? "PUT" : "CALL",
         spotPrice: btoSpot,
         target1Spot: spotPrice,
-        target2Spot: spotPrice + 3.0,
-        stopLossSpot: btoSpot - 1.5,
+        target2Spot: isPut ? spotPrice - 3.0 : spotPrice + 3.0,
+        stopLossSpot: isPut ? btoSpot + 1.5 : btoSpot - 1.5,
       });
 
       if (!contract) {
@@ -139,8 +142,11 @@ export async function GET(req: NextRequest) {
       const btoMid = contract.optionMid;
       const liveMid = Number((btoMid * 1.55).toFixed(2)); // estimated +55% gain at TP1
       const nowTs = Math.floor(Date.now() / 1000);
+      const spotPctGain = isPut
+        ? Number((((btoSpot - spotPrice) / btoSpot) * 100).toFixed(2))
+        : Number((((spotPrice - btoSpot) / btoSpot) * 100).toFixed(2));
       const testAlert: TradeLifecycleAlert = {
-        id: `preview-stc-${targetTicker}-${nowTs}`,
+        id: `preview-stc-${targetTicker}-${isPut ? "put" : "call"}-${nowTs}`,
         timestamp: new Date().toLocaleTimeString("en-US", {
           timeZone: "America/New_York",
           hour: "numeric",
@@ -149,23 +155,27 @@ export async function GET(req: NextRequest) {
         ts: nowTs,
         ticker: targetTicker,
         action: "SELL_TO_CLOSE",
-        contractType: "CALL",
+        contractType: isPut ? "PUT" : "CALL",
         contractLabel: contract.contractLabel,
         strike: contract.strike,
         expiration: contract.expiration,
         expHuman: contract.expHuman,
         robinhoodExp: contract.robinhoodExp,
         robinhoodTab: contract.robinhoodTab,
-        setupName: "Put Wall Bounce / Bullish Reversal",
+        setupName: isPut
+          ? "Call Wall Rejection / Bearish Reversal"
+          : "Put Wall Bounce / Bullish Reversal",
         reason: isTp1
           ? "TARGET 1 HIT · SELL 1 OF 2 CONTRACTS (LOCK PROFIT)"
+          : isPut
+          ? "TARGET 1 HIT · COVER 1 PUT (LOCK PROFIT)"
           : "TARGET 2 HIT · SELL FINAL 1 CONTRACT (FULL TARGET)",
         status: isTp1 ? "PARTIAL_TP1" : "CLOSED",
         spotPrice,
         btoSpotPrice: btoSpot,
         target1Spot: spotPrice,
-        target2Spot: spotPrice + 3.0,
-        stopLossSpot: isTp1 ? btoSpot : btoSpot - 1.5,
+        target2Spot: isPut ? spotPrice - 3.0 : spotPrice + 3.0,
+        stopLossSpot: isPut ? btoSpot + 1.5 : (isTp1 ? btoSpot : btoSpot - 1.5),
         optionMid: liveMid,
         btoOptionMid: btoMid,
         contractsQty: contract.contractsQty,
@@ -176,14 +186,14 @@ export async function GET(req: NextRequest) {
         estStopMid: contract.estStopMid,
         tp1Pct: contract.tp1Pct,
         tp2Pct: contract.tp2Pct,
-        pnlSpotPct: Number((((spotPrice - btoSpot) / btoSpot) * 100).toFixed(2)),
+        pnlSpotPct: spotPctGain,
         pnlOptionPct: Number((((liveMid - btoMid) / btoMid) * 100).toFixed(1)),
         rrRatio: 2.0,
         message: `${
-          isTp1 ? "💰 SELL TO CLOSE 1 OF 2 CONTRACTS" : "🎯 SELL TO CLOSE FINAL 1 CONTRACT"
+          isTp1 ? "💰 SELL TO CLOSE 1 OF 2 CONTRACTS" : isPut ? "💰 COVER 1 PUT CONTRACT" : "🎯 SELL TO CLOSE FINAL 1 CONTRACT"
         } · ${contract.contractLabel} @ $${liveMid.toFixed(2)} (+${Number(
           (((liveMid - btoMid) / btoMid) * 100).toFixed(1)
-        )}%) · Spot +${Number((((spotPrice - btoSpot) / btoSpot) * 100).toFixed(2))}%`,
+        )}%) · Spot +${spotPctGain}%`,
       };
 
       return NextResponse.json({

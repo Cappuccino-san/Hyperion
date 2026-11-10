@@ -176,6 +176,17 @@ export function matchTradeToCandleIndex(
 }
 
 /**
+ * Helper to resolve whether a trade/position is Short / Put across multiple schemas
+ */
+function isShortOrPut(pos: any): boolean {
+  if (!pos) return false;
+  const ct = String(pos.contractType || "").toUpperCase();
+  const dir = String(pos.direction || pos.type || "").toUpperCase();
+  const act = String(pos.action || "").toUpperCase();
+  return ct === "PUT" || dir === "SHORT" || act.includes("PUT") || act === "SELL_TO_OPEN";
+}
+
+/**
  * Extracts normalized trades for `ticker` from `serverTrades` (`activePositions`, `closedPositions`, `alerts`).
  */
 export function extractNormalizedTradesForTicker(
@@ -194,7 +205,7 @@ export function extractNormalizedTradesForTicker(
       byId.set(id, {
         id,
         ticker: sym,
-        contractType: pos.contractType === "PUT" ? "PUT" : "CALL",
+        contractType: isShortOrPut(pos) ? "PUT" : "CALL",
         status: "CLOSED",
         setupName: String(pos.setupName || ""),
         btoSpotPrice: Number(pos.btoSpotPrice || pos.spotPrice || 0),
@@ -220,7 +231,7 @@ export function extractNormalizedTradesForTicker(
       byId.set(id, {
         id,
         ticker: sym,
-        contractType: pos.contractType === "PUT" ? "PUT" : "CALL",
+        contractType: isShortOrPut(pos) ? "PUT" : "CALL",
         status: "OPEN",
         setupName: String(pos.setupName || ""),
         btoSpotPrice: Number(pos.btoSpotPrice || pos.spotPrice || 0),
@@ -256,7 +267,7 @@ export function extractNormalizedTradesForTicker(
       byId.set(id, {
         id,
         ticker: sym,
-        contractType: bto.contractType === "PUT" ? "PUT" : "CALL",
+        contractType: isShortOrPut(bto) ? "PUT" : "CALL",
         status: matchingStc ? "CLOSED" : "OPEN",
         setupName: String(bto.setupName || bto.reason || ""),
         btoSpotPrice: Number(bto.btoSpotPrice || bto.spotPrice || 0),
@@ -371,10 +382,15 @@ export function drawTradeExecutionMarkers(
       const curX = barToX(safeActiveIdx);
       const curY = priceToY(curCandle.close);
 
+      // Trajectory color strictly tracks live PnL polarity (Green = in-the-money / profit, Red = adverse move)
+      const dir = isPut ? -1 : 1;
+      const currentUnderlyingDelta = (curCandle.close - entrySpot) * dir;
+      const isCurProfit = currentUnderlyingDelta >= 0;
+
       ctx.save();
-      ctx.strokeStyle = isPut
-        ? "rgba(239, 68, 68, 0.55)"
-        : "rgba(16, 185, 129, 0.55)";
+      ctx.strokeStyle = isCurProfit
+        ? "rgba(16, 185, 129, 0.65)"
+        : "rgba(239, 68, 68, 0.65)";
       ctx.lineWidth = 1.4;
       ctx.setLineDash([3, 4]);
       ctx.beginPath();
@@ -509,8 +525,13 @@ export function drawTradeExecutionMarkers(
       // For covering a Put (Short), draw an upward triangle below the closing candle's low wick.
       // For closing a Call (Long), draw a downward triangle above the closing candle's high wick.
       if (isPut) {
-        const tipY = Math.min(plotBottomY - 20, exitYLow + 5);
-        const baseY = tipY + triH;
+        // Guarantee collision-free rendering: If candle reaches the bottom of the chart, place STC marker above high wick
+        const hasClearanceBelow = exitYLow + 5 + triH + 4 <= plotBottomY;
+        const tipY = hasClearanceBelow
+          ? exitYLow + 5
+          : Math.max(padTop + 20, exitYHigh - 5);
+        const baseY = hasClearanceBelow ? tipY + triH : tipY - triH;
+
         ctx.beginPath();
         ctx.moveTo(exitX, tipY);
         ctx.lineTo(exitX - triHalfW, baseY);
@@ -531,13 +552,17 @@ export function drawTradeExecutionMarkers(
 
         // Place right next to the STC triangle (or centered below if near right edge)
         let bx = exitX + triHalfW + 5;
-        let by = Math.min(plotBottomY - badgeH - 2, tipY);
+        let by = hasClearanceBelow
+          ? Math.min(plotBottomY - badgeH - 2, tipY)
+          : Math.max(padTop + 2, baseY - 2);
         if (bx + badgeW > plotRightX - 4) {
           bx = Math.max(
             padLeft + 2,
             Math.min(plotRightX - badgeW - 2, exitX - badgeW / 2)
           );
-          by = Math.min(plotBottomY - badgeH - 2, baseY + 3);
+          by = hasClearanceBelow
+            ? Math.min(plotBottomY - badgeH - 2, baseY + 3)
+            : Math.max(padTop + 2, baseY - badgeH - 3);
         }
 
         // Dark backing for readability over candles/ribbons, then glowing pill fill

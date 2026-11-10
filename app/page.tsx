@@ -11,7 +11,6 @@ import { AlertsFeed } from "@/components/intraday/AlertsFeed";
 import { HeatmapTable } from "@/components/heatmap/HeatmapTable";
 import { QuadView } from "@/components/views/QuadView";
 import { GaiaView } from "@/components/views/GaiaView";
-import { ChartsView } from "@/components/views/ChartsView";
 import { ScannerView } from "@/components/views/ScannerView";
 import { RecapView } from "@/components/views/RecapView";
 import { useDashboardStore } from "@/store/useDashboardStore";
@@ -66,8 +65,6 @@ export default function DashboardPage() {
         {(activeView === "Gaia" || activeView === "Antaeus" || activeView === "Atlas") && (
           <GaiaView />
         )}
-
-        {activeView === "Charts" && <ChartsView />}
 
         {activeView === "Scanner" && <ScannerView />}
         {activeView === "Recap" && <RecapView />}
