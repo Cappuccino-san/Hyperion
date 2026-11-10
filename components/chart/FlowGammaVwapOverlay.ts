@@ -102,15 +102,15 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     rightAxisWidth = 74,
     confluenceLevels = [],
     showCenterline = true,
-    showBands = true,
-    showShading = true,
-    showConfluenceMarkers = true,
+    showBands = false,
+    showShading = false,
+    showConfluenceMarkers = false,
     showRightAxisBadge = true,
-    showStructuralNodes = true,
-    showBandWickSignals = true,
+    showStructuralNodes = false,
+    showBandWickSignals = false,
     strikeNodes = [],
     referenceBadges = [],
-    showBeadedStrikes = true,
+    showBeadedStrikes = false,
     candles = [],
   } = options;
 
@@ -345,101 +345,8 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     ctx.restore();
   }
 
-  // -------------------------------------------------------------
-  // 3B. High-Contrast Beaded Strike Nodes ("Pearl Necklaces")
-  // -------------------------------------------------------------
-  if (showBeadedStrikes && strikeNodes.length > 0 && validLimit >= 1) {
-    const topBeadNodes = [...strikeNodes]
-      .filter((n) => n.isKing || (n.weight ?? 0) >= 0.35)
-      .sort((a, b) => ((b.isKing ? 2 : 0) + (b.weight ?? 0)) - ((a.isKing ? 2 : 0) + (a.weight ?? 0)))
-      .slice(0, 4);
-
-    const curSpot = activePt.spot;
-    const tol = Math.max(activePt.sigma * 1.5, curSpot * 0.005);
-
-    ctx.save();
-    for (const node of topBeadNodes) {
-      if (!node.strike || node.strike <= 0) continue;
-      const y = node.y !== undefined ? node.y : priceToY(node.strike);
-      if (y < padTop - 10 || y > chartHeight - padBottom + 10) continue;
-
-      const isGolden =
-        node.isKing ||
-        node.polarity === "call" ||
-        (node.polarity !== "put" && node.strike >= curSpot);
-
-      const coreColor = isGolden ? "#fbbf24" : "#c084fc";
-      const specColor = isGolden ? "#fef08a" : "#f3e8ff";
-      const haloColor = isGolden ? "rgba(245, 158, 11, 0.35)" : "rgba(168, 85, 247, 0.35)";
-      const trackColor = isGolden ? "rgba(251, 191, 36, 0.16)" : "rgba(192, 132, 252, 0.16)";
-
-      // Find active cluster span where price was near this strike
-      let firstActiveIdx = -1;
-      let lastActiveIdx = -1;
-
-      for (let i = 0; i <= validLimit; i++) {
-        const pt = points[i];
-        const h = pt.candleHigh ?? pt.spot;
-        const l = pt.candleLow ?? pt.spot;
-        const dist = node.strike >= l && node.strike <= h ? 0 : Math.min(Math.abs(h - node.strike), Math.abs(l - node.strike));
-        if (dist <= tol || i >= Math.max(0, validLimit - 24)) {
-          if (firstActiveIdx === -1) firstActiveIdx = i;
-          lastActiveIdx = i;
-        }
-      }
-
-      if (firstActiveIdx === -1) continue;
-
-      // Connecting thread across the cluster
-      const xStart = barToX(firstActiveIdx);
-      const xEnd = barToX(lastActiveIdx);
-      ctx.beginPath();
-      ctx.moveTo(xStart, y);
-      ctx.lineTo(xEnd, y);
-      ctx.lineWidth = node.isKing ? 1.2 : 0.8;
-      ctx.strokeStyle = trackColor;
-      ctx.setLineDash(node.isKing ? [] : [2, 3]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      const baseRadius = 2.1 + Math.min(1, Math.max(0, node.weight ?? 0.5)) * 1.35 + (node.isKing ? 0.45 : 0);
-
-      // Render pearl beads along cluster
-      for (let i = firstActiveIdx; i <= lastActiveIdx; i++) {
-        if (i % 2 !== 0 && !node.isKing && i < validLimit - 12) continue; // cluster stride
-        const pt = points[i];
-        const h = pt.candleHigh ?? pt.spot;
-        const l = pt.candleLow ?? pt.spot;
-        const dist = node.strike >= l && node.strike <= h ? 0 : Math.min(Math.abs(h - node.strike), Math.abs(l - node.strike));
-        const normDist = dist / Math.max(1e-5, tol);
-
-        const isTouched = dist <= tol * 0.22;
-        const r = isTouched ? baseRadius * 1.25 : baseRadius * Math.max(0.72, 1 - normDist * 0.28);
-        const bx = barToX(i);
-
-        if (isTouched || node.isKing) {
-          ctx.beginPath();
-          ctx.arc(bx, y, r + 2.0, 0, Math.PI * 2);
-          ctx.fillStyle = haloColor;
-          ctx.fill();
-        }
-
-        ctx.beginPath();
-        ctx.arc(bx, y, r, 0, Math.PI * 2);
-        ctx.fillStyle = coreColor;
-        ctx.fill();
-
-        // 3D specular highlight
-        if (r >= 2.2) {
-          ctx.beginPath();
-          ctx.arc(bx - r * 0.25, y - r * 0.25, Math.max(0.75, r * 0.35), 0, Math.PI * 2);
-          ctx.fillStyle = specColor;
-          ctx.fill();
-        }
-      }
-    }
-    ctx.restore();
-  }
+  // 3B. High-Contrast Beaded Strike Nodes ("Pearl Necklaces") - PURGED
+  // Stripped all bead/pearl loops across strikes
 
   // -------------------------------------------------------------
   // 4. Precision Wick Rejection Callouts (White Target Reticles - Image 1)

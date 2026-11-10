@@ -603,20 +603,13 @@ export function GaiaView() {
         : storeTradeAlerts,
   }), [serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts]);
   const [atlasPalette, setAtlasPalette] = useState<"ice" | "polarity">("polarity");
-  const [countdownSec, setCountdownSec] = useState<number>(() => {
+  const getCurrentBarCountdownStr = (): string => {
     const now = new Date();
-    return 300 - ((now.getUTCMinutes() % 5) * 60 + now.getUTCSeconds());
-  });
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      const now = new Date();
-      setCountdownSec(
-        300 - ((now.getUTCMinutes() % 5) * 60 + now.getUTCSeconds())
-      );
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
+    const rem = 300 - ((now.getUTCMinutes() % 5) * 60 + now.getUTCSeconds());
+    const m = Math.floor(rem / 60);
+    const s = rem % 60;
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  };
 
   const DIVSYM = useMemo(() => new Set(["SPY", "QQQ", "SPXW", "IWM"]), []);
 
@@ -1450,58 +1443,7 @@ export function GaiaView() {
       }
     }
 
-    // 1. Key Level Continuous Horizontal Lines:
-    // All-Exp King Line: Solid gold horizontal line (#eab308, width: 1.5px) spanning from candle area across outlook zone
-    if (yAllExpKing >= padTop && yAllExpKing <= height - padBottom) {
-      ctx.save();
-      ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.55)" : "#eab308";
-      ctx.lineWidth = 1.75;
-      ctx.beginPath();
-      ctx.moveTo(padLeft, yAllExpKing);
-      ctx.lineTo(outlookEndX, yAllExpKing);
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    // Filtered / 0DTE King Line: Dashed cyan horizontal line (#38bdf8, [5, 4], width: 1.5px) when different
-    if (filteredKingStrike !== allExpKingStrike && Number.isFinite(filteredKingStrike)) {
-      ctx.strokeStyle = atlasPalette === "ice" ? "rgba(56, 189, 248, 0.75)" : "#38bdf8";
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([5, 4]);
-      ctx.beginPath();
-      ctx.moveTo(padLeft, yFilteredKing);
-      ctx.lineTo(outlookEndX, yFilteredKing);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-
-    // Call Wall line (subtle dashed line)
-    if (callWallStrike !== allExpKingStrike && callWallStrike !== filteredKingStrike) {
-      const yCall = priceToY(callWallStrike);
-      ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.22)" : "rgba(34, 211, 238, 0.35)";
-      ctx.lineWidth = 1;
-      ctx.setLineDash([3, 4]);
-      ctx.beginPath();
-      ctx.moveTo(padLeft, yCall);
-      ctx.lineTo(outlookEndX, yCall);
-      ctx.stroke();
-    }
-
-    // Put Wall line (subtle dashed line)
-    if (
-      putWallStrike !== allExpKingStrike &&
-      putWallStrike !== filteredKingStrike &&
-      putWallStrike !== callWallStrike
-    ) {
-      const yPut = priceToY(putWallStrike);
-      ctx.strokeStyle = atlasPalette === "ice" ? "rgba(255, 255, 255, 0.22)" : "rgba(192, 132, 252, 0.35)";
-      ctx.lineWidth = 1;
-      ctx.setLineDash([3, 4]);
-      ctx.beginPath();
-      ctx.moveTo(padLeft, yPut);
-      ctx.lineTo(outlookEndX, yPut);
-      ctx.stroke();
-    }
+    // Key level calculations preserved for math anchors (continuous strike lines stripped)
     ctx.setLineDash([]);
 
     // Strike step and Proximity scale for moneyflow calculation
@@ -1512,9 +1454,12 @@ export function GaiaView() {
     const sigmaProxSq2 = 2 * sigmaProx * sigmaProx;
 
     // -------------------------------------------------------------------------
-    // Top-K Active Institutional Strike Filter (Strictly K <= 4 levels - Image 1 Spec)
+    // Top-K Active Institutional Strike Filter (Strictly K <= 5 within active 1.5σ band)
     // -------------------------------------------------------------------------
     const curSpotPrice = dataset.candles[safeActiveIdx]?.close ?? dataset.priorClose;
+    const activeSigma1 = Math.max(1.0, dataset.sigma1Move);
+    const activeExpectedBand = activeSigma1 * 1.5;
+
     const rankedCandidateStrikes = dataset.visibleStrikes.map((s) => {
       const activeVal = activeBookCol.strikeValues[s] ?? 0;
       const isKing = s === allExpKingStrike || s === filteredKingStrike;
@@ -1523,189 +1468,28 @@ export function GaiaView() {
       const isWall = isCallWall || isPutWall;
 
       const dist = Math.abs(s - curSpotPrice);
-      const normDist = dist / Math.max(1, dataset.sigma1Move * 1.5);
+      const normDist = dist / activeExpectedBand;
       const spotProxWeight = Math.exp(-1.2 * normDist * normDist);
 
       const rawConc = Math.min(1.0, Math.abs(activeVal) / maxSessionExposure);
       const structuralBoost = isKing ? 0.40 : isWall ? 0.22 : 0.0;
       const score = (rawConc * 0.65 + structuralBoost) * (0.35 + 0.65 * spotProxWeight);
 
-      return { strike: s, score, isKing, isCallWall, isPutWall, val: activeVal };
+      return { strike: s, score, isKing, isCallWall, isPutWall, val: activeVal, inBand: dist <= activeExpectedBand };
     });
 
     rankedCandidateStrikes.sort((a, b) => b.score - a.score);
 
-    // Strictly limit to at most 4 active nodes (King + Walls + top active strike)
     const activeNodeMap = new Map<number, (typeof rankedCandidateStrikes)[0]>();
     for (const item of rankedCandidateStrikes) {
-      if (activeNodeMap.size >= 4) break;
-      if (item.isKing || item.isCallWall || item.isPutWall || item.score >= 0.20) {
+      if (!item.inBand && !item.isKing) continue;
+      if (activeNodeMap.size >= 5) break;
+      if (item.isKing || item.isCallWall || item.isPutWall || item.score >= 0.25) {
         activeNodeMap.set(item.strike, item);
       }
     }
 
-    // Render bar-by-bar position beads / diamonds / triangles across time (t in [0, safeActiveIdx])
-    for (let t = 0; t <= safeActiveIdx; t++) {
-      const col = dataset.columnsByBar[t];
-      if (!col) continue;
-      const cx = barToX(t);
-      const spotAtBar = dataset.candles[t]?.close ?? dataset.priorClose;
-      const colKingStrike = isFiltered ? col.filteredKingStrike : col.allExpKingStrike;
-
-      for (const strike of dataset.visibleStrikes) {
-        const activeMeta = activeNodeMap.get(strike);
-        // STRICT SUPPRESSION: Completely skip all non-Top-K strikes
-        if (!activeMeta) continue;
-
-        const cy = priceToY(strike);
-        if (cy < padTop - 12 || cy > height - padBottom + 12) continue;
-
-        const val = col.strikeValues[strike] ?? 0;
-        const absVal = Math.abs(val);
-        const conc = Math.min(1.0, absVal / maxSessionExposure);
-
-        const dist = Math.abs(strike - spotAtBar);
-        const prox = Math.exp(-(dist * dist) / sigmaProxSq2);
-        // Dynamic intensity combining raw position size and dealer hedging proximity
-        const intensity = Math.min(
-          1.0,
-          Math.max(0.0, Math.pow(conc, 0.72) * (0.28 + 0.72 * prox) * 1.25)
-        );
-
-        const isKing =
-          strike === filteredKingStrike ||
-          strike === allExpKingStrike ||
-          strike === colKingStrike ||
-          (strike === allExpKingStrike && conc >= 0.75);
-        const isCallWall = !isKing && (strike === callWallStrike);
-        const isPutWall = !isKing && (strike === putWallStrike);
-
-        // Maximum bead width allowed based on horizontal bar spacing
-        const maxBeadW = Math.min(colStepX * 0.48, 4.6);
-        const beadRadius = Math.max(1.6, Math.min(maxBeadW, 1.6 + intensity * 2.8));
-
-        // 1. Quiescent / Low Position: Suppress completely to keep chart clean and uncluttered (Image 1 Style)
-        if (intensity < 0.20 && !isKing) {
-          continue;
-        }
-
-        // 2. King Strike: Solid circular beads `●` glowing brightly
-        if (isKing) {
-          ctx.save();
-          if (atlasPalette === "ice") {
-            ctx.shadowColor = "rgba(255, 255, 255, 0.95)";
-            ctx.shadowBlur = Math.round(10 + intensity * 6);
-            ctx.fillStyle = "#ffffff";
-          } else {
-            ctx.shadowColor = "rgba(250, 204, 21, 0.85)";
-            ctx.shadowBlur = Math.round(10 + intensity * 6);
-            ctx.fillStyle = "#facc15";
-          }
-          ctx.globalAlpha = Math.min(0.98, 0.75 + intensity * 0.23);
-          ctx.beginPath();
-          ctx.arc(cx, cy, Math.max(2.4, beadRadius), 0, Math.PI * 2);
-          ctx.fill();
-          ctx.restore();
-          continue;
-        }
-
-        // 3. Call Wall: Row of diamonds `◆` (hollow when small, solid with glow when position grows)
-        if (isCallWall) {
-          const dw = Math.max(3.0, Math.min(maxBeadW * 1.9, 3.0 + intensity * 4.6));
-          ctx.save();
-          if (atlasPalette === "ice") {
-            if (intensity >= 0.35) {
-              ctx.shadowColor = "rgba(255, 255, 255, 0.85)";
-              ctx.shadowBlur = Math.round(8 * intensity);
-            }
-            ctx.fillStyle = "#ffffff";
-            ctx.strokeStyle = "#ffffff";
-          } else {
-            if (intensity >= 0.35) {
-              ctx.shadowColor = "rgba(34, 211, 238, 0.75)";
-              ctx.shadowBlur = Math.round(8 * intensity);
-            }
-            ctx.fillStyle = "#22d3ee";
-            ctx.strokeStyle = "#22d3ee";
-          }
-          ctx.globalAlpha = Math.min(0.95, 0.4 + intensity * 0.55);
-          ctx.beginPath();
-          ctx.moveTo(cx, cy - dw / 2);
-          ctx.lineTo(cx + dw / 2, cy);
-          ctx.lineTo(cx, cy + dw / 2);
-          ctx.lineTo(cx - dw / 2, cy);
-          ctx.closePath();
-          if (intensity < 0.32) {
-            ctx.lineWidth = 1.15;
-            ctx.stroke();
-          } else {
-            ctx.fill();
-          }
-          ctx.restore();
-          continue;
-        }
-
-        // 4. Put Wall: Row of triangles `▲` (hollow when small, solid with glow when position grows)
-        if (isPutWall) {
-          const tw = Math.max(3.2, Math.min(maxBeadW * 1.9, 3.2 + intensity * 4.4));
-          ctx.save();
-          if (atlasPalette === "ice") {
-            if (intensity >= 0.35) {
-              ctx.shadowColor = "rgba(255, 255, 255, 0.85)";
-              ctx.shadowBlur = Math.round(8 * intensity);
-            }
-            ctx.fillStyle = "#ffffff";
-            ctx.strokeStyle = "#ffffff";
-          } else {
-            if (intensity >= 0.35) {
-              ctx.shadowColor = "rgba(192, 132, 252, 0.75)";
-              ctx.shadowBlur = Math.round(8 * intensity);
-            }
-            ctx.fillStyle = "#c084fc";
-            ctx.strokeStyle = "#c084fc";
-          }
-          ctx.globalAlpha = Math.min(0.95, 0.4 + intensity * 0.55);
-          ctx.beginPath();
-          ctx.moveTo(cx, cy - tw / 2);
-          ctx.lineTo(cx + tw / 2, cy + tw / 2);
-          ctx.lineTo(cx - tw / 2, cy + tw / 2);
-          ctx.closePath();
-          if (intensity < 0.32) {
-            ctx.lineWidth = 1.15;
-            ctx.stroke();
-          } else {
-            ctx.fill();
-          }
-          ctx.restore();
-          continue;
-        }
-
-        // 5. Other Top-K Active Strikes:
-        // Render solid glowing beads when position has genuine conviction (Image 1 Style)
-        if (intensity < 0.30) continue;
-        const nodeColor =
-          atlasPalette === "ice"
-            ? (intensity >= 0.5 ? "#ffffff" : "#bae6fd")
-            : exposureMode === "VEX"
-              ? (val >= 0 ? "#f59e0b" : "#8b5cf6")
-              : (val >= 0 ? "#22d3ee" : "#a855f7");
-
-        ctx.save();
-        if (intensity >= 0.5) {
-          ctx.shadowColor =
-            atlasPalette === "ice"
-              ? "rgba(255, 255, 255, 0.75)"
-              : (val >= 0 ? "rgba(34, 211, 238, 0.65)" : "rgba(192, 132, 252, 0.65)");
-          ctx.shadowBlur = Math.round(6 * intensity);
-        }
-        ctx.fillStyle = nodeColor;
-        ctx.globalAlpha = Math.min(0.92, 0.45 + intensity * 0.5);
-        ctx.beginPath();
-        ctx.arc(cx, cy, beadRadius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-      }
-    }
+    // Strike matrix and bead dots completely purged - zero dot clutter
 
     // =========================================================================
     // LAYER 2: Book Center & Moving Averages
@@ -1729,37 +1513,7 @@ export function GaiaView() {
       ctx.restore();
     }
 
-    // 2. Stepped Daily MAs:
-    // SMA 5 (D) as a stepped 1.5px solid white line (#ffffff)
-    // EMA 21 (D) (#14b8a6, 1.25px) and SMA 55 (D) (#f97316, 1.25px)
-    const drawSteppedLine = (
-      getPointY: (idx: number) => number,
-      strokeColor: string,
-      lineWidth: number
-    ) => {
-      if (safeActiveIdx < 1) return;
-      ctx.save();
-      ctx.strokeStyle = strokeColor;
-      ctx.lineWidth = lineWidth;
-      ctx.beginPath();
-      for (let t = 0; t <= safeActiveIdx; t++) {
-        const x = barToX(t);
-        const y = getPointY(t);
-        if (t === 0) {
-          ctx.moveTo(x - colStepX * 0.4, y);
-          ctx.lineTo(x + colStepX * 0.5, y);
-        } else {
-          ctx.lineTo(x - colStepX * 0.5, y);
-          ctx.lineTo(x + colStepX * 0.5, y);
-        }
-      }
-      ctx.stroke();
-      ctx.restore();
-    };
-
-    drawSteppedLine((t) => priceToY(dataset.candles[t].sma5d), "#ffffff", 1.5);
-    drawSteppedLine((t) => priceToY(dataset.candles[t].ema21d), "#14b8a6", 1.25);
-    drawSteppedLine((t) => priceToY(dataset.candles[t].sma55d), "#f97316", 1.25);
+    // Stepped daily MAs purged (white stepped line stripped)
 
     // 3. Dynamic Intraday SMA 34 (5m) (1.75px, #ef4444 when close < sma34, #22c55e when close >= sma34)
     if (safeActiveIdx >= 1) {
@@ -1915,13 +1669,13 @@ export function GaiaView() {
         rightAxisWidth: 64,
         confluenceLevels,
         showCenterline: true,
-        showBands: true,
-        showShading: true,
-        showConfluenceMarkers: true,
+        showBands: false,
+        showShading: false,
+        showConfluenceMarkers: false,
         showRightAxisBadge: false,
-        strikeNodes: overlayStrikeNodes,
-        referenceBadges,
-        showBeadedStrikes: false, // Clean Single Ownership: GaiaView renders time-series beads; Overlay renders reticles & corridor
+        strikeNodes: [],
+        referenceBadges: [], // Zero badge collision over active price candles; levels anchor to Y-axis gutter
+        showBeadedStrikes: false,
         candles: dataset.candles,
       });
     }
@@ -2075,372 +1829,8 @@ export function GaiaView() {
     const yPlus2 = priceToY(pPlus2);
     const yMinus2 = priceToY(pMinus2);
 
-    ctx.save();
-    // Outer ±2σ wings fill (rgba(168, 85, 247, 0.14))
-    ctx.fillStyle = "rgba(168, 85, 247, 0.14)";
-    ctx.beginPath();
-    ctx.moveTo(dividerX, yPriorClose);
-    ctx.lineTo(outlookRightX, yPlus2);
-    ctx.lineTo(outlookRightX, yPlus1);
-    ctx.closePath();
-    ctx.fill();
-
-    ctx.beginPath();
-    ctx.moveTo(dividerX, yPriorClose);
-    ctx.lineTo(outlookRightX, yMinus1);
-    ctx.lineTo(outlookRightX, yMinus2);
-    ctx.closePath();
-    ctx.fill();
-
-    // Subtle horizontal plateau band fills at the right edge of the 2σ cone
-    const plateauRatio2 = 0.72;
-    const plateauX2 = dividerX + (outlookRightX - dividerX) * plateauRatio2;
-    const plateauYTop2 = yPriorClose + (yPlus2 - yPriorClose) * plateauRatio2;
-    const plateauYBot2 = yPriorClose + (yMinus2 - yPriorClose) * plateauRatio2;
-
-    ctx.fillStyle = "rgba(168, 85, 247, 0.22)";
-    ctx.beginPath();
-    ctx.moveTo(plateauX2, plateauYTop2);
-    ctx.lineTo(outlookRightX, yPlus2);
-    ctx.lineTo(outlookRightX, plateauYTop2);
-    ctx.closePath();
-    ctx.fill();
-
-    ctx.beginPath();
-    ctx.moveTo(plateauX2, plateauYBot2);
-    ctx.lineTo(outlookRightX, yMinus2);
-    ctx.lineTo(outlookRightX, plateauYBot2);
-    ctx.closePath();
-    ctx.fill();
-
-    ctx.strokeStyle = "rgba(168, 85, 247, 0.45)";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(plateauX2, plateauYTop2);
-    ctx.lineTo(outlookRightX, plateauYTop2);
-    ctx.moveTo(plateauX2, plateauYBot2);
-    ctx.lineTo(outlookRightX, plateauYBot2);
-    ctx.stroke();
-
-    // Inner ±1σ cone fill (rgba(56, 189, 248, 0.16))
-    ctx.fillStyle = "rgba(56, 189, 248, 0.16)";
-    ctx.beginPath();
-    ctx.moveTo(dividerX, yPriorClose);
-    ctx.lineTo(outlookRightX, yPlus1);
-    ctx.lineTo(outlookRightX, yMinus1);
-    ctx.closePath();
-    ctx.fill();
-
-    // Stroke ±2σ rays (#a855f7, 1.25px)
-    ctx.strokeStyle = "#a855f7";
-    ctx.lineWidth = 1.25;
-    ctx.beginPath();
-    ctx.moveTo(dividerX, yPriorClose);
-    ctx.lineTo(outlookRightX, yPlus2);
-    ctx.moveTo(dividerX, yPriorClose);
-    ctx.lineTo(outlookRightX, yMinus2);
-    ctx.stroke();
-
-    // Stroke ±1σ rays (#38bdf8, 1.25px)
-    ctx.strokeStyle = "#38bdf8";
-    ctx.lineWidth = 1.25;
-    ctx.beginPath();
-    ctx.moveTo(dividerX, yPriorClose);
-    ctx.lineTo(outlookRightX, yPlus1);
-    ctx.moveTo(dividerX, yPriorClose);
-    ctx.lineTo(outlookRightX, yMinus1);
-    ctx.stroke();
-
-    // Crisp white circular vertex dot (#ffffff, radius 3.5px) at Prior Close on outlook divider
-    ctx.fillStyle = "#ffffff";
-    ctx.beginPath();
-    ctx.arc(dividerX, yPriorClose, 3.5, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Pin (+GEX, cyan tint) and Fast-move (-GEX, purple tint) shading inside right-side outlook cone
-    ctx.save();
-    ctx.beginPath();
-    ctx.moveTo(dividerX, yPriorClose);
-    ctx.lineTo(outlookRightX, yPlus2);
-    ctx.lineTo(outlookRightX, yMinus2);
-    ctx.closePath();
-    ctx.clip();
-
-    const activeCol = dataset.columnsByBar[safeActiveIdx];
-    if (activeCol) {
-      // Shade Pin zones (+exposure)
-      const posStrikes = dataset.visibleStrikes.filter(
-        (k) =>
-          (activeCol.strikeValues[k] ?? 0) > 0 &&
-          Math.abs(k - dataset.priorClose) <= dataset.sigma2Move
-      );
-      posStrikes.forEach((k) => {
-        const y = priceToY(k);
-        ctx.fillStyle = "rgba(34, 211, 238, 0.22)";
-        ctx.fillRect(dividerX, y - 4, outlookRightX - dividerX, 8);
-      });
-
-      // Shade Fast zones (-exposure)
-      const negStrikes = dataset.visibleStrikes.filter(
-        (k) =>
-          (activeCol.strikeValues[k] ?? 0) < 0 &&
-          Math.abs(k - dataset.priorClose) <= dataset.sigma2Move
-      );
-      negStrikes.forEach((k) => {
-        const y = priceToY(k);
-        ctx.fillStyle = "rgba(232, 121, 249, 0.24)";
-        ctx.fillRect(dividerX, y - 4, outlookRightX - dividerX, 8);
-      });
-    }
-    ctx.restore();
-    ctx.restore();
-
-    // Luminous Volumetric Rays from Active Spot to Key Levels (Screenshots 3, 4, 5)
-    const curSpot = dataset.candles[safeActiveIdx]?.close ?? dataset.priorClose;
-    const spotX = barToX(safeActiveIdx);
-    const spotY = priceToY(curSpot);
-
-    // Volumetric Light Beams expanding to key strikes at outlookRightX
-    const keyStrikesToBeam = dataset.visibleStrikes
-      .map((s) => {
-        const val = activeBookCol.strikeValues[s] ?? 0;
-        const absVal = Math.abs(val);
-        const concPct = Math.round((absVal / Math.max(1, maxSessionExposure)) * 100);
-        const isKing = s === activeBookCol.allExpKingStrike || s === activeBookCol.filteredKingStrike;
-        return { strike: s, absVal, concPct, isKing };
-      })
-      .filter((item) => item.concPct >= 14 || item.isKing)
-      .sort((a, b) => b.concPct - a.concPct)
-      .slice(0, 6);
-
-    keyStrikesToBeam.forEach(({ strike, concPct, isKing }) => {
-      const targetY = priceToY(strike);
-      const u = Math.min(1.0, concPct / 100);
-      const beamH = Math.max(3.5, 3.5 + u * 12);
-      const beamGrad = ctx.createLinearGradient(spotX, spotY, outlookRightX, targetY);
-
-      if (atlasPalette === "ice") {
-        beamGrad.addColorStop(0, `rgba(255, 255, 255, ${isKing ? 0.38 : 0.12 + u * 0.22})`);
-        beamGrad.addColorStop(0.35, `rgba(255, 255, 255, ${isKing ? 0.22 : 0.06 + u * 0.14})`);
-        beamGrad.addColorStop(1, `rgba(255, 255, 255, ${isKing ? 0.05 : 0.01})`);
-      } else {
-        const beamColor = isKing
-          ? "250, 204, 21"
-          : (activeBookCol.strikeValues[strike] ?? 0) >= 0
-            ? "34, 211, 238"
-            : "192, 132, 252";
-        beamGrad.addColorStop(0, `rgba(${beamColor}, ${isKing ? 0.40 : 0.14 + u * 0.24})`);
-        beamGrad.addColorStop(0.35, `rgba(${beamColor}, ${isKing ? 0.24 : 0.08 + u * 0.15})`);
-        beamGrad.addColorStop(1, `rgba(${beamColor}, 0.02)`);
-      }
-
-      ctx.save();
-      ctx.fillStyle = beamGrad;
-      ctx.beginPath();
-      ctx.moveTo(spotX, spotY);
-      ctx.lineTo(outlookRightX, targetY - beamH / 2);
-      ctx.lineTo(outlookRightX, targetY + beamH / 2);
-      ctx.closePath();
-      ctx.fill();
-      ctx.restore();
-    });
-
-    // Path to King Projection:
-    // - When a specific expiration filter is selected (e.g. NEXT / WEEK), project to yFilteredKing.
-    // - When expFilter === "ALL", if All-exp King is a weak/distant multi-day tail (<15% share or >1.05σ away)
-    //   while Tactical 0DTE/Next-Exp King is dominant (>=20% share), project primary intraday path to Tactical King
-    //   and render the distant All-exp King path as a secondary muted reference curve.
-    if (pathToKing && dataset.candles[safeActiveIdx]) {
-      const startX = barToX(safeActiveIdx);
-      const startY = priceToY(dataset.candles[safeActiveIdx].close);
-      const endX = outlookEndX;
-
-      const isAllExpWeakOrDistant =
-        filteredKingStrike !== allExpKingStrike &&
-        Number.isFinite(filteredKingStrike) &&
-        ((activeBookCol.allExpKingConcPct < 15 && activeBookCol.filteredKingConcPct >= 20) ||
-          Math.abs(allExpKingStrike - curSpot) > dataset.sigma1Move * 1.05);
-
-      const useTacticalPrimary =
-        (expFilter !== "ALL" && Number.isFinite(filteredKingStrike)) ||
-        isAllExpWeakOrDistant;
-
-      const primaryEndY = useTacticalPrimary ? yFilteredKing : yAllExpKing;
-      const primaryColor =
-        useTacticalPrimary && filteredKingStrike !== allExpKingStrike
-          ? "#38bdf8"
-          : "#eab308";
-
-      const drawKingCurve = (
-        targetY: number,
-        strokeColor: string,
-        dotColor: string,
-        lineWidth: number,
-        dash: number[]
-      ) => {
-        ctx.save();
-        ctx.strokeStyle = strokeColor;
-        ctx.lineWidth = lineWidth;
-        ctx.setLineDash(dash);
-        ctx.beginPath();
-        ctx.moveTo(startX, startY);
-
-        const steps = 16;
-        for (let s = 1; s <= steps; s++) {
-          const u = s / steps;
-          const px = startX + (endX - startX) * u;
-          const ease = 1 - Math.pow(1 - u, 1.65);
-          const waveOffset =
-            s === steps ? 0 : Math.sin(u * Math.PI * 3) * 2.5 * (1 - u);
-          const py = startY + (targetY - startY) * ease + waveOffset;
-          ctx.lineTo(px, py);
-        }
-        ctx.stroke();
-        ctx.setLineDash([]);
-
-        ctx.fillStyle = dotColor;
-        ctx.beginPath();
-        ctx.arc(endX, targetY, 2.6, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-      };
-
-      // If All-Exp King is distant/weak on ALL view, draw muted multi-day reference curve first
-      if (expFilter === "ALL" && isAllExpWeakOrDistant) {
-        const clampedYAllExpKing = Math.max(padTop + 14, Math.min(height - padBottom - 14, yAllExpKing));
-        drawKingCurve(
-          clampedYAllExpKing,
-          "rgba(234, 179, 8, 0.65)",
-          "rgba(250, 204, 21, 0.85)",
-          1.4,
-          [2, 5]
-        );
-      }
-
-      drawKingCurve(
-        primaryEndY,
-        primaryColor,
-        useTacticalPrimary && filteredKingStrike !== allExpKingStrike ? "#38bdf8" : "#facc15",
-        1.5,
-        [4, 4]
-      );
-    }
-
-    // Dark pill badges for 1σ, 2σ, and King {Strike}
-    const drawBadge = (
-      text: string,
-      edgeX: number,
-      rawCenterY: number,
-      options?: {
-        bgColor?: string;
-        borderColor?: string;
-        textColor?: string;
-        maskBehind?: boolean;
-        align?: "left" | "right";
-      }
-    ): number => {
-      const {
-        bgColor = "#0f1522",
-        borderColor = "#232d42",
-        textColor = "#e2e8f0",
-        maskBehind = false,
-        align = "right",
-      } = options ?? {};
-      ctx.save();
-      ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
-      const metrics = ctx.measureText(text);
-      const padH = 6;
-      const badgeW = metrics.width + padH * 2;
-      const badgeH = 18;
-      const centerY = Math.max(
-        padTop + badgeH / 2 + 2,
-        Math.min(height - padBottom - badgeH / 2 - 2, rawCenterY)
-      );
-      const bx = align === "left" ? edgeX : edgeX - badgeW;
-      const by = centerY - badgeH / 2;
-
-      if (maskBehind) {
-        ctx.fillStyle = "#0d111a";
-        ctx.fillRect(bx - 3, by - 1, badgeW + 6, badgeH + 2);
-      }
-
-      ctx.fillStyle = bgColor;
-      ctx.strokeStyle = borderColor;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(bx, by, badgeW, badgeH, 5);
-      ctx.fill();
-      ctx.stroke();
-
-      ctx.fillStyle = textColor;
-      ctx.textBaseline = "middle";
-      ctx.fillText(text, bx + padH, centerY + 0.5);
-      ctx.restore();
-      return badgeW;
-    };
-
-    // 2σ and 1σ badges inside the outlook column
-    drawBadge(`2σ ${pPlus2.toFixed(2)}`, outlookRightX - 4, yPlus2 + 9, {
-      bgColor: "#111726",
-      borderColor: "rgba(168, 85, 247, 0.45)",
-      textColor: "#f8fafc",
-    });
-    drawBadge("1σ", outlookRightX - 4, yPlus1 + 6, {
-      bgColor: "#111726",
-      borderColor: "rgba(56, 189, 248, 0.45)",
-      textColor: "#f8fafc",
-    });
-    drawBadge("1σ", outlookRightX - 4, yMinus1 - 6, {
-      bgColor: "#111726",
-      borderColor: "rgba(56, 189, 248, 0.45)",
-      textColor: "#f8fafc",
-    });
-    drawBadge("2σ", outlookRightX - 4, yMinus2 - 9, {
-      bgColor: "#111726",
-      borderColor: "rgba(168, 85, 247, 0.45)",
-      textColor: "#f8fafc",
-    });
-
-    // Global All-exp King {Strike} callout badge immediately inside the left edge of the outlook column (outlookStartX + 6px)
-    const isMacroKingOffscreen = yAllExpKing < padTop + 6 || yAllExpKing > height - padBottom - 6;
-    const distPts = allExpKingStrike - curSpot;
-    const distSign = distPts >= 0 ? "+" : "";
-    const macroKingText = isMacroKingOffscreen
-      ? `${yAllExpKing > height - padBottom ? "▼ " : "▲ "}Macro King ${allExpKingStrike} (${distSign}${distPts.toFixed(1)})`
-      : `King ${allExpKingStrike}`;
-
-    const kingBadgeW = drawBadge(
-      macroKingText,
-      dividerX + 6,
-      yAllExpKing,
-      {
-        bgColor: isMacroKingOffscreen ? "#1c1404" : "#101520",
-        borderColor: "rgba(234, 179, 8, 0.9)",
-        textColor: isMacroKingOffscreen ? "#fde047" : "#facc15",
-        maskBehind: true,
-        align: "left",
-      }
-    );
-
-    // Filtered / 0DTE King {Strike} callout badge immediately inside the left edge of the outlook column (outlookStartX + 6px)
-    if (filteredKingStrike !== allExpKingStrike && Number.isFinite(filteredKingStrike)) {
-      const isCloseToAllExpKing = Math.abs(yFilteredKing - yAllExpKing) < 22;
-      const filteredBadgeLeftX = isCloseToAllExpKing
-        ? dividerX + 6 + kingBadgeW + 6
-        : dividerX + 6;
-      drawBadge(
-        `${canvasFilterBadgePrefix} ${filteredKingStrike}`,
-        filteredBadgeLeftX,
-        yFilteredKing,
-        {
-          bgColor: "#151b28",
-          borderColor: "rgba(56, 189, 248, 0.6)",
-          textColor: "#38bdf8",
-          maskBehind: true,
-          align: "left",
-        }
-      );
-    }
+    // Clean Minimalist Outlook: All heavy cone fills, diagonal ray fans, and floating pills purged.
+    // Price levels are displayed in the right Y-axis gutter.
 
     // =========================================================================
     // LAYER 5.5: Authoritative Server Trades Execution Overlay (BTO/STC Markers, Trajectory & PnL Badges)
@@ -2583,6 +1973,8 @@ export function GaiaView() {
     });
 
     // Active Spot Badge on Right Axis (with Countdown Clock Timer, e.g. 774.00 02:01)
+    const curSpot = dataset.candles[safeActiveIdx]?.close ?? dataset.priorClose;
+    const spotX = barToX(safeActiveIdx);
     const ySpot = priceToY(curSpot);
     if (ySpot >= padTop && ySpot <= height - padBottom) {
       // Dotted guide line across from active candle to spot badge
@@ -2598,9 +1990,7 @@ export function GaiaView() {
 
       // Spot Pill with Countdown Timer
       const spotLabel = curSpot.toFixed(2);
-      const minLeft = Math.floor(countdownSec / 60);
-      const secLeft = countdownSec % 60;
-      const timerStr = `${String(minLeft).padStart(2, "0")}:${String(secLeft).padStart(2, "0")}`;
+      const timerStr = getCurrentBarCountdownStr();
       const badgeW = 76;
       const badgeH = 24;
       const bx = outlookRightX + 4;
@@ -2901,7 +2291,6 @@ export function GaiaView() {
     flowVwapPoints,
     hoverCursor,
     atlasPalette,
-    countdownSec,
     hudTradeSignals,
     effectiveServerTrades,
     przmHudSignals,
@@ -3656,87 +3045,19 @@ export function GaiaView() {
             </button>
           )}
 
-          {/* Layer 4: Multi-Timeframe Divergence HUD Table (top-left of candlestick zone, SPY, QQQ, SPXW, IWM only) */}
+          {/* Minimalist MTF Divergence Status Strip (Non-occluding, zero-background header bar) */}
           {dataset && DIVSYM.has(loadedTicker.toUpperCase()) && (
-            <div
-              className="absolute top-3.5 left-5 z-10 bg-[#0d121c]/95 border border-[#232d42] rounded-md text-[11px] font-mono overflow-hidden shadow-lg backdrop-blur-sm"
-            >
-              <table className="border-collapse">
-                <tbody>
-                  {(divPayload?.rows && divPayload.rows.length === 5
-                    ? divPayload.rows.map((r) => ({
-                        tf: r.tf,
-                        label:
-                          r.tf === "5"
-                            ? "5 min divergence"
-                            : r.tf === "30"
-                              ? "30 min divergence"
-                              : r.tf === "120"
-                                ? "2HR divergence"
-                                : r.tf === "D"
-                                  ? "Daily divergence"
-                                  : "Weekly divergence",
-                        status: r.state,
-                        detail:
-                          r.state === "NO" || !r.signal
-                            ? "No confirmed divergence in the last 30 bars"
-                            : `${r.signal.type.toUpperCase()} · pivots ${divWhen(r.signal.t1, r.intraday)} (${r.signal.p1}) → ${divWhen(r.signal.t2, r.intraday)} (${r.signal.p2})`,
-                        near:
-                          r.signal?.near && r.signal.near.length > 0
-                            ? r.signal.near.map((n) => `${n[0]} ${n[1]}`).join(", ")
-                            : null,
-                      }))
-                    : [
-                        { tf: "5", label: "5 min divergence", status: mtfDivergence.tf5m, detail: "No confirmed divergence in the last 30 bars", near: null },
-                        { tf: "30", label: "30 min divergence", status: mtfDivergence.tf30m, detail: "No confirmed divergence in the last 30 bars", near: null },
-                        { tf: "120", label: "2HR divergence", status: mtfDivergence.tf2h, detail: "No confirmed divergence in the last 30 bars", near: null },
-                        { tf: "D", label: "Daily divergence", status: mtfDivergence.tfDaily, detail: "No confirmed divergence in the last 30 bars", near: null },
-                        { tf: "W", label: "Weekly divergence", status: mtfDivergence.tfWeekly, detail: "No confirmed divergence in the last 30 bars", near: null },
-                      ]
-                  ).map((row, idx) => {
-                    const isOpen = openDivTf === row.tf;
-                    return (
-                      <React.Fragment key={row.tf}>
-                        <tr
-                          onClick={() => setOpenDivTf(isOpen ? null : row.tf)}
-                          className={cn(
-                            "cursor-pointer hover:bg-white/5 transition-colors",
-                            idx > 0 && "border-t border-[#1e2638]"
-                          )}
-                        >
-                          <td className="px-2.5 py-1 text-slate-200 border-r border-[#1e2638]">
-                            {row.label}
-                          </td>
-                          <td
-                            className={cn(
-                              "px-2.5 py-1 text-center font-bold min-w-[42px]",
-                              row.status === "BULL"
-                                ? "text-[#22c55e]"
-                                : row.status === "BEAR"
-                                  ? "text-[#ef4444]"
-                                  : "text-slate-400"
-                            )}
-                          >
-                            {row.status}
-                          </td>
-                        </tr>
-                        {isOpen && (
-                          <tr className="border-t border-[#1e2638]/50 bg-[#080d17]">
-                            <td colSpan={2} className="px-2.5 py-1 text-[10px] text-slate-400 max-w-[240px]">
-                              <span>{row.detail}</span>
-                              {row.near && (
-                                <span className="text-[#facc15] font-semibold ml-1">
-                                  · near {row.near}
-                                </span>
-                              )}
-                            </td>
-                          </tr>
-                        )}
-                      </React.Fragment>
-                    );
-                  })}
-                </tbody>
-              </table>
+            <div className="absolute top-2 left-4 z-10 flex items-center gap-2 font-mono text-[11px] text-slate-400 select-none pointer-events-none">
+              <span className="text-slate-500 font-semibold tracking-wider">MTF:</span>
+              <span>5m <strong className={mtfDivergence.tf5m === "BULL" ? "text-emerald-400" : mtfDivergence.tf5m === "BEAR" ? "text-rose-400" : "text-slate-500"}>{mtfDivergence.tf5m === "BULL" ? "▲" : mtfDivergence.tf5m === "BEAR" ? "▼" : "—"}</strong></span>
+              <span className="text-slate-700">|</span>
+              <span>30m <strong className={mtfDivergence.tf30m === "BULL" ? "text-emerald-400" : mtfDivergence.tf30m === "BEAR" ? "text-rose-400" : "text-slate-500"}>{mtfDivergence.tf30m === "BULL" ? "▲" : mtfDivergence.tf30m === "BEAR" ? "▼" : "—"}</strong></span>
+              <span className="text-slate-700">|</span>
+              <span>2H <strong className={mtfDivergence.tf2h === "BULL" ? "text-emerald-400" : mtfDivergence.tf2h === "BEAR" ? "text-rose-400" : "text-slate-500"}>{mtfDivergence.tf2h === "BULL" ? "▲" : mtfDivergence.tf2h === "BEAR" ? "▼" : "—"}</strong></span>
+              <span className="text-slate-700">|</span>
+              <span>1D <strong className={mtfDivergence.tfDaily === "BULL" ? "text-emerald-400" : mtfDivergence.tfDaily === "BEAR" ? "text-rose-400" : "text-slate-500"}>{mtfDivergence.tfDaily === "BULL" ? "▲" : mtfDivergence.tfDaily === "BEAR" ? "▼" : "—"}</strong></span>
+              <span className="text-slate-700">|</span>
+              <span>1W <strong className={mtfDivergence.tfWeekly === "BULL" ? "text-emerald-400" : mtfDivergence.tfWeekly === "BEAR" ? "text-rose-400" : "text-slate-500"}>{mtfDivergence.tfWeekly === "BULL" ? "▲" : mtfDivergence.tfWeekly === "BEAR" ? "▼" : "—"}</strong></span>
             </div>
           )}
         </div>

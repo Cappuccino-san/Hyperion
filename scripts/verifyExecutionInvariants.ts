@@ -973,19 +973,7 @@ async function runTestSuite() {
     stopLossSpot: 745,
   };
   const gapBracket = initializeOcoBrackets(gapConfig);
-  const gapQuote: NbboQuote = {
-    bid: 1.15, // Gapped above TP2 ($0.80)
-    ask: 1.18,
-    mid: 1.165,
-    spreadPct: 2.5,
-    isStale: false,
-    delta: 0.8,
-    gamma: 0.05,
-    theta: -0.01,
-    timestamp: Date.now(),
-    exchange: "CBOE",
-    source: "REALTIME_NBBO_SYNCHRONIZED",
-  };
+  const gapQuote = createMockNbbo({ bid: 1.15, ask: 1.18 });
   const gapResult = evaluateOcoBrackets({
     bracket: gapBracket,
     config: gapConfig,
