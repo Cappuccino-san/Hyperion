@@ -58,6 +58,7 @@ export function QuadView() {
   const setFilters = useDashboardStore((state) => state.setFilters);
   const setTicker = useDashboardStore((state) => state.setTicker);
   const setActiveView = useDashboardStore((state) => state.setActiveView);
+  const serverActivePositions = useDashboardStore((state) => state.serverActivePositions);
 
   const [quadPayloads, setQuadPayloads] = useState<
     Record<string, OptionsAnalyticsPayload>
@@ -397,6 +398,19 @@ export function QuadView() {
                     <b className="text-sm font-extrabold text-white group-hover:text-cyan-400 transition-colors">
                       {sym}
                     </b>
+                    {serverActivePositions?.[sym] && (
+                      <span
+                        className={cn(
+                          "text-[9px] font-mono px-1.5 py-0.5 rounded border uppercase tracking-wider font-extrabold animate-pulse",
+                          serverActivePositions[sym]?.contractType === "CALL"
+                            ? "bg-emerald-500/15 text-emerald-300 border-emerald-400/40"
+                            : "bg-purple-500/15 text-purple-300 border-purple-400/40"
+                        )}
+                        title={`Active ${serverActivePositions[sym]?.contractType} Position`}
+                      >
+                        {serverActivePositions[sym]?.contractType} ${serverActivePositions[sym]?.strike}
+                      </span>
+                    )}
                     <span className="font-mono text-[13px] font-bold text-slate-100 tabular-nums">
                       ${spot.toFixed(2)}
                     </span>

@@ -291,17 +291,26 @@ export function buildLiveTelemetryForTicker(
   ticker: string,
   overrides?: Partial<LiveTickerTelemetry>
 ): LiveTickerTelemetry {
-  const preset: TickerPreset = getTickerPreset(ticker);
+  const preset: TickerPreset = getTickerPreset(ticker, overrides?.spotPrice);
   const spotPrice = overrides?.spotPrice ?? preset.spotPrice;
   const previousClose = overrides?.previousClose ?? preset.previousClose;
+  const iv = preset.impliedVolatility > 0 ? preset.impliedVolatility : 0.25;
   const em =
     overrides?.expectedMoveDaily ??
     calculateExpectedMove(
       spotPrice,
-      preset.impliedVolatility,
+      iv,
       overrides?.atmCallMid,
       overrides?.atmPutMid
     );
+
+  const step = overrides?.strikeStep ?? preset.strikeStep ?? (spotPrice >= 250 ? 5 : spotPrice >= 100 ? 2.5 : 1);
+  const centerStrike = Math.round(spotPrice / step) * step;
+
+  // Ensure king nodes match current spot magnitude rather than obsolete presets
+  const isValidPresetKing = (k: number) => k > 0 && Math.abs(k - spotPrice) / spotPrice < 0.25;
+  const gexKing = overrides?.gexKing ?? (isValidPresetKing(preset.kingPreset.allExpKing) ? preset.kingPreset.allExpKing : centerStrike);
+  const vexKing = overrides?.vexKing ?? (isValidPresetKing(preset.kingPreset.zeroDteKing) ? preset.kingPreset.zeroDteKing : centerStrike);
 
   return {
     ticker,
@@ -312,8 +321,8 @@ export function buildLiveTelemetryForTicker(
     atmPutMid: overrides?.atmPutMid,
     netGex: overrides?.netGex ?? preset.netMetrics.netGex,
     netVex: overrides?.netVex ?? preset.netMetrics.netVex,
-    gexKing: overrides?.gexKing ?? preset.kingPreset.allExpKing,
-    vexKing: overrides?.vexKing ?? preset.kingPreset.zeroDteKing,
+    gexKing,
+    vexKing,
     kingStrength:
       overrides?.kingStrength ??
       Math.round(
@@ -325,7 +334,7 @@ export function buildLiveTelemetryForTicker(
             4
         )
       ),
-    strikeStep: overrides?.strikeStep ?? preset.strikeStep,
+    strikeStep: step,
   };
 }
 

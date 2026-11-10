@@ -485,7 +485,7 @@ export function computeOptionsAnalytics(params: {
   dataSource: DataSourceType;
   spotPrice: number;
   previousClose: number;
-  impliedVolatility: number; // decimal
+  impliedVolatility?: number; // decimal
   contracts: NormalizedOptionContract[];
   activeExpirationFilter?: string;
   extendedQuote?: ExtendedQuoteInfo | null;
@@ -507,6 +507,10 @@ export function computeOptionsAnalytics(params: {
   } = params;
 
   const preset = getTickerPreset(ticker);
+  const safeIv =
+    impliedVolatility != null && Number.isFinite(impliedVolatility) && impliedVolatility > 0
+      ? impliedVolatility
+      : (preset?.impliedVolatility ?? 0.25);
 
   // Full book aggregation: keep all valid positive strikes with open interest or volume
   const validContracts = contracts.filter(
@@ -637,7 +641,7 @@ export function computeOptionsAnalytics(params: {
         ? contract.iv > 4
           ? contract.iv / 100
           : contract.iv
-        : impliedVolatility;
+        : safeIv;
 
     // Calibrated Gamma Greeks (r = 0.0460, q = 0.0, calendar T = days / 365)
     const bs = computeBlackScholesGreeks(
@@ -988,7 +992,7 @@ export function computeOptionsAnalytics(params: {
         ? c.iv > 4
           ? c.iv / 100
           : c.iv
-        : impliedVolatility;
+        : safeIv;
     zgContracts.push({
       strike: c.strike,
       T,
@@ -1167,7 +1171,7 @@ export function computeOptionsAnalytics(params: {
     ? computeExpirationExpectedMove(
         dailyExpIso,
         spotPrice,
-        impliedVolatility,
+        safeIv,
         isoToDays.get(dailyExpIso) ?? 1,
         contractsByExp.get(dailyExpIso) ?? []
       )
@@ -1177,7 +1181,7 @@ export function computeOptionsAnalytics(params: {
     ? computeExpirationExpectedMove(
         weeklyExpIso,
         spotPrice,
-        impliedVolatility,
+        safeIv,
         isoToDays.get(weeklyExpIso) ?? 5,
         contractsByExp.get(weeklyExpIso) ?? []
       )
@@ -1187,7 +1191,7 @@ export function computeOptionsAnalytics(params: {
     ? computeExpirationExpectedMove(
         monthlyExpIso,
         spotPrice,
-        impliedVolatility,
+        safeIv,
         isoToDays.get(monthlyExpIso) ?? 21,
         contractsByExp.get(monthlyExpIso) ?? []
       )
@@ -1247,7 +1251,7 @@ export function computeOptionsAnalytics(params: {
       }) + " ET",
     spotPrice: Number(spotPrice.toFixed(2)),
     previousClose: Number(previousClose.toFixed(2)),
-    impliedVolatility: Number(impliedVolatility.toFixed(4)),
+    impliedVolatility: Number(safeIv.toFixed(4)),
     strikeStep: detectedStep,
     extendedQuote,
     expectedMoves: {

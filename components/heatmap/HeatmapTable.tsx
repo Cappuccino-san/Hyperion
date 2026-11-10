@@ -484,10 +484,10 @@ export function HeatmapTable() {
     // Deterministic Fallback (160 strikes)
     const totalRows = 160;
     const halfRows = Math.floor(totalRows / 2);
+    const effectiveSpot = spotPrice > 0 ? spotPrice : preset.spotPrice;
     const centerStrike =
-      Math.round(preset.spotPrice / strikeStep) * strikeStep;
-    const nearestAtmStrike =
-      Math.round(spotPrice / strikeStep) * strikeStep;
+      Math.round(effectiveSpot / strikeStep) * strikeStep;
+    const nearestAtmStrike = centerStrike;
 
     const tickerSeed = activeTicker
       .split("")

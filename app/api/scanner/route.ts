@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { optionsMemoryCache } from "@/lib/marketCache";
+import { getTickerPreset } from "@/lib/tickerPresets";
 
 export const dynamic = "force-dynamic";
 
@@ -21,10 +22,26 @@ interface RawScannerRow {
   moved?: boolean;
 }
 
-function overlayLiveKingMetrics(rows: RawScannerRow[]): RawScannerRow[] {
+function overlayLiveKingMetrics(
+  rows: RawScannerRow[],
+  liveQuotes: Record<string, number> = {}
+): RawScannerRow[] {
   const updated = rows.map((row) => {
-    const cached = optionsMemoryCache.get(row.t.toUpperCase())?.payload;
+    const sym = row.t.toUpperCase();
+    const cached = optionsMemoryCache.get(sym)?.payload;
     if (!cached || cached.strikes.length === 0) {
+      const livePx = liveQuotes[sym];
+      if (livePx && livePx > 0) {
+        const pts = Number((row.king - livePx).toFixed(2));
+        const pct = Number(((pts / livePx) * 100).toFixed(2));
+        return {
+          ...row,
+          px: livePx,
+          pts,
+          pct,
+          book: "Live Quote",
+        };
+      }
       return row;
     }
 
@@ -91,6 +108,29 @@ export async function GET() {
   });
   const nowIso = new Date().toISOString();
 
+  // Pre-fetch live quotes for all scanner symbols in a single sub-second batch
+  const liveQuotes: Record<string, number> = {};
+  try {
+    const symbols = "AAPL,MU,META,IWM,SPY,QQQ,MSFT,GME,AMZN,ARM,SMCI,MSTR,NVDA,GOOGL,SOFI,IBIT,GLD,DIA,AMD,TSLA";
+    const res = await fetch(`https://api.robinhood.com/quotes/?symbols=${symbols}`, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
+      },
+      cache: "no-store",
+    });
+    if (res.ok) {
+      const json = await res.json();
+      for (const item of json?.results || []) {
+        const s = String(item?.symbol || "").toUpperCase();
+        const p = Number(item?.last_trade_price ?? item?.bid_price ?? 0);
+        if (s && p > 0) liveQuotes[s] = Number(p.toFixed(2));
+      }
+    }
+  } catch {
+    // Non-fatal fallback
+  }
+
   const scannerPayload = {
     scans: [
       {
@@ -124,7 +164,7 @@ export async function GET() {
           { t: "NDXP", px: 29161.17, king: 29200.0, pts: 38.83, pct: 0.13, xem: 0.12, neg: true, str: 25, share: 8.6, base: 16, score: 0, rr: 0.2409, book: "Oct 16, 4:00 PM ET", contested: false, moved: true },
           { t: "AMD", px: 529.07, king: 620.0, pts: 90.93, pct: 17.19, xem: 6.16, neg: true, str: 18, share: 4.4, base: 10, score: 0, rr: 0.2285, book: "Oct 16, 3:59 PM ET", contested: false, moved: true },
           { t: "TSLA", px: 354.72, king: 400.0, pts: 45.28, pct: 12.76, xem: 6.01, neg: false, str: 39, share: 8.4, base: 18, score: 0, rr: 0.1333, book: "Oct 16, 4:14 PM ET", contested: false, moved: true },
-        ]),
+        ], liveQuotes),
       },
       {
         slot: "15:50",
@@ -164,7 +204,7 @@ export async function GET() {
           { t: "RIVN", px: 12.42, king: 20.0, pts: 7.58, pct: 61.03, xem: 12.23, neg: false, str: 24, share: 10.9, base: 11, score: 0, rr: 0.1905, book: "Oct 16, 4:00 PM ET", contested: true, moved: true },
           { t: "AMD", px: 529.07, king: 620.0, pts: 90.93, pct: 17.19, xem: 6.16, neg: true, str: 18, share: 4.4, base: 10, score: 0, rr: 0.2285, book: "Oct 16, 3:59 PM ET", contested: false, moved: true },
           { t: "TSLA", px: 354.72, king: 400.0, pts: 45.28, pct: 12.76, xem: 6.01, neg: false, str: 39, share: 8.4, base: 18, score: 0, rr: 0.1333, book: "Oct 16, 4:14 PM ET", contested: false, moved: true },
-        ]),
+        ], liveQuotes),
       },
     ],
     running: null,

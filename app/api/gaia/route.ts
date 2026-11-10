@@ -500,7 +500,7 @@ async function fetchLiveOptionsBuckets(
       const rhJson = await rhRes.json();
       const p = Number(rhJson?.results?.[0]?.last_trade_price ?? rhJson?.results?.[0]?.bid_price ?? 0);
       if (p > 0 && Number.isFinite(p)) {
-        const mult = sym === "SPX" || sym === "SPXW" ? 10 : 1;
+        const mult = sym === "SPX" || sym === "SPXW" ? 10 : sym === "NDX" || sym === "NDXP" ? 40 : 1;
         liveSpot = Number((p * mult).toFixed(2));
       }
     }

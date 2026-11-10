@@ -1,0 +1,41 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    container_name: hyperion-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - path: .env.local
+        required: false
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOSTNAME=0.0.0.0
+    volumes:
+      - ./.cache:/app/.cache
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # Optional background auditor service
+  # Run with: docker compose --profile audit up -d
+  audit-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: hyperion-auditor
+    profiles:
+      - audit
+    restart: unless-stopped
+    volumes:
+      - ./.cache:/app/.cache
+    command: ["npm", "run", "daemon:audit"]
+

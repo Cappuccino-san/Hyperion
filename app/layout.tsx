@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
+import { GlobalMarketDataSync } from "@/components/GlobalMarketDataSync";
 import "./globals.css";
 
 const inter = Inter({
@@ -28,6 +29,7 @@ export default function RootLayout({
   return (
     <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable} dark`}>
       <body className="min-h-screen bg-argon-bg text-argon-text font-sans antialiased selection:bg-argon-primary selection:text-white">
+        <GlobalMarketDataSync />
         {children}
       </body>
     </html>

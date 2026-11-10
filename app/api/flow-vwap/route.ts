@@ -8,6 +8,8 @@ import {
   NormalizedOptionContract,
   parseOccSymbol,
 } from "@/lib/optionsExposure";
+import { optionsMemoryCache } from "@/lib/marketCache";
+import { getTickerPreset } from "@/lib/tickerPresets";
 
 export const dynamic = "force-dynamic";
 
@@ -134,14 +136,15 @@ async function fetchIntradayCandles(
  * Fallback synthetic session candles if external Yahoo is unreachable
  */
 function generateSyntheticSessionCandles(ticker: string): RawBar[] {
+  const clean = ticker.trim().toUpperCase();
+  const cachedSpot = optionsMemoryCache.get(clean)?.payload?.spotPrice;
+  const presetSpot = getTickerPreset(clean).spotPrice;
   const baseSpot =
-    ticker === "SPY"
-      ? 582.5
-      : ticker === "QQQ"
-      ? 492.0
-      : ticker === "SPXW" || ticker === "SPX"
-      ? 5830.0
-      : 500.0;
+    cachedSpot && cachedSpot > 0
+      ? cachedSpot
+      : presetSpot > 0
+      ? presetSpot
+      : 100.0;
 
   const now = Math.floor(Date.now() / 1000);
   const bars: RawBar[] = [];

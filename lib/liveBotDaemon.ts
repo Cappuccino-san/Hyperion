@@ -198,6 +198,28 @@ export function ensureLiveBotRunning(): { running: boolean; pollCount: number; l
   };
 }
 
+export function stopLiveBot(): void {
+  const botState = getBotState();
+  if (botState.intervalId) {
+    clearInterval(botState.intervalId);
+    botState.intervalId = null;
+  }
+  botState.isPolling = false;
+  botState.isEvaluatingLiveBar = false;
+  botState.lastStatus = "STOPPED";
+}
+
+// Register graceful shutdown hooks for container lifecycles
+if (typeof process !== "undefined" && typeof window === "undefined") {
+  const handleSignal = (signal: string) => {
+    stopLiveBot();
+    console.log(`[LIVE-BOT-DAEMON] Cleanly halted background poller on ${signal}.`);
+  };
+
+  process.once("SIGTERM", () => handleSignal("SIGTERM"));
+  process.once("SIGINT", () => handleSignal("SIGINT"));
+}
+
 export function getLiveBotStatus() {
   const botState = getBotState();
   return {

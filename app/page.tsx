@@ -22,20 +22,6 @@ export default function DashboardPage() {
   const setSetupModalOpen = useDashboardStore(
     (state) => state.setSetupModalOpen
   );
-  const fetchOptionsChain = useDashboardStore(
-    (state) => state.fetchOptionsChain
-  );
-
-  // Poll /api/options?ticker=${activeTicker} immediately & constantly every 5 seconds so Heatmap/Gaia stream live prices
-  useEffect(() => {
-    fetchOptionsChain(activeTicker);
-
-    const pollInterval = setInterval(() => {
-      fetchOptionsChain(activeTicker);
-    }, 5_000);
-
-    return () => clearInterval(pollInterval);
-  }, [activeTicker, fetchOptionsChain]);
 
   return (
     <div className="min-h-screen bg-[#0b0d17] text-argon-text flex flex-col">

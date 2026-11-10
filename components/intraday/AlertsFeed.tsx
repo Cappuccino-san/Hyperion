@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useEffect, useRef, useState, useCallback } from "react";
-import { useDashboardStore } from "@/store/useDashboardStore";
+import React, { useEffect, useRef, useState } from "react";
+import { useDashboardStore, getTickerPreset } from "@/store/useDashboardStore";
 
 interface OptionTradePositionUI {
   id: string;
@@ -48,7 +48,7 @@ export function AlertsFeed() {
   // Tactical 0DTE / Next-Exp levels for intraday Pre-Trade Radar
   // Anchors BTO Put triggers and Call triggers to 0DTE walls instead of distant all-expiration LEAPS outliers ($800)
   const zeroDteLevels = gammaLevelsByFilter?.["0DTE"] ?? gammaLevelsByFilter?.["THIS_WEEK"];
-  const currentSpot = spotPrice || 764;
+  const currentSpot = spotPrice > 0 ? spotPrice : (getTickerPreset(activeTicker)?.spotPrice || 764);
 
   const tacticalCallWall =
     zeroDteLevels?.callWall && zeroDteLevels.callWall > 0
@@ -157,18 +157,21 @@ export function AlertsFeed() {
   const putTarget1 = tacticalPivot;
   const putTarget2 = tacticalSupport;
 
-  const [activePosition, setActivePosition] = useState<OptionTradePositionUI | null>(null);
-  const [signalAlerts, setSignalAlerts] = useState<
-    { id: string; timestamp: string; message: string; ts?: number }[]
-  >([]);
-  const [closedCount, setClosedCount] = useState<number>(0);
+  const serverActivePositions = useDashboardStore((state) => state.serverActivePositions);
+  const serverClosedTrades = useDashboardStore((state) => state.serverClosedTrades);
+  const serverTradeAlerts = useDashboardStore((state) => state.serverTradeAlerts);
+  const fetchServerTrades = useDashboardStore((state) => state.fetchServerTrades);
+
+  const activePosition = (serverActivePositions?.[activeTicker] as OptionTradePositionUI) ?? null;
+  const signalAlerts = (serverTradeAlerts || []) as { id: string; timestamp: string; message: string; ts?: number }[];
+  const closedCount = Array.isArray(serverClosedTrades) ? serverClosedTrades.length : 0;
   const [radarSending, setRadarSending] = useState(false);
 
   const handleSendRadar = async () => {
     try {
       setRadarSending(true);
       await fetch("/api/signals?action=send_radar");
-      await fetchSignals();
+      await fetchServerTrades(activeTicker);
     } catch {
       // ignore
     } finally {
@@ -177,26 +180,6 @@ export function AlertsFeed() {
   };
 
   const isConfigured = Boolean(discordConfig?.enabled && discordConfig?.webhookUrl);
-
-  const fetchSignals = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/signals?ticker=${encodeURIComponent(activeTicker)}`, {
-        cache: "no-store",
-      });
-      if (!res.ok) return;
-      const data = await res.json();
-      const pos = data?.activePositions?.[activeTicker] ?? null;
-      setActivePosition(pos);
-      if (Array.isArray(data?.alerts)) {
-        setSignalAlerts(data.alerts);
-      }
-      if (Array.isArray(data?.closedPositions)) {
-        setClosedCount(data.closedPositions.length);
-      }
-    } catch {
-      // Non-fatal
-    }
-  }, [activeTicker]);
 
   // Combine execution signal alerts from /api/signals with structural wall alerts from store
   const combinedAlerts = React.useMemo(() => {
@@ -223,12 +206,6 @@ export function AlertsFeed() {
     // Put BTO / STC execution alerts at the bottom (most prominent in auto-scrolled log) or top
     return list;
   }, [signalAlerts, alerts]);
-
-  useEffect(() => {
-    fetchSignals();
-    const interval = setInterval(fetchSignals, 5000);
-    return () => clearInterval(interval);
-  }, [fetchSignals]);
 
   useEffect(() => {
     const el = scrollContainerRef.current;

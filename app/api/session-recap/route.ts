@@ -7,12 +7,9 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request) {
   try {
     const possiblePaths = [
-      "C:\\Users\\Nick Napoli\\.gemini\\antigravity\\brain\\cd5d267b-592c-4cfb-90eb-adfeffbfc61b\\scratch\\terrashade\\api_recap.json",
-      path.resolve(
-        process.env.USERPROFILE || "C:\\Users\\Nick Napoli",
-        ".gemini/antigravity/brain/cd5d267b-592c-4cfb-90eb-adfeffbfc61b/scratch/terrashade/api_recap.json"
-      ),
       path.resolve(process.cwd(), "scratch/terrashade/api_recap.json"),
+      path.resolve(process.cwd(), ".cache/terrashade/api_recap.json"),
+      ...(process.env.SESSION_RECAP_PATH ? [path.resolve(process.env.SESSION_RECAP_PATH)] : []),
     ];
 
     for (const p of possiblePaths) {

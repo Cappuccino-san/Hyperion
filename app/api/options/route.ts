@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   computeOptionsAnalytics,
-  buildSimulatedAnalyticsPayload,
   ExtendedQuoteInfo,
   globalContractsCache,
   NormalizedOptionContract,
@@ -122,7 +121,7 @@ async function fetchRealtimeSpotQuote(
       const p = Number(q?.last_trade_price ?? q?.bid_price ?? 0);
       const prevClose = Number(q?.previous_close ?? 0);
       if (p > 0 && Number.isFinite(p)) {
-        const mult = sym === "SPXW" || sym === "SPX" ? 10 : 1;
+        const mult = sym === "SPXW" || sym === "SPX" ? 10 : sym === "NDXP" || sym === "NDX" ? 40 : 1;
         return {
           spotPrice: Number((p * mult).toFixed(2)),
           previousClose: prevClose > 0 ? Number((prevClose * mult).toFixed(2)) : undefined,
@@ -481,7 +480,6 @@ async function attachIntraday(
     let gammaLevels = payload.gammaLevels;
     let gammaLevelsByFilter = payload.gammaLevelsByFilter;
     if (
-      payload.dataSource === "SIMULATED" &&
       officialLevels &&
       officialLevels.callWall > 0
     ) {
@@ -693,24 +691,25 @@ export async function GET(request: NextRequest) {
     return NextResponse.json(enriched, {
       headers: {
         "X-Hyperion-Data-Status": "STALE_SYNCING",
+        "Cache-Control": "no-store, max-age=0",
       },
     });
   }
 
-  // Tier 3: Deterministic High-Fidelity Simulation Fallback
-  // Ensures traders can always inspect options chains, heatmap, gamma levels, and expected moves even if live feed is down/unreachable
-  try {
-    const simPayload = buildSimulatedAnalyticsPayload(ticker);
-    const enriched = await attachIntraday({
-      ...simPayload,
-      isStale: false,
-      connectionStatus: "OFFLINE",
-    });
-    return NextResponse.json(enriched);
-  } catch {
-    return NextResponse.json(
-      { error: `Options feed unavailable for ${ticker}` },
-      { status: 502 }
-    );
-  }
+  // Certified Live-Only: No synthetic or simulated fallbacks.
+  // Return honest 502 with reconnecting state when upstream feeds are unreachable.
+  return NextResponse.json(
+    {
+      error: `Live options feed currently unavailable for ${ticker}. Syncing live market data...`,
+      ticker,
+      connectionStatus: "SYNCING",
+      isLiveOnly: true,
+    },
+    {
+      status: 502,
+      headers: {
+        "Cache-Control": "no-store, max-age=0",
+      },
+    }
+  );
 }

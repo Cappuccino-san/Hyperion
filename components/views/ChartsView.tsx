@@ -96,7 +96,7 @@ function generateSessionCandles(params: {
       prevClose * 0.65 +
       (rawCloses.slice(0, i + 1).reduce((a, b) => a + b, 0) / (i + 1)) * 0.35;
 
-    const sessionDay = i < 28 ? "Oct 15" : "Oct 16";
+    const sessionDay = new Date().toLocaleDateString("en-US", { month: "short", day: "numeric" });
     const minsFromOpen = (i % 28) * 14;
     const hh = String(9 + Math.floor((30 + minsFromOpen) / 60)).padStart(2, "0");
     const mm = String((30 + minsFromOpen) % 60).padStart(2, "0");
@@ -749,22 +749,29 @@ export function ChartsView() {
 
   useEffect(() => {
     let active = true;
-    CHART_SYMBOLS.forEach(async (sym) => {
-      try {
-        const res = await fetch(`/api/options?ticker=${sym}`, {
-          cache: "no-store",
-        });
-        if (!res.ok) return;
-        const data: OptionsAnalyticsPayload = await res.json();
-        if (active) {
-          setChartPayloads((prev) => ({ ...prev, [sym]: data }));
+    const updateCharts = () => {
+      CHART_SYMBOLS.forEach(async (sym) => {
+        try {
+          const res = await fetch(`/api/options?ticker=${sym}`, {
+            cache: "no-store",
+          });
+          if (!res.ok) return;
+          const data: OptionsAnalyticsPayload = await res.json();
+          if (active) {
+            setChartPayloads((prev) => ({ ...prev, [sym]: data }));
+          }
+        } catch {
+          // Fallback to preset
         }
-      } catch {
-        // Fallback to preset
-      }
-    });
+      });
+    };
+
+    updateCharts();
+    const interval = setInterval(updateCharts, 5_000);
+
     return () => {
       active = false;
+      clearInterval(interval);
     };
   }, []);
 

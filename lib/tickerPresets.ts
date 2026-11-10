@@ -751,43 +751,103 @@ export const TICKER_PRESETS: Record<string, TickerPreset> = {
   },
 };
 
-export function getTickerPreset(rawTicker: string): TickerPreset {
+export function getTickerPreset(rawTicker: string, liveSpot?: number): TickerPreset {
   const clean = rawTicker.trim().toUpperCase();
-  if (TICKER_PRESETS[clean]) {
-    return TICKER_PRESETS[clean];
+
+  // 1. Check live memory cache dynamically first
+  const globalCache = (
+    globalThis as unknown as {
+      __hyperionOptionsMemoryCache?: Map<string, { timestamp: number; payload: any }>;
+    }
+  ).__hyperionOptionsMemoryCache;
+
+  const cached = globalCache?.get(clean)?.payload;
+  if (cached && cached.spotPrice > 0) {
+    const spot = cached.spotPrice;
+    const step = cached.strikeStep || (spot >= 250 ? 5 : spot >= 100 ? 2.5 : 1);
+    const center = Math.round(spot / step) * step;
+    return {
+      ticker: clean,
+      name: `${clean} Options Chain`,
+      spotPrice: spot,
+      previousClose: cached.previousClose ?? spot,
+      impliedVolatility: cached.impliedVolatility ?? 0.25,
+      netMetrics: cached.netMetrics ?? { netGex: 0, netVex: 0 },
+      gammaLevels: cached.gammaLevels ?? {
+        putWall: center - step * 3,
+        zeroGamma: center,
+        callWall: center + step * 3,
+      },
+      kingPreset: {
+        allExpKing: cached.kingNode?.allExpKing ?? center,
+        zeroDteKing: cached.kingNode?.zeroDteKing ?? cached.kingNode?.allExpKing ?? center,
+        weeklyKing: cached.kingNode?.weeklyKing ?? cached.kingNode?.allExpKing ?? center,
+        opexKing: cached.kingNode?.opexKing ?? cached.kingNode?.allExpKing ?? center,
+        kingValue: cached.kingNode?.kingValue ?? 100,
+        secondLargestStrike: cached.kingNode?.secondLargestStrike ?? center - step,
+        secondLargestValue: cached.kingNode?.secondLargestValue ?? 50,
+        totalBoardGamma: cached.kingNode?.totalBoardGamma ?? 500,
+      },
+      strikeStep: step,
+    };
   }
-  const hash = clean
-    .split("")
-    .reduce((acc, ch, idx) => acc + ch.charCodeAt(0) * (idx + 3), 0);
-  const baseSpot = Number((60 + (hash % 340) + ((hash % 10) * 0.25)).toFixed(2));
+
+  // 2. Check static presets (SPY, QQQ, etc. baseline fallbacks)
+  if (TICKER_PRESETS[clean]) {
+    const base = TICKER_PRESETS[clean];
+    if (liveSpot && liveSpot > 0 && Math.abs(liveSpot - base.spotPrice) / base.spotPrice > 0.05) {
+      // Dynamic scaling if liveSpot diverges from old static preset
+      const step = base.strikeStep;
+      const center = Math.round(liveSpot / step) * step;
+      return {
+        ...base,
+        spotPrice: liveSpot,
+        previousClose: liveSpot,
+        gammaLevels: {
+          putWall: center - step * 3,
+          zeroGamma: center,
+          callWall: center + step * 3,
+        },
+        kingPreset: {
+          ...base.kingPreset,
+          allExpKing: center,
+          zeroDteKing: center,
+          weeklyKing: center,
+        },
+      };
+    }
+    return base;
+  }
+
+  // 3. Dynamic synthesis for unlisted tickers (Zero hardcoded ASCII hash % 340)
+  const baseSpot = liveSpot && liveSpot > 0 ? liveSpot : 100.0;
   const step = baseSpot >= 250 ? 5 : baseSpot >= 100 ? 2.5 : 1;
   const centerStrike = Math.round(baseSpot / step) * step;
-  const isPos = hash % 3 !== 0;
 
   return {
     ticker: clean,
     name: `${clean} Options Chain`,
     spotPrice: baseSpot,
-    previousClose: Number((baseSpot * (isPos ? 0.988 : 1.012)).toFixed(2)),
-    impliedVolatility: Number((0.26 + (hash % 35) * 0.01).toFixed(2)),
+    previousClose: baseSpot,
+    impliedVolatility: 0.25,
     netMetrics: {
-      netGex: isPos ? Number((0.65 + (hash % 25) * 0.08).toFixed(2)) : Number((-0.45 - (hash % 20) * 0.07).toFixed(2)),
-      netVex: isPos ? Number((95 + (hash % 180)).toFixed(1)) : Number((-80 - (hash % 140)).toFixed(1)),
+      netGex: 0,
+      netVex: 0,
     },
     gammaLevels: {
       putWall: centerStrike - step * 3,
-      zeroGamma: isPos ? centerStrike - step : centerStrike + step,
+      zeroGamma: centerStrike,
       callWall: centerStrike + step * 3,
     },
     kingPreset: {
-      allExpKing: centerStrike + step,
+      allExpKing: centerStrike,
       zeroDteKing: centerStrike,
-      weeklyKing: centerStrike + step,
-      opexKing: centerStrike + step * 2,
-      kingValue: 135.0,
+      weeklyKing: centerStrike,
+      opexKing: centerStrike + step,
+      kingValue: 100.0,
       secondLargestStrike: centerStrike - step,
-      secondLargestValue: 78.0,
-      totalBoardGamma: 510.0,
+      secondLargestValue: 50.0,
+      totalBoardGamma: 300.0,
     },
     strikeStep: step,
   };
