@@ -10,6 +10,8 @@ import {
 import {
   drawFlowGammaVwapOverlay,
   ConfluenceLevel,
+  StrikeNodeOverlayItem,
+  ReferenceBadgeItem,
 } from "@/components/chart/FlowGammaVwapOverlay";
 import {
   GaiaCallPutBiasHud,
@@ -700,7 +702,8 @@ export function GaiaView() {
   // Adjustable Chart Window States (Horizontal & Vertical)
   const [chartHeight, setChartHeight] = useState<number>(540); // 380 .. 950 px
   const [chartWidth, setChartWidth] = useState<number | null>(null); // null = 100% full width, or number in px (640 .. 2400)
-  const [dividerRatio, setDividerRatio] = useState<number>(0.76); // 0.35 .. 0.90 (Outlook cone vs Candlestick session width)
+  const [fluxFocusMode, setFluxFocusMode] = useState<boolean>(true);
+  const [dividerRatio, setDividerRatio] = useState<number>(0.88); // 0.88 in Flux Focus (88% Candlesticks) .. 0.65 in Expanded Outlook
   const [xScale, setXScale] = useState<number>(1.0); // 0.5 .. 4.0 horizontal candle zoom
   const [xPanOffset, setXPanOffset] = useState<number>(0); // horizontal pan px
   const [startHour, setStartHour] = useState<number>(7); // 7 = 7:00 AM Premkt (default), 8 = 8:00 AM, 9 = 9:30 AM RTH
@@ -1803,6 +1806,87 @@ export function GaiaView() {
       if (curKingStrike > 0) {
         confluenceLevels.push({ name: "King Node", strike: curKingStrike });
       }
+
+      // Collect Strike Nodes for Beaded Pearl Necklaces (Image 1 Style)
+      const overlayStrikeNodes: StrikeNodeOverlayItem[] = [];
+      const activeCol = dataset.columnsByBar[safeActiveIdx];
+      if (activeCol) {
+        for (const st of dataset.visibleStrikes) {
+          const val = activeCol.strikeValues[st] ?? 0;
+          const isKing = st === activeCol.allExpKingStrike || st === activeCol.filteredKingStrike;
+          const isCall = st === callWallStrike;
+          const isPut = st === putWallStrike;
+          if (isKing || isCall || isPut || Math.abs(val) > 4) {
+            overlayStrikeNodes.push({
+              strike: st,
+              y: priceToY(st),
+              weight: Math.min(1, Math.abs(val) / 25),
+              isKing,
+              polarity: isKing || isCall || val >= 0 ? "call" : "put",
+            });
+          }
+        }
+      }
+
+      // Contextual Reference Badges (PDH, PMH, PML, Day ±1σ)
+      const pmCandles = dataset.candles.filter((c) => c.timeLabel && c.timeLabel < "09:30");
+      const pmh = pmCandles.length > 0 ? Math.max(...pmCandles.map((c) => c.high)) : null;
+      const pml = pmCandles.length > 0 ? Math.min(...pmCandles.map((c) => c.low)) : null;
+      const dayPlus1 = dataset.priorClose + dataset.sigma1Move;
+      const dayMinus1 = dataset.priorClose - dataset.sigma1Move;
+
+      const referenceBadges: ReferenceBadgeItem[] = [];
+      if (dayPlus1 > 0) {
+        referenceBadges.push({
+          label: `Day +1σ ${dayPlus1.toFixed(1)}`,
+          price: dayPlus1,
+          bg: "#111422",
+          border: "#38bdf8",
+          text: "#38bdf8",
+          lineColor: "rgba(56, 189, 248, 0.45)",
+        });
+      }
+      if (pmh && pmh > 0) {
+        referenceBadges.push({
+          label: `PMH ${pmh.toFixed(1)}`,
+          price: pmh,
+          bg: "#111422",
+          border: "#fbbf24",
+          text: "#fbbf24",
+          lineColor: "rgba(251, 191, 36, 0.45)",
+        });
+      }
+      if (dataset.priorClose > 0) {
+        referenceBadges.push({
+          label: `PDH ${dataset.priorClose.toFixed(1)}`,
+          price: dataset.priorClose,
+          bg: "#111422",
+          border: "#cbd5e1",
+          text: "#cbd5e1",
+          lineColor: "rgba(148, 163, 184, 0.45)",
+        });
+      }
+      if (pml && pml > 0) {
+        referenceBadges.push({
+          label: `PML ${pml.toFixed(1)}`,
+          price: pml,
+          bg: "#111422",
+          border: "#f43f5e",
+          text: "#f43f5e",
+          lineColor: "rgba(244, 63, 94, 0.45)",
+        });
+      }
+      if (dayMinus1 > 0) {
+        referenceBadges.push({
+          label: `Day -1σ ${dayMinus1.toFixed(1)}`,
+          price: dayMinus1,
+          bg: "#111422",
+          border: "#c084fc",
+          text: "#c084fc",
+          lineColor: "rgba(192, 132, 252, 0.45)",
+        });
+      }
+
       drawFlowGammaVwapOverlay({
         ctx,
         points: flowVwapPoints,
@@ -1821,6 +1905,10 @@ export function GaiaView() {
         showShading: true,
         showConfluenceMarkers: true,
         showRightAxisBadge: false,
+        strikeNodes: overlayStrikeNodes,
+        referenceBadges,
+        showBeadedStrikes: true,
+        candles: dataset.candles,
       });
     }
 
@@ -3082,6 +3170,28 @@ export function GaiaView() {
             9:30 AM RTH
           </button>
         </div>
+
+        {/* Flux Focus Viewport Mode Toggle (Benchmark Image 1 Style) */}
+        <button
+          type="button"
+          onClick={() => {
+            setFluxFocusMode((prev) => {
+              const next = !prev;
+              setDividerRatio(next ? 0.88 : 0.65);
+              return next;
+            });
+          }}
+          className={cn(
+            "rounded-full px-3 py-1.5 text-xs font-mono font-bold tracking-wider transition border cursor-pointer flex items-center gap-1.5",
+            fluxFocusMode
+              ? "bg-amber-500/20 text-amber-300 border-amber-400/50 shadow-[0_0_10px_rgba(245,158,11,0.25)]"
+              : "bg-[#151b28] text-slate-400 border-[#232d42] hover:text-white"
+          )}
+          title="Toggle Full-Width Flux Corridor (88% Price Action Space) vs Expanded Outlook Cone"
+        >
+          <span className={cn("w-2 h-2 rounded-full", fluxFocusMode ? "bg-amber-400 animate-pulse" : "bg-slate-500")} />
+          {fluxFocusMode ? "⚡ FLUX CORRIDOR: 88%" : "OUTLOOK CONE: EXPANDED"}
+        </button>
 
         {/* 6. Reset View Pill */}
         <button

@@ -13,8 +13,13 @@ import {
   evaluateTradeSignals,
   evaluateAllActivePositions,
   getDailyTradeAlerts,
+  loadTradeStore,
 } from "@/lib/tradeSignalEngine";
-import { ensureLiveBotRunning } from "@/lib/liveBotDaemon";
+import {
+  ensureLiveBotRunning,
+  acquireBarEvaluationLock,
+  releaseBarEvaluationLock,
+} from "@/lib/liveBotDaemon";
 import { globalTelemetry } from "@/lib/telemetry";
 
 import { optionsMemoryCache as memoryCache } from "@/lib/marketCache";
@@ -497,6 +502,36 @@ async function attachIntraday(
 
     // Evaluate stateful BTO / STC long-only options signals
     let mergedAlerts = alerts;
+    const hasLock = acquireBarEvaluationLock();
+    if (!hasLock) {
+      try {
+        const cachedStore = loadTradeStore();
+        const tickerAlerts = (cachedStore.alerts ?? []).filter(
+          (ta: any) =>
+            ta.ticker === payload.ticker ||
+            (payload.ticker === "SPX" && ta.ticker === "SPXW")
+        );
+        if (tickerAlerts.length > 0) {
+          const tradeAlertItems = tickerAlerts.map((ta: any) => ({
+            id: ta.id,
+            ts: ta.ts,
+            symbol: ta.ticker,
+            timestamp: ta.timestamp,
+            time: ta.timestamp,
+            message: ta.message,
+            msg: ta.message,
+            type: (ta.action === "BUY_TO_OPEN"
+              ? ta.contractType === "CALL"
+                ? "call"
+                : "put"
+              : "zero") as "call" | "put" | "zero" | "king",
+          }));
+          mergedAlerts = [...alerts, ...tradeAlertItems];
+        }
+      } catch {
+        // Non-fatal
+      }
+    } else {
     try {
       // Guard and evaluate all active positions across all tickers first
       await evaluateAllActivePositions();
@@ -613,7 +648,10 @@ async function attachIntraday(
       }
     } catch {
       // Non-fatal
+    } finally {
+      releaseBarEvaluationLock();
     }
+  }
 
     return {
       ...payload,

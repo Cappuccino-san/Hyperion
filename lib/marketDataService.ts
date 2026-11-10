@@ -52,14 +52,67 @@ export interface ExecutionFillResult {
   fillReceiptId: string;
 }
 
+const HOLIDAYS_2026 = new Set([
+  "2026-01-01",
+  "2026-01-19",
+  "2026-02-16",
+  "2026-04-03",
+  "2026-05-25",
+  "2026-06-19",
+  "2026-07-03",
+  "2026-09-07",
+  "2026-11-26",
+  "2026-12-25",
+]);
+
 /**
- * Validates whether the market is open for trading (9:30 AM to 4:00 PM ET)
+ * Validates whether the market is open for trading (9:30 AM to 4:00 PM ET, Mon-Fri, excluding US market holidays)
  */
 export function isMarketOpen(nowEt?: Date): { open: boolean; reason?: string } {
+  const d = nowEt ?? new Date();
+  let dayOfWeek: number;
+  let dateIso: string;
+  try {
+    const etString = d.toLocaleString("en-US", { timeZone: "America/New_York" });
+    const etDate = new Date(etString);
+    dayOfWeek = etDate.getDay();
+    const y = etDate.getFullYear();
+    const m = String(etDate.getMonth() + 1).padStart(2, "0");
+    const day = String(etDate.getDate()).padStart(2, "0");
+    dateIso = `${y}-${m}-${day}`;
+  } catch {
+    dayOfWeek = d.getDay();
+    dateIso = "";
+  }
+
+  // 1. Weekend check (0 = Sunday, 6 = Saturday)
+  if (dayOfWeek === 0 || dayOfWeek === 6) {
+    return {
+      open: false,
+      reason: "MARKET_CLOSED: US equity options markets are closed on weekends.",
+    };
+  }
+
+  // 2. US Exchange Holiday check
+  if (dateIso && HOLIDAYS_2026.has(dateIso)) {
+    return {
+      open: false,
+      reason: `MARKET_CLOSED: US equity options markets are closed for scheduled exchange holiday (${dateIso}).`,
+    };
+  }
+
   const { hours, minutes } = getNowEtTime(nowEt);
   const totalMins = hours * 60 + minutes;
 
-  // Pre-market starts at 7:00 AM (420 mins), Regular hours 9:30 AM (570 mins) to 4:00 PM (960 mins)
+  // 3. Premarket check (< 9:30 AM ET = 570 mins)
+  if (totalMins < 570) {
+    return {
+      open: false,
+      reason: "MARKET_CLOSED: Regular options trading commences at 9:30 AM ET.",
+    };
+  }
+
+  // 4. Post-market check (>= 4:00 PM ET = 960 mins)
   if (totalMins >= 960) {
     return {
       open: false,

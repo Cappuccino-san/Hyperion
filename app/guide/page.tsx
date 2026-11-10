@@ -227,6 +227,43 @@ export default function GuidePage() {
             Live pitch-black node-pulse tracking canvas built directly into Gaia. Renders multi-timeframe candlesticks alongside dynamic comet-tail acoustic waveform ribbons at active structural nodes (King, 0DTE King, Call Wall, Put Wall, Zero γ). Features right-axis live spot countdown timer, interactive nodes drawer, adjustable vertical/horizontal scaling & pan, and a dedicated Replay button (⟲) with scrubber transport controls.
           </p>
         </section>
+
+        {/* 9. Glossary & PDE Physics */}
+        <section id="glossary" className="bg-[#111827]/60 border border-slate-800 rounded-2xl p-4 space-y-3">
+          <h2 className="text-xs font-bold uppercase tracking-widest text-cyan-400 font-mono">
+            Glossary & PDE Physics Formulations
+          </h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs text-slate-300">
+            <div className="bg-[#0b0f19] p-3 rounded-lg border border-slate-800/80">
+              <span className="font-mono font-bold text-amber-400">GEX King / VEX King:</span> The strike holding the largest single-strike absolute Gamma (GEX) or Vanna (VEX) exposure across the active chain, acting as a structural dealer pinning magnet.
+            </div>
+            <div className="bg-[#0b0f19] p-3 rounded-lg border border-slate-800/80">
+              <span className="font-mono font-bold text-cyan-400">Péclet Number (Pe):</span> Non-dimensional ratio of directional drift velocity to dealer gamma diffusion (Pe = μ · W / σ²). High positive values indicate advective breakouts; negative values indicate dealer mean reversion.
+            </div>
+            <div className="bg-[#0b0f19] p-3 rounded-lg border border-slate-800/80">
+              <span className="font-mono font-bold text-emerald-400">Ceiling Share (χ):</span> Percentage of PDE probability mass advecting toward the upper boundary (χ = (e^Pe - 1) / (e^Pe - e^-Pe)). Values above 55% confirm upward advection toward ceiling nodes.
+            </div>
+            <div className="bg-[#0b0f19] p-3 rounded-lg border border-slate-800/80">
+              <span className="font-mono font-bold text-rose-400">Boundary Flux (J_net):</span> Instantaneous probability current crossing the daily Expected Move boundaries (J_net = J_ceiling - J_floor), measuring breakout pressure.
+            </div>
+          </div>
+        </section>
+
+        {/* 10. Data & Timing */}
+        <section id="data" className="bg-[#111827]/60 border border-slate-800 rounded-2xl p-4 space-y-3">
+          <h2 className="text-xs font-bold uppercase tracking-widest text-cyan-400 font-mono">
+            Data Architecture & Session Timing
+          </h2>
+          <p className="text-xs text-slate-300 leading-relaxed">
+            Hyperion operates strictly on certified live exchange data feeds with zero synthetic fallbacks:
+          </p>
+          <ul className="text-xs text-slate-300 space-y-1.5 list-disc list-inside">
+            <li><b className="text-white">Sub-Second Live Quotes:</b> Real-time bid/ask and spot ticks ingested via Robinhood and Tradier OPRA gateways.</li>
+            <li><b className="text-white">Full-Chain Options Book:</b> CBOE Delayed Quotes JSON feed with automatic 10-second server micro-caching.</li>
+            <li><b className="text-white">Regular Trading Hours (RTH):</b> Market hours strictly enforced from 9:30 AM to 4:00 PM ET, Monday through Friday, respecting all official US equity market holidays.</li>
+            <li><b className="text-white">Connection Badges:</b> Green indicates active real-time synchronization; amber indicates off-market hours or automatic reconnecting retries.</li>
+          </ul>
+        </section>
       </main>
 
       <footer className="border-t border-white/10 bg-[#111422]/80 py-4 px-4 mt-8">
