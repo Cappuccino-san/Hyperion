@@ -59,6 +59,7 @@ export interface DrawTradeExecutionMarkersOptions {
   barToX: (barIdx: number) => number;
   priceToY: (price: number) => number;
   serverTrades?: ServerTradesState | null;
+  fsmSignals?: any[];
   padLeft?: number;
   plotRightX?: number;
   padTop?: number;
@@ -191,14 +192,15 @@ function isShortOrPut(pos: any): boolean {
  */
 export function extractNormalizedTradesForTicker(
   ticker: string,
-  serverTrades?: ServerTradesState | null
+  serverTrades?: ServerTradesState | null,
+  fsmSignals?: any[]
 ): NormalizedChartTrade[] {
-  if (!serverTrades || !ticker) return [];
+  if (!serverTrades && (!fsmSignals || fsmSignals.length === 0)) return [];
   const sym = ticker.toUpperCase();
   const byId = new Map<string, NormalizedChartTrade>();
 
   // 1. Closed Positions
-  if (Array.isArray(serverTrades.closedPositions)) {
+  if (serverTrades && Array.isArray(serverTrades.closedPositions)) {
     for (const pos of serverTrades.closedPositions) {
       if (!pos || String(pos.ticker || "").toUpperCase() !== sym) continue;
       const id = String(pos.id || `${sym}-${pos.contractType}-${pos.openedTs || pos.openedAt}`);
@@ -223,7 +225,7 @@ export function extractNormalizedTradesForTicker(
   }
 
   // 2. Active Positions
-  if (serverTrades.activePositions && typeof serverTrades.activePositions === "object") {
+  if (serverTrades?.activePositions && typeof serverTrades.activePositions === "object") {
     for (const pos of Object.values(serverTrades.activePositions)) {
       if (!pos || String(pos.ticker || "").toUpperCase() !== sym) continue;
       const id = String(pos.id || `${sym}-${pos.contractType}-${pos.openedTs || pos.openedAt}`);
@@ -244,7 +246,7 @@ export function extractNormalizedTradesForTicker(
   }
 
   // 3. Fallback: Reconstruct from `alerts` if `activePositions` / `closedPositions` were empty
-  if (byId.size === 0 && Array.isArray(serverTrades.alerts)) {
+  if (byId.size === 0 && serverTrades && Array.isArray(serverTrades.alerts)) {
     const btoAlerts = serverTrades.alerts.filter(
       (a) =>
         a &&
@@ -287,6 +289,71 @@ export function extractNormalizedTradesForTicker(
     }
   }
 
+  // 4. Fallback: Synthesize NormalizedChartTrade items from FSM signals if server trades are absent
+  if (byId.size === 0 && Array.isArray(fsmSignals) && fsmSignals.length > 0) {
+    fsmSignals.forEach((sig: any, idx: number) => {
+      if (!sig) return;
+      if (sig.ticker && String(sig.ticker).toUpperCase() !== sym) return;
+      const isPut = isShortOrPut(sig);
+      const contractType: "CALL" | "PUT" = isPut ? "PUT" : "CALL";
+      const btoSpot = Number(sig.price || sig.btoSpotPrice || 0);
+      if (btoSpot <= 0) return;
+
+      const rawClosedSpot = Number(sig.exitPrice ?? sig.closedSpotPrice ?? 0);
+      const hasClosedSpot = Number.isFinite(rawClosedSpot) && rawClosedSpot > 0;
+      const rawOpenTs = Number(sig.timestamp ?? sig.openedTs ?? 0);
+      const openedTs =
+        Number.isFinite(rawOpenTs) && rawOpenTs > 0
+          ? rawOpenTs < 1e11
+            ? rawOpenTs * 1000
+            : rawOpenTs
+          : undefined;
+      const openedAt = sig.time || sig.openedAt || undefined;
+      const rawCloseTs = Number(sig.exitTimestamp ?? sig.closedTs ?? 0);
+      const closedTs =
+        Number.isFinite(rawCloseTs) && rawCloseTs > 0
+          ? rawCloseTs < 1e11
+            ? rawCloseTs * 1000
+            : rawCloseTs
+          : undefined;
+      const closedAt = sig.exitTime || sig.closedAt || undefined;
+
+      const isClosed = Boolean(
+        sig.isClosed ||
+          sig.status === "CLOSED" ||
+          (hasClosedSpot && (closedTs !== undefined || Boolean(closedAt)))
+      );
+
+      let pnlOptionPct: number | undefined = Number.isFinite(Number(sig.pnlOptionPct))
+        ? Number(sig.pnlOptionPct)
+        : undefined;
+
+      if (pnlOptionPct === undefined && isClosed && hasClosedSpot && btoSpot > 0) {
+        const directionalPct = isPut
+          ? ((btoSpot - rawClosedSpot) / btoSpot) * 100
+          : ((rawClosedSpot - btoSpot) / btoSpot) * 100;
+        pnlOptionPct = Number((directionalPct * 25).toFixed(1));
+      }
+
+      const id = String(sig.id || `${sym}-fsm-${openedTs || openedAt}-${contractType}-${idx}`);
+      byId.set(id, {
+        id,
+        ticker: sym,
+        contractType,
+        status: isClosed ? "CLOSED" : "OPEN",
+        setupName: String(sig.label || sig.setupName || (isPut ? "PUT SETUP" : "CALL SETUP")),
+        btoSpotPrice: btoSpot,
+        openedAt,
+        openedTs,
+        closedSpotPrice: isClosed && hasClosedSpot ? rawClosedSpot : undefined,
+        closedAt: isClosed ? closedAt : undefined,
+        closedTs: isClosed ? closedTs : undefined,
+        pnlOptionPct,
+        exitReason: sig.reason || sig.exitReason || undefined,
+      });
+    });
+  }
+
   return Array.from(byId.values());
 }
 
@@ -305,6 +372,7 @@ export function drawTradeExecutionMarkers(
     barToX,
     priceToY,
     serverTrades,
+    fsmSignals,
     padLeft = 18,
     plotRightX = 9999,
     padTop = 18,
@@ -312,7 +380,7 @@ export function drawTradeExecutionMarkers(
   } = options;
 
   if (!candles || candles.length === 0 || safeActiveIdx < 0) return;
-  const trades = extractNormalizedTradesForTicker(ticker, serverTrades);
+  const trades = extractNormalizedTradesForTicker(ticker, serverTrades, fsmSignals);
   if (trades.length === 0) return;
 
   for (const trade of trades) {

@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { evaluatePrzmCallLedger, PrzmSignalPoint, PrzmCandlePoint } from "@/components/gaia/PrzmTacticalHud";
+import { extractNormalizedTradesForTicker } from "@/components/chart/TradeExecutionMarkersOverlay";
 import { initializeOcoBrackets, evaluateOcoBrackets } from "@/lib/bracketOrderEngine";
 import { NbboQuote } from "@/lib/marketDataService";
 
@@ -424,5 +425,62 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
     assert.strictEqual(entry.delta, 2.71, "Server PUT delta must be +2.71 pts!");
     assert.strictEqual(entry.status, "RIGHT", "Server closed PUT must be RIGHT!");
     assert.strictEqual(summary.winRatePct, 100);
+  });
+
+  it("FSM Signal Fallback Invariant: Closed Short FSM signal normalizes to PUT trade with positive PnL", () => {
+    const fsmSignals = [
+      {
+        id: "sig-short-fsm-1",
+        ticker: "SPY",
+        type: "SHORT",
+        price: 749.01,
+        exitPrice: 746.30,
+        isClosed: true,
+        openedTs: 1730736000,
+        exitTimestamp: 1730738100,
+        time: "9:30 AM",
+        label: "SHORT",
+        reason: "MOMENTUM COVER",
+      },
+    ];
+
+    // Server trades is empty
+    const trades = extractNormalizedTradesForTicker("SPY", null, fsmSignals);
+    assert.strictEqual(trades.length, 1);
+    const trade = trades[0];
+
+    assert.strictEqual(trade.ticker, "SPY");
+    assert.strictEqual(trade.contractType, "PUT");
+    assert.strictEqual(trade.status, "CLOSED");
+    assert.strictEqual(trade.btoSpotPrice, 749.01);
+    assert.strictEqual(trade.closedSpotPrice, 746.30);
+    assert.ok(
+      typeof trade.pnlOptionPct === "number" && trade.pnlOptionPct > 0,
+      `Expected positive pnlOptionPct for winning short, got ${trade.pnlOptionPct}`
+    );
+  });
+
+  it("FSM Signal Fallback Invariant: Active Open Call FSM signal normalizes to OPEN CALL trade", () => {
+    const fsmSignals = [
+      {
+        id: "sig-open-call-1",
+        ticker: "SPY",
+        type: "LONG",
+        price: 753.50,
+        isClosed: false,
+        openedTs: 1730736000,
+        time: "9:30 AM",
+        label: "LONG · OPEN",
+      },
+    ];
+
+    const trades = extractNormalizedTradesForTicker("SPY", { activePositions: {}, closedPositions: [] }, fsmSignals);
+    assert.strictEqual(trades.length, 1);
+    const trade = trades[0];
+
+    assert.strictEqual(trade.ticker, "SPY");
+    assert.strictEqual(trade.contractType, "CALL");
+    assert.strictEqual(trade.status, "OPEN");
+    assert.strictEqual(trade.btoSpotPrice, 753.50);
   });
 });

@@ -23,10 +23,19 @@ export interface PositionSizingResult {
 }
 
 export const MAX_SMALL_ACCOUNT_BUDGET = 100.0; // Hard dollar ceiling: strictly <= $100.00
+const MAX_OUTLAY_CENTS = 10000; // $100.00 in cents
+
+export interface SizingResult {
+  allowed: boolean;
+  contractsQty: number;
+  totalOutlay: number;
+  rejectionReason?: "BUDGET_REJECTED" | "SPREAD_TOO_WIDE" | "AFTER_HOURS_REJECTED" | "INVALID_QUOTE";
+}
 
 /**
  * Calculates position size based on contract ask price.
  * Enforces the strict small account rule: total capital outlay MUST always be <= $100.00.
+ * Utilizes integer-cent arithmetic to eliminate IEEE-754 floating-point drift.
  */
 export function calculateSmallAccountSize(contractAsk: number): PositionSizingResult {
   if (!Number.isFinite(contractAsk) || contractAsk <= 0) {
@@ -41,11 +50,12 @@ export function calculateSmallAccountSize(contractAsk: number): PositionSizingRe
     };
   }
 
-  // Contract cost in dollars = Ask price * 100 shares per contract
-  const contractCost = Number((contractAsk * 100).toFixed(2));
+  // Contract cost in integer cents = Ask price * 100 shares * 100 cents
+  const singleContractCents = Math.round(contractAsk * 10000);
+  const contractCost = singleContractCents / 100;
 
-  // 1. If contract cost exceeds $100.00, reject execution immediately
-  if (contractCost > MAX_SMALL_ACCOUNT_BUDGET) {
+  // 1. If single contract cost exceeds $100.00 (10,000 cents), reject execution immediately
+  if (singleContractCents > MAX_OUTLAY_CENTS) {
     return {
       allowed: false,
       contractAsk,
@@ -59,10 +69,10 @@ export function calculateSmallAccountSize(contractAsk: number): PositionSizingRe
     };
   }
 
-  // 2. If 2 contracts cost <= $100.00 (Ask <= $0.50), size 2 contracts
-  if (Number((contractCost * 2).toFixed(2)) <= MAX_SMALL_ACCOUNT_BUDGET) {
+  // 2. If 2 contracts cost <= $100.00 (20,000 cents / 2 <= 10,000 cents, Ask <= $0.50), size 2 contracts
+  if (2 * singleContractCents <= MAX_OUTLAY_CENTS) {
     const contractsQty: 1 | 2 = 2;
-    const totalOutlay = Number((contractCost * contractsQty).toFixed(2));
+    const totalOutlay = (2 * singleContractCents) / 100;
     return {
       allowed: true,
       contractAsk,
@@ -75,7 +85,7 @@ export function calculateSmallAccountSize(contractAsk: number): PositionSizingRe
 
   // 3. Otherwise (Ask between $0.51 and $1.00), size exactly 1 contract
   const contractsQty: 1 | 2 = 1;
-  const totalOutlay = Number((contractCost * contractsQty).toFixed(2));
+  const totalOutlay = singleContractCents / 100;
   return {
     allowed: true,
     contractAsk,
@@ -83,6 +93,65 @@ export function calculateSmallAccountSize(contractAsk: number): PositionSizingRe
     contractsQty,
     totalOutlay,
     sizingTier: "ONE_CONTRACT",
+  };
+}
+
+/**
+ * Carbon Audit hardened position sizer with NBBO spread validation and integer-cent precision.
+ */
+export function calculatePositionSize(askPrice: number, bidPrice?: number): SizingResult {
+  if (!Number.isFinite(askPrice) || askPrice <= 0) {
+    return {
+      allowed: false,
+      contractsQty: 0,
+      totalOutlay: 0,
+      rejectionReason: "INVALID_QUOTE",
+    };
+  }
+
+  if (bidPrice !== undefined && (!Number.isFinite(bidPrice) || bidPrice < 0 || bidPrice > askPrice)) {
+    return {
+      allowed: false,
+      contractsQty: 0,
+      totalOutlay: 0,
+      rejectionReason: "INVALID_QUOTE",
+    };
+  }
+
+  const singleContractCents = Math.round(askPrice * 10000);
+  if (singleContractCents > MAX_OUTLAY_CENTS) {
+    return {
+      allowed: false,
+      contractsQty: 0,
+      totalOutlay: 0,
+      rejectionReason: "BUDGET_REJECTED",
+    };
+  }
+
+  if (bidPrice !== undefined) {
+    const spread = (askPrice - bidPrice) / askPrice;
+    if (spread > 0.25) {
+      return {
+        allowed: false,
+        contractsQty: 0,
+        totalOutlay: 0,
+        rejectionReason: "SPREAD_TOO_WIDE",
+      };
+    }
+  }
+
+  if (2 * singleContractCents <= MAX_OUTLAY_CENTS) {
+    return {
+      allowed: true,
+      contractsQty: 2,
+      totalOutlay: (2 * singleContractCents) / 100,
+    };
+  }
+
+  return {
+    allowed: true,
+    contractsQty: 1,
+    totalOutlay: singleContractCents / 100,
   };
 }
 

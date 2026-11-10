@@ -625,6 +625,11 @@ export function GaiaView() {
   const [guideExpanded, setGuideExpanded] = useState<boolean>(false);
   const [selectedSessionIso, setSelectedSessionIso] = useState<string>("");
   const [hudTradeSignals, setHudTradeSignals] = useState<GaiaHudTradeSignal[]>([]);
+  const [przmHudSignals, setPrzmHudSignals] = useState<any[]>([]);
+
+  useEffect(() => {
+    setPrzmHudSignals([]);
+  }, [loadedTicker]);
 
   // Dynamic Trade Signals Engine Hook for Gaia HUD & Canvas Execution Markers
   useEffect(() => {
@@ -1506,6 +1511,39 @@ export function GaiaView() {
     const sigmaProx = Math.max(2.0, strikeStep * 2.5, dataset.sigma1Move * 0.25);
     const sigmaProxSq2 = 2 * sigmaProx * sigmaProx;
 
+    // -------------------------------------------------------------------------
+    // Top-K Active Institutional Strike Filter (Strictly K <= 4 levels - Image 1 Spec)
+    // -------------------------------------------------------------------------
+    const curSpotPrice = dataset.candles[safeActiveIdx]?.close ?? dataset.priorClose;
+    const rankedCandidateStrikes = dataset.visibleStrikes.map((s) => {
+      const activeVal = activeBookCol.strikeValues[s] ?? 0;
+      const isKing = s === allExpKingStrike || s === filteredKingStrike;
+      const isCallWall = s === callWallStrike;
+      const isPutWall = s === putWallStrike;
+      const isWall = isCallWall || isPutWall;
+
+      const dist = Math.abs(s - curSpotPrice);
+      const normDist = dist / Math.max(1, dataset.sigma1Move * 1.5);
+      const spotProxWeight = Math.exp(-1.2 * normDist * normDist);
+
+      const rawConc = Math.min(1.0, Math.abs(activeVal) / maxSessionExposure);
+      const structuralBoost = isKing ? 0.40 : isWall ? 0.22 : 0.0;
+      const score = (rawConc * 0.65 + structuralBoost) * (0.35 + 0.65 * spotProxWeight);
+
+      return { strike: s, score, isKing, isCallWall, isPutWall, val: activeVal };
+    });
+
+    rankedCandidateStrikes.sort((a, b) => b.score - a.score);
+
+    // Strictly limit to at most 4 active nodes (King + Walls + top active strike)
+    const activeNodeMap = new Map<number, (typeof rankedCandidateStrikes)[0]>();
+    for (const item of rankedCandidateStrikes) {
+      if (activeNodeMap.size >= 4) break;
+      if (item.isKing || item.isCallWall || item.isPutWall || item.score >= 0.20) {
+        activeNodeMap.set(item.strike, item);
+      }
+    }
+
     // Render bar-by-bar position beads / diamonds / triangles across time (t in [0, safeActiveIdx])
     for (let t = 0; t <= safeActiveIdx; t++) {
       const col = dataset.columnsByBar[t];
@@ -1515,6 +1553,10 @@ export function GaiaView() {
       const colKingStrike = isFiltered ? col.filteredKingStrike : col.allExpKingStrike;
 
       for (const strike of dataset.visibleStrikes) {
+        const activeMeta = activeNodeMap.get(strike);
+        // STRICT SUPPRESSION: Completely skip all non-Top-K strikes
+        if (!activeMeta) continue;
+
         const cy = priceToY(strike);
         if (cy < padTop - 12 || cy > height - padBottom + 12) continue;
 
@@ -1542,17 +1584,8 @@ export function GaiaView() {
         const maxBeadW = Math.min(colStepX * 0.48, 4.6);
         const beadRadius = Math.max(1.6, Math.min(maxBeadW, 1.6 + intensity * 2.8));
 
-        // 1. Quiescent / Low Position: subtle micro-dash to keep chart sharp and uncluttered
-        if (intensity < 0.16 && !isKing) {
-          ctx.save();
-          ctx.fillStyle =
-            atlasPalette === "ice"
-              ? "rgba(255, 255, 255, 0.14)"
-              : val >= 0
-                ? "rgba(34, 211, 238, 0.18)"
-                : "rgba(192, 132, 252, 0.18)";
-          ctx.fillRect(cx - 1.5, cy - 0.75, 3, 1.5);
-          ctx.restore();
+        // 1. Quiescent / Low Position: Suppress completely to keep chart clean and uncluttered (Image 1 Style)
+        if (intensity < 0.20 && !isKing) {
           continue;
         }
 
@@ -1647,8 +1680,9 @@ export function GaiaView() {
           continue;
         }
 
-        // 5. Other Active Strikes:
-        // Position grows from hollow ring `○` into solid glowing bead `●`
+        // 5. Other Top-K Active Strikes:
+        // Render solid glowing beads when position has genuine conviction (Image 1 Style)
+        if (intensity < 0.30) continue;
         const nodeColor =
           atlasPalette === "ice"
             ? (intensity >= 0.5 ? "#ffffff" : "#bae6fd")
@@ -1657,29 +1691,18 @@ export function GaiaView() {
               : (val >= 0 ? "#22d3ee" : "#a855f7");
 
         ctx.save();
-        if (intensity < 0.38) {
-          // Hollow ring indicating nascent / intermediate position
-          ctx.strokeStyle = nodeColor;
-          ctx.lineWidth = 1.1;
-          ctx.globalAlpha = Math.min(0.65, 0.25 + intensity * 0.5);
-          ctx.beginPath();
-          ctx.arc(cx, cy, Math.max(1.5, beadRadius * 0.85), 0, Math.PI * 2);
-          ctx.stroke();
-        } else {
-          // Solid bead indicating substantial accumulated position
-          if (intensity >= 0.5) {
-            ctx.shadowColor =
-              atlasPalette === "ice"
-                ? "rgba(255, 255, 255, 0.75)"
-                : (val >= 0 ? "rgba(34, 211, 238, 0.65)" : "rgba(192, 132, 252, 0.65)");
-            ctx.shadowBlur = Math.round(6 * intensity);
-          }
-          ctx.fillStyle = nodeColor;
-          ctx.globalAlpha = Math.min(0.92, 0.45 + intensity * 0.5);
-          ctx.beginPath();
-          ctx.arc(cx, cy, beadRadius, 0, Math.PI * 2);
-          ctx.fill();
+        if (intensity >= 0.5) {
+          ctx.shadowColor =
+            atlasPalette === "ice"
+              ? "rgba(255, 255, 255, 0.75)"
+              : (val >= 0 ? "rgba(34, 211, 238, 0.65)" : "rgba(192, 132, 252, 0.65)");
+          ctx.shadowBlur = Math.round(6 * intensity);
         }
+        ctx.fillStyle = nodeColor;
+        ctx.globalAlpha = Math.min(0.92, 0.45 + intensity * 0.5);
+        ctx.beginPath();
+        ctx.arc(cx, cy, beadRadius, 0, Math.PI * 2);
+        ctx.fill();
         ctx.restore();
       }
     }
@@ -1807,26 +1830,17 @@ export function GaiaView() {
         confluenceLevels.push({ name: "King Node", strike: curKingStrike });
       }
 
-      // Collect Strike Nodes for Beaded Pearl Necklaces (Image 1 Style)
+      // Collect Top-K Strike Nodes for Wick Reticles and Confluence (Strictly bounded from activeNodeMap)
       const overlayStrikeNodes: StrikeNodeOverlayItem[] = [];
-      const activeCol = dataset.columnsByBar[safeActiveIdx];
-      if (activeCol) {
-        for (const st of dataset.visibleStrikes) {
-          const val = activeCol.strikeValues[st] ?? 0;
-          const isKing = st === activeCol.allExpKingStrike || st === activeCol.filteredKingStrike;
-          const isCall = st === callWallStrike;
-          const isPut = st === putWallStrike;
-          if (isKing || isCall || isPut || Math.abs(val) > 4) {
-            overlayStrikeNodes.push({
-              strike: st,
-              y: priceToY(st),
-              weight: Math.min(1, Math.abs(val) / 25),
-              isKing,
-              polarity: isKing || isCall || val >= 0 ? "call" : "put",
-            });
-          }
-        }
-      }
+      Array.from(activeNodeMap.entries()).forEach(([st, meta]) => {
+        overlayStrikeNodes.push({
+          strike: st,
+          y: priceToY(st),
+          weight: Math.min(1, Math.abs(meta.val) / (maxSessionExposure * 0.5)),
+          isKing: meta.isKing,
+          polarity: meta.isKing || meta.isCallWall || meta.val >= 0 ? "call" : "put",
+        });
+      });
 
       // Contextual Reference Badges (PDH, PMH, PML, Day ±1σ)
       const pmCandles = dataset.candles.filter((c) => c.timeLabel && c.timeLabel < "09:30");
@@ -1907,7 +1921,7 @@ export function GaiaView() {
         showRightAxisBadge: false,
         strikeNodes: overlayStrikeNodes,
         referenceBadges,
-        showBeadedStrikes: true,
+        showBeadedStrikes: false, // Clean Single Ownership: GaiaView renders time-series beads; Overlay renders reticles & corridor
         candles: dataset.candles,
       });
     }
@@ -2439,6 +2453,7 @@ export function GaiaView() {
       barToX,
       priceToY,
       serverTrades: effectiveServerTrades,
+      fsmSignals: przmHudSignals,
       padLeft,
       plotRightX: dividerX,
       padTop,
@@ -2889,6 +2904,7 @@ export function GaiaView() {
     countdownSec,
     hudTradeSignals,
     effectiveServerTrades,
+    przmHudSignals,
   ]);
 
   const isSma34Bullish = activeCandle
@@ -3494,6 +3510,7 @@ export function GaiaView() {
         liveSpot={activeCandle ? activeCandle.close : null}
         tradeSignals={hudTradeSignals}
         serverTrades={effectiveServerTrades}
+        onSignalsEvaluated={setPrzmHudSignals}
         onSymbolChange={(sym) => {
           setTickerInput(sym);
           setLoadedTicker(sym);

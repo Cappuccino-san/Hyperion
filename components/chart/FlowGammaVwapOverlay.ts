@@ -349,11 +349,16 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
   // 3B. High-Contrast Beaded Strike Nodes ("Pearl Necklaces")
   // -------------------------------------------------------------
   if (showBeadedStrikes && strikeNodes.length > 0 && validLimit >= 1) {
+    const topBeadNodes = [...strikeNodes]
+      .filter((n) => n.isKing || (n.weight ?? 0) >= 0.35)
+      .sort((a, b) => ((b.isKing ? 2 : 0) + (b.weight ?? 0)) - ((a.isKing ? 2 : 0) + (a.weight ?? 0)))
+      .slice(0, 4);
+
     const curSpot = activePt.spot;
     const tol = Math.max(activePt.sigma * 1.5, curSpot * 0.005);
 
     ctx.save();
-    for (const node of strikeNodes) {
+    for (const node of topBeadNodes) {
       if (!node.strike || node.strike <= 0) continue;
       const y = node.y !== undefined ? node.y : priceToY(node.strike);
       if (y < padTop - 10 || y > chartHeight - padBottom + 10) continue;

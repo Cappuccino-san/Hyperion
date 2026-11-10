@@ -55,6 +55,7 @@ export interface GaiaCallPutBiasHudProps {
   tradeSignals?: GaiaHudTradeSignal[];
   serverTrades?: ServerTradeData;
   onSymbolChange?: (symbol: string) => void;
+  onSignalsEvaluated?: (signals: PrzmSignalPoint[]) => void;
   className?: string;
 }
 
@@ -243,6 +244,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   tradeSignals = [],
   serverTrades: serverTradesProp,
   onSymbolChange,
+  onSignalsEvaluated,
   className = "",
 }) => {
   const uid = useId().replace(/:/g, "");
@@ -810,11 +812,72 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     }));
   }, [intrinsicSignals, xForIdx, yForPrice]);
 
+  const przmSignals: PrzmSignalPoint[] = useMemo(() => {
+    return intrinsicSignals
+      .filter((m) => !(m as any).isPending)
+      .map((m) => ({
+      id: m.id,
+      index: m.barIndex,
+      time: enrichedPoints[m.barIndex]?.timeLabel ?? "",
+      timestamp: enrichedPoints[m.barIndex]?.timestamp ?? 0,
+      price: m.price,
+      type: m.isCall ? "LONG" : "SHORT",
+      tag: m.label.includes("OPEN")
+        ? "OPEN"
+        : m.label.includes("PEAK")
+        ? "PEAK"
+        : m.label.includes("BREAK")
+        ? "BREAK"
+        : "CONT",
+      label: m.label,
+      excursion: m.mfePoints,
+      reason: m.label,
+      barSpanSeconds: (m as any).barSpanSeconds,
+      barCloseTimestamp: (m as any).barCloseTimestamp,
+      exitPrice: (m as any).exitPrice,
+      exitTimestamp: (m as any).exitTimestamp,
+      exitIndex: (m as any).exitIndex,
+      exitReason: (m as any).exitReason,
+      isClosed: (m as any).isClosed,
+    }));
+  }, [intrinsicSignals, enrichedPoints]);
+
+  // Emit evaluated FSM signals upward with structural fingerprint guard to prevent render loop
+  const onSignalsEvaluatedRef = useRef(onSignalsEvaluated);
+  onSignalsEvaluatedRef.current = onSignalsEvaluated;
+  const prevSignalsFingerprintRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!onSignalsEvaluatedRef.current) return;
+    const sym = String(activeSymbol || "").trim().toUpperCase();
+    const tagged = (przmSignals || []).map((s) => ({
+      ...s,
+      ticker: sym,
+    }));
+    const fingerprint = `${sym}::${tagged
+      .map(
+        (s) =>
+          `${s.id ?? ""}:${s.timestamp ?? s.time ?? ""}:${s.type ?? ""}:${
+            s.price ?? ""
+          }:${s.isClosed ? 1 : 0}:${s.exitPrice ?? ""}:${s.exitTimestamp ?? ""}:${
+            s.reason ?? ""
+          }`
+      )
+      .join("|")}`;
+
+    if (fingerprint !== prevSignalsFingerprintRef.current) {
+      prevSignalsFingerprintRef.current = fingerprint;
+      onSignalsEvaluatedRef.current(tagged);
+    }
+  }, [przmSignals, activeSymbol]);
+
   // Project authoritative server trades (BTO / STC + PnL badges + trajectory) onto SVG coordinates
   const svgServerTradeMarkers = useMemo(() => {
-    const trades = extractNormalizedTradesForTicker(activeSymbol, internalServerTrades).filter(
-      (t) => !String(t.id).startsWith("test-")
-    );
+    const trades = extractNormalizedTradesForTicker(
+      activeSymbol,
+      internalServerTrades,
+      przmSignals
+    ).filter((t) => !String(t.id).startsWith("test-"));
     if (trades.length === 0 || enrichedPoints.length === 0) return [];
     return trades
       .map((trade) => {
@@ -883,7 +946,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         };
       })
       .filter((item): item is NonNullable<typeof item> => item !== null);
-  }, [activeSymbol, internalServerTrades, enrichedPoints, xForIdx, yForPrice]);
+  }, [activeSymbol, internalServerTrades, przmSignals, enrichedPoints, xForIdx, yForPrice]);
 
   // Structural Metrics (Open 9:30 & Straddle Expected Move) - Strictly Viewport-Invariant
   const structuralMetrics = useMemo(() => {
@@ -924,36 +987,6 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       boundaryFlux: pt.netFlux,
     }));
   }, [enrichedPoints]);
-
-  const przmSignals: PrzmSignalPoint[] = useMemo(() => {
-    return intrinsicSignals
-      .filter((m) => !(m as any).isPending)
-      .map((m) => ({
-      id: m.id,
-      index: m.barIndex,
-      time: enrichedPoints[m.barIndex]?.timeLabel ?? "",
-      timestamp: enrichedPoints[m.barIndex]?.timestamp ?? 0,
-      price: m.price,
-      type: m.isCall ? "LONG" : "SHORT",
-      tag: m.label.includes("OPEN")
-        ? "OPEN"
-        : m.label.includes("PEAK")
-        ? "PEAK"
-        : m.label.includes("BREAK")
-        ? "BREAK"
-        : "CONT",
-      label: m.label,
-      excursion: m.mfePoints,
-      reason: m.label,
-      barSpanSeconds: (m as any).barSpanSeconds,
-      barCloseTimestamp: (m as any).barCloseTimestamp,
-      exitPrice: (m as any).exitPrice,
-      exitTimestamp: (m as any).exitTimestamp,
-      exitIndex: (m as any).exitIndex,
-      exitReason: (m as any).exitReason,
-      isClosed: (m as any).isClosed,
-    }));
-  }, [intrinsicSignals, enrichedPoints]);
 
   // Auto-sync active Gaia SPY signals directly to Discord trade-signals engine
   const lastSyncedGaiaSigFingerprint = useRef<string>("");
@@ -1402,7 +1435,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             const isCall = m.isCall;
             const isPending = (m as any).isPending ?? false;
             const isOpen = (m as any).isOpen ?? false;
-            const showBadgeCallout = isOpen || isPending;
+            const hasAuthoritativeTradeOverlay = svgServerTradeMarkers.length > 0;
+            const showBadgeCallout = isPending || (isOpen && !hasAuthoritativeTradeOverlay);
             const markerColor = isCall ? "#00F5D4" : "#FF2A55";
             const excursionText = m.mfePoints >= 0.2 ? ` +$${m.mfePoints.toFixed(1)}` : "";
             const badgeY = isCall

@@ -12,13 +12,15 @@
  * 4. Microstructure Broker Fill Slips & Reconciliation
  */
 
-import { calculateSmallAccountSize, assertSmallAccountInvariant, MAX_SMALL_ACCOUNT_BUDGET } from "../lib/positionSizer";
+import { calculateSmallAccountSize, calculatePositionSize, assertSmallAccountInvariant, MAX_SMALL_ACCOUNT_BUDGET } from "../lib/positionSizer";
 import { executeNbboOrder, NbboQuote } from "../lib/marketDataService";
 import {
   initializeOcoBrackets,
   evaluateOcoBrackets,
+  parseEtTimeSeconds,
   OcoBracketConfig,
 } from "../lib/bracketOrderEngine";
+import { computeFluxDecay } from "../lib/flowGammaVwap";
 import { dispatchBrokerOrder, BrokerOrderRequest } from "../lib/brokerExecution";
 import {
   selectSmallAccountContract,
@@ -919,6 +921,86 @@ async function runTestSuite() {
     postClosedTradeReentryViolations === 0,
     "500-Transition Monte Carlo 10C: EXACTLY ZERO re-entries after closed trade (LOCKED_FOR_DAY strictly terminal)"
   );
+
+  // ===========================================================================
+  // 11. GEMINI 4 CARBON AUDIT HARDENING & EDGE-CASE INVARIANTS
+  // ===========================================================================
+  console.log("\n11. Verifying Gemini 4 Carbon Audit Edge-Case Invariants...");
+
+  // 1. Zero, negative, and crossed market quote rejection
+  const zeroQuote = calculatePositionSize(0, 0);
+  assert(zeroQuote.allowed === false, "Zero askPrice must strictly be rejected");
+  assert(zeroQuote.rejectionReason === "INVALID_QUOTE", "Zero askPrice rejection reason must be INVALID_QUOTE");
+
+  const negativeQuote = calculatePositionSize(-0.5, -0.6);
+  assert(negativeQuote.allowed === false, "Negative askPrice must strictly be rejected");
+  assert(negativeQuote.rejectionReason === "INVALID_QUOTE", "Negative askPrice rejection reason must be INVALID_QUOTE");
+
+  const crossedQuote = calculatePositionSize(0.50, 0.55);
+  assert(crossedQuote.allowed === false, "Crossed market (bid > ask) must strictly be rejected");
+  assert(crossedQuote.rejectionReason === "INVALID_QUOTE", "Crossed market rejection reason must be INVALID_QUOTE");
+
+  // 2. Exact $100.00 capital boundary free of IEEE-754 float drift
+  const exactTwo = calculatePositionSize(0.50, 0.48);
+  assert(exactTwo.allowed === true, "Ask $0.50 must be allowed");
+  assert(exactTwo.contractsQty === 2, "Ask $0.50 must size exactly 2 contracts");
+  assert(exactTwo.totalOutlay === 100.0, "Ask $0.50 total outlay must equal exactly $100.00");
+
+  const overTwoUnderOne = calculatePositionSize(0.51, 0.49);
+  assert(overTwoUnderOne.allowed === true, "Ask $0.51 must be allowed");
+  assert(overTwoUnderOne.contractsQty === 1, "Ask $0.51 must size exactly 1 contract");
+  assert(overTwoUnderOne.totalOutlay === 51.0, "Ask $0.51 total outlay must equal exactly $51.00");
+
+  // 3. Integer time parsing protects unpadded morning timestamps from 15:55 MOC cutoff
+  const sec945 = parseEtTimeSeconds("9:45:00");
+  const sec1555 = parseEtTimeSeconds("15:55:00");
+  assert(sec945 === 35100, "9:45:00 ET parsed into 35,100 seconds");
+  assert(sec1555 === 57300, "15:55:00 ET parsed into 57,300 seconds");
+  assert(sec945 < sec1555, "9:45:00 ET strictly precedes 15:55:00 ET in integer seconds (eliminates ASCII bug)");
+
+  // 4. Gap-over TP1+TP2 in a single tick closes 100% of contracts immediately
+  const gapConfig: OcoBracketConfig = {
+    entryPrice: 0.50,
+    contractsQty: 2,
+    contractType: "CALL",
+    openedAtEt: "09:35:00",
+    openedTs: Date.now(),
+    tp1TargetPct: 30, // 0.65
+    tp2TargetPct: 60, // 0.80
+    stopLossMaxLossPct: 25,
+    target1Spot: 755,
+    target2Spot: 760,
+    stopLossSpot: 745,
+  };
+  const gapBracket = initializeOcoBrackets(gapConfig);
+  const gapQuote: NbboQuote = {
+    bid: 1.15, // Gapped above TP2 ($0.80)
+    ask: 1.18,
+    mid: 1.165,
+    spreadPct: 2.5,
+    isStale: false,
+    delta: 0.8,
+    gamma: 0.05,
+    theta: -0.01,
+    timestamp: Date.now(),
+    exchange: "CBOE",
+    source: "REALTIME_NBBO_SYNCHRONIZED",
+  };
+  const gapResult = evaluateOcoBrackets({
+    bracket: gapBracket,
+    config: gapConfig,
+    currentNbbo: gapQuote,
+    underlyingSpot: 762,
+    nowEt: new Date("2026-11-03T14:35:00Z"), // 10:35 AM ET
+  });
+  assert(gapResult.action === "EXIT_TP2", "Gap-over TP1+TP2 tick must trigger EXIT_TP2");
+  assert(gapResult.contractsToClose === 2, "Gap-over TP1+TP2 must close 100% (2 contracts) immediately");
+  assert(gapResult.updatedBracket.remainingContracts === 0, "Zero remaining contracts after gap-over TP2 exit");
+
+  // 5. Out-of-order negative dt cannot amplify Flux chi > 1
+  const fluxDecayResult = computeFluxDecay(0.8, -500, 300);
+  assert(fluxDecayResult <= 0.8, "Negative dt tick cannot amplify Flux decay above base chi");
+  assert(fluxDecayResult >= 0, "Flux decay remains non-negative for positive chi");
 
   // ===========================================================================
   // FINAL REPORT

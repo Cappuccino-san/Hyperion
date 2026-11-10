@@ -342,6 +342,18 @@ export function evaluateSpectralFlowAndFluxAtTau(params: {
 }
 
 /**
+ * Spectral Flow VWAP Flux decay with non-negative dt and clamped conviction.
+ * Prevents negative time tick intervals from amplifying chi > 1.
+ */
+export function computeFluxDecay(chi: number, dtMs: number, halfLifeSeconds: number = 300): number {
+  const safeHalfLife = Math.max(1, halfLifeSeconds);
+  const safeDtMs = Math.max(0, Number.isFinite(dtMs) ? dtMs : 0);
+  const clampedChi = Math.max(-1, Math.min(1, Number.isFinite(chi) ? chi : 0));
+  const lambda = Math.LN2 / safeHalfLife;
+  return clampedChi * Math.exp(-lambda * (safeDtMs / 1000));
+}
+
+/**
  * Computes Dollar-Gamma Trade Weighting for an option trade print:
  * Weight_i = | Pi_i * Gamma_i * S_t^2 * 0.01 |
  * Where Pi_i = size * premium * 100 (total dollar premium transacted)

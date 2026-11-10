@@ -100,6 +100,19 @@ export function initializeOcoBrackets(config: OcoBracketConfig): OcoBracketState
 }
 
 /**
+ * Parses ET time strings ("HH:MM:SS" or "H:MM:SS") into integer seconds-since-midnight.
+ * Eliminates ASCII lexicographical comparison bugs (e.g. "9:45:00" > "15:55:00").
+ */
+export function parseEtTimeSeconds(timeEt: string): number {
+  const parts = timeEt.trim().split(":").map(Number);
+  if (parts.length < 2 || parts.some((n) => !Number.isFinite(n))) {
+    return 0;
+  }
+  const [hh, mm, ss = 0] = parts;
+  return (hh % 24) * 3600 + mm * 60 + ss;
+}
+
+/**
  * Evaluates resting OCO brackets against real-time market data
  */
 export function evaluateOcoBrackets(params: {
@@ -118,9 +131,10 @@ export function evaluateOcoBrackets(params: {
     hour12: false,
     hourCycle: "h23",
   });
-  const [rawHours, minutes] = etString.split(":").map(Number);
+  const [rawHours, minutes, seconds = 0] = etString.split(":").map(Number);
   const hours = rawHours % 24;
   const totalMins = hours * 60 + minutes;
+  const totalSeconds = hours * 3600 + minutes * 60 + seconds;
 
   // Real-time PnL calculated from current BID (hitting the bid on exit) vs entry ASK
   const liveBid = Math.max(0.01, currentNbbo.bid);
@@ -151,7 +165,7 @@ export function evaluateOcoBrackets(params: {
   // --------------------------------------------------------------------------
   // RULE 1: 15:55:00 ET Hard Market-On-Close Liquidation
   // --------------------------------------------------------------------------
-  if (totalMins >= 15 * 60 + 55) {
+  if (totalSeconds >= 15 * 3600 + 55 * 60) {
     updatedBracket.status = "CLOSED";
     const closingQty = updatedBracket.remainingContracts;
     updatedBracket.remainingContracts = 0;
@@ -197,24 +211,28 @@ export function evaluateOcoBrackets(params: {
   }
 
   // --------------------------------------------------------------------------
-  // RULE 3: Target 2 Full Exit (For 2-Contract Runner Position)
+  // RULE 3: Target 2 Full Exit (For Runner Position OR Gap-Over TP1+TP2)
   // --------------------------------------------------------------------------
-  if (
-    updatedBracket.status === "PARTIAL_TP1_FILLED" &&
-    (liveBid >= updatedBracket.tp2LimitPrice ||
-      (isCall && underlyingSpot >= config.target2Spot) ||
-      (!isCall && underlyingSpot <= config.target2Spot) ||
-      pnlPct >= (config.tp2TargetPct || 60))
-  ) {
+  const isTp2Hit =
+    liveBid >= updatedBracket.tp2LimitPrice ||
+    (isCall && underlyingSpot >= config.target2Spot) ||
+    (!isCall && underlyingSpot <= config.target2Spot) ||
+    pnlPct >= (config.tp2TargetPct || 60);
+
+  if (isTp2Hit && (updatedBracket.status === "PARTIAL_TP1_FILLED" || updatedBracket.status === "ARMED")) {
+    const isGapOver = updatedBracket.status === "ARMED";
     updatedBracket.status = "CLOSED";
+    const closingQty = updatedBracket.remainingContracts;
     updatedBracket.remainingContracts = 0;
     return {
       action: "EXIT_TP2",
       triggered: true,
-      reason: `TARGET 2 HIT · SELL FINAL RUNNER @ $${liveBid.toFixed(2)} (+${pnlPct}%)`,
+      reason: isGapOver
+        ? `TARGET 2 HIT (GAP-OVER) · FULL EXIT ALL ${closingQty} CONTRACTS @ $${liveBid.toFixed(2)} (+${pnlPct}%)`
+        : `TARGET 2 HIT · SELL FINAL RUNNER @ $${liveBid.toFixed(2)} (+${pnlPct}%)`,
       exitPrice: liveBid,
       pnlPct,
-      contractsToClose: 1,
+      contractsToClose: closingQty,
       updatedBracket,
     };
   }
