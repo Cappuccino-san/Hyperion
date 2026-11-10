@@ -1,6 +1,5 @@
 import { create } from "zustand";
 import {
-  buildSimulatedAnalyticsPayload,
   type ComputedStrikeRow,
   type DataSourceType,
   type ExpectedMovesPayload,
@@ -680,28 +679,27 @@ export interface DashboardState {
 
 const defaultPreset = TICKER_PRESETS.SPY;
 const defaultKing = buildKingNodeMetrics(defaultPreset, "0DTE");
-const initialSimulated = buildSimulatedAnalyticsPayload("SPY");
 
 export const useDashboardStore = create<DashboardState>((set, get) => ({
   activeView: "Heatmap",
   activeTicker: defaultPreset.ticker,
-  dataSource: "SIMULATED",
+  dataSource: "CBOE_MARKET_DATA",
   connectionStatus: "LIVE",
   isStaleSnapshot: false,
-  isLoadingChain: false,
+  isLoadingChain: true,
   liveTickPrice: null,
   liveTickTimestamp: 0,
   liveTickDirection: "flat",
   liveTickCount: 0,
   toastMessage: null,
-  lastUpdated: "19:04 UTC",
+  lastUpdated: "--:-- ET",
   bookTimestamp: null,
   spotPrice: defaultPreset.spotPrice,
   previousClose: defaultPreset.previousClose,
   impliedVolatility: defaultPreset.impliedVolatility,
   strikeStep: defaultPreset.strikeStep,
   extendedQuote: null,
-  expectedMoves: initialSimulated.expectedMoves ?? null,
+  expectedMoves: null,
   netMetrics: { ...defaultPreset.netMetrics },
   allExpNetMetrics: { ...defaultPreset.netMetrics },
   gammaLevels: { ...defaultPreset.gammaLevels },
@@ -710,20 +708,14 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   kingNode: defaultKing,
   allExpKingNode: defaultKing,
   kingByFilter: null,
-  chainExpirations: initialSimulated.expirations,
-  chainStrikes: initialSimulated.strikes,
+  chainExpirations: [],
+  chainStrikes: [],
   gridFilters: {
     metric: "GEX",
     expiration: "ALL",
   },
   alerts: [],
-  intradayData: generateIntradayTrajectory({
-    ticker: defaultPreset.ticker,
-    spotPrice: defaultPreset.spotPrice,
-    previousClose: defaultPreset.previousClose,
-    gammaLevels: defaultPreset.gammaLevels,
-    strikeStep: defaultPreset.strikeStep,
-  }),
+  intradayData: [],
   flowGammaVwapData: {
     flowVwap: defaultPreset.spotPrice,
     upper1s: Number((defaultPreset.spotPrice + 1.25).toFixed(2)),
@@ -1402,7 +1394,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       if (!res.ok) {
         // If we already have live data for this ticker, retain the last verified valid snapshot!
         const state = get();
-        if (state.activeTicker === targetTicker && state.chainStrikes.length > 0 && state.dataSource !== "SIMULATED") {
+        if (state.activeTicker === targetTicker && state.chainStrikes.length > 0) {
           set({
             isLoadingChain: false,
             connectionStatus: "SYNCING",
@@ -1412,14 +1404,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
           return;
         }
 
-        const fallback = buildSimulatedAnalyticsPayload(targetTicker);
-        get().hydrateFromMarketData(fallback);
+        // Live-only guarantee: never fall back to simulated mock data
         set({
           isLoadingChain: false,
-          connectionStatus: "OFFLINE",
+          connectionStatus: "SYNCING",
           isStaleSnapshot: false,
           toastMessage: showToastOnError
-            ? `Options feed connected (offline model for ${targetTicker})`
+            ? `Syncing live market data for ${targetTicker}...`
             : null,
         });
         return;
@@ -1427,8 +1418,8 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       const payload: OptionsAnalyticsPayload = await res.json();
       get().hydrateFromMarketData(payload);
 
-      const status: "LIVE" | "SYNCING" | "RECONNECTING" | "OFFLINE" =
-        payload.connectionStatus ?? (payload.isStale ? "SYNCING" : payload.dataSource === "SIMULATED" ? "OFFLINE" : "LIVE");
+      const status: "LIVE" | "SYNCING" | "RECONNECTING" =
+        payload.connectionStatus === "SYNCING" || payload.isStale ? "SYNCING" : "LIVE";
 
       set({
         isLoadingChain: false,
@@ -1439,7 +1430,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     } catch {
       // Network fetch failure: if valid data exists, serve last verified valid snapshot with SYNCING indicator
       const state = get();
-      if (state.activeTicker === targetTicker && state.chainStrikes.length > 0 && state.dataSource !== "SIMULATED") {
+      if (state.activeTicker === targetTicker && state.chainStrikes.length > 0) {
         set({
           isLoadingChain: false,
           connectionStatus: "SYNCING",
@@ -1449,14 +1440,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
             : null,
         });
       } else {
-        const fallback = buildSimulatedAnalyticsPayload(targetTicker);
-        get().hydrateFromMarketData(fallback);
         set({
           isLoadingChain: false,
-          connectionStatus: "OFFLINE",
+          connectionStatus: "SYNCING",
           isStaleSnapshot: false,
           toastMessage: showToastOnError
-            ? `Operating in offline options simulation for ${targetTicker}`
+            ? `Syncing live market data for ${targetTicker}...`
             : null,
         });
       }

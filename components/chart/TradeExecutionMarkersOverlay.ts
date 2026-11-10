@@ -2,7 +2,7 @@
  * On-Chart Trade Execution Markers & PnL Badges Renderer
  *
  * Plots live and closed quantitative engine trades (`BTO` and `STC`) directly onto
- * the candlestick canvas (`AtlasView.tsx`, `GaiaView.tsx`, and `AntaeusCanvas.tsx`).
+ * the candlestick canvas (`GaiaView.tsx`).
  *
  * Layers Rendered:
  * 1. Trade Trajectory Line:

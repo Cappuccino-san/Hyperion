@@ -7,7 +7,7 @@ import {
   TickerPreset,
 } from "@/lib/tickerPresets";
 
-export type DataSourceType = "TRADIER_LIVE" | "CBOE_MARKET_DATA" | "SIMULATED";
+export type DataSourceType = "TRADIER_LIVE" | "CBOE_MARKET_DATA" | "ROBINHOOD_LIVE";
 
 export interface NormalizedOptionContract {
   symbol: string;
@@ -1288,88 +1288,5 @@ export function computeOptionsAnalytics(params: {
     expirations,
     strikes: strikesDesc,
   };
-}
-
-/**
- * Tier 3: Deterministic Fallback generator when offline or live market data is unreachable
- */
-export function buildSimulatedAnalyticsPayload(
-  ticker: TickerSymbol,
-  activeExpirationFilter = "0DTE"
-): OptionsAnalyticsPayload {
-  const preset = getTickerPreset(ticker);
-  const step = preset.strikeStep;
-  const centerStrike = Math.round(preset.spotPrice / step) * step;
-  const halfRows = Math.min(110, Math.max(40, Math.round((preset.spotPrice * 0.15) / step)));
-
-  const simExpirations = [
-    "2026-10-23",
-    "2026-10-26",
-    "2026-10-27",
-    "2026-10-28",
-    "2026-10-29",
-    "2026-10-30",
-    "2026-11-06",
-    "2026-11-13",
-    "2026-11-20",
-    "2026-11-27",
-    "2026-12-18",
-    "2027-01-15",
-  ];
-
-  const contracts: NormalizedOptionContract[] = [];
-  for (let i = -halfRows; i <= halfRows; i++) {
-    const strike = centerStrike + i * step;
-    if (strike <= 0) continue;
-
-    simExpirations.forEach((exp, expIdx) => {
-      const distCall = Math.abs(strike - preset.gammaLevels.callWall) / (step * 8);
-      const distPut = Math.abs(strike - preset.gammaLevels.putWall) / (step * 8);
-      const callBell = Math.exp(-distCall * distCall);
-      const putBell = Math.exp(-distPut * distPut);
-      const dteScale = expIdx === 0 ? 1.4 : expIdx === 4 ? 1.7 : 0.9;
-
-      const callOI = Math.round((800 + callBell * 18000) * dteScale);
-      const putOI = Math.round((800 + putBell * 17000) * dteScale);
-
-      contracts.push({
-        symbol: `${ticker}_${exp}_C_${strike}`,
-        expiration: exp,
-        optionType: "C",
-        strike,
-        openInterest: callOI,
-        volume: Math.round(callOI * 0.4),
-        iv: preset.impliedVolatility,
-        delta: 0,
-        gamma: 0,
-        vega: 0,
-        percentChange: Math.round((callBell - 0.3) * 28),
-      });
-
-      contracts.push({
-        symbol: `${ticker}_${exp}_P_${strike}`,
-        expiration: exp,
-        optionType: "P",
-        strike,
-        openInterest: putOI,
-        volume: Math.round(putOI * 0.4),
-        iv: preset.impliedVolatility,
-        delta: 0,
-        gamma: 0,
-        vega: 0,
-        percentChange: Math.round((putBell - 0.3) * 24),
-      });
-    });
-  }
-
-  return computeOptionsAnalytics({
-    ticker,
-    dataSource: "SIMULATED",
-    spotPrice: preset.spotPrice,
-    previousClose: preset.previousClose,
-    impliedVolatility: preset.impliedVolatility,
-    contracts,
-    activeExpirationFilter,
-  });
 }
 

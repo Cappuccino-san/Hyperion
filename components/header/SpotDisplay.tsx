@@ -37,7 +37,6 @@ export function SpotDisplay() {
     connectionStatus === "SYNCING" ||
     connectionStatus === "RECONNECTING" ||
     isStaleSnapshot;
-  const isSimulated = dataSource === "SIMULATED";
 
   const sourceBadge = isLoadingChain
     ? {
@@ -57,17 +56,11 @@ export function SpotDisplay() {
             className:
               "bg-emerald-500/15 text-emerald-300 border-emerald-400/40",
           }
-        : isSimulated
-          ? {
-              label: "OFFLINE SIM",
-              className:
-                "bg-amber-500/15 text-amber-300 border-amber-400/40",
-            }
-          : {
-              label: "LIVE",
-              className:
-                "bg-emerald-500/15 text-emerald-300 border-emerald-400/40",
-            };
+        : {
+            label: "LIVE",
+            className:
+              "bg-emerald-500/15 text-emerald-300 border-emerald-400/40",
+          };
 
   return (
     <div className="argon-card rounded-xl p-4 space-y-2">
@@ -157,9 +150,7 @@ export function SpotDisplay() {
                 ? "bg-cyan-500/15 border-cyan-400/40"
                 : isSyncing
                   ? "bg-amber-500/15 border-amber-400/40"
-                  : isSimulated
-                    ? "bg-slate-800/80 border-slate-700"
-                    : "bg-emerald-500/15 border-emerald-400/40"
+                  : "bg-emerald-500/15 border-emerald-400/40"
             )}
           >
             <span className="relative flex h-2 w-2">
@@ -170,9 +161,7 @@ export function SpotDisplay() {
                     ? "bg-cyan-400"
                     : isSyncing
                       ? "bg-amber-400"
-                      : isSimulated
-                        ? "bg-slate-400"
-                        : "bg-emerald-400"
+                      : "bg-emerald-400"
                 )}
               />
               <span
@@ -182,9 +171,7 @@ export function SpotDisplay() {
                     ? "bg-cyan-400"
                     : isSyncing
                       ? "bg-amber-400"
-                      : isSimulated
-                        ? "bg-slate-400"
-                        : "bg-emerald-400"
+                      : "bg-emerald-400"
                 )}
               />
             </span>
@@ -195,9 +182,7 @@ export function SpotDisplay() {
                   ? "text-cyan-300"
                   : isSyncing
                     ? "text-amber-300 font-extrabold"
-                    : isSimulated
-                      ? "text-slate-400"
-                      : "text-emerald-300"
+                    : "text-emerald-300"
               )}
             >
               {isLoadingChain
@@ -206,9 +191,7 @@ export function SpotDisplay() {
                   : "CONNECTING"
                 : isSyncing
                   ? "LIVE (SYNCING)"
-                  : isSimulated
-                    ? "OFFLINE"
-                    : "LIVE"}
+                  : "LIVE"}
             </span>
           </div>
 
