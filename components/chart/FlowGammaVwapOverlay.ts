@@ -168,7 +168,7 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
   }
 
   // -------------------------------------------------------------
-  // 1. 3-Tier Volumetric Golden-Amber Flux Corridor (Benchmark Image 1)
+  // 1. Subtle Regime-Tinted Flux Field Corridor (Alpha capped 0.06 - 0.12 max)
   // -------------------------------------------------------------
   if (showShading && validLimit >= 1) {
     ctx.save();
@@ -188,13 +188,40 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
       bottomMaxY = chartHeight - padBottom;
     }
 
-    // Tier 1A: Base Full Corridor (-2σ to +2σ) Warm Amber Gradient
+    // Determine dynamic regime polarity tint from active Flux snapshot
+    const rawChi =
+      (activePt as FlowGammaVwapSnapshot & { chi?: number; callPutFlowRatio?: number }).chi ??
+      (activePt.spot >= activePt.flowVwap ? 0.56 : 0.44);
+    const isExhaustion =
+      activePt.spot >= (activePt.upper2s ?? activePt.upper2Sigma) ||
+      activePt.spot <= (activePt.lower2s ?? activePt.lower2Sigma);
+
+    let edgeColor = "rgba(251, 191, 36, 0.11)"; // Subtle amber near neutral / exhaustion
+    let midColor = "rgba(245, 158, 11, 0.08)";
+    let coreColor = "rgba(217, 119, 6, 0.06)";
+    let cushionFill = "rgba(251, 191, 36, 0.04)";
+
+    if (!isExhaustion && rawChi > 0.52) {
+      // Bullish Flux (χ > 0.50): Emerald / Cyan translucent tint
+      edgeColor = "rgba(34, 211, 238, 0.12)";
+      midColor = "rgba(16, 185, 129, 0.09)";
+      coreColor = "rgba(16, 185, 129, 0.06)";
+      cushionFill = "rgba(34, 211, 238, 0.04)";
+    } else if (!isExhaustion && rawChi < 0.48) {
+      // Bearish Flux (χ < 0.50): Crimson / Violet translucent tint
+      edgeColor = "rgba(192, 132, 252, 0.12)";
+      midColor = "rgba(244, 63, 94, 0.09)";
+      coreColor = "rgba(244, 63, 94, 0.06)";
+      cushionFill = "rgba(244, 63, 94, 0.04)";
+    }
+
+    // Tier 1A: Base Full Corridor (-2σ to +2σ) Institutional Translucent Gradient
     const corridorGrad = ctx.createLinearGradient(0, topMinY, 0, bottomMaxY);
-    corridorGrad.addColorStop(0.0, "rgba(251, 191, 36, 0.28)");
-    corridorGrad.addColorStop(0.22, "rgba(245, 158, 11, 0.16)");
-    corridorGrad.addColorStop(0.5, "rgba(217, 119, 6, 0.08)");
-    corridorGrad.addColorStop(0.78, "rgba(245, 158, 11, 0.16)");
-    corridorGrad.addColorStop(1.0, "rgba(251, 191, 36, 0.28)");
+    corridorGrad.addColorStop(0.0, edgeColor);
+    corridorGrad.addColorStop(0.24, midColor);
+    corridorGrad.addColorStop(0.5, coreColor);
+    corridorGrad.addColorStop(0.76, midColor);
+    corridorGrad.addColorStop(1.0, edgeColor);
 
     ctx.beginPath();
     for (let i = 0; i <= validLimit; i++) {
@@ -212,7 +239,7 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     ctx.fillStyle = corridorGrad;
     ctx.fill();
 
-    // Tier 1B: Upper Golden Exhaustion Cushion Ribbon (+1σ to +2σ)
+    // Tier 1B: Upper Cushion Ribbon (+1σ to +2σ)
     ctx.beginPath();
     for (let i = 0; i <= validLimit; i++) {
       const x = barToX(i);
@@ -226,10 +253,10 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
       ctx.lineTo(x, y);
     }
     ctx.closePath();
-    ctx.fillStyle = "rgba(251, 191, 36, 0.22)";
+    ctx.fillStyle = cushionFill;
     ctx.fill();
 
-    // Tier 1C: Lower Golden Exhaustion Cushion Ribbon (-1σ to -2σ)
+    // Tier 1C: Lower Cushion Ribbon (-1σ to -2σ)
     ctx.beginPath();
     for (let i = 0; i <= validLimit; i++) {
       const x = barToX(i);
@@ -243,23 +270,21 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
       ctx.lineTo(x, y);
     }
     ctx.closePath();
-    ctx.fillStyle = "rgba(251, 191, 36, 0.22)";
+    ctx.fillStyle = cushionFill;
     ctx.fill();
 
     ctx.restore();
   }
 
   // -------------------------------------------------------------
-  // 2. Dispersion Contours (Luminous ±2σ Gold Walls & ±1σ Dashed Amber)
+  // 2. Dispersion Contours (Fine Dotted ±1σ / ±2σ Flux Boundaries)
   // -------------------------------------------------------------
   if (showBands) {
-    // A. Outer Bands (±2σ): Luminous Golden Walls with ambient blur
+    // A. Outer Bands (±2σ): Fine dotted institutional boundary
     ctx.save();
-    ctx.strokeStyle = "rgba(251, 191, 36, 0.88)";
-    ctx.lineWidth = 1.65;
-    ctx.shadowColor = "rgba(245, 158, 11, 0.45)";
-    ctx.shadowBlur = 6;
-    ctx.setLineDash([]);
+    ctx.strokeStyle = "rgba(251, 191, 36, 0.35)";
+    ctx.lineWidth = 1.0;
+    ctx.setLineDash([2, 3]);
 
     // +2 sigma
     ctx.beginPath();
@@ -282,11 +307,11 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     ctx.stroke();
     ctx.restore();
 
-    // B. Inner Bands (±1σ): Warm Amber Dashed Envelope
+    // B. Inner Bands (±1σ): Fine dotted envelope
     ctx.save();
-    ctx.strokeStyle = "rgba(253, 224, 71, 0.58)";
-    ctx.lineWidth = 1.15;
-    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = "rgba(251, 191, 36, 0.35)";
+    ctx.lineWidth = 1.0;
+    ctx.setLineDash([2, 3]);
 
     // +1 sigma
     ctx.beginPath();
@@ -327,12 +352,12 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
-    ctx.lineWidth = 5.0;
-    ctx.strokeStyle = "rgba(245, 158, 11, 0.28)";
+    ctx.lineWidth = 3.5;
+    ctx.strokeStyle = "rgba(245, 158, 11, 0.18)";
     ctx.stroke();
 
     // Pass 2: Crisp luminous golden-amber core
-    ctx.lineWidth = 2.1;
+    ctx.lineWidth = 1.65;
     ctx.strokeStyle = "#fbbf24";
     ctx.beginPath();
     for (let i = 0; i <= validLimit; i++) {

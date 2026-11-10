@@ -10,8 +10,6 @@ import {
 import {
   drawFlowGammaVwapOverlay,
   ConfluenceLevel,
-  StrikeNodeOverlayItem,
-  ReferenceBadgeItem,
 } from "@/components/chart/FlowGammaVwapOverlay";
 import {
   GaiaCallPutBiasHud,
@@ -1443,8 +1441,213 @@ export function GaiaView() {
       }
     }
 
-    // Key level calculations preserved for math anchors (continuous strike lines stripped)
+    // Determine Zero Gamma level (store gammaLevels or exact exposure sign-crossing interpolation)
+    let zeroGammaLevel =
+      gammaLevels?.zeroGamma && gammaLevels.zeroGamma > 0 ? gammaLevels.zeroGamma : 0;
+    if (zeroGammaLevel <= 0 && dataset.visibleStrikes.length > 1) {
+      const ascStrikes = [...dataset.visibleStrikes].sort((a, b) => a - b);
+      const refSpot = dataset.candles[safeActiveIdx]?.close ?? dataset.priorClose;
+      let bestDist = Infinity;
+      for (let i = 0; i < ascStrikes.length - 1; i++) {
+        const s1 = ascStrikes[i];
+        const s2 = ascStrikes[i + 1];
+        const v1 = activeBookCol.strikeValues[s1] ?? 0;
+        const v2 = activeBookCol.strikeValues[s2] ?? 0;
+        if ((v1 <= 0 && v2 >= 0) || (v1 >= 0 && v2 <= 0)) {
+          const denom = Math.abs(v1) + Math.abs(v2);
+          const cross = denom > 0 ? s1 + (Math.abs(v1) / denom) * (s2 - s1) : (s1 + s2) / 2;
+          const d = Math.abs(cross - refSpot);
+          if (d < bestDist) {
+            bestDist = d;
+            zeroGammaLevel = cross;
+          }
+        }
+      }
+    }
+
+    // =========================================================================
+    // LAYER 1A: Crisp Dotted Institutional Structural Levels (`padLeft` -> `dividerX`)
+    // =========================================================================
+    interface StructuralLineSpec {
+      price: number;
+      stroke: string;
+      dash: number[];
+      lineWidth: number;
+      label: string;
+      textColor: string;
+      priority: number;
+    }
+
+    const dayPlus1 = dataset.priorClose + dataset.sigma1Move;
+    const dayMinus1 = dataset.priorClose - dataset.sigma1Move;
+    const pdhPrice =
+      (livePayload as (GaiaLivePayload & { pdh?: number }) | null)?.pdh ??
+      dataset.priorClose;
+    const pdlPrice =
+      (livePayload as (GaiaLivePayload & { pdl?: number }) | null)?.pdl ??
+      (dataset.priorClose - dataset.sigma1Move * 0.65);
+
+    const structuralSpecs: StructuralLineSpec[] = [];
+
+    // 1. All-Exp King & Active Filtered King Node
+    if (allExpKingStrike > 0) {
+      structuralSpecs.push({
+        price: allExpKingStrike,
+        stroke: "rgba(250, 204, 21, 0.75)",
+        dash: [4, 4],
+        lineWidth: 1.25,
+        label: `KING ${allExpKingStrike}`,
+        textColor: "#facc15",
+        priority: 100,
+      });
+    }
+    if (filteredKingStrike > 0 && filteredKingStrike !== allExpKingStrike) {
+      structuralSpecs.push({
+        price: filteredKingStrike,
+        stroke: "rgba(250, 204, 21, 0.75)",
+        dash: [4, 4],
+        lineWidth: 1.25,
+        label: `KING ${filteredKingStrike}`,
+        textColor: "#facc15",
+        priority: 95,
+      });
+    }
+
+    // 2. Call Wall
+    if (callWallStrike > 0 && maxCallVal > 0) {
+      structuralSpecs.push({
+        price: callWallStrike,
+        stroke: "rgba(34, 211, 238, 0.65)",
+        dash: [3, 3],
+        lineWidth: 1.0,
+        label: `CALL WALL ${callWallStrike}`,
+        textColor: "#22d3ee",
+        priority: 85,
+      });
+    }
+
+    // 3. Put Wall
+    if (putWallStrike > 0 && maxPutVal < 0) {
+      structuralSpecs.push({
+        price: putWallStrike,
+        stroke: "rgba(192, 132, 252, 0.65)",
+        dash: [3, 3],
+        lineWidth: 1.0,
+        label: `PUT WALL ${putWallStrike}`,
+        textColor: "#c084fc",
+        priority: 85,
+      });
+    }
+
+    // 4. Zero Gamma
+    if (zeroGammaLevel > 0) {
+      structuralSpecs.push({
+        price: zeroGammaLevel,
+        stroke: "rgba(248, 250, 252, 0.70)",
+        dash: [5, 4],
+        lineWidth: 1.15,
+        label: `ZERO Γ ${zeroGammaLevel.toFixed(1)}`,
+        textColor: "#f8fafc",
+        priority: 90,
+      });
+    }
+
+    // 5. Expected Move Bounds (+1σ / -1σ / PDH / PDL)
+    const mutedRefLevels: Array<{ price: number; tag: string }> = [
+      { price: dayPlus1, tag: "+1σ" },
+      { price: dayMinus1, tag: "-1σ" },
+      { price: pdhPrice, tag: "PDH" },
+      { price: pdlPrice, tag: "PDL" },
+    ];
+    for (const ref of mutedRefLevels) {
+      if (ref.price > 0) {
+        structuralSpecs.push({
+          price: ref.price,
+          stroke: "rgba(148, 163, 184, 0.35)",
+          dash: [2, 4],
+          lineWidth: 1.0,
+          label: ref.tag,
+          textColor: "rgba(148, 163, 184, 0.78)",
+          priority: 40,
+        });
+      }
+    }
+
+    // Group co-located strikes (e.g., KING == CALL WALL) and de-collide micro-labels
+    structuralSpecs.sort((a, b) => b.priority - a.priority);
+    const mergedLines: Array<StructuralLineSpec & { y: number }> = [];
+    for (const spec of structuralSpecs) {
+      const y = Math.round(priceToY(spec.price)) + 0.5;
+      if (y < padTop + 6 || y > height - padBottom - 6) continue;
+      const samePrice = mergedLines.find((m) => Math.abs(m.price - spec.price) < 0.05);
+      if (samePrice) {
+        if (
+          spec.priority >= 80 &&
+          !samePrice.label.includes(spec.label.split(" ")[0])
+        ) {
+          samePrice.label = `${samePrice.label} · ${spec.label.replace(/\s+\d+(\.\d+)?$/, "")}`;
+        }
+        continue;
+      }
+      mergedLines.push({ ...spec, y });
+    }
+
+    ctx.save();
+    ctx.font = "bold 9px ui-monospace, SFMono-Regular, Menlo, monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "bottom";
+    const occupiedLabelYs: number[] = [];
+
+    for (const ln of mergedLines) {
+      ctx.strokeStyle = ln.stroke;
+      ctx.lineWidth = ln.lineWidth;
+      ctx.setLineDash(ln.dash);
+      ctx.beginPath();
+      ctx.moveTo(padLeft, ln.y);
+      ctx.lineTo(dividerX, ln.y);
+      ctx.stroke();
+
+      const collides = occupiedLabelYs.some((oy) => Math.abs(oy - ln.y) < 11);
+      if (!collides) {
+        ctx.fillStyle = ln.textColor;
+        ctx.fillText(ln.label, dividerX - 6, ln.y - 2);
+        occupiedLabelYs.push(ln.y);
+      }
+    }
+    ctx.restore();
     ctx.setLineDash([]);
+
+    // =========================================================================
+    // LAYER 1B: Flow Gamma VWAP Flux Field Corridor (Rendered behind candlesticks)
+    // =========================================================================
+    if (flowVwapPoints.length > 0) {
+      const confluenceLevels: ConfluenceLevel[] =
+        allExpKingStrike > 0 ? [{ name: "King Node", strike: allExpKingStrike }] : [];
+
+      drawFlowGammaVwapOverlay({
+        ctx,
+        points: flowVwapPoints,
+        safeActiveIdx,
+        barToX,
+        priceToY,
+        padLeft,
+        plotRightX: dividerX,
+        padTop,
+        padBottom,
+        chartHeight: height,
+        rightAxisWidth,
+        confluenceLevels,
+        showCenterline: true,
+        showBands: true,
+        showShading: true,
+        showConfluenceMarkers: false,
+        showRightAxisBadge: false,
+        strikeNodes: [],
+        referenceBadges: [],
+        showBeadedStrikes: false,
+        candles: dataset.candles,
+      });
+    }
 
     // Strike step and Proximity scale for moneyflow calculation
     const strikeStep = dataset.visibleStrikes.length > 1
@@ -1576,109 +1779,7 @@ export function GaiaView() {
       );
     }
 
-    // Flow VWAP x Gamma & Dynamic Dispersion Bands Overlay
-    if (flowVwapPoints.length > 0) {
-      const curKingStrike = dataset.columnsByBar[safeActiveIdx]?.allExpKingStrike ?? 0;
-      const confluenceLevels: ConfluenceLevel[] = [];
-      if (curKingStrike > 0) {
-        confluenceLevels.push({ name: "King Node", strike: curKingStrike });
-      }
 
-      // Collect Top-K Strike Nodes for Wick Reticles and Confluence (Strictly bounded from activeNodeMap)
-      const overlayStrikeNodes: StrikeNodeOverlayItem[] = [];
-      Array.from(activeNodeMap.entries()).forEach(([st, meta]) => {
-        overlayStrikeNodes.push({
-          strike: st,
-          y: priceToY(st),
-          weight: Math.min(1, Math.abs(meta.val) / (maxSessionExposure * 0.5)),
-          isKing: meta.isKing,
-          polarity: meta.isKing || meta.isCallWall || meta.val >= 0 ? "call" : "put",
-        });
-      });
-
-      // Contextual Reference Badges (PDH, PMH, PML, Day ±1σ)
-      const pmCandles = dataset.candles.filter((c) => c.timeLabel && c.timeLabel < "09:30");
-      const pmh = pmCandles.length > 0 ? Math.max(...pmCandles.map((c) => c.high)) : null;
-      const pml = pmCandles.length > 0 ? Math.min(...pmCandles.map((c) => c.low)) : null;
-      const dayPlus1 = dataset.priorClose + dataset.sigma1Move;
-      const dayMinus1 = dataset.priorClose - dataset.sigma1Move;
-
-      const referenceBadges: ReferenceBadgeItem[] = [];
-      if (dayPlus1 > 0) {
-        referenceBadges.push({
-          label: `Day +1σ ${dayPlus1.toFixed(1)}`,
-          price: dayPlus1,
-          bg: "#111422",
-          border: "#38bdf8",
-          text: "#38bdf8",
-          lineColor: "rgba(56, 189, 248, 0.45)",
-        });
-      }
-      if (pmh && pmh > 0) {
-        referenceBadges.push({
-          label: `PMH ${pmh.toFixed(1)}`,
-          price: pmh,
-          bg: "#111422",
-          border: "#fbbf24",
-          text: "#fbbf24",
-          lineColor: "rgba(251, 191, 36, 0.45)",
-        });
-      }
-      if (dataset.priorClose > 0) {
-        referenceBadges.push({
-          label: `PDH ${dataset.priorClose.toFixed(1)}`,
-          price: dataset.priorClose,
-          bg: "#111422",
-          border: "#cbd5e1",
-          text: "#cbd5e1",
-          lineColor: "rgba(148, 163, 184, 0.45)",
-        });
-      }
-      if (pml && pml > 0) {
-        referenceBadges.push({
-          label: `PML ${pml.toFixed(1)}`,
-          price: pml,
-          bg: "#111422",
-          border: "#f43f5e",
-          text: "#f43f5e",
-          lineColor: "rgba(244, 63, 94, 0.45)",
-        });
-      }
-      if (dayMinus1 > 0) {
-        referenceBadges.push({
-          label: `Day -1σ ${dayMinus1.toFixed(1)}`,
-          price: dayMinus1,
-          bg: "#111422",
-          border: "#c084fc",
-          text: "#c084fc",
-          lineColor: "rgba(192, 132, 252, 0.45)",
-        });
-      }
-
-      drawFlowGammaVwapOverlay({
-        ctx,
-        points: flowVwapPoints,
-        safeActiveIdx,
-        barToX,
-        priceToY,
-        padLeft: 18,
-        plotRightX: dividerX,
-        padTop: 36,
-        padBottom: 24,
-        chartHeight: height,
-        rightAxisWidth: 64,
-        confluenceLevels,
-        showCenterline: true,
-        showBands: false,
-        showShading: false,
-        showConfluenceMarkers: false,
-        showRightAxisBadge: false,
-        strikeNodes: [],
-        referenceBadges: [], // Zero badge collision over active price candles; levels anchor to Y-axis gutter
-        showBeadedStrikes: false,
-        candles: dataset.candles,
-      });
-    }
 
     // Non-Repainting 3-Left / 3-Right Pivot Divergence Lines & Triangles
     const drawTriangle = (tx: number, ty: number, isBull: boolean, isNearLevel: boolean = false) => {
@@ -2294,6 +2395,8 @@ export function GaiaView() {
     hudTradeSignals,
     effectiveServerTrades,
     przmHudSignals,
+    gammaLevels?.zeroGamma,
+    livePayload,
   ]);
 
   const isSma34Bullish = activeCandle
