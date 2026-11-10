@@ -986,7 +986,26 @@ export function computeOptionsAnalytics(params: {
       c.openInterest > 0 ? c.openInterest : Math.round(c.volume * 0.35);
     if (oi <= 0) continue;
     const days = isoToDays.get(c.expiration) ?? 0;
-    const T = Math.max(1 / 365, days / 365);
+    let T: number;
+    if (days === 0) {
+      // For 0DTE, compute true intraday fraction to 16:00 ET close using timezone-aware ET formatting
+      const now = new Date();
+      const etFormatter = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      const parts = etFormatter.formatToParts(now);
+      const etHour = Number(parts.find((p) => p.type === "hour")?.value ?? 9);
+      const etMin = Number(parts.find((p) => p.type === "minute")?.value ?? 30);
+      const currentEtMinutes = etHour * 60 + etMin;
+      const closeEtMinutes = 16 * 60; // 16:00 ET
+      const remainingMin = Math.max(5, Math.min(390, closeEtMinutes - currentEtMinutes));
+      T = remainingMin / (252 * 390);
+    } else {
+      T = Math.max(1 / 365, days / 365);
+    }
     const iv =
       c.iv > 0.02
         ? c.iv > 4

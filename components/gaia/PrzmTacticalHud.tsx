@@ -137,38 +137,48 @@ export function evaluatePrzmCallLedger(
   series: PrzmCandlePoint[],
   liveSpot: number,
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE",
-  serverTrades?: ServerTradeData
+  serverTrades?: ServerTradeData,
+  ticker = "SPY"
 ): PrzmLedgerSummary {
-  const storeState = useDashboardStore.getState();
+  const normTicker = (ticker || "SPY").trim().toUpperCase();
+  const storeState = serverTrades === undefined ? useDashboardStore.getState() : null;
   const rawClosed =
-    Array.isArray(serverTrades?.closedPositions) && serverTrades!.closedPositions.length > 0
+    Array.isArray(serverTrades?.closedPositions)
       ? serverTrades!.closedPositions
-      : Array.isArray(storeState.serverClosedTrades)
-        ? storeState.serverClosedTrades
+      : Array.isArray(storeState?.serverClosedTrades)
+        ? storeState!.serverClosedTrades
         : [];
   const rawActiveObj =
-    serverTrades?.activePositions && Object.keys(serverTrades.activePositions).length > 0
+    serverTrades?.activePositions
       ? serverTrades.activePositions
-      : storeState.serverActivePositions || {};
+      : storeState?.serverActivePositions || {};
   const rawAlerts =
-    Array.isArray(serverTrades?.alerts) && serverTrades!.alerts.length > 0
+    Array.isArray(serverTrades?.alerts)
       ? serverTrades!.alerts
-      : Array.isArray(storeState.serverTradeAlerts)
-        ? storeState.serverTradeAlerts
+      : Array.isArray(storeState?.serverTradeAlerts)
+        ? storeState!.serverTradeAlerts
         : [];
 
   // Reconstruct closed trades from alerts if closedPositions is empty but a SELL_TO_CLOSE alert exists
-  const serverClosed = [...rawClosed];
+  const serverClosed = [...rawClosed].filter(
+    (pos: any) => pos && (!pos.ticker || pos.ticker.toUpperCase() === normTicker)
+  );
   if (serverClosed.length === 0 && rawAlerts.length > 0) {
-    const stcAlerts = rawAlerts.filter((a: any) => a && a.action === "SELL_TO_CLOSE");
+    const stcAlerts = rawAlerts.filter(
+      (a: any) => a && a.action === "SELL_TO_CLOSE" && (!a.ticker || a.ticker.toUpperCase() === normTicker)
+    );
     for (const stc of stcAlerts) {
       const baseId = String(stc.id || "").replace(/-stc.*$/, "");
       const bto = rawAlerts.find(
-        (a: any) => a && a.action === "BUY_TO_OPEN" && String(a.id || "").startsWith(baseId)
+        (a: any) =>
+          a &&
+          a.action === "BUY_TO_OPEN" &&
+          String(a.id || "").startsWith(baseId) &&
+          (!a.ticker || a.ticker.toUpperCase() === normTicker)
       );
       serverClosed.push({
         id: baseId || stc.id,
-        ticker: stc.ticker || bto?.ticker || "SPY",
+        ticker: stc.ticker || bto?.ticker || normTicker,
         contractType: stc.contractType || bto?.contractType || "PUT",
         contractLabel: stc.contractLabel || bto?.contractLabel,
         status: "CLOSED",
@@ -190,6 +200,7 @@ export function evaluatePrzmCallLedger(
     (pos: any) =>
       pos &&
       pos.id &&
+      (!pos.ticker || pos.ticker.toUpperCase() === normTicker) &&
       !closedIds.has(pos.id) &&
       pos.status !== "CLOSED" &&
       !pos.closedTs &&
@@ -462,8 +473,8 @@ export const PrzmTopDeck: React.FC<{
   serverTrades?: ServerTradeData;
 }> = ({ ticker, liveSpot, series, signals, open930, straddleEm, activeFsmState, serverTrades }) => {
   const ledger = useMemo(
-    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades),
-    [signals, series, liveSpot, activeFsmState, serverTrades]
+    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, ticker),
+    [signals, series, liveSpot, activeFsmState, serverTrades, ticker]
   );
 
   // Live 1-second clock for "TO THE BELL" radial dial
@@ -857,10 +868,11 @@ export const PrzmCallLogDeck: React.FC<{
   liveSpot: number;
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
   serverTrades?: ServerTradeData;
-}> = ({ signals, series, liveSpot, activeFsmState, serverTrades }) => {
+  ticker?: string;
+}> = ({ signals, series, liveSpot, activeFsmState, serverTrades, ticker = "SPY" }) => {
   const ledger = useMemo(
-    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades),
-    [signals, series, liveSpot, activeFsmState, serverTrades]
+    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, ticker),
+    [signals, series, liveSpot, activeFsmState, serverTrades, ticker]
   );
 
   return (

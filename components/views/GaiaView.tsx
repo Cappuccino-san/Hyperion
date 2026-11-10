@@ -914,11 +914,27 @@ export function GaiaView() {
     const lastCol = dataset.columnsByBar[dataset.columnsByBar.length - 1];
     const allExpKingStrike = lastCol?.allExpKingStrike ?? 0;
     const filteredKingStrike = lastCol?.filteredKingStrike ?? 0;
+    const activeKing = expFilter === "ALL" ? allExpKingStrike : (filteredKingStrike || allExpKingStrike);
+    const apiCallWall = gammaLevels?.callWall ?? 0;
+    const apiPutWall = gammaLevels?.putWall ?? 0;
+    const apiZeroGamma = gammaLevels?.zeroGamma ?? 0;
+
+    // Include structural gamma walls/kings within ±1.75σ so key pins are never culled
+    const maxStructuralReach = Math.max(4.0, dataset.sigma1Move * 1.75);
+    const nearStructuralNodes = [
+      allExpKingStrike,
+      activeKing,
+      apiCallWall,
+      apiPutWall,
+      apiZeroGamma,
+    ].filter((p) => p > 0 && Math.abs(p - spot) <= maxStructuralReach);
 
     if (scopePreset === "focus") {
       // Focus: tightly around candle action and spot (Image 2)
       anchorPrices = [
-        ...(expFilter === "ALL" && allExpKingStrike > 0 ? [allExpKingStrike] : []),
+        ...(activeKing > 0 && Math.abs(activeKing - spot) <= dataset.sigma1Move * 1.15 ? [activeKing] : []),
+        ...(apiCallWall > 0 && Math.abs(apiCallWall - spot) <= dataset.sigma1Move * 1.15 ? [apiCallWall] : []),
+        ...(apiPutWall > 0 && Math.abs(apiPutWall - spot) <= dataset.sigma1Move * 1.15 ? [apiPutWall] : []),
         ...candleHighs,
         ...candleLows,
         spot,
@@ -927,9 +943,9 @@ export function GaiaView() {
         dataset.priorClose - dataset.sigma1Move * 0.45,
       ];
     } else if (scopePreset === "tactical") {
-      // Tactical: candles + 1σ expected move
+      // Tactical: candles + 1σ expected move + near-field structural walls/king
       anchorPrices = [
-        ...(expFilter === "ALL" && allExpKingStrike > 0 ? [allExpKingStrike] : []),
+        ...nearStructuralNodes,
         ...candleHighs,
         ...candleLows,
         spot,
@@ -968,7 +984,7 @@ export function GaiaView() {
     const yAxisTicks = computeNicePriceTicks(yMin, yMax, 6);
 
     return { yMin, yMax, yAxisTicks };
-  }, [dataset, scopePreset, yScale, yPanOffset]);
+  }, [dataset, scopePreset, expFilter, gammaLevels, yScale, yPanOffset]);
 
   const handleLoadTicker = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -1425,21 +1441,35 @@ export function GaiaView() {
     const outlookEndX = outlookRightX - 18;
 
     // Determine Call Wall (largest positive exposure) and Put Wall (largest negative exposure)
-    let callWallStrike = allExpKingStrike;
-    let putWallStrike = allExpKingStrike;
+    // Prefer authoritative signed GEX walls from /api/options (gammaLevels), falling back to signed strike scan
+    let signedCallStrike = 0;
+    let signedPutStrike = 0;
     let maxCallVal = 0;
     let maxPutVal = 0;
     for (const s of dataset.visibleStrikes) {
       const val = activeBookCol.strikeValues[s] ?? 0;
       if (val > maxCallVal) {
         maxCallVal = val;
-        callWallStrike = s;
+        signedCallStrike = s;
       }
       if (val < maxPutVal) {
         maxPutVal = val;
-        putWallStrike = s;
+        signedPutStrike = s;
       }
     }
+    const hasSignedPutBook = maxPutVal < 0;
+    const callWallStrike =
+      gammaLevels?.callWall && gammaLevels.callWall > 0
+        ? gammaLevels.callWall
+        : hasSignedPutBook && signedCallStrike > 0
+          ? signedCallStrike
+          : 0;
+    const putWallStrike =
+      gammaLevels?.putWall && gammaLevels.putWall > 0
+        ? gammaLevels.putWall
+        : hasSignedPutBook && signedPutStrike > 0
+          ? signedPutStrike
+          : 0;
 
     // Determine Zero Gamma level (store gammaLevels or exact exposure sign-crossing interpolation)
     let zeroGammaLevel =
@@ -1514,7 +1544,7 @@ export function GaiaView() {
     }
 
     // 2. Call Wall
-    if (callWallStrike > 0 && maxCallVal > 0) {
+    if (callWallStrike > 0) {
       structuralSpecs.push({
         price: callWallStrike,
         stroke: "rgba(34, 211, 238, 0.65)",
@@ -1527,7 +1557,7 @@ export function GaiaView() {
     }
 
     // 3. Put Wall
-    if (putWallStrike > 0 && maxPutVal < 0) {
+    if (putWallStrike > 0) {
       structuralSpecs.push({
         price: putWallStrike,
         stroke: "rgba(192, 132, 252, 0.65)",

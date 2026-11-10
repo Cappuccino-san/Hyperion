@@ -615,7 +615,7 @@ export function drawTradeExecutionMarkers(
         // Glowing PnL Badge right next to / below the STC marker
         ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
         const textW = ctx.measureText(badgeText).width;
-        const badgeW = textW + 12;
+        const badgeW = Math.max(82, Math.ceil(textW + 16));
         const badgeH = 18;
 
         // Place right next to the STC triangle (or centered below if near right edge)
@@ -674,7 +674,7 @@ export function drawTradeExecutionMarkers(
         // Glowing PnL Badge right next to / above the STC marker
         ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
         const textW = ctx.measureText(badgeText).width;
-        const badgeW = textW + 12;
+        const badgeW = Math.max(82, Math.ceil(textW + 16));
         const badgeH = 18;
 
         let bx = exitX + triHalfW + 5;

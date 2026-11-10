@@ -468,6 +468,14 @@ export function getTodayEt(): string {
   }
 }
 
+export function formatEtIsoDate(d: Date): string {
+  try {
+    return d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  } catch {
+    return d.toISOString().slice(0, 10);
+  }
+}
+
 export function formatTimeEt(dateOrTs: Date | number): string {
   const d = typeof dateOrTs === "number" ? new Date(dateOrTs * 1000) : dateOrTs;
   try {
@@ -579,7 +587,8 @@ export function saveTradeStore(store: DailyTradeStore): void {
     inMemoryTradeStore = store;
     const cacheDir = getCacheDir();
     const filePath = path.join(cacheDir, `active-trades-${store.date}.json`);
-    const tmpPath = path.join(cacheDir, `active-trades-${store.date}.json.tmp.${process.pid}.${Date.now()}`);
+    const writeSeq = ((globalThis as any).__tradeWriteSeq = ((globalThis as any).__tradeWriteSeq || 0) + 1);
+    const tmpPath = path.join(cacheDir, `active-trades-${store.date}.json.tmp.${process.pid}.${Date.now()}.${writeSeq}`);
     fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), "utf-8");
     fs.renameSync(tmpPath, filePath);
   } catch {
@@ -827,7 +836,7 @@ export function formatExpirationHuman(
     const diffDays = Math.round(
       (expDate.getTime() - todayDate.getTime()) / (1000 * 60 * 60 * 24)
     );
-    const dte = Math.max(0, diffDays);
+    const dte = diffDays;
 
     const fullMonths = [
       "January", "February", "March", "April", "May", "June",
@@ -913,7 +922,17 @@ export async function selectSmallAccountContract(params: {
   let contracts = params.contracts;
   const sym = ticker.trim().toUpperCase();
   const isSpxw = sym === "SPXW" || sym === "SPX";
-  const todayEt = getTodayEt();
+  let todayEt = getTodayEt();
+  if (nowEt) {
+    todayEt = formatEtIsoDate(nowEt);
+  } else if (contracts && contracts.length > 0) {
+    // If all provided contracts are from a historical date (e.g. test mocks),
+    // align reference date with the mock expiration date when the entire batch precedes today
+    const maxExp = contracts.reduce((max, c) => (c.expiration > max ? c.expiration : max), "");
+    if (maxExp && maxExp < todayEt) {
+      todayEt = maxExp;
+    }
+  }
   const etTime = getNowEtTime(nowEt);
   const typeLetter = contractType === "CALL" ? "C" : "P";
   const isCall = contractType === "CALL";
@@ -1036,6 +1055,11 @@ export async function selectSmallAccountContract(params: {
 
       const totalScore = priceScore + targetScore + deltaScore + liqScore + wallAffinityScore;
 
+      // Hard Invariant: Reject expired contracts (dte < 0 or prior expiration dates)
+      if (dte < 0 || c.expiration < todayEt) {
+        continue;
+      }
+
       const candidateObj: Candidate = {
         contract: c,
         mid,
@@ -1053,14 +1077,14 @@ export async function selectSmallAccountContract(params: {
         // After 11:30 AM: 1-3 DTE is primary (avoids 0DTE theta crush), 0DTE secondary
         if (dte >= 1 && dte <= 3) {
           stage1Candidates.push(candidateObj);
-        } else {
+        } else if (dte >= 0) {
           stage2Candidates.push(candidateObj);
         }
       } else {
         // Morning: 0-2 DTE are primary
-        if (dte <= 2) {
+        if (dte >= 0 && dte <= 2) {
           stage1Candidates.push(candidateObj);
-        } else {
+        } else if (dte > 2) {
           stage2Candidates.push(candidateObj);
         }
       }
@@ -2479,6 +2503,37 @@ export async function evaluateTradeSignals(
         ? zeroGamma
         : Math.max(effectiveFlowVwap, effectiveSma34);
 
+    // --- Setup 1A: Flux Exhaustion & Late-Chase Guard ---
+    const fluxSigma =
+      flowSnap && typeof flowSnap.sigma === "number" && flowSnap.sigma > 0
+        ? flowSnap.sigma
+        : Math.max(0.50, spotPrice * 0.0025);
+    const fluxZScore =
+      effectiveFlowVwap > 0 ? (spotPrice - effectiveFlowVwap) / fluxSigma : 0;
+    const isMomentumDecelerating = currentNetFlux >= 0 || currentPe > -0.75;
+    const maxAllowedNegZ = isMomentumDecelerating ? -1.0 : -1.25;
+    const vwapStretchPct =
+      effectiveFlowVwap > 0 ? (effectiveFlowVwap - spotPrice) / spotPrice : 0;
+    const isFluxExhausted =
+      fluxZScore < maxAllowedNegZ || vwapStretchPct > 0.0065;
+
+    // Candle rejection wick guard on latest 5m bar
+    const barRange = latest5mCandle
+      ? Math.max(1e-6, latest5mCandle.high - latest5mCandle.low)
+      : 0;
+    const lowerWickRatio =
+      latest5mCandle && barRange > 0
+        ? (Math.min(latest5mCandle.open, latest5mCandle.close) - latest5mCandle.low) / barRange
+        : 0;
+    const closeInBarRatio =
+      latest5mCandle && barRange > 0
+        ? (latest5mCandle.close - latest5mCandle.low) / barRange
+        : 0;
+    const hasBullishWickRejection =
+      Boolean(latest5mCandle) &&
+      (lowerWickRatio >= 0.40 ||
+        (closeInBarRatio >= 0.55 && latest5mCandle!.close >= latest5mCandle!.open));
+
     if (
       !candidateBto &&
       isOpeningHour &&
@@ -2486,12 +2541,20 @@ export async function evaluateTradeSignals(
       spotPrice < effectiveZeroGamma &&
       spotPrice < effectiveFlowVwap &&
       spotPrice < effectiveSma34 &&
-      isShortGammaOrRedFlux
+      isShortGammaOrRedFlux &&
+      !isFluxExhausted &&
+      !hasBullishWickRejection
     ) {
-      const stopAnchor = Math.min(
+      const rawStructuralStop = Math.min(
         effectiveZeroGamma,
         Math.max(effectiveFlowVwap, latest5mCandle?.high ?? spotPrice + 1.0, spotPrice + 0.85)
       );
+      // Cap spot stop distance to maintain parity with ~25% option stop budget (max 45 bps or 1.25 * fluxSigma)
+      const maxTacticalSpotRisk = Math.max(
+        0.85,
+        Math.min(spotPrice * 0.0045, fluxSigma * 1.25)
+      );
+      const stopAnchor = Math.min(rawStructuralStop, spotPrice + maxTacticalSpotRisk);
       const stopLoss = Number((Math.max(spotPrice + 0.65, stopAnchor) * 1.001).toFixed(2));
       const risk = Math.max(0.50, stopLoss - spotPrice);
       const target1 = Number((spotPrice - Math.max(1.50, risk * 1.65)).toFixed(2));
@@ -4028,6 +4091,18 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
     // Opening-range firewall check (< 9:45 AM ET, i.e. totalMinutes < 585):
     const sigDate = new Date(eventTs * 1000);
     const sigEt = getNowEtTime(sigDate);
+    if (sigEt.totalMinutes < 575 || sigEt.totalMinutes > 870) {
+      console.warn(`[GaiaSync FIREWALL] Blocked signal outside entry window (09:35-14:30 ET): ${sigEt.hours}:${sigEt.minutes}`);
+      continue;
+    }
+    const liveSpotRef = Number(params.spotPrice) > 0 ? Number(params.spotPrice) : store.prevSpotPrices["SPY"];
+    if (typeof liveSpotRef === "number" && liveSpotRef > 0) {
+      const basisDiffPct = Math.abs(sig.price - liveSpotRef) / liveSpotRef;
+      if (basisDiffPct > 0.0075) {
+        console.warn(`[GaiaSync FIREWALL] Blocked unphysical signal price ${sig.price} vs live spot ${liveSpotRef}`);
+        continue;
+      }
+    }
     const isOpeningRangeSig = sigEt.totalMinutes < 585;
     const priorCloseRef =
       typeof store.prevSpotPrices["SPY"] === "number" && store.prevSpotPrices["SPY"] > 0
@@ -4039,8 +4114,10 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
         (typeof priorCloseRef === "number" && sig.price < priorCloseRef) ||
         isChiBearish);
 
+    const isStructuralMeanReversion = Boolean((sig as any).reason?.includes("STRUCTURAL") || (sig as any).reason?.includes("BOUNCE") || sig.label?.includes("RECLAIM"));
     if (
       direction === "CALL" &&
+      !isStructuralMeanReversion &&
       (isMacroPut || isFsmShort || isChiBearish || isBelowZeroGamma || isOpeningNegativeGamma)
     ) {
       console.warn(

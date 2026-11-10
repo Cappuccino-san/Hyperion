@@ -33,6 +33,7 @@ import {
   saveTradeStore,
   DailyTradeStore,
   OptionTradePosition,
+  getTodayEt,
 } from "../lib/tradeSignalEngine";
 import {
   acquireBarEvaluationLock,
@@ -847,8 +848,9 @@ async function runTestSuite() {
         }
       : null;
 
+    const currentTestDate = getTodayEt();
     const storeInstance: DailyTradeStore = {
-      date: "2026-11-05",
+      date: currentTestDate,
       activePositions: mockActivePosition ? { SPY: mockActivePosition } : {},
       closedPositions: mockClosedTrades,
       alerts: [],
@@ -866,7 +868,7 @@ async function runTestSuite() {
     const syncRes = await syncGaiaSpySignalsToDiscord({
       ticker: "SPY",
       spotPrice: 764.5,
-      sessionDate: "2026-11-05",
+      sessionDate: currentTestDate,
       signals: [
         {
           id: `mc-short-${t}`,

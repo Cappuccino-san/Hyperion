@@ -9,7 +9,42 @@
  * 5. Dynamic bar duration inference and explicit RTH gating (9:30 AM - 4:00 PM ET)
  */
 
+import {
+  ENTRY_CUTOFF_MINS,
+  ENTRY_START_MINS,
+  EOD_FORCE_FLAT_MINS,
+  RTH_CLOSE_MINS,
+  RTH_OPEN_MINS,
+  etMinutesOfDay,
+} from "./gaiaSessionGuards";
+
 export type GaiaFsmState = "STAND_ASIDE" | "LONG" | "SHORT";
+
+/** Structural map supplied by the options book (all optional; omitted → equilibrium-only logic). */
+export interface GaiaStructuralLevels {
+  zeroGamma?: number;
+  callWall?: number;
+  putWall?: number;
+  bookCenter?: number;
+  priorClose?: number;
+  pdh?: number;
+  pdl?: number;
+  sigma1dLower?: number;
+  sigma1dUpper?: number;
+}
+
+export const GAIA_RTH_OPEN_MINS = RTH_OPEN_MINS;
+export const GAIA_ENTRY_START_MINS = ENTRY_START_MINS;
+export const GAIA_ENTRY_CUTOFF_MINS = ENTRY_CUTOFF_MINS;
+export const GAIA_EOD_FORCE_FLAT_MINS = EOD_FORCE_FLAT_MINS;
+export const GAIA_RTH_CLOSE_MINS = RTH_CLOSE_MINS;
+
+/** Wall proximity: never buy into a wall closer than this (underlying $). */
+const WALL_BLOCK_DOLLARS = 1.25;
+/** Structural take-profit fires when price trades within this distance of the target wall. */
+const TARGET_TOUCH_DOLLARS = 0.25;
+/** Minimum reward:risk to the structural target. */
+const MIN_REWARD_RISK = 1.5;
 
 export interface GaiaBarData {
   barTimestamp: number; // Bar open in epoch seconds
@@ -27,6 +62,14 @@ export interface GaiaBarData {
   flowVwap?: number;
   prevFlowVwap?: number;
   vwapSlope?: number;
+  sma34?: number;
+  prevSma34?: number;
+  prevChi?: number;
+  prevNetFlux?: number;
+  recentHigh3?: number; // Max high over bars [i-3..i]
+  recentLow4?: number; // Min low over bars [i-4..i]
+  bullDiv5m?: boolean; // Confirmed 5m bullish divergence within the last few bars
+  bearDiv5m?: boolean; // Confirmed 5m bearish divergence within the last few bars
   isClosed: boolean;
 }
 
@@ -34,6 +77,27 @@ export interface GaiaMacroContext {
   macroRegime: "CALL" | "PUT";
   sessionBiasScore?: number; // SES driver (-99 to +99)
   callDominancePct?: number; // Header chi% (0 to 100)
+  structuralLevels?: GaiaStructuralLevels;
+}
+
+/**
+ * Resolves ET minutes-of-day for a bar. Uses bar.etMins when present, otherwise derives
+ * it from a real epoch timestamp. Returns undefined for synthetic timestamps (legacy/test
+ * bars without time info), in which case time gates are not applied.
+ */
+export function resolveGaiaBarEtMinutes(bar: Pick<GaiaBarData, "etMins" | "barTimestamp">): number | undefined {
+  if (typeof bar.etMins === "number" && Number.isFinite(bar.etMins)) return bar.etMins;
+  if (typeof bar.barTimestamp === "number" && bar.barTimestamp > 1e9) return etMinutesOfDay(bar.barTimestamp);
+  return undefined;
+}
+
+interface TransitionResult {
+  nextState: GaiaFsmState;
+  reason?: string;
+  /** Fill price for exits that occur at a level (target touch / stop) rather than the bar close. */
+  fillPrice?: number;
+  targetWall?: number;
+  stopPrice?: number;
 }
 
 export interface GaiaEquilibriumDispersion {
@@ -63,6 +127,8 @@ export interface GaiaCommittedSignal {
   entryPrice?: number;
   exitPrice?: number;
   realizedPnl?: number;
+  targetWallPrice?: number;
+  stopLossPrice?: number;
 }
 
 export interface GaiaFsmSnapshot {
@@ -140,6 +206,8 @@ export class GaiaSignalFsm {
   private committedBarTimestamps = new Set<number>();
   private localExtremePrice: number = 0;
   private currentEntryPrice: number = 0;
+  private activeTargetWall: number = 0;
+  private activeStopPrice: number = 0;
 
   constructor(initialState: GaiaFsmState = "STAND_ASIDE") {
     this.committedState = initialState;
@@ -151,6 +219,8 @@ export class GaiaSignalFsm {
     this.committedBarTimestamps.clear();
     this.localExtremePrice = 0;
     this.currentEntryPrice = 0;
+    this.activeTargetWall = 0;
+    this.activeStopPrice = 0;
   }
 
   /**
@@ -162,8 +232,30 @@ export class GaiaSignalFsm {
     bar: GaiaBarData,
     dispersion: GaiaEquilibriumDispersion,
     macro?: GaiaMacroContext,
-    trackedLocalExtreme: number = 0
-  ): { nextState: GaiaFsmState; reason?: string } {
+    trackedLocalExtreme: number = 0,
+    entryPriceRef: number = 0,
+    targetWallRef: number = 0
+  ): TransitionResult {
+    const etMins = resolveGaiaBarEtMinutes(bar);
+
+    // 1. Strict After-Hours & Pre-Market Firewall (< 09:30 ET or >= 16:00 ET)
+    if (typeof etMins === "number" && (etMins < GAIA_RTH_OPEN_MINS || etMins >= GAIA_RTH_CLOSE_MINS)) {
+      return { nextState: currentState };
+    }
+
+    // 2. Mandatory 15:55 ET Hard EOD Flat Liquidation
+    if (typeof etMins === "number" && etMins >= GAIA_EOD_FORCE_FLAT_MINS) {
+      if (currentState !== "STAND_ASIDE") {
+        return { nextState: "STAND_ASIDE", reason: "EOD_1555_FORCE_CLOSE", fillPrice: bar.close };
+      }
+      return { nextState: "STAND_ASIDE" };
+    }
+
+    // 3. Strict Entry Window (09:30 open bar / 09:35 closed bar through 14:30 ET)
+    const isWithinEntryWindow = typeof etMins === "number"
+      ? (etMins >= GAIA_ENTRY_START_MINS && etMins <= GAIA_ENTRY_CUTOFF_MINS)
+      : true;
+
     // Excursion from structural equilibrium (chi=0.5, flux=0.0)
     const eChi = (bar.chi - 0.50) / dispersion.sigmaChi;
     const eFlux = bar.netFlux / dispersion.sigmaFlux;
@@ -174,9 +266,6 @@ export class GaiaSignalFsm {
       ? (macro.macroRegime === "CALL" || effectiveChi >= 0.50)
       : bar.chi >= 0.50;
     const isBearMacro = !isBullMacro;
-
-    // RTH Check: Entries only permitted during RTH (09:30 - 16:00 ET)
-    const isRth = bar.etMins === undefined || (bar.etMins >= 570 && bar.etMins <= 960);
 
     // Dynamic SNR Flux Threshold scaled by normalized session volatility
     const volRatio = dispersion.atr / Math.max(1, bar.close * 0.0035);
@@ -189,31 +278,178 @@ export class GaiaSignalFsm {
         ? bar.flowVwap - bar.prevFlowVwap
         : 0);
 
+    const levels = macro?.structuralLevels;
+    const zg = levels?.zeroGamma && levels.zeroGamma > 0 ? levels.zeroGamma : undefined;
+    const callWall = levels?.callWall && levels.callWall > 0 ? levels.callWall : undefined;
+    const putWall = levels?.putWall && levels.putWall > 0 ? levels.putWall : undefined;
+    const bookCenter = levels?.bookCenter && levels.bookCenter > 0 ? levels.bookCenter : undefined;
+    const pdh = levels?.pdh && levels.pdh > 0 ? levels.pdh : undefined;
+    const pdl = levels?.pdl && levels.pdl > 0 ? levels.pdl : undefined;
+    const sigma1dLower = levels?.sigma1dLower && levels.sigma1dLower > 0 ? levels.sigma1dLower : undefined;
+
+    // Overhead & Underlying Wall Proximity Computation
+    const overheadCandidates = [callWall, zg].filter(
+      (lvl): lvl is number => typeof lvl === "number" && lvl > bar.close
+    );
+    const nearestOverheadWall =
+      overheadCandidates.length > 0 ? Math.min(...overheadCandidates) : undefined;
+    const callBlockedByWall =
+      nearestOverheadWall !== undefined && nearestOverheadWall - bar.close < WALL_BLOCK_DOLLARS;
+
+    const putBlockedByWall =
+      putWall !== undefined && putWall < bar.close && bar.close - putWall < WALL_BLOCK_DOLLARS;
+
+    const unitRisk = Math.max(0.90, 1.15 * dispersion.atr);
+
     if (currentState === "STAND_ASIDE") {
-      if (!isRth) {
+      if (!isWithinEntryWindow) {
         return { nextState: "STAND_ASIDE" };
       }
 
-      // Long Breakout: Excursion + VWAP position + VWAP acceleration (slope >= 0)
-      const vwapLongOk =
-        bar.flowVwap === undefined || (bar.close >= bar.flowVwap && vwapSlope >= 0);
-      if (eChi >= 0.85 && eFlux >= zFluxThreshold && bar.chi >= 0.50 && isBullMacro && vwapLongOk) {
-        return { nextState: "LONG", reason: "EQUILIBRIUM_CALL_BREAKOUT" };
+      // =========================================================================
+      // HIGH-CONVICTION BTO PUT EVALUATION (Setups P-A & P-B)
+      // =========================================================================
+      if (!putBlockedByWall && levels) {
+        // Setup P-A (Upper Wall / Zero-Gamma / PDH Rejection)
+        const testHigh = bar.recentHigh3 ?? Math.max(bar.high, bar.open);
+        const nearUpper = [zg, callWall, pdh].some(
+          (lvl) => typeof lvl === "number" && Math.abs(testHigh - lvl) / lvl <= 0.0020
+        );
+        const belowFlowAndSma =
+          (bar.flowVwap === undefined || bar.close < bar.flowVwap) &&
+          (bar.sma34 === undefined || bar.close < bar.sma34);
+        const negativeFluxConfirm = bar.netFlux < 0 || bar.chi < 0.45 || Boolean(bar.bearDiv5m);
+        const downsideTarget = putWall ?? bookCenter ?? bar.close - 2.50;
+        const downsideRoom = (bar.close - downsideTarget) >= MIN_REWARD_RISK * unitRisk;
+
+        if (nearUpper && belowFlowAndSma && negativeFluxConfirm && downsideRoom) {
+          return {
+            nextState: "SHORT",
+            reason: "STRUCTURAL_PUT_UPPER_WALL_REJECTION",
+            targetWall: putWall ?? downsideTarget,
+            stopPrice: testHigh + 0.10,
+          };
+        }
+
+        // Setup P-B (Zero-Gamma / Book Center Breakdown Flush)
+        if (zg !== undefined && bar.close < zg && bookCenter !== undefined) {
+          const brokeCenter = bar.close < bookCenter && (bar.sma34 === undefined || bar.close < bar.sma34);
+          const downsideRoomFlush = (bar.close - (putWall ?? bar.close - 2.50)) >= MIN_REWARD_RISK * unitRisk;
+          const expandingBearFlux = bar.netFlux < 0 && (bar.prevNetFlux === undefined || bar.netFlux <= bar.prevNetFlux || bar.chi < 0.48);
+          if (brokeCenter && expandingBearFlux && downsideRoomFlush) {
+            return {
+              nextState: "SHORT",
+              reason: "STRUCTURAL_PUT_BREAKDOWN_FLUSH",
+              targetWall: putWall,
+              stopPrice: bookCenter + 0.20,
+            };
+          }
+        }
       }
 
-      // Short Breakdown: Excursion + VWAP position + VWAP acceleration (slope <= 0)
+      // =========================================================================
+      // HIGH-CONVICTION BTO CALL EVALUATION (Setups C-A & C-B)
+      // =========================================================================
+      if (!callBlockedByWall && levels) {
+        // Setup C-A (Put Wall / PDL Reversal + Reclaim)
+        const testLow = bar.recentLow4 ?? Math.min(bar.low, bar.open);
+        const nearLower = [putWall, pdl, sigma1dLower].some(
+          (lvl) => typeof lvl === "number" && Math.abs(testLow - lvl) / lvl <= 0.0025
+        ) || Boolean(bar.bullDiv5m);
+        const reclaimed =
+          (bookCenter !== undefined && bar.close > bookCenter) ||
+          (bar.sma34 !== undefined && bar.close > bar.sma34);
+        const improvingFlux =
+          (bar.prevChi !== undefined && bar.chi > bar.prevChi) ||
+          bar.netFlux > 0 ||
+          bar.close > bar.open;
+        const upsideTarget = callWall ?? zg ?? bar.close + 2.50;
+        const upsideRoom = (upsideTarget - bar.close) >= MIN_REWARD_RISK * unitRisk;
+
+        if (nearLower && reclaimed && improvingFlux && upsideRoom) {
+          return {
+            nextState: "LONG",
+            reason: "STRUCTURAL_CALL_WALL_BOUNCE_RECLAIM",
+            targetWall: upsideTarget,
+            stopPrice: testLow - 0.10,
+          };
+        }
+
+        // Setup C-B (Zero-Gamma / Positive-Gamma Breakout)
+        if (zg !== undefined && bar.close > zg) {
+          const aboveVwap = bar.flowVwap === undefined || bar.close > bar.flowVwap;
+          const upsideRoomBreakout = ((callWall ?? bar.close + 3.0) - bar.close) >= MIN_REWARD_RISK * unitRisk;
+          if (aboveVwap && bar.netFlux > 0 && bar.chi >= 0.50 && upsideRoomBreakout) {
+            return {
+              nextState: "LONG",
+              reason: "STRUCTURAL_CALL_WALL_BREAKOUT",
+              targetWall: callWall,
+              stopPrice: zg - 0.20,
+            };
+          }
+        }
+      }
+
+      // Standard Equilibrium Dispersion Breakout Fallback
+      const vwapLongOk =
+        bar.flowVwap === undefined || (bar.close >= bar.flowVwap && vwapSlope >= 0);
+      if (eChi >= 0.85 && eFlux >= zFluxThreshold && bar.chi >= 0.50 && isBullMacro && vwapLongOk && !callBlockedByWall) {
+        return { nextState: "LONG", reason: "EQUILIBRIUM_CALL_BREAKOUT", targetWall: callWall };
+      }
+
       const vwapShortOk =
         bar.flowVwap === undefined || (bar.close <= bar.flowVwap && vwapSlope <= 0);
-      if (eChi <= -0.85 && eFlux <= -zFluxThreshold && bar.chi < 0.50 && isBearMacro && !isBullMacro && vwapShortOk) {
-        return { nextState: "SHORT", reason: "EQUILIBRIUM_PUT_BREAKDOWN" };
+      if (eChi <= -0.85 && eFlux <= -zFluxThreshold && bar.chi < 0.50 && isBearMacro && !isBullMacro && vwapShortOk && !putBlockedByWall) {
+        return { nextState: "SHORT", reason: "EQUILIBRIUM_PUT_BREAKDOWN", targetWall: putWall };
       }
 
       return { nextState: "STAND_ASIDE" };
     }
 
     if (currentState === "LONG") {
+      const entryP = entryPriceRef || this.currentEntryPrice || bar.close;
+      const targetW = targetWallRef || this.activeTargetWall;
+
+      // 1. Structural Target Hit: High reaches within $0.25 of targetWall
+      if (targetW > entryP && bar.high >= targetW - TARGET_TOUCH_DOLLARS) {
+        return {
+          nextState: "STAND_ASIDE",
+          reason: "STRUCTURAL_TARGET_HIT",
+          fillPrice: targetW - TARGET_TOUCH_DOLLARS,
+        };
+      }
+
+      // 2. Progressive Profit Ratchets
+      if (targetW > entryP) {
+        const totalDist = targetW - entryP;
+        const peakGain = Math.max(0, (trackedLocalExtreme || bar.high) - entryP);
+        const progress = peakGain / totalDist;
+
+        // Stage 2 Ratchet (75% progress): Trail under prior 5m low
+        if (progress >= 0.75) {
+          const trailStop = (bar.low < bar.open ? bar.low : bar.open) - 0.05;
+          if (bar.close < trailStop) {
+            return {
+              nextState: "STAND_ASIDE",
+              reason: "PROFIT_RATCHET_STAGE2_TRAIL_STOP",
+              fillPrice: trailStop,
+            };
+          }
+        } else if (progress >= 0.50) {
+          // Stage 1 Ratchet (50% progress): Lock Breakeven + 10%
+          const be10Stop = entryP + totalDist * 0.10;
+          if (bar.close < be10Stop) {
+            return {
+              nextState: "STAND_ASIDE",
+              reason: "PROFIT_RATCHET_STAGE1_BE10",
+              fillPrice: be10Stop,
+            };
+          }
+        }
+      }
+
       // Reversal to SHORT strictly impossible unless macro regime has actively rotated to BEAR
-      if (isBearMacro && !isBullMacro && eChi <= -1.0 && eFlux <= -0.6 && isRth) {
+      if (isBearMacro && !isBullMacro && eChi <= -1.0 && eFlux <= -0.6) {
         return { nextState: "SHORT", reason: "MACRO_REVERSAL_TO_SHORT" };
       }
 
@@ -235,8 +471,49 @@ export class GaiaSignalFsm {
     }
 
     if (currentState === "SHORT") {
+      const entryP = entryPriceRef || this.currentEntryPrice || bar.close;
+      const targetW = targetWallRef || this.activeTargetWall;
+
+      // 1. Structural Target Hit: Low reaches within $0.25 of targetWall
+      if (targetW > 0 && targetW < entryP && bar.low <= targetW + TARGET_TOUCH_DOLLARS) {
+        return {
+          nextState: "STAND_ASIDE",
+          reason: "STRUCTURAL_TARGET_HIT",
+          fillPrice: targetW + TARGET_TOUCH_DOLLARS,
+        };
+      }
+
+      // 2. Progressive Profit Ratchets
+      if (targetW > 0 && targetW < entryP) {
+        const totalDist = entryP - targetW;
+        const peakGain = Math.max(0, entryP - (trackedLocalExtreme || bar.low));
+        const progress = peakGain / totalDist;
+
+        // Stage 2 Ratchet (75% progress): Trail above prior 5m high
+        if (progress >= 0.75) {
+          const trailStop = (bar.high > bar.open ? bar.high : bar.open) + 0.05;
+          if (bar.close > trailStop) {
+            return {
+              nextState: "STAND_ASIDE",
+              reason: "PROFIT_RATCHET_STAGE2_TRAIL_STOP",
+              fillPrice: trailStop,
+            };
+          }
+        } else if (progress >= 0.50) {
+          // Stage 1 Ratchet (50% progress): Lock Breakeven + 10%
+          const be10Stop = entryP - totalDist * 0.10;
+          if (bar.close > be10Stop) {
+            return {
+              nextState: "STAND_ASIDE",
+              reason: "PROFIT_RATCHET_STAGE1_BE10",
+              fillPrice: be10Stop,
+            };
+          }
+        }
+      }
+
       // Reversal to LONG strictly impossible unless macro regime has actively rotated to BULL
-      if (isBullMacro && !isBearMacro && eChi >= 1.0 && eFlux >= 0.6 && isRth) {
+      if (isBullMacro && !isBearMacro && eChi >= 1.0 && eFlux >= 0.6) {
         return { nextState: "LONG", reason: "MACRO_REVERSAL_TO_LONG" };
       }
 
@@ -293,13 +570,16 @@ export class GaiaSignalFsm {
       this.localExtremePrice = Math.min(this.localExtremePrice || bar.close, bar.low);
     }
 
-    const { nextState, reason } = this.evaluateTransition(
+    const transition = this.evaluateTransition(
       this.committedState,
       bar,
       disp,
       macro,
-      this.localExtremePrice
+      this.localExtremePrice,
+      this.currentEntryPrice,
+      this.activeTargetWall
     );
+    const { nextState, reason, fillPrice, targetWall, stopPrice } = transition;
 
     if (nextState === this.committedState) {
       return null;
@@ -315,27 +595,37 @@ export class GaiaSignalFsm {
     if (fromState === "STAND_ASIDE" && (nextState === "LONG" || nextState === "SHORT")) {
       this.currentEntryPrice = bar.close;
       this.localExtremePrice = bar.close;
+      this.activeTargetWall = targetWall || 0;
+      this.activeStopPrice = stopPrice || 0;
       entryPrice = bar.close;
     } else if ((fromState === "LONG" || fromState === "SHORT") && nextState === "STAND_ASIDE") {
       entryPrice = this.currentEntryPrice;
-      exitPrice = bar.close;
+      exitPrice = fillPrice ?? bar.close;
       realizedPnl = fromState === "LONG" ? exitPrice - entryPrice : entryPrice - exitPrice;
       this.currentEntryPrice = 0;
       this.localExtremePrice = 0;
+      this.activeTargetWall = 0;
+      this.activeStopPrice = 0;
     } else if (fromState === "LONG" && nextState === "SHORT") {
       entryPrice = this.currentEntryPrice;
-      exitPrice = bar.close;
+      exitPrice = fillPrice ?? bar.close;
       realizedPnl = exitPrice - entryPrice;
       this.currentEntryPrice = bar.close;
       this.localExtremePrice = bar.close;
+      this.activeTargetWall = targetWall || 0;
+      this.activeStopPrice = stopPrice || 0;
     } else if (fromState === "SHORT" && nextState === "LONG") {
       entryPrice = this.currentEntryPrice;
-      exitPrice = bar.close;
+      exitPrice = fillPrice ?? bar.close;
       realizedPnl = entryPrice - exitPrice;
       this.currentEntryPrice = bar.close;
       this.localExtremePrice = bar.close;
+      this.activeTargetWall = targetWall || 0;
+      this.activeStopPrice = stopPrice || 0;
     } else {
       this.localExtremePrice = 0;
+      this.activeTargetWall = 0;
+      this.activeStopPrice = 0;
     }
 
     const barSpanSec = bar.barSpanSeconds || disp.barDurationSec;
@@ -349,7 +639,7 @@ export class GaiaSignalFsm {
       fromState,
       toState: nextState,
       reason: reason || `${fromState}->${nextState}`,
-      price: bar.close,
+      price: exitPrice ?? bar.close,
       chi: bar.chi,
       chiPct: Math.round(bar.chi * 100),
       bias: bar.bias,
@@ -359,6 +649,8 @@ export class GaiaSignalFsm {
       entryPrice,
       exitPrice,
       realizedPnl,
+      targetWallPrice: targetWall || (fromState !== "STAND_ASIDE" ? this.activeTargetWall : undefined),
+      stopLossPrice: stopPrice,
     };
 
     this.committedCallLog.push(signal);
@@ -426,7 +718,9 @@ export class GaiaSignalFsm {
         liveUnclosedBar,
         dispersion,
         macro,
-        liveExtreme
+        liveExtreme,
+        this.currentEntryPrice,
+        this.activeTargetWall
       ).nextState;
     }
 

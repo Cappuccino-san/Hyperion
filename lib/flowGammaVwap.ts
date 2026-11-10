@@ -400,8 +400,8 @@ export function calculateDollarGammaWeight(trade: OptionFlowTradeInput): {
  */
 export class FlowGammaVwapEngine {
   private sumWeight = 0;
-  private sumWeightedSpot = 0;
-  private sumWeightedSpotSq = 0;
+  private runningMean = 0;
+  private runningM2 = 0; // M_2 = sum w_i * (S_i - mean)^2 via West's (1979) algorithm
   private runningSignedAccel = 0;
   private tradeCount = 0;
   private lastKnownSpot = 0;
@@ -411,6 +411,7 @@ export class FlowGammaVwapEngine {
   constructor(initialSpot = 0) {
     if (initialSpot > 0) {
       this.lastKnownSpot = initialSpot;
+      this.runningMean = initialSpot;
     }
   }
 
@@ -419,12 +420,13 @@ export class FlowGammaVwapEngine {
    */
   public reset(currentSpot?: number): void {
     this.sumWeight = 0;
-    this.sumWeightedSpot = 0;
-    this.sumWeightedSpotSq = 0;
+    this.runningMean = 0;
+    this.runningM2 = 0;
     this.runningSignedAccel = 0;
     this.tradeCount = 0;
     if (typeof currentSpot === "number" && currentSpot > 0) {
       this.lastKnownSpot = currentSpot;
+      this.runningMean = currentSpot;
     }
     this.sessionResetTimestamp = Date.now();
   }
@@ -476,9 +478,15 @@ export class FlowGammaVwapEngine {
     this.lastTimestamp = ts;
 
     if (validWeight > 0) {
-      this.sumWeight += validWeight;
-      this.sumWeightedSpot += validSpot * validWeight;
-      this.sumWeightedSpotSq += validSpot * validSpot * validWeight;
+      const oldWeight = this.sumWeight;
+      const newWeight = oldWeight + validWeight;
+      this.sumWeight = newWeight;
+
+      const delta = validSpot - (this.runningMean || validSpot);
+      const newMean = (this.runningMean || validSpot) + (validWeight / newWeight) * delta;
+      this.runningM2 += validWeight * delta * (validSpot - newMean);
+      this.runningMean = newMean;
+
       this.runningSignedAccel += signedWeight ?? validWeight;
       this.tradeCount += 1;
     }
@@ -517,13 +525,11 @@ export class FlowGammaVwapEngine {
       };
     }
 
-    // Weighted mean: VWAP_gamma = (sum W_i * S_i) / (sum W_i)
-    const flowVwap = this.sumWeightedSpot / this.sumWeight;
+    // Weighted mean: VWAP_gamma = mu_n
+    const flowVwap = this.runningMean;
 
-    // Running sample variance: sigma^2 = (sum W_i * (S_i - VWAP)^2) / (sum W_i)
-    // Numerically: (sum W_i * S_i^2 / sum W_i) - VWAP^2
-    const meanOfSquares = this.sumWeightedSpotSq / this.sumWeight;
-    const rawVariance = meanOfSquares - (flowVwap * flowVwap);
+    // Running sample variance via West's recurrence: sigma^2 = M_2 / sumWeight
+    const rawVariance = this.runningM2 / this.sumWeight;
     const clampedVariance = Math.max(0.10, Number.isFinite(rawVariance) ? rawVariance : 0.10);
     const sigma = Math.sqrt(clampedVariance);
 

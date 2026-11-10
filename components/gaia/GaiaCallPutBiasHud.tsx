@@ -259,7 +259,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   );
 
   useEffect(() => {
-    if (serverTradesProp && (serverTradesProp.closedPositions?.length || Object.keys(serverTradesProp.activePositions || {}).length)) {
+    if (serverTradesProp) {
       setInternalServerTrades(serverTradesProp);
     }
   }, [serverTradesProp]);
@@ -318,26 +318,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const effectiveCandles = useMemo(() => {
     const raw = (candles && candles.length > 0 ? candles : bars && bars.length > 0 ? bars : []) as GaiaHudCandle[];
     if (raw.length === 0) {
-      // Deterministic intraday fallback
-      const baseSpot = activeSymbol === "SPY" ? 759.75 : 502.5;
-      const count = 48;
-      const now = Date.now();
-      const mock: GaiaHudCandle[] = [];
-      let p = baseSpot;
-      for (let i = 0; i < count; i++) {
-        const t = now - (count - i) * 5 * 60 * 1000;
-        const phase = i / count;
-        const drift = phase < 0.25 ? 0.35 : phase < 0.55 ? -0.45 : phase < 0.8 ? 0.55 : -0.2;
-        const noise = (Math.sin(i * 0.4) + Math.cos(i * 0.7)) * 0.25;
-        const d = drift + noise;
-        const o = p;
-        const c = Number((o + d).toFixed(2));
-        const h = Number((Math.max(o, c) + 0.3).toFixed(2));
-        const l = Number((Math.min(o, c) - 0.3).toFixed(2));
-        mock.push({ timestamp: t, open: o, high: h, low: l, close: c, volume: 50000 });
-        p = c;
-      }
-      return mock;
+      return [];
     }
 
     // Normalize timestamps (seconds vs ms)
@@ -702,9 +683,16 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       };
     });
 
+    const bookCenter = typeof gammaLevels?.callWall === "number" && typeof gammaLevels?.putWall === "number" && gammaLevels.callWall > 0 && gammaLevels.putWall > 0 ? Number(((gammaLevels.callWall + gammaLevels.putWall) / 2).toFixed(2)) : undefined;
     const { snapshot } = fsm.commitSeries(bars, {
       macroRegime: activeRegime,
       callDominancePct: activeChiPct,
+      structuralLevels: {
+        zeroGamma: gammaLevels?.zeroGamma,
+        callWall: gammaLevels?.callWall,
+        putWall: gammaLevels?.putWall,
+        bookCenter,
+      },
     });
 
     // Pair directional entries with their subsequent exit signals from snapshot.committedCallLog
@@ -991,7 +979,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   // Auto-sync active Gaia SPY signals directly to Discord trade-signals engine
   const lastSyncedGaiaSigFingerprint = useRef<string>("");
   useEffect(() => {
-    if (activeSymbol !== "SPY" || !przmSignals || przmSignals.length === 0) return;
+    if (activeSymbol !== "SPY" || effectiveCandles.length === 0 || !przmSignals || przmSignals.length === 0 || !activeSpotPrice || activeSpotPrice <= 0) return;
     const fingerprint = przmSignals
       .map((s) => `${s.id}:${s.type}:${s.time}:${s.price.toFixed(2)}`)
       .join("|");
@@ -1542,7 +1530,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
               ? "rgba(16, 185, 129, 0.22)"
               : "rgba(239, 68, 68, 0.22)";
             const stcText = `STC ${pnlPct >= 0 ? "+" : ""}${Math.round(pnlPct)}%`;
-            const stcBadgeW = Math.max(76, stcText.length * 6.8 + 14);
+            const stcBadgeW = Math.max(86, stcText.length * 8.5 + 16);
 
             const btoTipY = isPut
               ? Math.max(padTop + 18, st.entryHighY - 6)
@@ -1894,6 +1882,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         liveSpot={activeSpotPrice}
         activeFsmState={fsmCommittedState}
         serverTrades={internalServerTrades}
+        ticker={activeSymbol}
       />
     </div>
   );
