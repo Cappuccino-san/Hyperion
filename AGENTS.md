@@ -33,3 +33,11 @@ Whenever the user asks "Ask Argon to...", "Argon, ...", "@argon", or asks for de
 2. Sends the challenge to Argon via `.agents/scripts/argon_bridge.py`.
 3. Displays Argon's architectural rationale, proposed diffs, and token/cost telemetry to the user.
 4. Waits for the user's approval before applying the changes.
+
+
+## JANE STREET PDE & RTH SESSION INVARIANTS (MANDATORY)
+- **Zero Synthetic Candles:** Never generate mock/sine-wave fallback candles in UI HUDs (`resolveRealCandles` must return `[]` when loading).
+- **RTH Entry Window (09:35 - 14:30 ET):** New BTO entries are strictly restricted to `575 <= etMins <= 870`. Zero new entries after 2:30 PM ET.
+- **Mandatory 15:55 ET MOC Flat Cutoff:** All open positions must liquidate at or before `15:55:00 ET` (`etMins >= 955`). Ticks `>= 16:00 ET` are dropped.
+- **PDE + Structural Wall Confluence:** Entries require Boundary Flux alignment (`chi`, `netFluxJ`, `pecletNumber`), >= 1.5R room to target wall, and >= $1.25 clearance from opposing walls. Exits fire within $0.25 of structural target walls with 50%/75% progressive stop ratchets.
+- **Expired Contract Firewall:** Never select contracts with `dte < 0` or `expiration < todayEt`.

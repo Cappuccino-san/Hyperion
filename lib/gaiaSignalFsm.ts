@@ -391,19 +391,40 @@ export class GaiaSignalFsm {
       }
 
       // Standard Equilibrium Dispersion Breakout Fallback
-      const vwapLongOk =
-        bar.flowVwap === undefined || (bar.close >= bar.flowVwap && vwapSlope >= 0);
-      if (eChi >= 0.85 && eFlux >= zFluxThreshold && bar.chi >= 0.50 && isBullMacro && vwapLongOk && !callBlockedByWall) {
-        return { nextState: "LONG", reason: "EQUILIBRIUM_CALL_BREAKOUT", targetWall: callWall };
-      }
+        // When structuralLevels are supplied, enforce strict Jane Street PDE Peclet + Flux persistence
+        const hasLevels = Boolean(levels && (zg || callWall || putWall));
+        const minEChi = hasLevels ? 1.25 : 0.85;
+        const minPeclet = hasLevels ? 1.5 : 0.0;
+        const vwapLongOk =
+          bar.flowVwap === undefined || (bar.close >= bar.flowVwap && vwapSlope >= 0);
+        if (
+          eChi >= minEChi &&
+          eFlux >= zFluxThreshold &&
+          Math.abs(bar.peclet) >= minPeclet &&
+          bar.chi >= 0.50 &&
+          isBullMacro &&
+          vwapLongOk &&
+          !callBlockedByWall
+        ) {
+          return { nextState: "LONG", reason: "EQUILIBRIUM_CALL_BREAKOUT", targetWall: callWall };
+        }
 
-      const vwapShortOk =
-        bar.flowVwap === undefined || (bar.close <= bar.flowVwap && vwapSlope <= 0);
-      if (eChi <= -0.85 && eFlux <= -zFluxThreshold && bar.chi < 0.50 && isBearMacro && !isBullMacro && vwapShortOk && !putBlockedByWall) {
-        return { nextState: "SHORT", reason: "EQUILIBRIUM_PUT_BREAKDOWN", targetWall: putWall };
-      }
+        const vwapShortOk =
+          bar.flowVwap === undefined || (bar.close <= bar.flowVwap && vwapSlope <= 0);
+        if (
+          eChi <= -minEChi &&
+          eFlux <= -zFluxThreshold &&
+          Math.abs(bar.peclet) >= minPeclet &&
+          bar.chi < 0.50 &&
+          isBearMacro &&
+          !isBullMacro &&
+          vwapShortOk &&
+          !putBlockedByWall
+        ) {
+          return { nextState: "SHORT", reason: "EQUILIBRIUM_PUT_BREAKDOWN", targetWall: putWall };
+        }
 
-      return { nextState: "STAND_ASIDE" };
+        return { nextState: "STAND_ASIDE" };
     }
 
     if (currentState === "LONG") {
