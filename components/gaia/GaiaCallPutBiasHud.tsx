@@ -1361,7 +1361,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
           {/* Horizontal Price Grid Lines & Right Y-Axis Numerical Labels */}
           {priceTicks.map((pt, idx) => {
-          const hideTickLabel = Math.abs(pt.y - yForPrice(activeSpotPrice)) < 15;
+          const vwapVal = (enrichedPoints.length > 0 ? (enrichedPoints[enrichedPoints.length - 1].flowVwap ?? 0) : 0);
+          const hideTickLabel = Math.abs(pt.y - yForPrice(activeSpotPrice)) < 16 || (vwapVal > 0 && Math.abs(pt.y - yForPrice(vwapVal)) < 16);
           return (
           <g key={`price-tick-${idx}`}>
               <line
