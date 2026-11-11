@@ -1897,8 +1897,11 @@ export function GaiaView() {
         const cx = barToX(matchedBarIdx);
         const isCall = sig.contractType === "CALL";
         const sigColor = isCall ? "#10b981" : "#f43f5e";
-        const entryY = priceToY(sig.spotPrice || candle.close);
         const candleY = isCall ? priceToY(candle.low) : priceToY(candle.high);
+        // Place Green (CALL) reticle circle BELOW candle low wick, Red (PUT) reticle circle ABOVE candle high wick
+        const entryY = isCall
+          ? Math.min(height - padBottom - 14, candleY + 8)
+          : Math.max(padTop + 14, candleY - 8);
 
         ctx.save();
         // 1. Entry price glowing core dot and reticle ring
@@ -1917,42 +1920,7 @@ export function GaiaView() {
         ctx.arc(cx, entryY, 3.2, 0, Math.PI * 2);
         ctx.fill();
 
-        // 2. Directional Triangle (▲ pointing up under candle for Call, ▼ above candle for Put)
-        const arrowY = isCall ? candleY + 12 : candleY - 12;
-        ctx.fillStyle = sigColor;
-        ctx.beginPath();
-        if (isCall) {
-          ctx.moveTo(cx, arrowY - 5);
-          ctx.lineTo(cx - 4.5, arrowY + 4);
-          ctx.lineTo(cx + 4.5, arrowY + 4);
-        } else {
-          ctx.moveTo(cx, arrowY + 5);
-          ctx.lineTo(cx - 4.5, arrowY - 4);
-          ctx.lineTo(cx + 4.5, arrowY - 4);
-        }
-        ctx.closePath();
-        ctx.fill();
-
-        // 3. Compact Tactical Badge Pill
-        const badgeText = isCall ? "▲ LONG BUY" : "▼ PUT BUY";
-        ctx.font = "bold 8.5px ui-monospace, SFMono-Regular, Menlo, monospace";
-        const textW = ctx.measureText(badgeText).width;
-        const pillW = Math.max(textW + 10, 58);
-        const pillH = 15;
-        const pillY = isCall ? arrowY + 6 : arrowY - 6 - pillH;
-
-        ctx.fillStyle = "rgba(10, 14, 23, 0.92)";
-        ctx.strokeStyle = sigColor;
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.roundRect(cx - pillW / 2, pillY, pillW, pillH, 3);
-        ctx.fill();
-        ctx.stroke();
-
-        ctx.fillStyle = sigColor;
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(badgeText, cx, pillY + pillH / 2);
+        // Layer 5.5 drawTradeExecutionMarkers renders the crisp BTO PUT / BTO CALL pill directly over this wick anchor
 
         ctx.restore();
       });

@@ -886,32 +886,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     if (trades.length === 0 || enrichedPoints.length === 0) return [];
     return trades
       .map((trade) => {
-        // Align with initial FSM signal if present to eliminate advection poll latency
-        const isCall = trade.contractType === "CALL";
-        let matchedFsmSig = trade.openedTs
-          ? intrinsicSignals.find(
-              (s) =>
-                s.isCall === isCall &&
-                Math.abs((s.barCloseTimestamp ?? 0) - trade.openedTs!) <= 900
-            )
-          : undefined;
-        if (!matchedFsmSig) {
-          matchedFsmSig = intrinsicSignals.find(
-            (s) => s.isCall === isCall && (s.isOpen || s.isClosed)
-          );
-        }
-
-        let entryIdx = matchedFsmSig ? matchedFsmSig.barIndex : -1;
-        if (entryIdx < 0) {
-          entryIdx = matchTradeToCandleIndex(
-            enrichedPoints,
-            trade.openedTs,
-            trade.openedAt
-          );
-        }
-        if (entryIdx < 0 && enrichedPoints.length > 0) {
-          entryIdx = 0;
-        }
+        // Match authoritative server trade timestamp/label ("10:15 AM ET", "1:15 PM ET") directly to candle index
+        let entryIdx = matchTradeToCandleIndex(
+          enrichedPoints,
+          trade.openedTs,
+          trade.openedAt
+        );
         if (entryIdx < 0) return null;
         const exitIdx =
           trade.status === "CLOSED"
