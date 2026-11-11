@@ -2617,6 +2617,37 @@ export async function evaluateTradeSignals(
       }
     }
 
+      // --- SETUP 1C: Zero-Gamma Flip & Boundary Flux Reclaim [BTO CALL] ---
+      const reclaimedZeroGammaAndVwap =
+        effectiveZeroGamma > 0 &&
+        spotPrice > effectiveZeroGamma &&
+        spotPrice > effectiveFlowVwap &&
+        spotPrice > effectiveSma34;
+      const hasPositiveFluxImpulse =
+        currentChi >= 0.48 || currentNetFlux > 0 || currentPe >= 0.40 || store.macroRegime === "CALL";
+      if (
+        !candidateBto &&
+        isMiddayReclaimWindow &&
+        reclaimedZeroGammaAndVwap &&
+        hasPositiveFluxImpulse &&
+        (!latest5mCandle || latest5mCandle.close >= latest5mCandle.open) &&
+        callRoomToWall >= 1.50
+      ) {
+        const stopLoss = Number((Math.min(effectiveFlowVwap - 0.15, spotPrice - 0.75)).toFixed(2));
+        const risk = Math.max(0.50, spotPrice - stopLoss);
+        if (callRoomToWall >= risk * 1.35) {
+          const target1 = Number((spotPrice + Math.min(callRoomToWall * 0.65, Math.max(1.25, risk * 1.60))).toFixed(2));
+          const target2 = Number(((typeof callMagnetTarget === "number" ? callMagnetTarget : tacticalCw) - 0.12).toFixed(2));
+          candidateBto = {
+            contractType: "CALL",
+            setupName: "Zero-Gamma Flip & Flux Reclaim [BTO CALL]",
+            stopLossSpot: stopLoss,
+            target1Spot: target1,
+            target2Spot: Math.max(target1 + 0.50, target2),
+          };
+        }
+      }
+
     // Allow SPY and watched tickers to evaluate structural setups (including Bearish Zero-Gamma Flush [BTO PUT])
     if (!candidateBto && flowSnap && latest5mCandle) {
       const bandSig = flowSnap.bandSignal;

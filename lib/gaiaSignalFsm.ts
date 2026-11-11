@@ -392,7 +392,25 @@ export class GaiaSignalFsm {
         }
       }
 
-      // Standard Equilibrium Dispersion Breakout Fallback
+      // Setup 1C: Jane Street Zero-Gamma Flip & Flux Field Reclaim (Post-10:15 AM V-Bottom Squeeze)
+        const zgLevel = typeof zg === "number" && zg > 0 ? zg : 0;
+        const vwapLevel = typeof bar.flowVwap === "number" && bar.flowVwap > 0 ? bar.flowVwap : 0;
+        const reclaimedZeroGamma = zgLevel > 0 && bar.close > zgLevel && bar.close > vwapLevel && vwapLevel > 0;
+        const fluxImpulseBull = (bar.chi >= 0.46 || eFlux >= 0.35) && bar.peclet >= 0.50 && vwapSlope >= 0;
+        if (
+          reclaimedZeroGamma &&
+          fluxImpulseBull &&
+          isBullMacro &&
+          !callBlockedByWall
+        ) {
+          return {
+            nextState: "LONG",
+            reason: "ZERO_GAMMA_FLUX_RECLAIM_CALL",
+            targetWall: callWall && callWall > bar.close + 1.0 ? callWall : Number((vwapLevel + 2.0 * Math.max(0.75, 1.25 * dispersion.atr)).toFixed(2))
+          };
+        }
+
+        // Standard Equilibrium Dispersion Breakout Fallback
         // Jane Street Invariant: When structural gamma levels are supplied, never fire mid-range noise scalps;
         // execute strictly on Structural Wall + PDE Boundary Flux setups (P-A, P-B, C-A, C-B) above.
         const hasStructuralMap = Boolean(levels && (zg || callWall || putWall));

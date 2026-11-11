@@ -259,7 +259,7 @@ export function evaluatePrzmCallLedger(
       heldMinutes: heldMin,
       heldLabel: formatHeldDuration(heldMin),
       index: 0,
-      contractLabel: pos.contractLabel,
+      contractLabel: (pos.contractLabel || (pos as any).optionSymbol),
       exitReason: pos.exitReason,
       isServerTrade: true,
     });
@@ -294,7 +294,7 @@ export function evaluatePrzmCallLedger(
       heldMinutes: heldMin,
       heldLabel: formatHeldDuration(heldMin),
       index: 0,
-      contractLabel: pos.contractLabel,
+      contractLabel: (pos.contractLabel || (pos as any).optionSymbol),
       isServerTrade: true,
     });
   }
@@ -910,7 +910,7 @@ export const PrzmCallLogDeck: React.FC<{
               } else if (entry.status === "RIGHT") {
                 const optPctStr =
                   typeof entry.pnlOptionPct === "number"
-                    ? `STC +${entry.pnlOptionPct.toFixed(1)}% · `
+                    ? `STC ${entry.pnlOptionPct > 0 ? "+" : ""}${entry.pnlOptionPct.toFixed(1)}% · `
                     : "STC · ";
                 statusBadge = `${optPctStr}+${Math.abs(entry.delta).toFixed(2)} pts · RIGHT`;
                 statusColor = "text-[#10b981] font-bold";

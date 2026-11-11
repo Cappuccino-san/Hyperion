@@ -3162,15 +3162,34 @@ export function GaiaView() {
           {dataset && DIVSYM.has(loadedTicker.toUpperCase()) && (
             <div className="absolute top-2 left-4 z-10 flex items-center gap-2 font-mono text-[11px] text-slate-400 select-none pointer-events-none">
               <span className="text-slate-500 font-semibold tracking-wider">MTF:</span>
-              <span>5m <strong className={mtfDivergence.tf5m === "BULL" ? "text-emerald-400" : mtfDivergence.tf5m === "BEAR" ? "text-rose-400" : "text-slate-500"}>{mtfDivergence.tf5m === "BULL" ? "▲" : mtfDivergence.tf5m === "BEAR" ? "▼" : "—"}</strong></span>
-              <span className="text-slate-700">|</span>
-              <span>30m <strong className={mtfDivergence.tf30m === "BULL" ? "text-emerald-400" : mtfDivergence.tf30m === "BEAR" ? "text-rose-400" : "text-slate-500"}>{mtfDivergence.tf30m === "BULL" ? "▲" : mtfDivergence.tf30m === "BEAR" ? "▼" : "—"}</strong></span>
-              <span className="text-slate-700">|</span>
-              <span>2H <strong className={mtfDivergence.tf2h === "BULL" ? "text-emerald-400" : mtfDivergence.tf2h === "BEAR" ? "text-rose-400" : "text-slate-500"}>{mtfDivergence.tf2h === "BULL" ? "▲" : mtfDivergence.tf2h === "BEAR" ? "▼" : "—"}</strong></span>
-              <span className="text-slate-700">|</span>
-              <span>1D <strong className={mtfDivergence.tfDaily === "BULL" ? "text-emerald-400" : mtfDivergence.tfDaily === "BEAR" ? "text-rose-400" : "text-slate-500"}>{mtfDivergence.tfDaily === "BULL" ? "▲" : mtfDivergence.tfDaily === "BEAR" ? "▼" : "—"}</strong></span>
-              <span className="text-slate-700">|</span>
-              <span>1W <strong className={mtfDivergence.tfWeekly === "BULL" ? "text-emerald-400" : mtfDivergence.tfWeekly === "BEAR" ? "text-rose-400" : "text-slate-500"}>{mtfDivergence.tfWeekly === "BULL" ? "▲" : mtfDivergence.tfWeekly === "BEAR" ? "▼" : "—"}</strong></span>
+              {(() => {
+                const c = dataset.candles[safeActiveIdx] || dataset.candles[dataset.candles.length - 1];
+                const cur = c?.close ?? dataset.priorClose ?? 0;
+                const vwap = (c as any)?.flowVwap ?? (dataset as any).flowVwap ?? cur;
+                const zg = (dataset as any).zeroGamma ?? (dataset as any).zeroGammaLevel ?? dataset.priorClose ?? vwap;
+                const slice = (n: number) => {
+                  const arr = dataset.candles.slice(Math.max(0, safeActiveIdx - n + 1), safeActiveIdx + 1);
+                  return arr.reduce((s, x) => s + x.close, 0) / Math.max(1, arr.length);
+                };
+                const tfs = [
+                  { label: "5m", bull: cur >= slice(6) && cur >= vwap },
+                  { label: "30m", bull: cur >= slice(12) && cur >= vwap },
+                  { label: "2H", bull: cur >= slice(24) && cur >= zg },
+                  { label: "1D", bull: cur >= (dataset.priorClose || zg) },
+                  { label: "1W", bull: cur >= zg },
+                ];
+                return tfs.map((tf, idx) => (
+                  <React.Fragment key={tf.label}>
+                    {idx > 0 && <span className="text-slate-700">|</span>}
+                    <span>
+                      {tf.label}{" "}
+                      <strong className={tf.bull ? "text-emerald-400" : "text-rose-400"}>
+                        {tf.bull ? "▲" : "▼"}
+                      </strong>
+                    </span>
+                  </React.Fragment>
+                ));
+              })()}
             </div>
           )}
         </div>
