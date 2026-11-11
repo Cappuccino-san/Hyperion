@@ -1522,10 +1522,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             const btoLabel = isPut ? "BTO PUT" : "BTO CALL";
             const pnlPct = st.pnlOptionPct ?? 0;
             const isProfit = pnlPct >= 0;
-            const stcColor = isProfit ? "#10b981" : "#ef4444";
-            const stcFill = isProfit
-              ? "rgba(16, 185, 129, 0.22)"
-              : "rgba(239, 68, 68, 0.22)";
+            const stcColor = isPut ? "#ef4444" : "#10b981";
+            const stcFill = isPut
+              ? "rgba(239, 68, 68, 0.22)"
+              : "rgba(16, 185, 129, 0.22)";
             const stcText = `STC ${pnlPct >= 0 ? "+" : ""}${Math.round(pnlPct)}%`;
             const stcBadgeW = Math.max(86, stcText.length * 8.5 + 16);
 

@@ -429,9 +429,7 @@ export function drawTradeExecutionMarkers(
       const isProfit = (trade.pnlOptionPct ?? 0) >= 0;
 
       ctx.save();
-      ctx.strokeStyle = isProfit
-        ? "rgba(16, 185, 129, 0.78)"
-        : "rgba(239, 68, 68, 0.78)";
+      ctx.strokeStyle = isPut ? "rgba(239, 68, 68, 0.78)" : "rgba(16, 185, 129, 0.78)";
       ctx.lineWidth = 1.75;
       ctx.setLineDash([4, 4]);
       ctx.beginPath();
@@ -446,7 +444,7 @@ export function drawTradeExecutionMarkers(
       ctx.arc(entryX, entrySpotY, 2.8, 0, Math.PI * 2);
       ctx.fill();
 
-      ctx.fillStyle = isProfit ? "#10b981" : "#ef4444";
+      ctx.fillStyle = btoColor;
       ctx.beginPath();
       ctx.arc(exitX, exitSpotY, 2.8, 0, Math.PI * 2);
       ctx.fill();
@@ -583,18 +581,16 @@ export function drawTradeExecutionMarkers(
 
       const pnlPct = trade.pnlOptionPct ?? 0;
       const isProfit = pnlPct >= 0;
-      const stcColor = isProfit ? "#10b981" : "#ef4444";
-      const stcFillBg = isProfit
-        ? "rgba(16, 185, 129, 0.2)"
-        : "rgba(239, 68, 68, 0.2)";
+      const stcColor = isPut ? "#ef4444" : "#10b981";
+      const stcFillBg = isPut
+        ? "rgba(239, 68, 68, 0.22)"
+        : "rgba(16, 185, 129, 0.22)";
       const pnlFormatted = `${pnlPct >= 0 ? "+" : ""}${Math.round(pnlPct)}%`;
       const badgeText = `STC ${pnlFormatted}`;
 
       ctx.save();
       ctx.fillStyle = stcColor;
-      ctx.shadowColor = isProfit
-        ? "rgba(16, 185, 129, 0.9)"
-        : "rgba(239, 68, 68, 0.9)";
+      ctx.shadowColor = isPut ? "rgba(239, 68, 68, 0.9)" : "rgba(16, 185, 129, 0.9)";
       ctx.shadowBlur = 10;
 
       // For covering a Put (Short), draw an upward triangle below the closing candle's low wick.
@@ -649,9 +645,7 @@ export function drawTradeExecutionMarkers(
         ctx.fillStyle = stcFillBg;
         ctx.strokeStyle = stcColor;
         ctx.lineWidth = 1.4;
-        ctx.shadowColor = isProfit
-          ? "rgba(16, 185, 129, 0.55)"
-          : "rgba(239, 68, 68, 0.55)";
+        ctx.shadowColor = isPut ? "rgba(239, 68, 68, 0.55)" : "rgba(16, 185, 129, 0.55)";
         ctx.shadowBlur = 8;
         ctx.beginPath();
         ctx.roundRect(bx, by, badgeW, badgeH, 5);
@@ -702,9 +696,7 @@ export function drawTradeExecutionMarkers(
         ctx.fillStyle = stcFillBg;
         ctx.strokeStyle = stcColor;
         ctx.lineWidth = 1.4;
-        ctx.shadowColor = isProfit
-          ? "rgba(16, 185, 129, 0.55)"
-          : "rgba(239, 68, 68, 0.55)";
+        ctx.shadowColor = isPut ? "rgba(239, 68, 68, 0.55)" : "rgba(16, 185, 129, 0.55)";
         ctx.shadowBlur = 8;
         ctx.beginPath();
         ctx.roundRect(bx, by, badgeW, badgeH, 5);

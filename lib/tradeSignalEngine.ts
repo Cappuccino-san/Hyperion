@@ -2576,7 +2576,7 @@ export async function evaluateTradeSignals(
 
     // --- SETUP 1B: Dynamic LOD Put Wall, King Node & Flux-Extremity Reclaim [BTO CALL] ---
     const isMiddayReclaimWindow = etTime.totalMinutes >= 600 && etTime.totalMinutes <= 870; // 10:00 AM - 2:30 PM ET
-    const activeKingNode = (filteredKing && filteredKing > 0) ? filteredKing : (allExpKing && allExpKing > 0 ? allExpKing : 0);
+    const activeKingNode = (filteredKing && filteredKing > 0) ? filteredKing : ((params as any).allExpKing && (params as any).allExpKing > 0 ? Number((params as any).allExpKing) : 0);
     const tacticalBookCenter = (activeKingNode > 0 && Math.abs(activeKingNode - spotPrice) / spotPrice <= 0.012)
       ? activeKingNode
       : (tacticalPw > 0 && tacticalCw > tacticalPw)
@@ -2834,7 +2834,8 @@ export async function evaluateTradeSignals(
     }
 
     // --- SETUP 2: BTO PUTS — Resistance Rejection / Bearish Reversal ---
-    if (candidateBto && store.closedPositions.length === 1 && lastClosed && candidateBto.contractType === lastClosed.contractType) {
+    const prevClosedTrade = store.closedPositions[store.closedPositions.length - 1];
+    if (candidateBto && store.closedPositions.length === 1 && prevClosedTrade && candidateBto.contractType === prevClosedTrade.contractType) {
       candidateBto = null; // Phase 2 must be an opposite-regime structural rotation (e.g. Morning Put Flush -> Midday Put Wall Call Reclaim)
     }
     if (!candidateBto) {
