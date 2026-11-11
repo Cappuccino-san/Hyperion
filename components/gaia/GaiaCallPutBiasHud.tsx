@@ -1360,8 +1360,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           })}
 
           {/* Horizontal Price Grid Lines & Right Y-Axis Numerical Labels */}
-          {priceTicks.map((pt, idx) => (
-            <g key={`price-tick-${idx}`}>
+          {priceTicks.map((pt, idx) => {
+          const hideTickLabel = Math.abs(pt.y - yForPrice(activeSpotPrice)) < 15;
+          return (
+          <g key={`price-tick-${idx}`}>
               <line
                 x1={padLeft}
                 y1={pt.y}
@@ -1371,7 +1373,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                 strokeWidth="1"
                 strokeDasharray="4 6"
               />
-              <text
+              {!hideTickLabel && <text
                 x={svgWidth - padRight + 8}
                 y={pt.y + 4}
                 fill="rgba(255, 255, 255, 0.45)"
@@ -1379,9 +1381,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                 fontFamily="monospace"
               >
                 ${pt.label}
-              </text>
-            </g>
-          ))}
+              </text>}
+          </g>
+          );
+        })}
 
           {/* Dynamic Regime Area Shading Underneath Price Curve */}
           {regimeSegments.map((seg, idx) => (
