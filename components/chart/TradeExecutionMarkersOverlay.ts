@@ -402,7 +402,11 @@ export function drawTradeExecutionMarkers(
     const entryX = barToX(entryIdx);
     const entrySpot =
       trade.btoSpotPrice > 0 ? trade.btoSpotPrice : entryCandle.close;
-    const entrySpotY = priceToY(entrySpot);
+    const isPutEarly = trade.contractType === "PUT";
+    // Place Red (PUT) circle slightly ABOVE candle high wick, Green (CALL) circle slightly BELOW candle low wick
+    const entrySpotY = isPutEarly
+      ? Math.max(padTop + 14, priceToY(entryCandle.high) - 6)
+      : Math.min(plotBottomY - 14, priceToY(entryCandle.low) + 6);
 
     const isPut = trade.contractType === "PUT";
     const btoColor = isPut ? "#ef4444" : "#10b981";
@@ -418,7 +422,10 @@ export function drawTradeExecutionMarkers(
         trade.closedSpotPrice && trade.closedSpotPrice > 0
           ? trade.closedSpotPrice
           : exitCandle.close;
-      const exitSpotY = priceToY(exitSpot);
+      // For PUT cover (upward green triangle below candle), place circle below low wick; for CALL exit, above high wick
+      const exitSpotY = isPut
+        ? Math.min(plotBottomY - 14, priceToY(exitCandle.low) + 6)
+        : Math.max(padTop + 14, priceToY(exitCandle.high) - 6);
       const isProfit = (trade.pnlOptionPct ?? 0) >= 0;
 
       ctx.save();
