@@ -2574,6 +2574,44 @@ export async function evaluateTradeSignals(
       };
     }
 
+    // --- SETUP 1B: Dynamic LOD Put Wall & Flux-Extremity Reclaim [BTO CALL] ---
+    const isMiddayReclaimWindow = etTime.totalMinutes >= 645 && etTime.totalMinutes <= 870; // 10:45 AM - 2:30 PM ET
+    const tacticalCw = callWall > spotPrice ? callWall : Number((spotPrice + Math.max(2.50, sigma1Move * 0.45)).toFixed(2));
+    const tacticalBookCenter = (tacticalPw > 0 && tacticalCw > tacticalPw)
+      ? Number(((tacticalCw + tacticalPw) / 2).toFixed(2))
+      : effectiveSma34;
+    const recent5mLow = latest5mCandle ? Math.min(latest5mCandle.low, spotPrice) : spotPrice;
+    const testedPutWallOrFluxExtremity =
+      (tacticalPw > 0 && Math.abs(recent5mLow - tacticalPw) / tacticalPw <= 0.0030) ||
+      (effectiveFlowVwap > 0 && (recent5mLow - effectiveFlowVwap) / fluxSigma <= -1.25);
+    const reclaimedCenterOrSma =
+      (tacticalBookCenter > 0 && spotPrice >= tacticalBookCenter) ||
+      (effectiveSma34 > 0 && spotPrice > effectiveSma34 && latest5mCandle && latest5mCandle.close > latest5mCandle.open);
+    const callRoomToWall = tacticalCw - spotPrice;
+
+    if (
+      !candidateBto &&
+      isMiddayReclaimWindow &&
+      testedPutWallOrFluxExtremity &&
+      reclaimedCenterOrSma &&
+      (!latest5mCandle || latest5mCandle.close >= latest5mCandle.open) &&
+      callRoomToWall >= 1.50
+    ) {
+      const stopLoss = Number((Math.min(recent5mLow - 0.15, spotPrice - 0.85)).toFixed(2));
+      const risk = Math.max(0.50, spotPrice - stopLoss);
+      if (callRoomToWall >= risk * 1.45) {
+        const target1 = Number((spotPrice + Math.min(callRoomToWall * 0.60, Math.max(1.25, risk * 1.50))).toFixed(2));
+        const target2 = Number((tacticalCw - 0.10).toFixed(2));
+        candidateBto = {
+          contractType: "CALL",
+          setupName: "Put Wall LOD & Flux Extremity Reclaim [BTO CALL]",
+          stopLossSpot: stopLoss,
+          target1Spot: target1,
+          target2Spot: Math.max(target1 + 0.50, target2),
+        };
+      }
+    }
+
     // Allow SPY and watched tickers to evaluate structural setups (including Bearish Zero-Gamma Flush [BTO PUT])
     if (!candidateBto && flowSnap && latest5mCandle) {
       const bandSig = flowSnap.bandSignal;

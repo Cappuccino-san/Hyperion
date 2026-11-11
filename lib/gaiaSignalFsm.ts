@@ -208,6 +208,7 @@ export class GaiaSignalFsm {
   private currentEntryPrice: number = 0;
   private activeTargetWall: number = 0;
   private activeStopPrice: number = 0;
+  private activeSetupReason: string = "";
 
   constructor(initialState: GaiaFsmState = "STAND_ASIDE") {
     this.committedState = initialState;
@@ -221,6 +222,7 @@ export class GaiaSignalFsm {
     this.currentEntryPrice = 0;
     this.activeTargetWall = 0;
     this.activeStopPrice = 0;
+    this.activeSetupReason = "";
   }
 
   /**
@@ -474,10 +476,15 @@ export class GaiaSignalFsm {
         return { nextState: "SHORT", reason: "MACRO_REVERSAL_TO_SHORT" };
       }
 
-      // If macro flips to BEAR, immediately neutralize
-      if (isBearMacro && !isBullMacro) {
-        return { nextState: "STAND_ASIDE", reason: "MACRO_REGIME_BEAR_FLIP" };
-      }
+      // Structural Stop Check for Setup C-A / C-B
+        if (this.activeStopPrice > 0 && bar.close < this.activeStopPrice) {
+          return { nextState: "STAND_ASIDE", reason: "STRUCTURAL_STOP_LOSS", fillPrice: bar.close };
+        }
+        // If macro flips to BEAR, neutralize ONLY non-structural equilibrium trades
+        const isStructuralLong = this.activeSetupReason.startsWith("STRUCTURAL_CALL");
+        if (!isStructuralLong && isBearMacro && !isBullMacro) {
+          return { nextState: "STAND_ASIDE", reason: "MACRO_REGIME_BEAR_FLIP" };
+        }
 
       // Trailing Volatility Envelope Exit: Breach of 1.5 * ATR from localHigh AND adverse flux confirmation
       const peakPrice = Math.max(trackedLocalExtreme || bar.close, bar.high);
@@ -538,10 +545,15 @@ export class GaiaSignalFsm {
         return { nextState: "LONG", reason: "MACRO_REVERSAL_TO_LONG" };
       }
 
-      // If macro flips to BULL, immediately neutralize
-      if (isBullMacro && !isBearMacro) {
-        return { nextState: "STAND_ASIDE", reason: "MACRO_REGIME_BULL_FLIP" };
-      }
+      // Structural Stop Check for Setup P-A / P-B
+        if (this.activeStopPrice > 0 && bar.close > this.activeStopPrice) {
+          return { nextState: "STAND_ASIDE", reason: "STRUCTURAL_STOP_LOSS", fillPrice: bar.close };
+        }
+        // If macro flips to BULL, neutralize ONLY non-structural equilibrium trades
+        const isStructuralShort = this.activeSetupReason.startsWith("STRUCTURAL_PUT");
+        if (!isStructuralShort && isBullMacro && !isBearMacro) {
+          return { nextState: "STAND_ASIDE", reason: "MACRO_REGIME_BULL_FLIP" };
+        }
 
       // Trailing Volatility Envelope Exit: Breach of 1.5 * ATR from localLow AND adverse flux confirmation
       const troughPrice = Math.min(trackedLocalExtreme || bar.close, bar.low);
@@ -618,6 +630,7 @@ export class GaiaSignalFsm {
       this.localExtremePrice = bar.close;
       this.activeTargetWall = targetWall || 0;
       this.activeStopPrice = stopPrice || 0;
+      this.activeSetupReason = reason || "";
       entryPrice = bar.close;
     } else if ((fromState === "LONG" || fromState === "SHORT") && nextState === "STAND_ASIDE") {
       entryPrice = this.currentEntryPrice;

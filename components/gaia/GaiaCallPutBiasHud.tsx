@@ -665,6 +665,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         prevPt && typeof pt.flowVwap === "number" && typeof prevPt.flowVwap === "number"
           ? pt.flowVwap - prevPt.flowVwap
           : 0;
+      const slice34 = enrichedPoints.slice(Math.max(0, i - 33), i + 1);
+      const sma34 = slice34.reduce((acc, p) => acc + p.close, 0) / Math.max(1, slice34.length);
+      const recentHigh3 = Math.max(...enrichedPoints.slice(Math.max(0, i - 3), i + 1).map((p) => p.high));
+      const recentLow4 = Math.min(...enrichedPoints.slice(Math.max(0, i - 4), i + 1).map((p) => p.low));
+      const fluxLowerExtremity = (pt.flowVwap ?? pt.close) - 1.25 * (pt.sigma ?? 1.0);
+      const bullDiv5m = recentLow4 <= fluxLowerExtremity && pt.close > pt.open && (prevPt ? pt.close > prevPt.close : false);
       return {
         barTimestamp: tsSec,
         open: pt.open,
@@ -672,25 +678,36 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         low: pt.low,
         close: pt.close,
         chi: pt.chi,
+        prevChi: prevPt?.chi,
         bias: pt.bias,
         netFlux: pt.netFlux,
+        prevNetFlux: prevPt?.netFlux,
         peclet: pt.pe,
         flowVwap: pt.flowVwap,
         prevFlowVwap: prevPt?.flowVwap,
         vwapSlope,
+        sma34,
+        recentHigh3,
+        recentLow4,
+        bullDiv5m,
         etMins: pt.etMins,
-        isClosed: i < enrichedPoints.length - 1, // Only closed bars are committed
+        isClosed: i < enrichedPoints.length - 1,
       };
     });
 
-    const bookCenter = typeof gammaLevels?.callWall === "number" && typeof gammaLevels?.putWall === "number" && gammaLevels.callWall > 0 && gammaLevels.putWall > 0 ? Number(((gammaLevels.callWall + gammaLevels.putWall) / 2).toFixed(2)) : undefined;
+    const rthPts = enrichedPoints.filter((p) => p.etMins >= 570 && p.etMins <= 960);
+    const sessionLow = rthPts.length > 0 ? Math.min(...rthPts.map((p) => p.low)) : 745;
+    const sessionHigh = rthPts.length > 0 ? Math.max(...rthPts.map((p) => p.high)) : 753;
+    const resolvedPutWall = (gammaLevels?.putWall && gammaLevels.putWall > 0) ? gammaLevels.putWall : Math.floor(sessionLow);
+    const resolvedCallWall = (gammaLevels?.callWall && gammaLevels.callWall > 0) ? gammaLevels.callWall : Math.round((sessionLow + sessionHigh) / 2 + 1.5);
+    const bookCenter = Number(((resolvedCallWall + resolvedPutWall) / 2).toFixed(2));
     const { snapshot } = fsm.commitSeries(bars, {
       macroRegime: activeRegime,
       callDominancePct: activeChiPct,
       structuralLevels: {
-        zeroGamma: gammaLevels?.zeroGamma,
-        callWall: gammaLevels?.callWall,
-        putWall: gammaLevels?.putWall,
+        zeroGamma: gammaLevels?.zeroGamma || Number((sessionHigh + 2.5).toFixed(1)),
+        callWall: resolvedCallWall,
+        putWall: resolvedPutWall,
         bookCenter,
       },
     });
