@@ -1435,7 +1435,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           />
 
           {/* Pinned Intraday Trade Markers */}
-          {markers.map((m) => {
+          {(svgServerTradeMarkers.length > 0 ? [] : markers).map((m) => {
             if (m.x < padLeft - 20 || m.x > svgWidth - padRight + 20) return null;
             const isCall = m.isCall;
             const isPending = (m as any).isPending ?? false;

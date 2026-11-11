@@ -393,16 +393,18 @@ export class GaiaSignalFsm {
       }
 
       // Standard Equilibrium Dispersion Breakout Fallback
-        // When structuralLevels are supplied, enforce strict Jane Street PDE Peclet + Flux persistence
-        const hasLevels = Boolean(levels && (zg || callWall || putWall));
-        const minEChi = hasLevels ? 1.25 : 0.85;
-        const minPeclet = hasLevels ? 1.5 : 0.0;
+        // Jane Street Invariant: When structural gamma levels are supplied, never fire mid-range noise scalps;
+        // execute strictly on Structural Wall + PDE Boundary Flux setups (P-A, P-B, C-A, C-B) above.
+        const hasStructuralMap = Boolean(levels && (zg || callWall || putWall));
+        if (hasStructuralMap) {
+          return { nextState: "STAND_ASIDE" };
+        }
+
         const vwapLongOk =
           bar.flowVwap === undefined || (bar.close >= bar.flowVwap && vwapSlope >= 0);
         if (
-          eChi >= minEChi &&
+          eChi >= 0.85 &&
           eFlux >= zFluxThreshold &&
-          Math.abs(bar.peclet) >= minPeclet &&
           bar.chi >= 0.50 &&
           isBullMacro &&
           vwapLongOk &&
@@ -414,9 +416,8 @@ export class GaiaSignalFsm {
         const vwapShortOk =
           bar.flowVwap === undefined || (bar.close <= bar.flowVwap && vwapSlope <= 0);
         if (
-          eChi <= -minEChi &&
+          eChi <= -0.85 &&
           eFlux <= -zFluxThreshold &&
-          Math.abs(bar.peclet) >= minPeclet &&
           bar.chi < 0.50 &&
           isBearMacro &&
           !isBullMacro &&

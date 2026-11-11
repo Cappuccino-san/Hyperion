@@ -2576,7 +2576,6 @@ export async function evaluateTradeSignals(
 
     // --- SETUP 1B: Dynamic LOD Put Wall & Flux-Extremity Reclaim [BTO CALL] ---
     const isMiddayReclaimWindow = etTime.totalMinutes >= 645 && etTime.totalMinutes <= 870; // 10:45 AM - 2:30 PM ET
-    const tacticalCw = callWall > spotPrice ? callWall : Number((spotPrice + Math.max(2.50, sigma1Move * 0.45)).toFixed(2));
     const tacticalBookCenter = (tacticalPw > 0 && tacticalCw > tacticalPw)
       ? Number(((tacticalCw + tacticalPw) / 2).toFixed(2))
       : effectiveSma34;
