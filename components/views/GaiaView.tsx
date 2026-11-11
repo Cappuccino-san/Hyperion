@@ -692,6 +692,8 @@ export function GaiaView() {
   const [activeBarIndex, setActiveBarIndex] = useState<number>(0);
   const [hoverBarIndex, setHoverBarIndex] = useState<number | null>(null);
   const [isReplaying, setIsReplaying] = useState<boolean>(false);
+  const isReplayingRef = useRef<boolean>(false);
+  useEffect(() => { isReplayingRef.current = isReplaying; }, [isReplaying]);
   const [openDivTf, setOpenDivTf] = useState<string | null>(null);
   const [divPayload, setDivPayload] = useState<DivergencePayload | null>(null);
 
@@ -763,7 +765,9 @@ export function GaiaView() {
         const payload = data as GaiaLivePayload;
         setLivePayload(payload);
         setSelectedSessionIso(payload.sessionDate);
-        setActiveBarIndex(Math.max(0, payload.candles.length - 1));
+        if (!isReplayingRef.current) {
+          setActiveBarIndex(Math.max(0, payload.candles.length - 1));
+        }
         setHoverBarIndex(null);
       } catch (err) {
         if (!silent) {
@@ -794,9 +798,15 @@ export function GaiaView() {
 
   useEffect(() => {
     fetchLiveGaia(loadedTicker, selectedSessionIso, startHour, false);
+  }, [loadedTicker, selectedSessionIso, startHour, fetchLiveGaia]);
+
+  useEffect(() => {
     if (!isReplaying && !selectedSessionIso) {
       const liveInterval = setInterval(() => {
-        if (typeof document === "undefined" || document.visibilityState === "visible") {
+        if (
+          !isReplayingRef.current &&
+          (typeof document === "undefined" || document.visibilityState === "visible")
+        ) {
           fetchLiveGaia(loadedTicker, "", startHour, true);
         }
       }, 2500);
@@ -806,7 +816,7 @@ export function GaiaView() {
 
   // Instant 800ms tick reactivity for GaiaView livePayload spot & candle tip
   useEffect(() => {
-    if (!liveTickPrice || liveTickPrice <= 0) return;
+    if (!liveTickPrice || liveTickPrice <= 0 || isReplaying) return;
     setLivePayload((prev) => {
       if (!prev) return prev;
       const candles = prev.candles;
@@ -882,7 +892,7 @@ export function GaiaView() {
         }
         return prev + 1;
       });
-    }, 140);
+    }, 320);
     return () => clearInterval(timer);
   }, [isReplaying, maxBarIdx]);
 
@@ -1024,9 +1034,11 @@ export function GaiaView() {
 
   const handleToggleReplay = () => {
     if (isReplaying) {
+      isReplayingRef.current = false;
       setIsReplaying(false);
     } else {
-      if (activeBarIndex >= maxBarIdx) {
+      isReplayingRef.current = true;
+      if (activeBarIndex >= maxBarIdx - 1) {
         setActiveBarIndex(0);
       }
       setIsReplaying(true);
@@ -3021,7 +3033,7 @@ export function GaiaView() {
       {/* 2E. Live Gaia Call/Put Bias & Every Call Today HUD */}
       <GaiaCallPutBiasHud
         symbol={loadedTicker}
-        candles={dataset?.candles?.map((c) => ({
+        candles={dataset?.candles?.slice(0, safeActiveIdx + 1).map((c) => ({
           timestamp: c.timestamp,
           open: c.open,
           high: c.high,
