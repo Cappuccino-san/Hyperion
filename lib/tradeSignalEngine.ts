@@ -2574,36 +2574,42 @@ export async function evaluateTradeSignals(
       };
     }
 
-    // --- SETUP 1B: Dynamic LOD Put Wall & Flux-Extremity Reclaim [BTO CALL] ---
-    const isMiddayReclaimWindow = etTime.totalMinutes >= 645 && etTime.totalMinutes <= 870; // 10:45 AM - 2:30 PM ET
-    const tacticalBookCenter = (tacticalPw > 0 && tacticalCw > tacticalPw)
-      ? Number(((tacticalCw + tacticalPw) / 2).toFixed(2))
-      : effectiveSma34;
+    // --- SETUP 1B: Dynamic LOD Put Wall, King Node & Flux-Extremity Reclaim [BTO CALL] ---
+    const isMiddayReclaimWindow = etTime.totalMinutes >= 600 && etTime.totalMinutes <= 870; // 10:00 AM - 2:30 PM ET
+    const activeKingNode = (filteredKing && filteredKing > 0) ? filteredKing : (allExpKing && allExpKing > 0 ? allExpKing : 0);
+    const tacticalBookCenter = (activeKingNode > 0 && Math.abs(activeKingNode - spotPrice) / spotPrice <= 0.012)
+      ? activeKingNode
+      : (tacticalPw > 0 && tacticalCw > tacticalPw)
+        ? Number(((tacticalCw + tacticalPw) / 2).toFixed(2))
+        : effectiveSma34;
     const recent5mLow = latest5mCandle ? Math.min(latest5mCandle.low, spotPrice) : spotPrice;
-    const testedPutWallOrFluxExtremity =
-      (tacticalPw > 0 && Math.abs(recent5mLow - tacticalPw) / tacticalPw <= 0.0030) ||
-      (effectiveFlowVwap > 0 && (recent5mLow - effectiveFlowVwap) / fluxSigma <= -1.25);
-    const reclaimedCenterOrSma =
-      (tacticalBookCenter > 0 && spotPrice >= tacticalBookCenter) ||
-      (effectiveSma34 > 0 && spotPrice > effectiveSma34 && latest5mCandle && latest5mCandle.close > latest5mCandle.open);
-    const callRoomToWall = tacticalCw - spotPrice;
+    const testedPutWallOrKingOrFlux =
+      (tacticalPw > 0 && Math.abs(recent5mLow - tacticalPw) / tacticalPw <= 0.0035) ||
+      (activeKingNode > 0 && recent5mLow <= activeKingNode && spotPrice >= activeKingNode) ||
+      (effectiveFlowVwap > 0 && (recent5mLow - effectiveFlowVwap) / fluxSigma <= -1.20);
+    const reclaimedKingOrSma =
+      (tacticalBookCenter > 0 && spotPrice >= tacticalBookCenter && (!latest5mCandle || latest5mCandle.close > latest5mCandle.open)) ||
+      (effectiveSma34 > 0 && spotPrice > effectiveSma34 && (!latest5mCandle || latest5mCandle.close > latest5mCandle.open));
+    const callMagnetTarget = (tacticalCw > spotPrice + 1.25)
+      ? tacticalCw
+      : (activeKingNode > spotPrice + 1.50 ? activeKingNode : Number((spotPrice + Math.max(2.50, fluxSigma * 2.2)).toFixed(2)));
+    const callRoomToWall = callMagnetTarget - spotPrice;
 
     if (
       !candidateBto &&
       isMiddayReclaimWindow &&
-      testedPutWallOrFluxExtremity &&
-      reclaimedCenterOrSma &&
-      (!latest5mCandle || latest5mCandle.close >= latest5mCandle.open) &&
+      testedPutWallOrKingOrFlux &&
+      reclaimedKingOrSma &&
       callRoomToWall >= 1.50
     ) {
       const stopLoss = Number((Math.min(recent5mLow - 0.15, spotPrice - 0.85)).toFixed(2));
       const risk = Math.max(0.50, spotPrice - stopLoss);
       if (callRoomToWall >= risk * 1.45) {
         const target1 = Number((spotPrice + Math.min(callRoomToWall * 0.60, Math.max(1.25, risk * 1.50))).toFixed(2));
-        const target2 = Number((tacticalCw - 0.10).toFixed(2));
+        const target2 = Number((callMagnetTarget - 0.10).toFixed(2));
         candidateBto = {
           contractType: "CALL",
-          setupName: "Put Wall LOD & Flux Extremity Reclaim [BTO CALL]",
+          setupName: "Put Wall / King Node & Flux Extremity Reclaim [BTO CALL]",
           stopLossSpot: stopLoss,
           target1Spot: target1,
           target2Spot: Math.max(target1 + 0.50, target2),
@@ -2828,6 +2834,9 @@ export async function evaluateTradeSignals(
     }
 
     // --- SETUP 2: BTO PUTS — Resistance Rejection / Bearish Reversal ---
+    if (candidateBto && store.closedPositions.length === 1 && lastClosed && candidateBto.contractType === lastClosed.contractType) {
+      candidateBto = null; // Phase 2 must be an opposite-regime structural rotation (e.g. Morning Put Flush -> Midday Put Wall Call Reclaim)
+    }
     if (!candidateBto) {
       const baseCallRejectRef =
         dailyExpectedMove?.high &&
