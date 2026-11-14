@@ -225,7 +225,13 @@ export function evaluatePrzmCallLedger(
       : typeof pos.spotPrice === "number" && pos.spotPrice > 0
         ? pos.spotPrice
         : btoSpot;
-    const delta = Number((isCall ? closedSpot - btoSpot : btoSpot - closedSpot).toFixed(2));
+    const entryBucket = pos.openedTs ? Math.floor(toEpochSeconds(pos.openedTs) / 300) * 300 : 0;
+    const exitBucket = pos.closedTs ? Math.floor(toEpochSeconds(pos.closedTs) / 300) * 300 : 0;
+    const entryBar = entryBucket > 0 ? series.find((b) => Math.floor(toEpochSeconds(b.timestamp) / 300) * 300 === entryBucket) : undefined;
+    const exitBar = exitBucket > 0 ? series.find((b) => Math.floor(toEpochSeconds(b.timestamp) / 300) * 300 === exitBucket) : undefined;
+    const clampedBto = entryBar && btoSpot > 0 ? Math.max(entryBar.low, Math.min(entryBar.high, btoSpot)) : btoSpot;
+    const clampedClosed = exitBar && closedSpot > 0 ? Math.max(exitBar.low, Math.min(exitBar.high, closedSpot)) : closedSpot;
+    const delta = Number((isCall ? clampedClosed - clampedBto : clampedBto - clampedClosed).toFixed(2));
     const isWin =
       pos.pnlOptionPct > 0 ||
       delta > 0.05 ||
@@ -247,12 +253,12 @@ export function evaluatePrzmCallLedger(
 
     serverEntries.push({
       id: pos.id,
-      timeFormatted: pos.openedAt || formatPrzmTime(undefined, pos.openedTs),
+      timeFormatted: pos.openedTs ? formatPrzmTime(pos.openedAt, pos.openedTs) : (pos.openedAt || ""),
       type,
       contractType: isCall ? "CALL" : "PUT",
-      entryPrice: btoSpot,
-      closedPrice: closedSpot,
-      closedTimeFormatted: pos.closedAt || (pos.closedTs ? formatPrzmTime(undefined, pos.closedTs) : undefined),
+      entryPrice: clampedBto,
+      closedPrice: clampedClosed,
+      closedTimeFormatted: pos.closedTs ? formatPrzmTime(pos.closedAt, pos.closedTs) : pos.closedAt,
       pnlOptionPct: typeof pos.pnlOptionPct === "number" ? pos.pnlOptionPct : undefined,
       status,
       delta,
@@ -275,8 +281,11 @@ export function evaluatePrzmCallLedger(
       : typeof pos.spotPrice === "number" && pos.spotPrice > 0
         ? pos.spotPrice
         : 0;
-    const currentSpot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : btoSpot;
-    const delta = Number((isCall ? currentSpot - btoSpot : btoSpot - currentSpot).toFixed(2));
+    const entryBucket = pos.openedTs ? Math.floor(toEpochSeconds(pos.openedTs) / 300) * 300 : 0;
+    const entryBar = entryBucket > 0 ? series.find((b) => Math.floor(toEpochSeconds(b.timestamp) / 300) * 300 === entryBucket) : undefined;
+    const clampedBto = entryBar && btoSpot > 0 ? Math.max(entryBar.low, Math.min(entryBar.high, btoSpot)) : btoSpot;
+    const currentSpot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : clampedBto;
+    const delta = Number((isCall ? currentSpot - clampedBto : clampedBto - currentSpot).toFixed(2));
     const nowTs = Math.floor(Date.now() / 1000);
     const heldMin =
       pos.openedTs && nowTs > pos.openedTs
@@ -285,10 +294,10 @@ export function evaluatePrzmCallLedger(
 
     serverEntries.push({
       id: pos.id,
-      timeFormatted: pos.openedAt || formatPrzmTime(undefined, pos.openedTs),
+      timeFormatted: pos.openedTs ? formatPrzmTime(pos.openedAt, pos.openedTs) : (pos.openedAt || ""),
       type,
       contractType: isCall ? "CALL" : "PUT",
-      entryPrice: btoSpot,
+      entryPrice: clampedBto,
       status: "OPEN",
       delta,
       heldMinutes: heldMin,

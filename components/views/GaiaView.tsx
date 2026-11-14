@@ -919,8 +919,19 @@ export function GaiaView() {
       dataset.candles[dataset.candles.length - 1]?.close ?? dataset.priorClose;
 
     const lastCol = dataset.columnsByBar[dataset.columnsByBar.length - 1];
-    const allExpKingStrike = lastCol?.allExpKingStrike ?? 0;
-    const filteredKingStrike = lastCol?.filteredKingStrike ?? 0;
+    const isLiveSynced = !isReplaying && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
+    const allExpKingStrike =
+      isLiveSynced && storeHeatmapKingNode?.allExpKing
+        ? storeHeatmapKingNode.allExpKing
+        : (lastCol?.allExpKingStrike ?? 0);
+    const filteredKingStrike =
+      isLiveSynced && storeHeatmapKingNode
+        ? expFilter === "0DTE" && storeHeatmapKingNode.zeroDteKing
+          ? storeHeatmapKingNode.zeroDteKing
+          : expFilter === "WEEK" && storeHeatmapKingNode.weeklyKing
+            ? storeHeatmapKingNode.weeklyKing
+            : storeHeatmapKingNode.allExpKing || lastCol?.filteredKingStrike || 0
+        : (lastCol?.filteredKingStrike ?? 0);
     const activeKing = expFilter === "ALL" ? allExpKingStrike : (filteredKingStrike || allExpKingStrike);
     const apiCallWall = gammaLevels?.callWall ?? 0;
     const apiPutWall = gammaLevels?.putWall ?? 0;
@@ -960,10 +971,13 @@ export function GaiaView() {
         dataset.priorClose + dataset.sigma1Move,
       ];
     } else {
-      // Cone: full ±2σ cone bounds + Kings (Image 1)
+      // Cone: full ±2σ cone bounds + Kings + live structural walls (Image 1)
       anchorPrices = [
         ...(allExpKingStrike > 0 ? [allExpKingStrike] : []),
         ...(filteredKingStrike > 0 ? [filteredKingStrike] : []),
+        ...(apiCallWall > 0 ? [apiCallWall] : []),
+        ...(apiPutWall > 0 ? [apiPutWall] : []),
+        ...(apiZeroGamma > 0 ? [apiZeroGamma] : []),
         ...dataset.visibleStrikes,
         ...candleHighs,
         ...candleLows,
@@ -977,7 +991,7 @@ export function GaiaView() {
     const rawSpan = Math.max(2.0, maxP - minP);
     const pad = Math.max(
       2.5,
-      rawSpan * (scopePreset === "focus" ? 0.14 : 0.09)
+      rawSpan * (scopePreset === "focus" ? 0.14 : 0.12)
     );
 
     const baseCenter = (minP + maxP) / 2;
@@ -991,7 +1005,7 @@ export function GaiaView() {
     const yAxisTicks = computeNicePriceTicks(yMin, yMax, 6);
 
     return { yMin, yMax, yAxisTicks };
-  }, [dataset, scopePreset, expFilter, gammaLevels, yScale, yPanOffset]);
+  }, [dataset, scopePreset, expFilter, gammaLevels, yScale, yPanOffset, isReplaying, storeHeatmapTicker, loadedTicker, storeHeatmapKingNode]);
 
   const handleLoadTicker = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -1637,7 +1651,7 @@ export function GaiaView() {
     const mergedLines: Array<StructuralLineSpec & { y: number }> = [];
     for (const spec of structuralSpecs) {
       const y = Math.round(priceToY(spec.price)) + 0.5;
-      if (y < padTop + 6 || y > height - padBottom - 6) continue;
+      if (y < padTop + 2 || y > height - padBottom - 2) continue;
       const samePrice = mergedLines.find((m) => Math.abs(m.price - spec.price) < 0.05);
       if (samePrice) {
         if (
@@ -1668,8 +1682,10 @@ export function GaiaView() {
 
       const collides = occupiedLabelYs.some((oy) => Math.abs(oy - ln.y) < 11);
       if (!collides) {
+        const drawBelow = ln.y - 12 < padTop + 2;
+        ctx.textBaseline = drawBelow ? "top" : "bottom";
         ctx.fillStyle = ln.textColor;
-        ctx.fillText(ln.label, dividerX - 6, ln.y - 2);
+        ctx.fillText(ln.label, dividerX - 6, drawBelow ? ln.y + 2 : ln.y - 2);
         occupiedLabelYs.push(ln.y);
       }
     }
@@ -2007,8 +2023,10 @@ export function GaiaView() {
 
     // Map visible strikes to {Strike} — {Concentration %} labels if within visible Y bounds
     dataset.visibleStrikes.forEach((strike) => {
-      const y = priceToY(strike);
-      if (y < padTop + 6 || y > height - padBottom - 6) return;
+      const rawY = priceToY(strike);
+      if (rawY < padTop + 2 || rawY > height - padBottom - 2) return;
+      const y = Math.max(padTop + 7, Math.min(height - padBottom - 7, rawY));
+      if (drawnStrikeYs.some((item) => Math.abs(item.y - y) < 11)) return;
 
       const val = (structuralBookCol ?? activeBookCol)!.strikeValues[strike] ?? 0;
       const absVal = Math.abs(val);
@@ -2064,16 +2082,21 @@ export function GaiaView() {
       }
     });
 
-    // Pinned right-axis indicator if All-Exp King is outside vertical price bounds
-    if (allExpKingStrike > 0 && expFilter === "ALL") {
-      const yMacro = priceToY(allExpKingStrike);
+    // Pinned right-axis indicator if All-Exp King or Filtered King is outside vertical price bounds
+    const pinnedKing = expFilter === "ALL" ? allExpKingStrike : (filteredKingStrike || allExpKingStrike);
+    if (pinnedKing > 0) {
+      const yMacro = priceToY(pinnedKing);
       if (yMacro < padTop + 6 || yMacro > height - padBottom - 6) {
         const isBelow = yMacro > height - padBottom - 6;
         const pinY = isBelow ? height - padBottom - 10 : padTop + 10;
         const arrow = isBelow ? "▼ " : "▲ ";
         ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
         ctx.fillStyle = atlasPalette === "ice" ? "#ffffff" : "#facc15";
-        ctx.fillText(`${arrow}${allExpKingStrike} · King ${(structuralBookCol ?? activeBookCol)!.allExpKingConcPct}%`, outlookRightX + 7, pinY);
+        const pct = expFilter === "ALL"
+          ? (structuralBookCol ?? activeBookCol)!.allExpKingConcPct
+          : (structuralBookCol ?? activeBookCol)!.filteredKingConcPct;
+        ctx.fillText(`${arrow}${pinnedKing} · ${expFilter === "ALL" ? "King" : canvasFilterBadgePrefix} ${pct}%`, outlookRightX + 7, pinY);
+        drawnStrikeYs.push({ y: pinY, strike: pinnedKing });
       }
     }
 
@@ -2122,7 +2145,7 @@ export function GaiaView() {
       const badgeW = 76;
       const badgeH = 24;
       const bx = outlookRightX + 4;
-      const by = ySpot - badgeH / 2;
+      const by = Math.max(padTop + 1, Math.min(height - padBottom - badgeH - 1, ySpot - badgeH / 2));
 
       ctx.save();
       ctx.fillStyle = "#0c101c";
@@ -2156,12 +2179,13 @@ export function GaiaView() {
     ) {
       const cursorRatio = 1 - (hoverCursor.y - padTop) / plotHeight;
       const cursorPrice = yMin + cursorRatio * (yMax - yMin);
+      const hy = Math.max(padTop + 9, Math.min(height - padBottom - 9, hoverCursor.y));
       ctx.save();
       ctx.fillStyle = "#1e293b";
       ctx.strokeStyle = "#38bdf8";
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.roundRect(outlookRightX + 3, hoverCursor.y - 8, rightAxisWidth - 6, 16, 3);
+      ctx.roundRect(outlookRightX + 3, hy - 8, rightAxisWidth - 6, 16, 3);
       ctx.fill();
       ctx.stroke();
 
@@ -2169,7 +2193,7 @@ export function GaiaView() {
       ctx.font = "bold 9px ui-monospace, monospace";
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
-      ctx.fillText(cursorPrice.toFixed(2), outlookRightX + 6, hoverCursor.y);
+      ctx.fillText(cursorPrice.toFixed(2), outlookRightX + 6, hy);
       ctx.restore();
     }
 

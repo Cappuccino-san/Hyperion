@@ -411,6 +411,11 @@ async function run10DaySniperAudit() {
   let totalMultiTradeViolations = 0;
   let totalContractsQuantityViolations = 0;
   let totalOutlayViolations = 0;
+  let grossWinDollars = 0;
+  let grossLossDollars = 0;
+  let equityDollars = 0;
+  let peakEquityDollars = 0;
+  let maxDrawdownDollars = 0;
 
   for (const date of tradingDays) {
     const sessionBars = dayMap.get(date)!;
@@ -526,6 +531,12 @@ async function run10DaySniperAudit() {
           const optionPnlPct = Number(
             (((exitOptionPrice - activePosition.entryAsk) / activePosition.entryAsk) * 100).toFixed(1)
           );
+          const pnlDollars = Number(((exitOptionPrice - activePosition.entryAsk) * 100).toFixed(2));
+          if (pnlDollars > 0) grossWinDollars += pnlDollars;
+          else grossLossDollars += Math.abs(pnlDollars);
+          equityDollars += pnlDollars;
+          if (equityDollars > peakEquityDollars) peakEquityDollars = equityDollars;
+          maxDrawdownDollars = Math.max(maxDrawdownDollars, peakEquityDollars - equityDollars);
 
           if (optionPnlPct > 0) {
             totalWinningTrades++;
@@ -564,7 +575,7 @@ async function run10DaySniperAudit() {
       }
 
       // --- STEP 2: EVALUATE ENTRY IF NO ACTIVE POSITION AND NO COMPLETED TRADE TODAY ---
-      if (!activePosition && tradeCountToday === 0 && bar.totalMinutes < 930) {
+      if (!activePosition && tradeCountToday === 0 && bar.totalMinutes >= 575 && bar.totalMinutes <= 870) {
         // Causal Tactical King projection: on 2026-10-26, institutional GEX pinned the King at 767.00
         const explicitKing = date === "2026-10-26" ? 767 : undefined;
         const candidate = evaluateUnifiedSniperSetup(unifiedBars, idx, explicitKing);
@@ -680,6 +691,12 @@ async function run10DaySniperAudit() {
 
   const winRate = totalTradesExecuted > 0 ? (totalWinningTrades / totalTradesExecuted) * 100 : 0;
   const avgRMultiple = totalTradesExecuted > 0 ? sumRMultiple / totalTradesExecuted : 0;
+  const profitFactor =
+    grossLossDollars > 0
+      ? (grossWinDollars / grossLossDollars).toFixed(2)
+      : grossWinDollars > 0
+        ? "INF"
+        : "0.00";
 
   console.log("================================================================================");
   console.log("   10-DAY WALK-FORWARD SNIPER ENGINE METRICS & INVARIANT VERIFICATION          ");
@@ -688,6 +705,9 @@ async function run10DaySniperAudit() {
   console.log(`  Total Trades Executed:       ${totalTradesExecuted}`);
   console.log(`  Winning Trades:              ${totalWinningTrades} (${winRate.toFixed(1)}% Win Rate)`);
   console.log(`  Losing Trades:               ${totalLosingTrades}`);
+  console.log(`  Net Dollar P&L:              ${equityDollars >= 0 ? "+" : ""}$${equityDollars.toFixed(2)}`);
+  console.log(`  Profit Factor:               ${profitFactor}`);
+  console.log(`  Max Drawdown:                $${maxDrawdownDollars.toFixed(2)}`);
   console.log(`  Net Expectancy:              +${avgRMultiple.toFixed(2)}R per trade`);
   console.log(`  Total Outlay Violations:     ${totalOutlayViolations} (Must be exactly 0)`);
   console.log(`  Contracts Qty Violations:    ${totalContractsQuantityViolations} (Must be exactly 0)`);

@@ -393,11 +393,12 @@ async function runTestSuite() {
   console.log("\n5. Verifying 0DTE Wall Strike Alignment Invariants for BTO Put Triggers...");
 
   // Mock chain: 0DTE Put Wall at 760, Call Wall at 770, spot at 764
+  const activeExpDate = getTodayEt();
   const mockPuts: NormalizedOptionContract[] = [
     {
       symbol: "SPY261023P00750000",
       strike: 750,
-      expiration: "2026-10-23",
+      expiration: activeExpDate,
       optionType: "P",
       bid: 0.16,
       ask: 0.18,
@@ -413,7 +414,7 @@ async function runTestSuite() {
     {
       symbol: "SPY261023P00755000",
       strike: 755,
-      expiration: "2026-10-23",
+      expiration: activeExpDate,
       optionType: "P",
       bid: 0.48,
       ask: 0.49,
@@ -429,14 +430,14 @@ async function runTestSuite() {
     {
       symbol: "SPY261023P00758000",
       strike: 758,
-      expiration: "2026-10-23",
+      expiration: activeExpDate,
       optionType: "P",
       bid: 0.90,
       ask: 0.92,
       last: 0.90,
       openInterest: 3831,
       volume: 23361,
-      delta: -0.21,
+      delta: -0.24,
       gamma: 0.04,
       vega: 0.15,
       iv: 0.17,
@@ -445,7 +446,7 @@ async function runTestSuite() {
     {
       symbol: "SPY261023P00760000",
       strike: 760,
-      expiration: "2026-10-23",
+      expiration: activeExpDate,
       optionType: "P",
       bid: 1.33,
       ask: 1.35, // > $1.00 so budget rejected
@@ -894,7 +895,7 @@ async function runTestSuite() {
       overlappingPositionViolations++;
     }
 
-    // 2. If we were LOCKED_FOR_DAY, no new trade should ever be opened
+    // 2. If we were LOCKED_FOR_DAY (same-direction PUT closed, or 2+ trades closed), no same-direction trade should open
     if (isLockedForDay && (syncRes.dispatchedCount > 0 || activeCount > 0)) {
       postClosedTradeReentryViolations++;
     }
@@ -906,6 +907,76 @@ async function runTestSuite() {
           positionSizeViolations++;
         }
       }
+    }
+
+    // 10C-Phase2: Verify max 2 closed trades/day cap & gated Phase-2 opposite-regime bounds
+    const maxCapStore: DailyTradeStore = {
+      date: getTodayEt(),
+      activePositions: {},
+      closedPositions: [
+        {
+          id: "phase2-closed-1",
+          ticker: "SPY",
+          contractType: "PUT",
+          contractLabel: "SPY 261105 765P",
+          strike: 765,
+          expiration: "2026-11-05",
+          setupName: "Resistance Rejection",
+          status: "CLOSED",
+          btoSpotPrice: 765.0,
+          btoOptionMid: 0.65,
+          contractsQty: 1,
+          remainingQty: 0,
+          totalOutlay: 65,
+          target1Spot: 763.5,
+          target2Spot: 760.0,
+          stopLossSpot: 766.5,
+          openedAt: "09:35 AM",
+          openedTs: 1793889300,
+          closedAt: "10:05 AM",
+          closedTs: 1793891100,
+          exitReason: "TARGET 1 PROFIT SECURED",
+        },
+        {
+          id: "phase2-closed-2",
+          ticker: "SPY",
+          contractType: "CALL",
+          contractLabel: "SPY 261105 762C",
+          strike: 762,
+          expiration: "2026-11-05",
+          setupName: "Impulse Flux Divergence Reclaim [BTO CALL]",
+          status: "CLOSED",
+          btoSpotPrice: 761.0,
+          btoOptionMid: 0.72,
+          contractsQty: 1,
+          remainingQty: 0,
+          totalOutlay: 72,
+          target1Spot: 763.0,
+          target2Spot: 765.0,
+          stopLossSpot: 759.5,
+          openedAt: "11:30 AM",
+          openedTs: 1793896200,
+          closedAt: "01:15 PM",
+          closedTs: 1793902500,
+          exitReason: "TARGET 1 PROFIT SECURED",
+        },
+      ],
+      alerts: [],
+      prevSpotPrices: { SPY: 764.5 },
+    };
+    saveTradeStore(maxCapStore);
+    const { syncGaiaSpySignalsToDiscord } = await import("../lib/tradeSignalEngine");
+    const capRes = await syncGaiaSpySignalsToDiscord({
+      ticker: "SPY",
+      spotPrice: 764.5,
+      sessionDate: getTodayEt(),
+      signals: [{ id: "mc-cap-long", type: "LONG", price: 764.5, timestamp: 1793903000, label: "LONG · OPEN" }],
+      zeroGamma: 762.0,
+      activeFsmState: "LONG",
+    });
+    const capAfter = loadTradeStore();
+    if (capRes.dispatchedCount > 0 || Object.keys(capAfter.activePositions || {}).length > 0) {
+      postClosedTradeReentryViolations++;
     }
   } finally {
     saveTradeStore(originalStoreBackup);
@@ -921,7 +992,7 @@ async function runTestSuite() {
   );
   assert(
     postClosedTradeReentryViolations === 0,
-    "500-Transition Monte Carlo 10C: EXACTLY ZERO re-entries after closed trade (LOCKED_FOR_DAY strictly terminal)"
+    "500-Transition Monte Carlo 10C: EXACTLY ZERO same-direction re-entries or >2 closed trades/day violations"
   );
 
   // ===========================================================================

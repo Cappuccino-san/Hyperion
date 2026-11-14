@@ -1,10 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { evaluatePrzmCallLedger, PrzmSignalPoint, PrzmCandlePoint } from "@/components/gaia/PrzmTacticalHud";
-import { extractNormalizedTradesForTicker } from "@/components/chart/TradeExecutionMarkersOverlay";
+import {
+  extractNormalizedTradesForTicker,
+  parseTimeLabelToMinutes,
+  clampSpotToCandle,
+} from "@/components/chart/TradeExecutionMarkersOverlay";
 import { initializeOcoBrackets, evaluateOcoBrackets } from "@/lib/bracketOrderEngine";
 import { NbboQuote } from "@/lib/marketDataService";
 import { clampToCandleRange } from "@/lib/tradeSignalEngine";
+import { acquireBarEvaluationLock, releaseBarEvaluationLock } from "@/lib/liveBotDaemon";
 
 describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
   it("Duration Normalization Invariant: 44-minute millisecond trade produces 44M, NOT 723H", () => {
@@ -521,5 +526,21 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
     const resolvedCol = structuralBookCol ?? hoveredBookCol;
     assert.strictEqual(resolvedCol.filteredKingStrike, 762, "0DTE KING must stay locked to live structuralBookCol");
     assert.strictEqual(resolvedCol.allExpKingStrike, 765, "ALL-EXP KING must stay locked to live structuralBookCol");
+  });
+
+  it("Cross-Frame Time & Candle Clamp Parity: '10 AM' parses to 600 mins and spot clamps within [low, high]", () => {
+    assert.strictEqual(parseTimeLabelToMinutes("10 AM"), 600, "'10 AM' without :MM must parse to 600 mins");
+    const clamped = clampSpotToCandle(754.26, { open: 754.4, high: 754.44, low: 752.05, close: 752.3 });
+    assert.strictEqual(clamped, 754.26);
+    const clampedHigh = clampSpotToCandle(755.10, { open: 754.4, high: 754.44, low: 752.05, close: 752.3 });
+    assert.strictEqual(clampedHigh, 754.44);
+  });
+
+  it("Daemon Lock Token Ownership Invariant: Mismatched release token cannot clear active bar lock", () => {
+    const tok = acquireBarEvaluationLock();
+    assert.ok(tok, "Initial lock acquisition must succeed");
+    releaseBarEvaluationLock(999999 as any);
+    assert.strictEqual(acquireBarEvaluationLock(), 0 as any, "Wrong token must not release active lock");
+    releaseBarEvaluationLock(tok as any);
   });
 });

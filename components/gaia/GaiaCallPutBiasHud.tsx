@@ -23,6 +23,7 @@ import {
 import {
   extractNormalizedTradesForTicker,
   matchTradeToCandleIndex,
+  clampSpotToCandle,
 } from "@/components/chart/TradeExecutionMarkersOverlay";
 
 export interface GaiaHudCandle {
@@ -258,8 +259,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     }
   }, [serverTradesProp]);
 
-  // Dynamic Trade Signals Engine Hook: Polls /api/signals every 5s to guarantee client is in lockstep with server daemon
+  // Dynamic Trade Signals Engine Hook: Polls /api/signals only when parent does not supply serverTradesProp
   useEffect(() => {
+    if (serverTradesProp !== undefined) return;
     let isMounted = true;
     async function syncServerTrades() {
       try {
@@ -285,7 +287,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       isMounted = false;
       clearInterval(interval);
     };
-  }, [activeSymbol]);
+  }, [activeSymbol, serverTradesProp]);
 
   // Chart Container & Dynamic Axis Scaling / Pan State
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -899,7 +901,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             ? matchTradeToCandleIndex(enrichedPoints, trade.closedTs, trade.closedAt)
             : -1;
         const entryBar = enrichedPoints[entryIdx];
-        const entrySpot = trade.btoSpotPrice > 0 ? trade.btoSpotPrice : entryBar.close;
+        const entrySpot = clampSpotToCandle(trade.btoSpotPrice, entryBar);
         const entryX = xForIdx(entryIdx);
         const entryY = yForPrice(entrySpot);
         const entryHighY = yForPrice(entryBar.high);
@@ -907,10 +909,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
         const isClosed = trade.status === "CLOSED" && exitIdx >= 0;
         const exitBar = isClosed ? enrichedPoints[exitIdx] : enrichedPoints[enrichedPoints.length - 1];
-        const exitSpot =
-          isClosed && trade.closedSpotPrice && trade.closedSpotPrice > 0
-            ? trade.closedSpotPrice
-            : exitBar.close;
+        const exitSpot = isClosed
+          ? clampSpotToCandle(trade.closedSpotPrice ?? exitBar.close, exitBar)
+          : exitBar.close;
         const exitX = isClosed ? xForIdx(exitIdx) : xForIdx(enrichedPoints.length - 1);
         const exitY = yForPrice(exitSpot);
         const exitHighY = yForPrice(exitBar.high);
@@ -1584,27 +1585,34 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                       stroke="#ffffff"
                       strokeWidth="1"
                     />
-                    <rect
-                      x={st.entryX - 30}
-                      y={btoPillY}
-                      width="60"
-                      height="15"
-                      rx="4"
-                      fill="rgba(15, 23, 42, 0.92)"
-                      stroke={btoColor}
-                      strokeWidth="1.2"
-                    />
-                    <text
-                      x={st.entryX}
-                      y={btoPillY + 10.5}
+                    {(() => {
+                      const btoPillX = Math.max(padLeft + 2, Math.min(svgWidth - padRight - 62, st.entryX - 30));
+                      return (
+                        <>
+                          <rect
+                            x={btoPillX}
+                            y={btoPillY}
+                            width="60"
+                            height="15"
+                            rx="4"
+                            fill="rgba(15, 23, 42, 0.92)"
+                            stroke={btoColor}
+                            strokeWidth="1.2"
+                          />
+                          <text
+                            x={btoPillX + 30}
+                            y={btoPillY + 10.5}
                       textAnchor="middle"
                       fill={isPut ? "#fca5a5" : "#6ee7b7"}
                       fontSize="9"
                       fontWeight="bold"
                       fontFamily="monospace"
                     >
-                      {btoLabel}
-                    </text>
+                            {btoLabel}
+                          </text>
+                        </>
+                      );
+                    })()}
                   </g>
                 )}
 

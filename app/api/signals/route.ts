@@ -232,8 +232,16 @@ export async function GET(req: NextRequest) {
     }
 
     if (searchParams.get("action") === "clear") {
-      clearDailyTrades();
-      return NextResponse.json({ success: true, message: "Daily trades cleared." });
+      const lockToken = acquireBarEvaluationLock();
+      if (!lockToken) {
+        return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
+      }
+      try {
+        clearDailyTrades();
+        return NextResponse.json({ success: true, message: "Daily trades cleared." });
+      } finally {
+        releaseBarEvaluationLock(lockToken);
+      }
     }
 
     if (searchParams.get("performance") === "true") {
@@ -247,21 +255,38 @@ export async function GET(req: NextRequest) {
     }
 
     if (searchParams.get("action") === "send_radar") {
-      const sent = await sendPreTradeRadarDiscordCard(webhookUrl);
-      return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
+      const lockToken = acquireBarEvaluationLock();
+      if (!lockToken) {
+        return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
+      }
+      try {
+        const sent = await sendPreTradeRadarDiscordCard(webhookUrl);
+        return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
+      } finally {
+        releaseBarEvaluationLock(lockToken);
+      }
     }
 
     if (searchParams.get("action") === "send_recap") {
-      const report = await checkAndSendMarketCloseRecap({ force: true, webhookUrl });
-      return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
+      const lockToken = acquireBarEvaluationLock();
+      if (!lockToken) {
+        return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
+      }
+      try {
+        const report = await checkAndSendMarketCloseRecap({ force: true, webhookUrl });
+        return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
+      } finally {
+        releaseBarEvaluationLock(lockToken);
+      }
     }
 
     // Continuously evaluate all open positions across all tickers against live CBOE quotes
-    if (acquireBarEvaluationLock()) {
+    const getLockToken = acquireBarEvaluationLock();
+    if (getLockToken) {
       try {
         await evaluateAllActivePositions({ webhookUrl });
       } finally {
-        releaseBarEvaluationLock();
+        releaseBarEvaluationLock(getLockToken);
       }
     }
 
@@ -286,7 +311,8 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
 
     if (body.action === "SYNC_GAIA_SPY_SIGNALS") {
-      if (!acquireBarEvaluationLock()) {
+      const lockToken = acquireBarEvaluationLock();
+      if (!lockToken) {
         return NextResponse.json({ success: false, busy: true, dispatchedCount: 0, keys: [] }, { status: 409 });
       }
       try {
@@ -304,33 +330,64 @@ export async function POST(req: NextRequest) {
         });
         return NextResponse.json({ success: true, ...res });
       } finally {
-        releaseBarEvaluationLock();
+        releaseBarEvaluationLock(lockToken);
       }
     }
 
     if (body.action === "clear") {
-      clearDailyTrades();
-      return NextResponse.json({ success: true, message: "Daily trades reset." });
+      const lockToken = acquireBarEvaluationLock();
+      if (!lockToken) {
+        return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
+      }
+      try {
+        clearDailyTrades();
+        return NextResponse.json({ success: true, message: "Daily trades reset." });
+      } finally {
+        releaseBarEvaluationLock(lockToken);
+      }
     }
 
     if (body.action === "send_daily_recap") {
-      const report = await checkAndSendMarketCloseRecap({ force: true, webhookUrl: body.webhookUrl });
-      return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
+      const lockToken = acquireBarEvaluationLock();
+      if (!lockToken) {
+        return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
+      }
+      try {
+        const report = await checkAndSendMarketCloseRecap({ force: true, webhookUrl: body.webhookUrl });
+        return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
+      } finally {
+        releaseBarEvaluationLock(lockToken);
+      }
     }
 
     if (body.action === "send_radar") {
-      const sent = await sendPreTradeRadarDiscordCard(body.webhookUrl);
-      return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
+      const lockToken = acquireBarEvaluationLock();
+      if (!lockToken) {
+        return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
+      }
+      try {
+        const sent = await sendPreTradeRadarDiscordCard(body.webhookUrl);
+        return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
+      } finally {
+        releaseBarEvaluationLock(lockToken);
+      }
     }
 
-    if (!acquireBarEvaluationLock()) {
+    const lockToken = acquireBarEvaluationLock();
+    if (!lockToken) {
       return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
     }
     try {
-      const result = await evaluateTradeSignals(body);
+      const normalizedBody = {
+        ...body,
+        ...(body.nowEt
+          ? { nowEt: new Date(body.nowEt), isHistoricalBackfill: body.isHistoricalBackfill ?? true }
+          : {}),
+      };
+      const result = await evaluateTradeSignals(normalizedBody);
       return NextResponse.json(result);
     } finally {
-      releaseBarEvaluationLock();
+      releaseBarEvaluationLock(lockToken);
     }
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);

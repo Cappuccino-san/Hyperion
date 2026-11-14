@@ -236,6 +236,27 @@ runTest("Spectral Flow VWAP & Flux Field PDEs satisfy boundary conditions and ch
   assert.ok(late.fluxAlpha > early.fluxAlpha, "Flux Alpha A(T) grows monotonically as T increases");
 });
 
+runTest("Windowed 30m Impulse Flux (impulseChi / deltaChi6Bar) recovers on afternoon bounce despite morning flush lag", () => {
+  const baseTs = 1794579000; // 09:00 ET
+  const candles = [
+    { timestamp: baseTs, etMins: 540, open: 762, high: 762.5, low: 761.5, close: 762, volume: 10000 },
+    { timestamp: baseTs + 1800, etMins: 570, open: 759, high: 760, low: 758, close: 758.1, volume: 50000 },
+    { timestamp: baseTs + 2100, etMins: 575, open: 758.1, high: 758.4, low: 756.2, close: 756.9, volume: 60000 },
+    { timestamp: baseTs + 2400, etMins: 580, open: 756.9, high: 757.3, low: 754.0, close: 754.4, volume: 70000 },
+    { timestamp: baseTs + 2700, etMins: 585, open: 754.4, high: 754.5, low: 749.0, close: 749.1, volume: 90000 },
+    { timestamp: baseTs + 3000, etMins: 590, open: 749.1, high: 750.2, low: 748.5, close: 749.2, volume: 40000 },
+    { timestamp: baseTs + 3300, etMins: 595, open: 749.2, high: 750.3, low: 748.8, close: 749.5, volume: 42000 },
+    { timestamp: baseTs + 3600, etMins: 600, open: 749.5, high: 750.8, low: 749.3, close: 750.6, volume: 45000 },
+    { timestamp: baseTs + 3900, etMins: 605, open: 750.6, high: 752.1, low: 750.5, close: 751.9, volume: 50000 },
+    { timestamp: baseTs + 4200, etMins: 610, open: 751.9, high: 753.2, low: 751.8, close: 753.0, volume: 55000 },
+    { timestamp: baseTs + 4500, etMins: 615, open: 753.0, high: 754.0, low: 752.8, close: 753.8, volume: 58000 },
+  ];
+  const series = computeBarFlowGammaVwapSeries(candles);
+  const bounceBar = series[series.length - 1];
+  assert.ok((bounceBar.impulseChi ?? 0) > 0.55, `Expected impulseChi > 0.55 on bounce, got ${bounceBar.impulseChi}`);
+  assert.ok((bounceBar.deltaChi6Bar ?? 0) > 0, `Expected positive deltaChi6Bar on reclaim, got ${bounceBar.deltaChi6Bar}`);
+});
+
 console.log(`\n=======================================================`);
 console.log(`Test Results: ${testsPassed} / ${testsRun} Passed`);
 console.log(`=======================================================\n`);

@@ -7,6 +7,14 @@ import {
 
 export const dynamic = "force-dynamic";
 
+type GaiaCoalescedResult =
+  | { ok: true; payload: GaiaLivePayload }
+  | { ok: false; error: string; status: number };
+
+const gaiaInFlight = new Map<string, Promise<GaiaCoalescedResult>>();
+const gaiaShortCache = new Map<string, { tsMs: number; payload: GaiaLivePayload }>();
+const GAIA_SHORT_CACHE_MS = 3_000;
+
 export type DivergenceStatus = "BULL" | "BEAR" | "NO";
 
 export interface GaiaSessionOption {
@@ -227,6 +235,7 @@ async function fetchYahooSeries(
       const etTime24 = d.toLocaleTimeString("en-US", {
         timeZone: "America/New_York",
         hour12: false,
+        hourCycle: "h23",
       });
       const [hNum, mNum] = etTime24.split(":").map(Number);
       if (startHour === 9) {
@@ -832,25 +841,30 @@ export async function GET(request: NextRequest) {
 
   const ticker = /^[A-Z0-9._-]{1,10}$/.test(rawTicker) ? rawTicker : "SPY";
   const yahooSymbol = mapYahooSymbol(ticker);
+  const cacheKey = `${ticker}:${requestedSession || "latest"}:${startHour}`;
 
-  try {
-    // Fetch live multi-timeframe candle series from Yahoo Finance in parallel
-    // 5m series includes pre-market starting from 7:00 AM ET (or 8:00 AM / 9:30 AM if requested)
-    const [bars5mRaw, bars30mRaw, bars60mRaw, bars1dRaw, bars1wkRaw] =
-      await Promise.all([
-        fetchYahooSeries(yahooSymbol, "5m", "1mo", true, startHour),
-        fetchYahooSeries(yahooSymbol, "30m", "1mo"),
-        fetchYahooSeries(yahooSymbol, "60m", "3mo"),
-        fetchYahooSeries(yahooSymbol, "1d", "6mo"),
-        fetchYahooSeries(yahooSymbol, "1wk", "2y"),
-      ]);
+  const cached = gaiaShortCache.get(cacheKey);
+  if (cached && Date.now() - cached.tsMs < GAIA_SHORT_CACHE_MS) {
+    return NextResponse.json(cached.payload);
+  }
 
-    if (bars5mRaw.length === 0 || bars1dRaw.length === 0) {
-      return NextResponse.json(
-        { error: `No live market bars returned for ${ticker}` },
-        { status: 502 }
-      );
-    }
+  let pending = gaiaInFlight.get(cacheKey);
+  if (!pending) {
+    pending = (async (): Promise<GaiaCoalescedResult> => {
+      // Fetch live multi-timeframe candle series from Yahoo Finance in parallel
+      // 5m series includes pre-market starting from 7:00 AM ET (or 8:00 AM / 9:30 AM if requested)
+      const [bars5mRaw, bars30mRaw, bars60mRaw, bars1dRaw, bars1wkRaw] =
+        await Promise.all([
+          fetchYahooSeries(yahooSymbol, "5m", "1mo", true, startHour),
+          fetchYahooSeries(yahooSymbol, "30m", "1mo"),
+          fetchYahooSeries(yahooSymbol, "60m", "3mo"),
+          fetchYahooSeries(yahooSymbol, "1d", "6mo"),
+          fetchYahooSeries(yahooSymbol, "1wk", "2y"),
+        ]);
+
+      if (bars5mRaw.length === 0 || bars1dRaw.length === 0) {
+        return { ok: false, error: `No live market bars returned for ${ticker}`, status: 502 };
+      }
 
     // Group 5m bars by ET trading session date
     const sessionDatesDesc = Array.from(
@@ -885,10 +899,7 @@ export async function GET(request: NextRequest) {
     }
 
     if (sessionGlobalIndices.length === 0) {
-      return NextResponse.json(
-        { error: `No 5m session bars found for ${ticker} on ${activeSessionDate}` },
-        { status: 502 }
-      );
+      return { ok: false, error: `No 5m session bars found for ${ticker} on ${activeSessionDate}`, status: 502 };
     }
 
     const firstSessionGlobalIdx = sessionGlobalIndices[0];
@@ -1076,7 +1087,22 @@ export async function GET(request: NextRequest) {
       optionBuckets: liveBook.buckets,
     };
 
-    return NextResponse.json(payload);
+      return { ok: true, payload };
+    })();
+    gaiaInFlight.set(cacheKey, pending);
+  }
+
+  try {
+    const result = await pending;
+    if (!result.ok) {
+      return NextResponse.json({ error: result.error }, { status: result.status });
+    }
+    gaiaShortCache.set(cacheKey, { tsMs: Date.now(), payload: result.payload });
+    if (gaiaShortCache.size > 32) {
+      const oldestKey = gaiaShortCache.keys().next().value;
+      if (oldestKey) gaiaShortCache.delete(oldestKey);
+    }
+    return NextResponse.json(result.payload);
   } catch (err) {
     const message =
       err instanceof Error ? err.message : "Live market feed error";
@@ -1084,5 +1110,9 @@ export async function GET(request: NextRequest) {
       { error: `Live Antaeus feed unavailable for ${ticker}: ${message}` },
       { status: 502 }
     );
+  } finally {
+    if (gaiaInFlight.get(cacheKey) === pending) {
+      gaiaInFlight.delete(cacheKey);
+    }
   }
 }

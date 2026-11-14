@@ -122,8 +122,15 @@ export function evaluateOcoBrackets(params: {
   underlyingSpot: number;
   candle5m?: { close: number; sma34: number } | null;
   nowEt?: Date;
+  fluxContext?: {
+    netFluxJ: number;
+    peclet: number;
+    impulseChi: number;
+    upper2Sigma?: number;
+    lower2Sigma?: number;
+  } | null;
 }): OcoEvaluationResult {
-  const { bracket, config, currentNbbo, underlyingSpot, candle5m, nowEt } = params;
+  const { bracket, config, currentNbbo, underlyingSpot, candle5m, nowEt, fluxContext } = params;
   const now = nowEt ?? new Date();
 
   const etString = now.toLocaleTimeString("en-US", {
@@ -265,8 +272,14 @@ export function evaluateOcoBrackets(params: {
         contractsToClose: 1,
         updatedBracket,
       };
-    } else {
-      // 1 contract: In disciplined small-account trading, exit 100% at TP1!
+    } else if (
+      !(
+        fluxContext &&
+        ((isCall && fluxContext.netFluxJ > 0 && (fluxContext.impulseChi > 0.72 || fluxContext.peclet >= 1.0)) ||
+          (!isCall && fluxContext.netFluxJ < 0 && (fluxContext.impulseChi < 0.28 || fluxContext.peclet <= -1.0)))
+      )
+    ) {
+      // 1 contract: exit 100% at TP1 unless Boundary Flux remains solidly aligned toward Target 2 / ±2σ
       updatedBracket.status = "CLOSED";
       updatedBracket.remainingContracts = 0;
 

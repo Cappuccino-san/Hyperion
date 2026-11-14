@@ -13,6 +13,7 @@ interface LiveBotGlobalState {
   isPolling: boolean;
   isEvaluatingLiveBar: boolean;
   lockAcquiredAtMs: number;
+  lockToken: number;
   startedAtMs: number;
   lastPollAtMs: number;
   lastStatus: string;
@@ -64,6 +65,7 @@ function getBotState(): LiveBotGlobalState {
       isPolling: false,
       isEvaluatingLiveBar: false,
       lockAcquiredAtMs: 0,
+      lockToken: 0,
       startedAtMs: Date.now(),
       lastPollAtMs: 0,
       lastStatus: "IDLE",
@@ -79,35 +81,40 @@ export function isEvaluatingLiveBar(): boolean {
   return Boolean(globalThis.__hyperionLiveBotState?.isEvaluatingLiveBar);
 }
 
-export function acquireBarEvaluationLock(): boolean {
+export function acquireBarEvaluationLock(): number {
   const state = getBotState();
   const nowMs = Date.now();
   if (state.isEvaluatingLiveBar && nowMs - state.lockAcquiredAtMs < 30_000) {
-    return false;
+    return 0;
   }
   state.isEvaluatingLiveBar = true;
   state.lockAcquiredAtMs = nowMs;
-  return true;
+  state.lockToken = (state.lockToken || 0) + 1;
+  return state.lockToken;
 }
 
-export function releaseBarEvaluationLock(): void {
+export function releaseBarEvaluationLock(token?: number): void {
   const state = getBotState();
+  if (typeof token === "number" && token > 0 && state.lockToken !== token) {
+    return;
+  }
   state.isEvaluatingLiveBar = false;
   state.lockAcquiredAtMs = 0;
 }
 
 export async function runLiveBotTick(): Promise<void> {
   const botState = getBotState();
-  if (botState.isPolling || botState.isEvaluatingLiveBar) return;
+  if (botState.isPolling) return;
 
   if (!isWithinRthWindow()) {
     botState.lastStatus = "OUTSIDE_RTH";
     return;
   }
 
-  // Atomic Memory Lock Acquisition
+  // Atomic Token-Owned Lock Acquisition
+  const lockToken = acquireBarEvaluationLock();
+  if (!lockToken) return;
   botState.isPolling = true;
-  botState.isEvaluatingLiveBar = true;
   botState.lastPollAtMs = Date.now();
   botState.pollCount += 1;
   botState.lastStatus = "POLLING_RTH";
@@ -181,7 +188,7 @@ export async function runLiveBotTick(): Promise<void> {
   } catch (err) {
     botState.lastStatus = `ERROR: ${err instanceof Error ? err.message : "unknown"}`;
   } finally {
-    botState.isEvaluatingLiveBar = false;
+    releaseBarEvaluationLock(lockToken);
     botState.isPolling = false;
   }
 }

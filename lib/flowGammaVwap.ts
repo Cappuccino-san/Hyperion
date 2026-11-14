@@ -74,6 +74,10 @@ export interface FlowGammaVwapSnapshot {
   ceilingFluxJ?: number;      // J_c(tau) = -Gamma * dPhi/dx |_{x=W}
   floorFluxJ?: number;        // J_f(tau) = +Gamma * dPhi/dx |_{x=0}
   netFluxJ?: number;          // J_c(tau) - J_f(tau)
+  impulsePeclet?: number;     // 30-min (6-bar) windowed Pe_impulse
+  impulseChi?: number;        // chi(Pe_impulse) in (0, 1) unaffected by morning session lag
+  deltaChi6Bar?: number;      // chi[i] - chi[i-6]
+  deltaNetFlux6Bar?: number;  // netFluxJ[i] - netFluxJ[i-6]
   fluxAlpha?: number;         // A(T) cumulative integrated ceiling flux
   fluxRegime?: FluxRegime;
   bandSignal?: FlowBandSignal;
@@ -605,8 +609,6 @@ export function computeBarFlowGammaVwapSeries(
   const refOpenSpot = candles[0].open || candles[0].close;
 
   if (optionsBook && optionsBook.length > 0) {
-  // RTH_SESSION_RESET_GUARD: Track RTH open transition (09:30 ET) to reset pre-market variance skew
-  let hasResetForRth = false;
     for (const opt of optionsBook) {
       const gamma = Math.max(0, Number(opt.gamma) || 0);
       const vol = Math.max(1, Number(opt.volume) || (Number(opt.openInterest) || 0) * 0.05);
@@ -702,9 +704,17 @@ export function computeBarFlowGammaVwapSeries(
   let runningLow = +Infinity;
   let causalAtr = 0;
   const atrAlpha = 1 / 14;
+  let hasResetForRth = false;
 
   for (let i = 0; i < candles.length; i++) {
     const c = candles[i];
+    const etMins = (c as any).etMins;
+    if (!hasResetForRth && typeof etMins === "number" && etMins >= 570) {
+      hasResetForRth = true;
+      engine.reset(c.open || c.close);
+      runningHigh = c.high;
+      runningLow = c.low;
+    }
     const spot = c.close;
     const barVol = Math.max(1, c.volume || 100);
 
@@ -784,23 +794,29 @@ export function computeBarFlowGammaVwapSeries(
     // Multi-Horizon Structural Advection Velocity (Session Open + VWAP + Momentum)
     const open930 = candles.find((b) => ((b as any).etMins ?? 0) >= 570)?.open ?? candles[0].open;
     const currentVwap = baseSnap.flowVwap || c.close;
-    const atrEst = Math.max(0.40, (c.high - c.low) * 1.5);
+    const atrEst = Math.max(0.40, causalAtr);
 
     // 1. Session Macro Horizon: Distance from 9:30 AM Open
     const macroDrive = (c.close - open930) / (2.2 * atrEst);
     // 2. Structural Horizon: Distance from Flow VWAP
     const vwapDrive = (c.close - currentVwap) / (1.2 * atrEst);
-    // 3. Short-Term Impulse Horizon (12-bar & 4-bar)
-    const lb12 = Math.max(0, i - 12);
+    // 3. Windowed 30m (6-bar), 20m (4-bar) & 10m (2-bar) Impulse Horizon
+    const lb6 = Math.max(0, i - 6);
     const lb4 = Math.max(0, i - 4);
+    const lb2 = Math.max(0, i - 2);
     const impulseDrive = (
-      0.6 * ((c.close - candles[lb12].close) / atrEst) +
-      0.4 * ((c.close - candles[lb4].close) / atrEst)
+      0.20 * ((c.close - candles[lb6].close) / atrEst) +
+      0.45 * ((c.close - candles[lb4].close) / atrEst) +
+      0.35 * ((c.close - candles[lb2].close) / atrEst)
     );
 
     const combinedDrive = 0.45 * macroDrive + 0.35 * vwapDrive + 0.20 * impulseDrive;
     const muDelta = Math.max(-8.0, Math.min(8.0, combinedDrive * 2.8));
     const sigmaC = Math.max(0.1, Math.log1p(barWeight) * 0.25);
+    const safeGammaImp = Math.max(1e-4, gammaDiff);
+    const impulseMuDelta = Math.max(-8.0, Math.min(8.0, impulseDrive * 2.8));
+    const impulsePeclet = Number(Math.max(-25, Math.min(25, (impulseMuDelta * W) / safeGammaImp)).toFixed(3));
+    const impulseChi = Number(computeCeilingShareChi(impulsePeclet).toFixed(4));
 
     const pdeState = evaluateSpectralFlowAndFluxAtTau({
       tauMinutes,
@@ -868,6 +884,14 @@ export function computeBarFlowGammaVwapSeries(
       ceilingFluxJ: pdeState.ceilingFluxJ,
       floorFluxJ: pdeState.floorFluxJ,
       netFluxJ: pdeState.netFluxJ,
+      impulsePeclet,
+      impulseChi,
+      deltaChi6Bar: i >= 6 && results[i - 6]?.ceilingShareChi !== undefined
+        ? Number((pdeState.ceilingShareChi - results[i - 6].ceilingShareChi!).toFixed(4))
+        : 0,
+      deltaNetFlux6Bar: i >= 6 && results[i - 6]?.netFluxJ !== undefined
+        ? Number((pdeState.netFluxJ - results[i - 6].netFluxJ!).toFixed(2))
+        : 0,
       fluxAlpha: pdeState.fluxAlpha,
       fluxRegime: pdeState.fluxRegime,
       bandSignal,

@@ -73,10 +73,10 @@ export interface DrawTradeExecutionMarkersOptions {
 export function parseTimeLabelToMinutes(label?: string): number | null {
   if (!label || typeof label !== "string") return null;
   const trimmed = label.trim();
-  const match = trimmed.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?/i);
+  const match = trimmed.match(/(\d{1,2})(?::(\d{2}))?(?::\d{2})?\s*(AM|PM)?/i);
   if (!match) return null;
   let hours = parseInt(match[1], 10);
-  const mins = parseInt(match[2], 10);
+  const mins = match[2] ? parseInt(match[2], 10) : 0;
   if (Number.isNaN(hours) || Number.isNaN(mins)) return null;
   const meridiem = (match[3] || "").toUpperCase();
   if (meridiem === "PM" && hours < 12) hours += 12;
@@ -361,6 +361,15 @@ export function extractNormalizedTradesForTicker(
   return Array.from(byId.values());
 }
 
+/** Clamps an execution spot price inside the matched candle's [low, high] range. */
+export function clampSpotToCandle(spot: number, candle: ChartCandleLike): number {
+  const lo = Math.min(candle.low, candle.high);
+  const hi = Math.max(candle.low, candle.high);
+  if (!Number.isFinite(spot) || spot <= 0) return candle.close;
+  if (hi <= 0) return spot;
+  return Math.max(lo, Math.min(hi, spot));
+}
+
 /**
  * Draws the On-Chart Trade Execution Markers (`BTO` triangles + labels, `STC` cover markers,
  * glowing PnL pill badges, and dotted trajectory connectors) onto a 2D canvas context.
@@ -404,13 +413,8 @@ export function drawTradeExecutionMarkers(
 
     const entryCandle = candles[entryIdx];
     const entryX = barToX(entryIdx);
-    const entrySpot =
-      trade.btoSpotPrice > 0 ? trade.btoSpotPrice : entryCandle.close;
-    const isPutEarly = trade.contractType === "PUT";
-    // Place Red (PUT) circle slightly ABOVE candle high wick, Green (CALL) circle slightly BELOW candle low wick
-    const entrySpotY = isPutEarly
-      ? Math.max(padTop + 14, priceToY(entryCandle.high) - 6)
-      : Math.min(plotBottomY - 14, priceToY(entryCandle.low) + 6);
+    const entrySpot = clampSpotToCandle(trade.btoSpotPrice, entryCandle);
+    const entrySpotY = Math.max(padTop + 4, Math.min(plotBottomY - 4, priceToY(entrySpot)));
 
     const isPut = trade.contractType === "PUT";
     const btoColor = isPut ? "#ef4444" : "#10b981";
@@ -422,14 +426,8 @@ export function drawTradeExecutionMarkers(
     if (isClosedAndVisible) {
       const exitCandle = candles[exitIdxRaw];
       const exitX = barToX(exitIdxRaw);
-      const exitSpot =
-        trade.closedSpotPrice && trade.closedSpotPrice > 0
-          ? trade.closedSpotPrice
-          : exitCandle.close;
-      // For PUT cover (upward green triangle below candle), place circle below low wick; for CALL exit, above high wick
-      const exitSpotY = isPut
-        ? Math.min(plotBottomY - 14, priceToY(exitCandle.low) + 6)
-        : Math.max(padTop + 14, priceToY(exitCandle.high) - 6);
+      const exitSpot = clampSpotToCandle(trade.closedSpotPrice ?? exitCandle.close, exitCandle);
+      const exitSpotY = Math.max(padTop + 4, Math.min(plotBottomY - 4, priceToY(exitSpot)));
       const isProfit = (trade.pnlOptionPct ?? 0) >= 0;
 
       ctx.save();

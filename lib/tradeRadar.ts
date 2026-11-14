@@ -501,9 +501,12 @@ export async function sendPreTradeRadarDiscordCard(customWebhookUrl?: string): P
       contractsQty: 1,
       remainingQty: 1,
       totalOutlay: 0,
+      isHistoricalBackfill: true,
       message: `📡 PRE-TRADE RADAR UPDATED: SPY $${radar.setups[0]?.spotPrice.toFixed(2)} testing toward Put Wall $${radar.setups[0]?.putWall}. Waiting for 5m confirmation.`,
     };
 
+    store.dispatchedAlertIds = store.dispatchedAlertIds || {};
+    store.dispatchedAlertIds[radarAlert.id] = true;
     store.alerts.push(radarAlert);
     saveTradeStore(store);
 

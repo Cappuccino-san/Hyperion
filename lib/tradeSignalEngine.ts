@@ -529,17 +529,27 @@ export function loadTradeStore(): DailyTradeStore {
     return inMemoryTradeStore;
   }
 
-  // Retain the last 3 days of active-trades-*.json cache files to prevent premature midnight wipe
+  // Retain the last 7 calendar days of active-trades-*.json and reap stale .tmp.* files (> 5 min old)
   try {
     const files = fs.readdirSync(cacheDir);
     const validDates = new Set<string>();
-    for (let dayOffset = 0; dayOffset < 3; dayOffset++) {
+    for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
       const dt = new Date();
       dt.setDate(dt.getDate() - dayOffset);
       const dtStr = dt.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
       validDates.add(dtStr);
     }
+    const staleTmpCutoffMs = Date.now() - 5 * 60_000;
     for (const f of files) {
+      if (f.startsWith("active-trades-") && f.includes(".json.tmp.")) {
+        try {
+          const full = path.join(cacheDir, f);
+          if (fs.statSync(full).mtimeMs < staleTmpCutoffMs) fs.unlinkSync(full);
+        } catch {
+          // ignore cleanup failures
+        }
+        continue;
+      }
       if (f.startsWith("active-trades-") && f.endsWith(".json")) {
         const matchesCurrentWindow = Array.from(validDates).some((d) => f.includes(d));
         if (!matchesCurrentWindow) {
@@ -581,18 +591,36 @@ export function loadTradeStore(): DailyTradeStore {
 }
 
 export function saveTradeStore(store: DailyTradeStore): void {
+  const cacheDir = getCacheDir();
+  const filePath = path.join(cacheDir, `active-trades-${store.date}.json`);
+  const writeSeq = ((globalThis as any).__tradeWriteSeq = ((globalThis as any).__tradeWriteSeq || 0) + 1);
+  const tmpPath = path.join(cacheDir, `active-trades-${store.date}.json.tmp.${process.pid}.${Date.now()}.${writeSeq}`);
   try {
     store.version = (store.version ?? 0) + 1;
     store.updatedAtMs = Date.now();
     inMemoryTradeStore = store;
-    const cacheDir = getCacheDir();
-    const filePath = path.join(cacheDir, `active-trades-${store.date}.json`);
-    const writeSeq = ((globalThis as any).__tradeWriteSeq = ((globalThis as any).__tradeWriteSeq || 0) + 1);
-    const tmpPath = path.join(cacheDir, `active-trades-${store.date}.json.tmp.${process.pid}.${Date.now()}.${writeSeq}`);
     fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), "utf-8");
-    fs.renameSync(tmpPath, filePath);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        fs.renameSync(tmpPath, filePath);
+        return;
+      } catch (renameErr: any) {
+        const code = renameErr?.code;
+        if (attempt < 2 && (code === "EPERM" || code === "EACCES" || code === "EBUSY")) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+          continue;
+        }
+        throw renameErr;
+      }
+    }
   } catch {
     // Non-fatal if filesystem write fails (e.g. read-only environment)
+  } finally {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      // ignore tmp cleanup failure
+    }
   }
 }
 
@@ -624,8 +652,10 @@ export function getDailyTradeAlerts(ticker?: string): TradeLifecycleAlert[] {
 
 export function clearDailyTrades(): void {
   const today = getTodayEt();
+  const prevVersion = inMemoryTradeStore?.date === today ? (inMemoryTradeStore.version ?? 0) : 0;
   inMemoryTradeStore = {
     date: today,
+    version: prevVersion,
     activePositions: {},
     closedPositions: [],
     alerts: [],
@@ -970,9 +1000,9 @@ export async function selectSmallAccountContract(params: {
       // Strict Sub-$1.00 Ask Cap: retail buys at ASK ($0.15 <= ask <= $0.99)
       if (askPrice < 0.15 || askPrice > 0.99) continue;
 
-      // Reject low-delta lotto contracts (< 0.18 delta) to avoid rapid theta drag
+      // Reject low-delta lotto contracts (< 0.22 delta) to avoid rapid theta drag
       const absDelta = Math.abs(c.delta || 0.30);
-      if (absDelta < 0.18) continue;
+      if (absDelta < 0.22) continue;
 
       // Reject wide-spread contracts (> 24% spread) to avoid immediate execution penalty
       if (c.bid && c.ask && c.ask > c.bid) {
@@ -1003,8 +1033,11 @@ export async function selectSmallAccountContract(params: {
       const distToTarget = Math.abs(c.strike - effectiveTarget1);
       const targetScore = Math.max(0, 40 - distToTarget * 4);
 
-      // Delta score (0.18 - 0.45 ideal for sub-$1.00 OTMs)
-      const deltaScore = absDelta >= 0.18 && absDelta <= 0.45 ? 30 : 10;
+      // Convexity-per-dollar score (with absDelta >= 0.22 floor already enforced)
+      const gammaEst = Math.max(0, c.gamma || 0);
+      const expMove = Math.max(0.5, Math.abs(effectiveTarget1 - effectiveSpot));
+      const convexityPerDollar = (absDelta + 0.5 * gammaEst * expMove) / Math.max(0.15, askPrice);
+      const deltaScore = (absDelta >= 0.22 && absDelta <= 0.45 ? 20 : 5) + Math.min(35, convexityPerDollar * 20);
 
       // Liquidity score
       const liqScore = Math.min(25, ((c.openInterest || 0) + (c.volume || 0)) / 100);
@@ -1071,10 +1104,13 @@ export async function selectSmallAccountContract(params: {
       };
 
       if (isAfternoon) {
-        // After 11:30 AM: 1-3 DTE is primary (avoids 0DTE theta crush), 0DTE secondary
-        if (dte >= 1 && dte <= 3) {
+        // After 11:30 AM ET: 1-2 DTE is primary (avoids 0DTE theta crush); 3+ DTE / 0DTE penalized fallback
+        if (dte >= 1 && dte <= 2) {
           stage1Candidates.push(candidateObj);
-        } else if (dte >= 0) {
+        } else if (dte >= 3) {
+          stage2Candidates.push(candidateObj);
+        } else if (dte === 0) {
+          candidateObj.score -= 25;
           stage2Candidates.push(candidateObj);
         }
       } else {
@@ -2100,9 +2136,14 @@ export async function evaluateTradeSignals(
 
   let activePos: OptionTradePosition | null = store.activePositions[normalizedTicker] ?? null;
 
-  // Linear Single-Slot State Machine Invariant: FLAT (0 trades) -> ACTIVE (1 contract) -> LOCKED_FOR_DAY (1 trade completed)
-  // If 1 trade has completed today and no active position is open, terminate evaluation immediately.
-  if ((store.closedPositions?.length ?? 0) >= 1 && !activePos) {
+  // Gated Single-Slot / Phase-2 Opposite-Regime State Machine:
+  // Max 2 closed trades/day; Phase-2 Call reclaim allowed only after 10:45 AM ET following a closed PUT.
+  const canTryPhase2CallReclaim =
+    (store.closedPositions?.length ?? 0) === 1 &&
+    store.closedPositions[0]?.contractType === "PUT" &&
+    etTime.totalMinutes >= 645 &&
+    etTime.totalMinutes <= 870;
+  if (((store.closedPositions?.length ?? 0) >= 2 || ((store.closedPositions?.length ?? 0) >= 1 && !canTryPhase2CallReclaim)) && !activePos) {
     return {
       ticker: normalizedTicker,
       activePosition: null,
@@ -2240,32 +2281,31 @@ export async function evaluateTradeSignals(
       activePos = null;
     };
 
-    // Progressive Stop Ratchets (50% -> BE+10%, 75% -> prior 5m bar trail) toward Target Wall
+    // Progressive Runner Trailing Stop (>= 1.5R or 75% to Wall -> prior 5m bar trail) on ZGF/Flux runners
     const flowSnapExit = latest5mCandle?.flowSnapshot ?? null;
     const exitChi = typeof flowSnapExit?.ceilingShareChi === "number" ? flowSnapExit.ceilingShareChi : 0.5;
+    const exitImpChi = typeof flowSnapExit?.impulseChi === "number" ? flowSnapExit.impulseChi : exitChi;
+    const exitPe = typeof flowSnapExit?.pecletNumber === "number" ? flowSnapExit.pecletNumber : 0;
     const exitFlux = typeof flowSnapExit?.netFluxJ === "number" ? flowSnapExit.netFluxJ : 0;
+    const isRunnerSetup =
+      activePos.setupName.includes("Bearish Zero-Gamma Flush") ||
+      activePos.setupName.includes("Flux") ||
+      activePos.setupName.includes("Impulse");
     const solidFluxAligned = isCall
-      ? (exitFlux > 0 && exitChi > 0.85)
-      : (exitFlux < 0 && exitChi < 0.15);
+      ? ((exitFlux > 0 || exitImpChi > 0.72) && (exitChi > 0.85 || exitImpChi > 0.80 || exitPe >= 1.2))
+      : ((exitFlux < 0 || exitImpChi < 0.28) && (exitChi < 0.15 || exitImpChi < 0.20 || exitPe <= -1.2));
     const distToWall = Math.abs(activePos.target2Spot - activePos.btoSpotPrice);
+    const initialRisk = Math.max(0.25, Math.abs(activePos.btoSpotPrice - activePos.stopLossSpot));
+    const currentR = (isCall ? spotPrice - activePos.btoSpotPrice : activePos.btoSpotPrice - spotPrice) / initialRisk;
     const progressToWall = distToWall > 0
       ? (isCall ? spotPrice - activePos.btoSpotPrice : activePos.btoSpotPrice - spotPrice) / distToWall
       : 0;
-    if (activePos.status === "OPEN" && distToWall > 0) {
-      if (progressToWall >= 0.75 && latest5mCandle) {
-        const trailStop = isCall
-          ? Number((latest5mCandle.low - 0.05).toFixed(2))
-          : Number((latest5mCandle.high + 0.05).toFixed(2));
-        if ((isCall && trailStop > activePos.stopLossSpot) || (!isCall && trailStop < activePos.stopLossSpot)) {
-          activePos.stopLossSpot = trailStop;
-        }
-      } else if (progressToWall >= 0.50 || pnlOptionPct >= 20) {
-        const be10Stop = isCall
-          ? Number((activePos.btoSpotPrice + distToWall * 0.10).toFixed(2))
-          : Number((activePos.btoSpotPrice - distToWall * 0.10).toFixed(2));
-        if ((isCall && activePos.stopLossSpot < be10Stop) || (!isCall && activePos.stopLossSpot > be10Stop)) {
-          activePos.stopLossSpot = be10Stop;
-        }
+    if (activePos.status === "OPEN" && isRunnerSetup && (currentR >= 1.5 || progressToWall >= 0.75) && latest5mCandle) {
+      const trailStop = isCall
+        ? Number((latest5mCandle.low - 0.05).toFixed(2))
+        : Number((latest5mCandle.high + 0.05).toFixed(2));
+      if ((isCall && trailStop > activePos.stopLossSpot) || (!isCall && trailStop < activePos.stopLossSpot)) {
+        activePos.stopLossSpot = trailStop;
       }
     }
 
@@ -2288,7 +2328,7 @@ export async function evaluateTradeSignals(
     // Enforce minimum holding noise buffer (heldMin >= 1 bar) and substantial move confirmation
     else if (
       activePos.status === "OPEN" &&
-      !solidFluxAligned &&
+      !(isRunnerSetup && solidFluxAligned) &&
       heldMin >= 1 &&
       ((!isCall &&
         ((params.putWall > 0 &&
@@ -2325,10 +2365,10 @@ export async function evaluateTradeSignals(
     ) {
       closePosition("TARGET 2 HIT · FULL PROFIT EXIT", "Target 2 Full Profit");
     }
-    // 5. STC (TARGET 1 HIT · 1 CONTRACT SNIPER FULL EXIT — bypassed for active Bearish Zero-Gamma Flush while below SMA34)
+    // 5. STC (TARGET 1 HIT · 1 CONTRACT SNIPER FULL EXIT — retained on non-ZGF/non-Flux trades per Pitfall A)
     else if (
       activePos.status === "OPEN" &&
-      !solidFluxAligned &&
+      !(isRunnerSetup && solidFluxAligned) &&
       !activePos.setupName.includes("Bearish Zero-Gamma Flush") &&
       ((isCall && spotPrice >= activePos.target1Spot) ||
         (!isCall && spotPrice <= activePos.target1Spot) ||
@@ -2377,9 +2417,17 @@ export async function evaluateTradeSignals(
   // STEP B: EVALUATE BTO ENTRY RULES (Single-Slot Automaton: 1 Trade Max Per Day)
   // --------------------------------------------------------------------------
   const positionTickerForCheck = normalizedTicker === "SPXW" || normalizedTicker === "SPX" ? "SPY" : normalizedTicker;
-  const hasCompletedTradeToday = store.closedPositions.some(
+  const sameTickerClosed = store.closedPositions.filter(
     (p) => p.ticker === positionTickerForCheck || p.ticker === normalizedTicker
   );
+  const isPhase2CallReclaimWindow =
+    sameTickerClosed.length === 1 &&
+    sameTickerClosed[0]?.contractType === "PUT" &&
+    etTime.totalMinutes >= 645 &&
+    etTime.totalMinutes <= 870;
+  const hasCompletedTradeToday =
+    sameTickerClosed.length >= 2 ||
+    (sameTickerClosed.length >= 1 && !isPhase2CallReclaimWindow);
   const hasActiveTrade = Boolean(
     activePos ||
     hadActivePositionAtStart ||
@@ -2800,14 +2848,27 @@ export async function evaluateTradeSignals(
     // Block Support Bounce Calls if spot is below Zero Gamma (negative gamma hedging regime),
     // below Flow VWAP, below 5m SMA34, or market is in a Put regime (chi < 50% / macroRegime === "PUT").
     // Enforces opening-range firewall (< 9:45 AM ET) when indicators are unpopulated or in negative gamma.
+    const deltaChi6 = typeof flowSnap?.deltaChi6Bar === "number" ? flowSnap.deltaChi6Bar : 0;
+    const deltaFlux6 = typeof flowSnap?.deltaNetFlux6Bar === "number" ? flowSnap.deltaNetFlux6Bar : 0;
+    const impChi = typeof flowSnap?.impulseChi === "number" ? flowSnap.impulseChi : currentChi;
+    const impPe = typeof flowSnap?.impulsePeclet === "number" ? flowSnap.impulsePeclet : currentPe;
+    const hasBullImpulseReclaim = Boolean(
+      !isOpeningRange &&
+      etTime.totalMinutes >= 645 &&
+      impChi >= 0.65 &&
+      deltaChi6 >= 0.04 &&
+      (deltaFlux6 > 0 || impPe >= 0.40) &&
+      (divergence5m === "BULL" || divergence30m === "BULL" || (latest5mCandle && latest5mCandle.close > latest5mCandle.open))
+    );
     const isCounterTrendCallBlocked = Boolean(
+      !hasBullImpulseReclaim && (
       (zeroGamma > 0 && spotPrice < zeroGamma) ||
       (flowSnap && typeof flowSnap.flowVwap === "number" && spotPrice < flowSnap.flowVwap) ||
       (latest5mCandle && typeof latest5mCandle.sma34 === "number" && spotPrice < latest5mCandle.sma34) ||
       currentChi < 0.50 ||
       store.macroRegime === "PUT" ||
       isOpeningNegativeGamma ||
-      (isOpeningRange && (currentChi < 0.50 || isOpeningNegativeGamma))
+      (isOpeningRange && (currentChi < 0.50 || isOpeningNegativeGamma)))
     );
 
     const isBullConfirmation =
@@ -3130,6 +3191,34 @@ export async function evaluateTradeSignals(
       candidateBto = null;
     }
 
+    // --- SETUP 5: Windowed Impulse Flux & Divergence Reclaim [BTO CALL] (No sma34 lag per Pitfall C) ---
+    if (!candidateBto && hasBullImpulseReclaim && (tacticalPw > 0 ? spotPrice >= tacticalPw * 0.997 : true)) {
+      const reclaimFloor = Math.min(latest5mCandle?.low ?? spotPrice, tacticalPw > 0 && tacticalPw <= spotPrice ? tacticalPw : spotPrice);
+      const stopLoss = Number((Math.min(reclaimFloor - 0.15, spotPrice - 0.85)).toFixed(2));
+      const risk = Math.max(0.50, spotPrice - stopLoss);
+      const callTargetWall = callMagnetTarget > spotPrice + 1.50 ? callMagnetTarget : Number((spotPrice + risk * 2.5).toFixed(2));
+      if (callTargetWall - spotPrice >= risk * 1.5) {
+        const target1 = Number((spotPrice + Math.max(1.25, risk * 1.5)).toFixed(2));
+        const target2 = Number(Math.max(target1 + 0.50, callTargetWall - 0.10).toFixed(2));
+        candidateBto = {
+          contractType: "CALL",
+          setupName: "Impulse Flux & Divergence Reclaim [BTO CALL]",
+          stopLossSpot: stopLoss,
+          target1Spot: target1,
+          target2Spot: target2,
+        };
+      }
+    }
+
+    // Phase-2 Gate: Second trade today must be an opposite-regime CALL reclaim with impulseChi >= 0.65 && deltaChi6Bar >= 0.04
+    if (
+      candidateBto &&
+      isPhase2CallReclaimWindow &&
+      !(candidateBto.contractType === "CALL" && impChi >= 0.65 && deltaChi6 >= 0.04)
+    ) {
+      candidateBto = null;
+    }
+
     // --- GATE: Minimum R:R Ratio Check >= 1.4 ---
     if (candidateBto) {
       const risk = Math.abs(spotPrice - candidateBto.stopLossSpot);
@@ -3379,6 +3468,7 @@ export async function evaluateAllActivePositions(params?: {
       }
       if (
         pos.contractType === "CALL" &&
+        !isStructuralSetup &&
         (fsmState === "SHORT" || store.macroRegime === "PUT" || (store.chiPct ?? 50) < 50)
       ) {
         console.warn("[evaluateAllActivePositions] Purging zombie SPY CALL position while FSM is SHORT/PUT.");
@@ -3772,8 +3862,8 @@ export function evaluateUnifiedSniperSetup(
   const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
   const etMins = hour * 60 + minute;
 
-  // Allow entries from 09:30 ET (570) through 15:15 ET (915)
-  if (etMins < 9 * 60 + 30 || etMins > 15 * 60 + 15) return null;
+  // Mandatory RTH Entry Window: 09:35 ET (575) through 14:30 ET (870)
+  if (etMins < 575 || etMins > 870) return null;
 
   const features = computeUnifiedSniperFeatures(bars, idx, explicitKingStrike);
   const spot = bar.close;
@@ -3804,8 +3894,8 @@ export function evaluateUnifiedSniperSetup(
     (spot < vwap && kingStrike < spot) ||
     (spot < vwap && vwapSlope < -0.02 && isLowerLows);
 
-  const isMorningMomentumWindow = etMins >= 9 * 60 + 30 && etMins <= 11 * 60;
-  const isOpeningHourFlushWindow = etMins >= 9 * 60 + 30 && etMins <= 10 * 60 + 30;
+  const isMorningMomentumWindow = etMins >= 575 && etMins <= 11 * 60;
+  const isOpeningHourFlushWindow = etMins >= 575 && etMins <= 10 * 60 + 30;
 
   // Opening range (first 15m)
   const openingSlice = bars.slice(0, Math.min(3, bars.length));
@@ -3951,6 +4041,7 @@ export interface SyncGaiaSpyParams {
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
   macroRegime?: "CALL" | "PUT";
   chiPct?: number;
+  impulseChi?: number;
   zeroGamma?: number;
   sessionDate?: string;
   webhookUrl?: string;
@@ -4105,9 +4196,14 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
         (typeof priorCloseRef === "number" && sig.price < priorCloseRef) ||
         isChiBearish);
 
+    const isImpulseCallReclaim =
+      !isOpeningRangeSig &&
+      ((params.impulseChi ?? 0) >= 0.65 ||
+        Boolean(sig.label?.includes("Impulse") || sig.tag?.includes("IMPULSE")));
     const isHardBearishFlux = (store.chiPct ?? 50) < 45 || effectiveMacro === "PUT" || store.activeFsmState === "SHORT";
     if (
       direction === "CALL" &&
+      !isImpulseCallReclaim &&
       (isHardBearishFlux || isBelowZeroGamma || isOpeningNegativeGamma)
     ) {
       console.warn(
@@ -4282,7 +4378,8 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
     // Handle Opposing Reversal Exit
     if (nextSig && nextSig.type !== sig.type) {
       const exitKey = `${resolvedDate}:SPY:EXIT:${slot}`;
-      if (!dispatchedSet.has(exitKey)) {
+      const dedupExitAlertId = `gaia-spy-${exitKey.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
+      if (!dispatchedSet.has(exitKey) && !store.dispatchedAlertIds?.[dedupExitAlertId]) {
         dispatchedSet.add(exitKey);
         newlyDispatched.push(exitKey);
 
