@@ -1343,9 +1343,10 @@ export function GaiaView() {
       return;
     }
 
-    const axisStartMins = startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
+    const axisStartMins = startHour === 7 ? 0 : startHour === 8 ? 480 : 570;
+    const axisEndMins = startHour === 7 ? 1440 : 1020;
     const totalSessionSlots = Math.max(
-      Math.round((1020 - axisStartMins) / 5),
+      Math.round((axisEndMins - axisStartMins) / 5),
       dataset.candles.length
     );
     const stepX = (sessionWidth / totalSessionSlots) * xScale;
@@ -1554,9 +1555,10 @@ export function GaiaView() {
     // Left Zone (custom width via dividerRatio) & Right Zone (outlook Zone)
     const dividerX = Math.round(padLeft + totalPlotWidth * dividerRatio);
     const sessionWidth = dividerX - padLeft;
-    const axisStartMins = startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
+    const axisStartMins = startHour === 7 ? 0 : startHour === 8 ? 480 : 570;
+    const axisEndMins = startHour === 7 ? 1440 : 1020;
     const totalSessionSlots = Math.max(
-      Math.round((1020 - axisStartMins) / 5),
+      Math.round((axisEndMins - axisStartMins) / 5),
       dataset.candles.length
     );
 
@@ -1583,7 +1585,7 @@ export function GaiaView() {
     const minsToX = (etMins: number): number => {
       const stepX = (sessionWidth / totalSessionSlots) * xScale;
       const slotIdx = (etMins - axisStartMins) / 5;
-      return padLeft + xPanOffset + (slotIdx + 0.5) * stepX;
+      return padLeft + xPanOffset + slotIdx * stepX;
     };
 
     // Subtle horizontal grid lines at the price axis ticks
@@ -2436,32 +2438,47 @@ export function GaiaView() {
       });
     }
 
-    // Generate full-day milestone schedule (7:00 AM to 5:00 PM ET: 420..1020 mins)
-    const milestoneSchedule: { h: number; m: number; label: string; isMarketOpen?: boolean; isMarketClose?: boolean }[] = [];
-    for (let h = startHour; h <= 17; h++) {
-      if (h === 9) {
-        if (startHour < 9) {
-          milestoneSchedule.push({ h: 9, m: 0, label: "9:00" });
-        }
-        milestoneSchedule.push({ h: 9, m: 30, label: "9:30", isMarketOpen: true });
-        continue;
-      }
-      if (h === 16) {
-        milestoneSchedule.push({ h: 16, m: 0, label: "4:00", isMarketClose: true });
-        continue;
-      }
-      const displayH = h > 12 ? h - 12 : h;
-      milestoneSchedule.push({ h, m: 0, label: `${displayH}:00` });
-    }
+    // Generate 24h 3-hour milestone schedule (00:00 to 24:00 ET) in full-day mode, or hourly for filtered sessions
+    const milestoneSchedule: { h: number; m: number; label: string; isMarketOpen?: boolean; isMarketClose?: boolean }[] =
+      startHour === 7
+        ? [
+            { h: 0, m: 0, label: "12:00" },
+            { h: 3, m: 0, label: "3:00" },
+            { h: 6, m: 0, label: "6:00" },
+            { h: 9, m: 30, label: "9:30", isMarketOpen: true },
+            { h: 12, m: 0, label: "12:00" },
+            { h: 16, m: 0, label: "4:00", isMarketClose: true },
+            { h: 19, m: 0, label: "7:00" },
+            { h: 22, m: 0, label: "10:00" },
+          ]
+        : (() => {
+            const list: { h: number; m: number; label: string; isMarketOpen?: boolean; isMarketClose?: boolean }[] = [];
+            for (let h = startHour; h <= 17; h++) {
+              if (h === 9) {
+                if (startHour < 9) {
+                  list.push({ h: 9, m: 0, label: "9:00" });
+                }
+                list.push({ h: 9, m: 30, label: "9:30", isMarketOpen: true });
+                continue;
+              }
+              if (h === 16) {
+                list.push({ h: 16, m: 0, label: "4:00", isMarketClose: true });
+                continue;
+              }
+              const displayH = h > 12 ? h - 12 : h;
+              list.push({ h, m: 0, label: `${displayH}:00` });
+            }
+            return list;
+          })();
 
     milestoneSchedule.forEach((ms) => {
       const timeKey = `${String(ms.h).padStart(2, "0")}:${String(ms.m).padStart(2, "0")}`;
       const etMins = ms.h * 60 + ms.m;
       let x = -1;
-      if (candleHourIndices.has(timeKey)) {
-        x = barToX(candleHourIndices.get(timeKey)!);
-      } else if (etMins >= axisStartMins && etMins <= 1020) {
+      if (etMins >= axisStartMins && etMins <= axisEndMins) {
         x = minsToX(etMins);
+      } else if (candleHourIndices.has(timeKey)) {
+        x = barToX(candleHourIndices.get(timeKey)!);
       }
 
       if (x >= padLeft - 4 && x <= dividerX + 4) {
@@ -2957,16 +2974,17 @@ export function GaiaView() {
             const canvasW = canvasRef.current?.clientWidth || 1050;
             const totalPlotW = Math.max(200, canvasW - CHART_PAD_LEFT - CHART_RIGHT_AXIS_WIDTH);
             const approxSessionW = totalPlotW * dividerRatio;
-            const axisStartMins = startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
+            const axisStartMins = startHour === 7 ? 0 : startHour === 8 ? 480 : 570;
+            const axisEndMins = startHour === 7 ? 1440 : 1020;
             const totalSlots = Math.max(
-              Math.round((1020 - axisStartMins) / 5),
+              Math.round((axisEndMins - axisStartMins) / 5),
               dataset?.candles.length ?? 0
             );
             const rthOpenSlot = Math.max(0, (570 - axisStartMins) / 5);
             const paddedRthSlots = 82; // 78 RTH bars (9:30-4:00) + 2-slot symmetric margin
             const nextXScale = totalSlots / paddedRthSlots;
             const nextStepX = (approxSessionW / totalSlots) * nextXScale;
-            const nextXPan = 2 * nextStepX - (rthOpenSlot + 0.5) * nextStepX;
+            const nextXPan = 2 * nextStepX - rthOpenSlot * nextStepX;
             setXScale(nextXScale);
             setXPanOffset(nextXPan);
             setYScale(1.0);
@@ -3285,6 +3303,7 @@ export function GaiaView() {
         liveSpot={activeCandle ? activeCandle.close : null}
         tradeSignals={hudTradeSignals}
         serverTrades={effectiveServerTrades}
+        dividerRatio={dividerRatio}
         onSignalsEvaluated={setPrzmHudSignals}
         onSymbolChange={(sym) => {
           const cleaned = sym.trim().toUpperCase() || "SPY";

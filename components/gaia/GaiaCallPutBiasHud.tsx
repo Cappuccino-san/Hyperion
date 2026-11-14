@@ -59,6 +59,7 @@ export interface GaiaCallPutBiasHudProps {
   serverTrades?: ServerTradeData;
   onSymbolChange?: (symbol: string) => void;
   onSignalsEvaluated?: (signals: PrzmSignalPoint[]) => void;
+  dividerRatio?: number;
   className?: string;
 }
 
@@ -102,9 +103,9 @@ interface TimeTick {
 // EXTENDED SESSION TIMELINE (7:00 AM - 5:00 PM ET) CONSTANTS & HELPERS
 // ============================================================================
 
-export const EXTENDED_SESSION_START_MINS = 420; // 07:00 AM ET (7 * 60)
-export const EXTENDED_SESSION_END_MINS = 1020;  // 05:00 PM ET (17 * 60)
-export const EXTENDED_SESSION_SPAN_MINS = 600;  // 10 hours (600 mins)
+export const EXTENDED_SESSION_START_MINS = 0; // 12:00 AM ET (0 * 60)
+export const EXTENDED_SESSION_END_MINS = 1440;  // 12:00 AM next day ET (24 * 60)
+export const EXTENDED_SESSION_SPAN_MINS = 1440; // Full 24 hours (1440 mins, 288 5m slots)
 export const RTH_OPEN_MINS = 570;               // 09:30 AM ET (9 * 60 + 30)
 export const RTH_CLOSE_MINS = 960;              // 04:00 PM ET (16 * 60)
 
@@ -116,18 +117,14 @@ export interface SessionTickMilestone {
 }
 
 export const EXTENDED_SESSION_TICKS: readonly SessionTickMilestone[] = [
-  { etMins: 420, label: "7:00am", isMajor: true },
-  { etMins: 480, label: "8:00am", isMajor: true },
-  { etMins: 540, label: "9:00am", isMajor: true },
+  { etMins: 0, label: "12:00am", isMajor: true },
+  { etMins: 180, label: "3:00am", isMajor: true },
+  { etMins: 360, label: "6:00am", isMajor: true },
   { etMins: 570, label: "9:30am", isMajor: true, isRthBoundary: true },
-  { etMins: 600, label: "10:00am", isMajor: true },
-  { etMins: 660, label: "11:00am", isMajor: true },
   { etMins: 720, label: "12:00pm", isMajor: true },
-  { etMins: 780, label: "1:00pm", isMajor: true },
-  { etMins: 840, label: "2:00pm", isMajor: true },
-  { etMins: 900, label: "3:00pm", isMajor: true },
   { etMins: 960, label: "4:00pm", isMajor: true, isRthBoundary: true },
-  { etMins: 1020, label: "5:00pm", isMajor: true },
+  { etMins: 1140, label: "7:00pm", isMajor: true },
+  { etMins: 1320, label: "10:00pm", isMajor: true },
 ] as const;
 
 export function resolveBarEtMinutes(
@@ -240,6 +237,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   serverTrades: serverTradesProp,
   onSymbolChange,
   onSignalsEvaluated,
+  dividerRatio = 1,
   className = "",
 }) => {
   const uid = useId().replace(/:/g, "");
@@ -410,7 +408,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   // Dimensions & Coordinates
   const svgWidth = 980;
   const svgHeight = 440;
-  const padLeft = 24;
+  const padLeft = 18;
   const padRight = 84; // Room for right Y-axis price labels
   const padTop = 36;
   const chartBottom = 265;
@@ -421,7 +419,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const histZeroY = (histTop + histBottom) / 2;
   const histHalfH = (histBottom - histTop) / 2;
 
-  const plotW = svgWidth - padLeft - padRight;
+  const fullPlotW = svgWidth - padLeft - padRight;
+  const clampedDivider = Math.max(0.4, Math.min(1, dividerRatio));
+  const plotW = fullPlotW * clampedDivider;
   const plotH = chartBottom - padTop;
 
   // Raw Price Extrema & Dynamic Adjusted Y-Domain
@@ -512,7 +512,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     return ticks;
   }, [priceDomain, yForPrice, padTop, chartBottom]);
 
-  // 4. Exact Milestone Timing Ticks for X-Axis (7:00am – 5:00pm ET)
+  // 4. Exact Milestone Timing Ticks for X-Axis (00:00 – 24:00 ET)
   const timeTicks = useMemo<TimeTick[]>(() => {
     return EXTENDED_SESSION_TICKS.map((t) => {
       const x = xFromEtMins(t.etMins);
@@ -1146,7 +1146,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
   return (
     <div
-      className={`bg-[#0d0e19] border border-[#1e2035] rounded-2xl p-4 sm:p-5 text-white select-none relative overflow-hidden shadow-2xl ${className}`}
+      className={`bg-[#0d0e19] border border-[#1e2035] rounded-2xl p-4 text-white select-none relative overflow-hidden shadow-2xl ${className}`}
     >
       {/* Tactical HUD Corner Reticles (┌ ┐ └ ┘) */}
       <div className="absolute top-2.5 left-3 text-[#4f5670] font-mono text-xs select-none pointer-events-none">┌</div>
@@ -1242,20 +1242,11 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           </button>
           <button
             onClick={() => {
-              const rthIdx = effectiveCandles.findIndex((c) => {
-                const parts = ET_PARTS_FORMATTER.formatToParts(new Date(c.timestamp ?? 0));
-                const h = parseInt(parts.find((p) => p.type === "hour")?.value ?? "0", 10);
-                const m = parseInt(parts.find((p) => p.type === "minute")?.value ?? "0", 10);
-                return h === 9 && m === 30;
-              });
-              if (rthIdx >= 0) {
-                const fraction = rthIdx / Math.max(1, effectiveCandles.length - 1);
-                setXScale(1.35);
-                setXPanOffset((0.5 - fraction) * plotW * 0.6);
-              } else {
-                setXScale(1.2);
-                setXPanOffset(0);
-              }
+              const nextScale = EXTENDED_SESSION_SPAN_MINS / 410;
+              const rthCenterMins = (RTH_OPEN_MINS + RTH_CLOSE_MINS) / 2;
+              const centerFrac = (rthCenterMins - EXTENDED_SESSION_START_MINS) / EXTENDED_SESSION_SPAN_MINS;
+              setXScale(nextScale);
+              setXPanOffset(-((centerFrac - 0.5) * plotW * nextScale));
               setYScale(1.0);
               setYPanOffset(0);
             }}
@@ -1266,8 +1257,15 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           </button>
           <button
             onClick={() => {
-              setXScale(2.4);
-              setXPanOffset(-plotW * 0.45);
+              const latestMins =
+                enrichedPoints.length > 0
+                  ? enrichedPoints[enrichedPoints.length - 1].etMins
+                  : RTH_CLOSE_MINS;
+              const nextScale = EXTENDED_SESSION_SPAN_MINS / 150;
+              const targetCenterMins = Math.max(75, Math.min(EXTENDED_SESSION_END_MINS - 60, latestMins - 60));
+              const centerFrac = (targetCenterMins - EXTENDED_SESSION_START_MINS) / EXTENDED_SESSION_SPAN_MINS;
+              setXScale(nextScale);
+              setXPanOffset(-((centerFrac - 0.5) * plotW * nextScale));
               setYScale(1.0);
               setYPanOffset(0);
             }}
@@ -1364,7 +1362,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
           {/* Vertical Time Milestone Guides (cutting across all panes for clear timing) */}
           {timeTicks.map((t, idx) => {
-            if (t.x < padLeft || t.x > svgWidth - padRight) return null;
+            if (t.x < padLeft || t.x > padLeft + plotW + 2) return null;
             return (
               <g key={`time-guide-${idx}`}>
                 <line
@@ -1372,7 +1370,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                   y1={padTop}
                   x2={t.x}
                   y2={histBottom}
-                  stroke={t.isRthOpen ? "#00F5D4" : "#1e293b"}
+                  stroke={t.isRthOpen ? "#2dd4bf" : "#1e293b"}
                   strokeWidth={t.isRthOpen ? 1.5 : 1}
                   strokeDasharray={t.isRthOpen ? "none" : "3 5"}
                   opacity={t.isRthOpen ? 0.75 : 0.6}
@@ -1381,7 +1379,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                   x={t.x}
                   y={svgHeight - 12}
                   textAnchor="middle"
-                  fill={t.isRthOpen ? "#00F5D4" : "rgba(255, 255, 255, 0.45)"}
+                  fill={t.isRthOpen ? "#2dd4bf" : "rgba(255, 255, 255, 0.45)"}
                   fontSize="10"
                   fontFamily="monospace"
                   fontWeight={t.isRthOpen ? "bold" : "normal"}
@@ -1768,8 +1766,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
               const latestActualSec = latestActualRaw > 1e11 ? Math.floor(latestActualRaw / 1000) : latestActualRaw;
               const nowSec = Math.floor(Date.now() / 1000);
               const slotIsFuture = normSlotTs > 0 && (normSlotTs > nowSec || (latestActualSec > 0 && normSlotTs > latestActualSec));
-              if (pt.baseX < padLeft || pt.baseX > svgWidth - padRight) return null;
-              const slotW = (plotW / 120) * xScale;
+              if (pt.baseX < padLeft || pt.baseX > padLeft + plotW + 2) return null;
+              const slotW = (plotW / 288) * xScale;
               const tickW = Math.max(2, slotW - 1.8);
               const isCall = pt.regime === "CALL";
               const col = slotIsFuture ? "rgba(148, 163, 184, 0.25)" : isCall ? "#00F5D4" : "#FF2A55";
