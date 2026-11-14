@@ -215,7 +215,7 @@ export function evaluatePrzmCallLedger(
   for (const pos of serverClosed) {
     if (!pos || !pos.id || String(pos.id).startsWith("test-")) continue;
     const openedSec = pos.openedTs ? toEpochSeconds(pos.openedTs) : 0;
-    if (hasReplayCutoff && openedSec > replayBarTsSec!) continue;
+    if (hasReplayCutoff && (openedSec === 0 || openedSec > replayBarTsSec!)) continue;
     const closedSec = pos.closedTs ? toEpochSeconds(pos.closedTs) : 0;
     const isStillOpenInReplay = hasReplayCutoff && (closedSec === 0 || closedSec > replayBarTsSec!);
 
@@ -306,7 +306,7 @@ export function evaluatePrzmCallLedger(
   for (const pos of serverActive) {
     if (!pos || !pos.id) continue;
     const openedSec = pos.openedTs ? toEpochSeconds(pos.openedTs) : 0;
-    if (hasReplayCutoff && openedSec > replayBarTsSec!) continue;
+    if (hasReplayCutoff && (openedSec === 0 || openedSec > replayBarTsSec!)) continue;
     const isShort = isShortOrPutTrade(pos);
     const isCall = !isShort;
     const type: "LONG" | "SHORT" = isShort ? "SHORT" : "LONG";
@@ -320,10 +320,10 @@ export function evaluatePrzmCallLedger(
     const clampedBto = entryBar && btoSpot > 0 ? Math.max(entryBar.low, Math.min(entryBar.high, btoSpot)) : btoSpot;
     const currentSpot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : clampedBto;
     const delta = Number((isCall ? currentSpot - clampedBto : clampedBto - currentSpot).toFixed(2));
-    const nowTs = Math.floor(Date.now() / 1000);
+    const nowTs = hasReplayCutoff ? replayBarTsSec! : Math.floor(Date.now() / 1000);
     const heldMin =
-      pos.openedTs && nowTs > pos.openedTs
-        ? Math.max(1, Math.round((nowTs - pos.openedTs) / 60))
+      openedSec > 0 && nowTs > openedSec
+        ? Math.max(1, Math.round((nowTs - openedSec) / 60))
         : 5;
 
     serverEntries.push({
@@ -358,13 +358,13 @@ export function evaluatePrzmCallLedger(
   const sorted = [...signals]
     .filter((s) => {
       if (!hasReplayCutoff) return true;
-      const barTs = toEpochSeconds(series[s.index]?.timestamp ?? s.timestamp);
+      const barTs = toEpochSeconds(s.timestamp ?? series[s.index]?.timestamp);
       return barTs === 0 || barTs <= replayBarTsSec!;
     })
     .sort((a, b) => a.index - b.index);
   const lastBarIdx = series.length > 0 ? series.length - 1 : 0;
   const lastBarTsSec = series.length > 0 ? toEpochSeconds(series[lastBarIdx]?.timestamp) : 0;
-  const nowSec = Math.floor(Date.now() / 1000);
+  const nowSec = hasReplayCutoff ? replayBarTsSec! : Math.floor(Date.now() / 1000);
 
   const chronologicalEntries: EvaluatedCallEntry[] = sorted.map((sig, idx) => {
     const isNewest = idx === sorted.length - 1;
@@ -385,27 +385,35 @@ export function evaluatePrzmCallLedger(
     const endBar = series[endIdx] ?? series[lastBarIdx];
     const entryTsSec = toEpochSeconds(entryBar?.timestamp);
     const endTsSec = toEpochSeconds(endBar?.timestamp);
+    const exitTsSec = sig.exitTimestamp ? toEpochSeconds(sig.exitTimestamp) : endTsSec;
+    const maskedFutureExit =
+      hasReplayCutoff && sig.isClosed === true && (exitTsSec === 0 || exitTsSec > replayBarTsSec!);
     const barSpanMinutes = Math.max(1, (endIdx - sig.index) * 5);
+
+    const isCurrentlyOpen =
+      sig.isClosed === false ||
+      maskedFutureExit ||
+      (isNewest && activeFsmState !== undefined && activeFsmState === sig.type);
 
     let heldMinutes = barSpanMinutes;
     if (entryTsSec > 0) {
-      let refEndSec = endTsSec;
-      if (isNewest && lastBarTsSec > 0) {
-        // Advance to nowSec if stream is within 15 mins of last candle
-        refEndSec =
-          nowSec >= lastBarTsSec && nowSec - lastBarTsSec <= 15 * 60
-            ? nowSec
-            : lastBarTsSec;
+      let refEndSec = maskedFutureExit ? replayBarTsSec! : endTsSec;
+      if (isCurrentlyOpen && lastBarTsSec > 0) {
+        if (hasReplayCutoff) {
+          refEndSec = replayBarTsSec!;
+        } else {
+          // Advance to nowSec if stream is within 15 mins of last candle
+          refEndSec =
+            nowSec >= lastBarTsSec && nowSec - lastBarTsSec <= 15 * 60
+              ? nowSec
+              : lastBarTsSec;
+        }
       }
       if (refEndSec >= entryTsSec) {
         const diffMin = Math.round((refEndSec - entryTsSec) / 60);
         heldMinutes = diffMin >= 1 && diffMin <= 390 ? diffMin : barSpanMinutes;
       }
     }
-
-    const isCurrentlyOpen =
-      sig.isClosed === false ||
-      (isNewest && activeFsmState !== undefined && activeFsmState === sig.type);
 
     const exitPrice = sig.exitPrice ?? endBar?.close ?? sig.price;
     const finalMarkPrice = isCurrentlyOpen

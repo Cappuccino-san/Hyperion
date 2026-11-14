@@ -443,8 +443,8 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
       { barTimestamp: 1000, open: 757.2, high: 757.5, low: 755.8, close: 756.0, chi: 0.25, bias: -0.45, netFlux: -0.35, peclet: -2.2, flowVwap: 756.8, sma34: 757.0, etMins: 575, isClosed: true },
       // Bar 1 (09:40 ET, 580)
       { barTimestamp: 1300, open: 756.0, high: 756.1, low: 753.0, close: 753.2, chi: 0.20, bias: -0.50, netFlux: -0.40, peclet: -2.5, flowVwap: 755.5, sma34: 756.2, etMins: 580, isClosed: true },
-      // Bar 2 (09:50 ET, 590): Holds then sweeps Put Wall 750 -> big winning SHORT (> +0.5% spot = +100%+ option profit)
-      { barTimestamp: 1900, open: 753.2, high: 753.3, low: 750.1, close: 750.4, chi: 0.22, bias: -0.45, netFlux: -0.32, peclet: -2.0, flowVwap: 754.0, sma34: 754.5, etMins: 590, isClosed: true },
+      // Bar 2 (09:50 ET, 590): Holds near Put Wall 750 (Stage-2 trail) without touching 750.25 -> closes on Bar 3 reversal
+      { barTimestamp: 1900, open: 753.2, high: 751.2, low: 750.4, close: 750.5, chi: 0.22, bias: -0.45, netFlux: -0.32, peclet: -2.0, flowVwap: 754.0, sma34: 754.5, etMins: 590, isClosed: true },
       // Bar 3 (10:15 ET, 615): Reversal >= $0.75 closes Leg-1 winning SHORT at 751.80
       { barTimestamp: 3400, open: 750.5, high: 752.0, low: 750.4, close: 751.8, chi: 0.56, bias: 0.15, netFlux: 0.10, peclet: 0.4, flowVwap: 751.5, sma34: 751.6, etMins: 615, isClosed: true },
       // Bar 4 (10:35 ET, 635 -> +1200s < 1800s cooldown, < 10:45 ET): Attempted reclaim must stay STAND_ASIDE
@@ -515,5 +515,94 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
     assert.strictEqual(newlyCommitted.length, 1);
     assert.strictEqual(newlyCommitted[0].toState, "LONG");
     assert.strictEqual(newlyCommitted[0].reason, "POSITIVE_GAMMA_PUT_WALL_BOUNCE_CALL");
+  });
+
+  it("Leg-2 Window Boundary (10:30-14:30 ET): 10:25 ET rejected despite >= 30m cooldown; 10:30 ET admitted", () => {
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [
+      { barTimestamp: 1000, open: 757.0, high: 757.2, low: 755.5, close: 755.8, chi: 0.25, bias: -0.45, netFlux: -0.35, peclet: -2.2, flowVwap: 756.5, sma34: 756.8, etMins: 575, isClosed: true },
+      { barTimestamp: 1600, open: 755.8, high: 756.0, low: 752.8, close: 753.0, chi: 0.22, bias: -0.48, netFlux: -0.36, peclet: -2.3, flowVwap: 755.0, sma34: 755.4, etMins: 585, isClosed: true },
+      { barTimestamp: 1900, open: 753.0, high: 753.2, low: 750.1, close: 750.2, chi: 0.25, bias: -0.25, netFlux: -0.18, peclet: -1.1, flowVwap: 753.5, sma34: 753.6, etMins: 590, isClosed: true }, // 09:50 ET close
+      // 10:25 ET (625): +2100s >= 1800s cooldown met, still blocked before 10:30 ET
+      { barTimestamp: 4000, open: 750.3, high: 751.6, low: 750.1, close: 751.4, recentLow4: 750.1, chi: 0.59, impulseChi: 0.68, deltaNetFlux6Bar: 0.20, bias: 0.35, netFlux: 0.25, peclet: 1.0, impulsePeclet: 1.6, flowVwap: 751.0, sma34: 751.1, bullDiv5m: true, etMins: 625, isClosed: true },
+      // 10:30 ET (630): opens Leg-2 LONG
+      { barTimestamp: 4300, open: 750.4, high: 751.8, low: 750.1, close: 751.7, recentLow4: 750.1, chi: 0.60, impulseChi: 0.69, deltaNetFlux6Bar: 0.22, bias: 0.38, netFlux: 0.26, peclet: 1.1, impulsePeclet: 1.7, flowVwap: 751.2, sma34: 751.3, bullDiv5m: true, etMins: 630, isClosed: true },
+    ];
+    const { newlyCommitted } = fsm.commitSeries(bars, {
+      macroRegime: "PUT",
+      callDominancePct: 35,
+      structuralLevels: { putWall: 750, callWall: 760, zeroGamma: 758, bookCenter: 755 },
+    });
+    const entries = newlyCommitted.filter((s) => s.toState === "LONG" || s.toState === "SHORT");
+    assert.strictEqual(entries.length, 2);
+    assert.strictEqual(entries[1].toState, "LONG");
+    assert.strictEqual(entries[1].barTimestamp, 4300, "Leg-2 must reject 10:25 ET (625) and admit 10:30 ET (630)");
+  });
+
+  it("Same-Direction Leg-2 Block & Asymmetric Call Wall Rejection Cooldown (< 1800s blocked, >= 1800s allowed)", () => {
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [
+      { barTimestamp: 1000, open: 757.0, high: 759.0, low: 756.8, close: 758.5, chi: 0.84, bias: 0.42, netFlux: 0.32, peclet: 2.2, flowVwap: 757.2, sma34: 757.0, etMins: 575, isClosed: true },
+      { barTimestamp: 3400, open: 761.8, high: 762.1, low: 759.8, close: 760.0, recentHigh3: 762.1, chi: 0.38, bias: -0.25, netFlux: -0.18, peclet: -1.1, flowVwap: 760.5, sma34: 760.8, etMins: 615, isClosed: true }, // close Leg-1 LONG
+      // +1795s < 1800s (10:44:55 ET): Call Wall SHORT blocked
+      { barTimestamp: 5195, open: 761.9, high: 762.0, low: 760.2, close: 760.4, recentHigh3: 762.0, chi: 0.40, impulseChi: 0.32, deltaNetFlux6Bar: -0.22, bias: -0.35, netFlux: -0.24, peclet: -0.9, impulsePeclet: -1.6, flowVwap: 760.9, sma34: 761.0, bearDiv5m: true, etMins: 644, isClosed: true },
+      // 11:30 ET (+3600s): same-direction Put Wall LONG attempt strictly blocked (<= 1 per direction)
+      { barTimestamp: 7000, open: 750.3, high: 751.9, low: 750.1, close: 751.7, recentLow4: 750.1, chi: 0.62, impulseChi: 0.72, deltaNetFlux6Bar: 0.24, bias: 0.38, netFlux: 0.28, peclet: 1.1, impulsePeclet: 1.7, flowVwap: 751.2, sma34: 751.4, bullDiv5m: true, etMins: 690, isClosed: true },
+      // 11:35 ET (+3900s): opposite-direction Call Wall SHORT admitted
+      { barTimestamp: 7300, open: 761.9, high: 762.0, low: 760.2, close: 760.4, recentHigh3: 762.0, chi: 0.41, impulseChi: 0.32, deltaNetFlux6Bar: -0.22, bias: -0.35, netFlux: -0.24, peclet: -0.9, impulsePeclet: -1.6, flowVwap: 760.9, sma34: 761.0, bearDiv5m: true, etMins: 695, isClosed: true },
+    ];
+    const { newlyCommitted } = fsm.commitSeries(bars, {
+      macroRegime: "CALL",
+      callDominancePct: 60,
+      structuralLevels: { putWall: 750, callWall: 762, zeroGamma: 756, bookCenter: 756 },
+    });
+    const entries = newlyCommitted.filter((s) => s.toState === "LONG" || s.toState === "SHORT");
+    assert.strictEqual(entries.length, 2);
+    assert.strictEqual(entries[1].toState, "SHORT");
+    assert.strictEqual(entries[1].barTimestamp, 7300, "Same-direction LONG & <1800s cooldown SHORT must both be blocked");
+  });
+
+  it("Symmetrical Reversal Hold (< 2 bars / 10m) and < $0.75 vs >= $0.75 Adverse Invalidation (LONG & SHORT)", () => {
+    const longFsm = new GaiaSignalFsm();
+    const longBars: GaiaBarData[] = [
+      { barTimestamp: 1000, open: 757.2, high: 757.5, low: 755.8, close: 756.0, chi: 0.25, bias: -0.45, netFlux: -0.35, peclet: -2.2, flowVwap: 756.8, sma34: 757.0, etMins: 575, isClosed: true },
+      { barTimestamp: 1300, open: 756.0, high: 756.2, low: 752.5, close: 752.8, chi: 0.22, bias: -0.46, netFlux: -0.36, peclet: -2.3, flowVwap: 755.0, sma34: 755.5, etMins: 580, isClosed: true },
+      { barTimestamp: 1900, open: 752.8, high: 753.0, low: 750.1, close: 750.2, chi: 0.25, bias: -0.25, netFlux: -0.18, peclet: -1.1, flowVwap: 753.2, sma34: 753.3, etMins: 590, isClosed: true }, // exit Leg-1 SHORT
+      // Leg-2 LONG at 751.70 (stopPrice 749.95)
+      { barTimestamp: 4300, open: 750.3, high: 751.9, low: 750.1, close: 751.7, recentLow4: 750.1, chi: 0.59, impulseChi: 0.68, deltaNetFlux6Bar: 0.20, bias: 0.35, netFlux: 0.25, peclet: 1.0, impulsePeclet: 1.6, flowVwap: 751.2, sma34: 751.4, bullDiv5m: true, etMins: 630, isClosed: true },
+      // Bar +1 (barsHeld=1 < 2): -$0.85 adverse (>= $0.75) + negative flux -> MUST hold (<10m guard)
+      { barTimestamp: 4600, open: 751.7, high: 751.8, low: 750.8, close: 750.85, chi: 0.42, bias: -0.25, netFlux: -0.18, peclet: -1.1, flowVwap: 751.5, sma34: 751.5, etMins: 635, isClosed: true },
+      // Bar +2 (barsHeld=2 >= 2): -$0.70 adverse (< $0.75) + negative flux -> MUST hold (<$0.75 guard)
+      { barTimestamp: 4900, open: 750.85, high: 751.1, low: 750.8, close: 751.0, chi: 0.42, bias: -0.22, netFlux: -0.16, peclet: -1.0, flowVwap: 751.5, sma34: 751.4, etMins: 640, isClosed: true },
+      // Bar +3 (barsHeld=3 >= 2): -$0.80 adverse (>= $0.75) + negative flux + pe<=-0.75 -> MUST exit
+      { barTimestamp: 5200, open: 751.0, high: 751.1, low: 750.7, close: 750.9, chi: 0.40, bias: -0.28, netFlux: -0.20, peclet: -1.2, flowVwap: 751.5, sma34: 751.4, etMins: 645, isClosed: true },
+    ];
+    const longOut = longFsm.commitSeries(longBars, {
+      macroRegime: "PUT",
+      callDominancePct: 35,
+      structuralLevels: { putWall: 750, callWall: 760, zeroGamma: 758, bookCenter: 755 },
+    });
+    const longExits = longOut.newlyCommitted.filter((s) => s.fromState === "LONG" && s.toState === "STAND_ASIDE");
+    assert.strictEqual(longExits.length, 1);
+    assert.strictEqual(longExits[0].barTimestamp, 5200, "Reversal exit fires strictly once barsHeld>=2 AND adverseMove>=$0.75");
+    assert.strictEqual(longExits[0].reason, "UPPER_FLUX_FIELD_TARGET_OR_FLUX_FLIP");
+  });
+
+  it("Leg-2 Saturation Deadlock Unlock (2026-11-13): saturated impulseChi >= 0.60 + deltaNetFlux6Bar <= 0 unlocks via flowVwap reclaim", () => {
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [
+      { barTimestamp: 1000, open: 757.0, high: 757.2, low: 755.5, close: 755.8, chi: 0.20, bias: -0.45, netFlux: -0.35, peclet: -2.2, flowVwap: 756.5, sma34: 756.8, etMins: 575, isClosed: true },
+      { barTimestamp: 1600, open: 755.8, high: 756.0, low: 749.2, close: 750.0, chi: 0.04, bias: -0.50, netFlux: -0.40, peclet: -2.5, flowVwap: 753.0, sma34: 754.0, etMins: 585, isClosed: true },
+      { barTimestamp: 1900, open: 750.0, high: 752.0, low: 749.9, close: 751.8, chi: 0.56, bias: 0.12, netFlux: 0.08, peclet: 0.4, flowVwap: 751.4, sma34: 751.6, etMins: 590, isClosed: true },
+      // 11:30 AM ET (690): session chi lagged, impulseChi=0.96 saturated (deltaNetFlux6Bar=0), slight red bar reclaiming flowVwap (still < sma34)
+      { barTimestamp: 7000, open: 750.85, high: 751.1, low: 749.6, close: 750.78, recentLow4: 749.6, chi: 0.04, impulseChi: 0.96, deltaNetFlux6Bar: 0.0, bias: 0.30, netFlux: 0.10, peclet: -1.8, impulsePeclet: 4.5, flowVwap: 750.50, sma34: 751.63, bullDiv5m: true, etMins: 690, isClosed: true },
+    ];
+    const { newlyCommitted } = fsm.commitSeries(bars, {
+      macroRegime: "PUT",
+      callDominancePct: 25,
+      structuralLevels: { putWall: 750, callWall: 760, zeroGamma: 756, bookCenter: 755 },
+    });
+    const leg2 = newlyCommitted.find((s) => s.barTimestamp === 7000);
+    assert.ok(leg2 && leg2.toState === "LONG", "Saturated impulseChi >= 0.60 with flowVwap reclaim must unlock Leg-2 LONG despite deltaNetFlux6Bar === 0");
   });
 });

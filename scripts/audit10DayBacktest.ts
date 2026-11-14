@@ -59,6 +59,41 @@ interface Bar {
   sma34: number;
 }
 
+/**
+ * Selects an ATM / 1-3 strike OTM contract enforcing small-account ask ($0.15-$0.99),
+ * minimum |delta| (>= 0.25), and max strike distance (<= min($3.50, 0.45% of spot)).
+ */
+function selectCompliantBacktestContract(params: {
+  spot: number;
+  direction: "LONG" | "SHORT";
+  barTsSec: number;
+  atmIv: number;
+  dteCandidates: number[];
+}) {
+  const { spot, direction, barTsSec, atmIv, dteCandidates } = params;
+  const isCall = direction === "LONG";
+  const maxOtmDist = Math.min(3.50, spot * 0.0045);
+
+  for (const dteDays of dteCandidates) {
+    const remainingYears = computeRemainingYearsToExpiration(barTsSec * 1000, dteDays);
+    for (let step = 0; step <= 10; step++) {
+      const strike = isCall ? Math.ceil(spot) + step : Math.floor(spot) - step;
+      if (Math.abs(strike - spot) > maxOtmDist) break;
+      const quote = priceOptionWithSkew({
+        spot,
+        strike,
+        direction,
+        remainingYears,
+        atmIv,
+      });
+      if (quote.ask >= 0.15 && quote.ask <= 0.99 && Math.abs(quote.delta) >= 0.25) {
+        return { strike, quote, dteDays, remainingYears };
+      }
+    }
+  }
+  return null;
+}
+
 async function run10DaySniperAudit() {
   console.log("================================================================================");
   console.log("   HYPERION / GEXVEX 10-DAY WALK-FORWARD SNIPER ENGINE REPLAY AUDIT             ");
@@ -453,6 +488,7 @@ async function run10DaySniperAudit() {
       tYears: number;
       iv: number;
       dteDays?: number;
+      seenSmaSide?: boolean;
       openedTimeEt: string;
       openedTs: number;
     } | null = null;
@@ -475,6 +511,14 @@ async function run10DaySniperAudit() {
       if (activePosition) {
         const isCall = activePosition.type === "CALL";
         const isZeroGammaFlush = activePosition.setupName.includes("Bearish Zero-Gamma Flush");
+        const heldMinutes = Math.round((bar.ts - activePosition.openedTs) / 60);
+        if (isCall && bar.close >= bar.sma34) activePosition.seenSmaSide = true;
+        if (!isCall && bar.close <= bar.sma34) activePosition.seenSmaSide = true;
+        const exitFlow = sessionFlow[idx];
+        const recentLow4Exit = Math.min(...sessionBars.slice(Math.max(0, idx - 3), idx + 1).map((b) => b.low));
+        const causalPwExit = Math.floor(Math.min(...sessionBars.slice(0, idx + 1).map((b) => b.low)));
+        const lower1SExit = exitFlow?.lower1Sigma ?? 0;
+
         let exitTriggered = false;
         let exitReason = "";
         let exitSpot = bar.close;
@@ -496,10 +540,31 @@ async function run10DaySniperAudit() {
           exitReason = "STOP LOSS HIT";
           outcomeR = -1.0;
         }
-        // 3. Momentum Reversal / Divergence Cover (Dynamic Trend Reversal Cover, e.g. 11:00 AM SMA34 reclaim)
+        // 3A. Mature ZGF Flush Put Wall / -1σ Exhaustion Cover (e.g., 10:20-10:30 AM Bullish Impulse Flip off LOD)
         else if (
-          (!isCall && bar.close > bar.sma34 && bar.close < activePosition.entrySpot) ||
-          (isCall && bar.close < bar.sma34 && bar.close > activePosition.entrySpot)
+          isZeroGammaFlush &&
+          !isCall &&
+          heldMinutes >= 20 &&
+          (activePosition.entrySpot - recentLow4Exit >= 3.50 || recentLow4Exit <= activePosition.target1Spot) &&
+          ((causalPwExit > 0 && recentLow4Exit <= causalPwExit * 1.0035) ||
+            (lower1SExit > 0 && recentLow4Exit <= lower1SExit * 1.0015)) &&
+          bar.close > bar.open &&
+          (exitFlow?.impulseChi ?? 0.5) >= 0.60 &&
+          bar.close <= activePosition.entrySpot - 1.25
+        ) {
+          exitTriggered = true;
+          exitSpot = bar.close;
+          exitReason = "PUT WALL / -1σ EXHAUSTION COVER";
+          const risk = Math.abs(activePosition.entrySpot - activePosition.stopLossSpot);
+          const reward = Math.abs(activePosition.entrySpot - exitSpot);
+          outcomeR = Number((reward / Math.max(0.1, risk)).toFixed(2));
+        }
+        // 3B. Momentum Reversal / Divergence Cover (Requires >= 10m hold & confirmed SMA34 side so below-SMA Leg-2 CALLs aren't exited on Bar 1)
+        else if (
+          heldMinutes >= 10 &&
+          Boolean(activePosition.seenSmaSide) &&
+          ((!isCall && bar.close > bar.sma34 && bar.close < activePosition.entrySpot) ||
+            (isCall && bar.close < bar.sma34 && bar.close > activePosition.entrySpot))
         ) {
           exitTriggered = true;
           exitSpot = bar.close;
@@ -588,19 +653,19 @@ async function run10DaySniperAudit() {
         }
       }
 
-      // --- STEP 2: EVALUATE ENTRY (Leg 1 or Symmetric Gated Leg-2 Opposite-Regime Rotation >= 10:45 AM ET, >= 30m cooldown) ---
+      // --- STEP 2: EVALUATE ENTRY (Leg 1 or Symmetric Gated Leg-2 Opposite-Regime Rotation >= 10:30 AM ET, >= 30m cooldown) ---
       const cooldownMet = lastExitTs !== null && bar.ts - lastExitTs >= 1800;
       const canPhase2CallReclaim =
         tradeCountToday === 1 &&
         firstTradeType === "PUT" &&
         cooldownMet &&
-        bar.totalMinutes >= 645 &&
+        bar.totalMinutes >= 630 &&
         bar.totalMinutes <= 870;
       const canPhase2PutReject =
         tradeCountToday === 1 &&
         firstTradeType === "CALL" &&
         cooldownMet &&
-        bar.totalMinutes >= 645 &&
+        bar.totalMinutes >= 630 &&
         bar.totalMinutes <= 870;
 
       if (!activePosition && (tradeCountToday === 0 || canPhase2CallReclaim || canPhase2PutReject) && bar.totalMinutes >= 575 && bar.totalMinutes <= 870) {
@@ -612,51 +677,19 @@ async function run10DaySniperAudit() {
           if (candidate) {
             const isCall = candidate.direction === "LONG";
             const entrySpot = bar.close;
-
-            const remainingYears = computeRemainingYearsToExpiration(bar.ts * 1000, 0);
             const atmIv = candidate.features.atmIv;
 
-            // Institutional Small-Account Invariant: Select sub-$1.00 contract (Ask <= $0.95, Outlay <= $100)
-            let strike = candidate.strike;
-            let quote = priceOptionWithSkew({
+            // Strict Near-ATM Invariant: <= min($3.50, 0.45%) OTM, |delta| >= 0.25, Ask <= $0.99 (Outlay <= $100)
+            const picked = selectCompliantBacktestContract({
               spot: entrySpot,
-              strike,
               direction: candidate.direction,
-              remainingYears,
+              barTsSec: bar.ts,
               atmIv,
+              dteCandidates: [0],
             });
+            if (!picked) continue;
 
-            if (isCall) {
-              for (let k = Math.ceil(entrySpot); k <= Math.ceil(entrySpot) + 35; k++) {
-                const q = priceOptionWithSkew({
-                  spot: entrySpot,
-                  strike: k,
-                  direction: "LONG",
-                  remainingYears,
-                  atmIv,
-                });
-                if (q.ask <= 0.95) {
-                  strike = k;
-                  quote = q;
-                  break;
-                }
-              }
-            } else {
-              for (let k = Math.floor(entrySpot); k >= Math.floor(entrySpot) - 35; k--) {
-                const q = priceOptionWithSkew({
-                  spot: entrySpot,
-                  strike: k,
-                  direction: "SHORT",
-                  remainingYears,
-                  atmIv,
-                });
-                if (q.ask <= 0.95) {
-                  strike = k;
-                  quote = q;
-                  break;
-                }
-              }
-            }
+            const { strike, quote, dteDays, remainingYears } = picked;
 
             // Bid/ask crossing on entry: market buy at ask
             const entryAsk = quote.ask;
@@ -690,7 +723,8 @@ async function run10DaySniperAudit() {
               entryAsk,
               tYears: remainingYears,
               iv: atmIv,
-              dteDays: 0,
+              dteDays,
+              seenSmaSide: isCall ? entrySpot >= bar.sma34 : entrySpot <= bar.sma34,
               openedTimeEt: bar.timeEt,
               openedTs: bar.ts,
             };
@@ -716,8 +750,27 @@ async function run10DaySniperAudit() {
           const recent4Bars = sessionBars.slice(Math.max(0, idx - 3), idx + 1);
           const recentLow4 = Math.min(...recent4Bars.map((b) => b.low));
           const recentHigh4 = Math.max(...recent4Bars.map((b) => b.high));
-          const bullDiv5m = recentLow4 <= fvwap - 1.25 * sigma && bar.close > bar.open;
-          const bearDiv5m = recentHigh4 >= fvwap + 1.25 * sigma && bar.close < bar.open;
+          let bullDiv5m = recentLow4 <= fvwap - 1.25 * sigma && bar.close > bar.open;
+          let bearDiv5m = recentHigh4 >= fvwap + 1.25 * sigma && bar.close < bar.open;
+          for (let look = 1; look <= 6 && idx - look >= 1; look++) {
+            const pb = sessionBars[idx - look];
+            const pf = sessionFlow[idx - look];
+            const pr4 = sessionBars.slice(Math.max(0, idx - look - 3), idx - look + 1);
+            if (
+              Math.min(...pr4.map((x) => x.low)) <= (pf?.flowVwap ?? pb.close) - 1.25 * (pf?.sigma ?? sigma) &&
+              pb.close > pb.open &&
+              bar.close >= pb.low
+            ) {
+              bullDiv5m = true;
+            }
+            if (
+              Math.max(...pr4.map((x) => x.high)) >= (pf?.flowVwap ?? pb.close) + 1.25 * (pf?.sigma ?? sigma) &&
+              pb.close < pb.open &&
+              bar.close <= pb.high
+            ) {
+              bearDiv5m = true;
+            }
+          }
 
           const testedPutWallOrMinus1S =
             (causalPutWall > 0 && Math.abs(recentLow4 - causalPutWall) / causalPutWall <= 0.0035) ||
@@ -729,119 +782,76 @@ async function run10DaySniperAudit() {
           const bullRoom = causalCallWall - bar.close;
           const bearRoom = bar.close - causalPutWall;
 
+          let leg2Signal: { dir: "CALL" | "PUT"; setupName: string; stopLossSpot: number } | null = null;
           if (
             canPhase2CallReclaim &&
             testedPutWallOrMinus1S &&
             impChi >= 0.60 &&
-            (dChi6 >= 0.03 || dImpChi6 >= 0.06) &&
-            dFlux6 > 0 &&
-            barBody <= 1.25 &&
+            (dChi6 >= 0.03 || dImpChi6 >= 0.06 || dFlux6 > 0 || bar.close >= fvwap || bar.close >= bar.sma34) &&
+            barBody <= 2.25 &&
             bullRoom >= 1.50 &&
-            (bullDiv5m || (bar.close > bar.open && bar.close >= fvwap && bar.close >= bar.sma34))
+            ((bullDiv5m && (bar.close >= fvwap || bar.close >= bar.sma34)) ||
+              (bar.close > bar.open && bar.close >= fvwap && bar.close >= bar.sma34))
           ) {
-            const entrySpot = bar.close;
-            const etDow = new Date(`${date}T12:00:00Z`).getUTCDay();
-            const dteDays = bar.totalMinutes >= 690 ? (etDow === 5 ? 3 : 1) : 0;
-            const remainingYears = computeRemainingYearsToExpiration(bar.ts * 1000, dteDays);
-            const atmIv = estimateDynamicAtmIv(unifiedBars, idx);
-            let strike = Math.ceil(entrySpot);
-            let quote = priceOptionWithSkew({
-              spot: entrySpot,
-              strike,
-              direction: "LONG",
-              remainingYears,
-              atmIv,
-            });
-            for (let k = Math.ceil(entrySpot); k <= Math.ceil(entrySpot) + 35; k++) {
-              const q = priceOptionWithSkew({
-                spot: entrySpot,
-                strike: k,
-                direction: "LONG",
-                remainingYears,
-                atmIv,
-              });
-              if (q.ask <= 0.95) {
-                strike = k;
-                quote = q;
-                break;
-              }
-            }
-            const stopLossSpot = Number(Math.min(recentLow4 - 0.15, entrySpot - 0.85).toFixed(2));
-            const risk = Math.max(0.5, entrySpot - stopLossSpot);
-            const target1Spot = Number((entrySpot + Math.max(1.25, risk * 1.5)).toFixed(2));
-            const target2Spot = Number((target1Spot + risk).toFixed(2));
-
-            activePosition = {
-              type: "CALL",
+            leg2Signal = {
+              dir: "CALL",
               setupName: "Leg-2 Put Wall / -1σ Bullish Reclaim",
-              strike,
-              entrySpot,
-              target1Spot,
-              target2Spot,
-              stopLossSpot,
-              entryAsk: quote.ask,
-              tYears: remainingYears,
-              iv: atmIv,
-              dteDays,
-              openedTimeEt: bar.timeEt,
-              openedTs: bar.ts,
+              stopLossSpot: Number(Math.min(recentLow4 - 0.15, bar.close - 0.85).toFixed(2)),
             };
-            tradeCountToday++;
-            if (tradeCountToday > 2) totalMultiTradeViolations++;
           } else if (
             canPhase2PutReject &&
             testedCallWallOrPlus1S &&
             impChi <= 0.40 &&
-            (dChi6 <= -0.03 || dImpChi6 <= -0.06) &&
-            dFlux6 < 0 &&
-            -barBody <= 1.25 &&
+            (dChi6 <= -0.03 || dImpChi6 <= -0.06 || dFlux6 < 0 || bar.close <= fvwap || bar.close <= bar.sma34) &&
+            -barBody <= 2.25 &&
             bearRoom >= 1.50 &&
-            (bearDiv5m || (bar.close < bar.open && bar.close <= fvwap && bar.close <= bar.sma34))
+            ((bearDiv5m && (bar.close <= fvwap || bar.close <= bar.sma34)) ||
+              (bar.close < bar.open && bar.close <= fvwap && bar.close <= bar.sma34))
           ) {
+            leg2Signal = {
+              dir: "PUT",
+              setupName: "Leg-2 Call Wall / +1σ Bearish Rejection",
+              stopLossSpot: Number(Math.max(recentHigh4 + 0.15, bar.close + 0.85).toFixed(2)),
+            };
+          }
+
+          if (leg2Signal) {
+            const isCall = leg2Signal.dir === "CALL";
             const entrySpot = bar.close;
-            const etDow = new Date(`${date}T12:00:00Z`).getUTCDay();
-            const dteDays = bar.totalMinutes >= 690 ? (etDow === 5 ? 3 : 1) : 0;
-            const remainingYears = computeRemainingYearsToExpiration(bar.ts * 1000, dteDays);
+            // 1 trading session DTE (never calendar 3 on Friday), falling back to 0DTE if >$0.99 or <0.25 delta
+            const dteCandidates = bar.totalMinutes >= 690 ? [1, 0] : [0];
             const atmIv = estimateDynamicAtmIv(unifiedBars, idx);
-            let strike = Math.floor(entrySpot);
-            let quote = priceOptionWithSkew({
+            const picked = selectCompliantBacktestContract({
               spot: entrySpot,
-              strike,
-              direction: "SHORT",
-              remainingYears,
+              direction: isCall ? "LONG" : "SHORT",
+              barTsSec: bar.ts,
               atmIv,
+              dteCandidates,
             });
-            for (let k = Math.floor(entrySpot); k >= Math.floor(entrySpot) - 35; k--) {
-              const q = priceOptionWithSkew({
-                spot: entrySpot,
-                strike: k,
-                direction: "SHORT",
-                remainingYears,
-                atmIv,
-              });
-              if (q.ask <= 0.95) {
-                strike = k;
-                quote = q;
-                break;
-              }
-            }
-            const stopLossSpot = Number(Math.max(recentHigh4 + 0.15, entrySpot + 0.85).toFixed(2));
-            const risk = Math.max(0.5, stopLossSpot - entrySpot);
-            const target1Spot = Number((entrySpot - Math.max(1.25, risk * 1.5)).toFixed(2));
-            const target2Spot = Number((target1Spot - risk).toFixed(2));
+            if (!picked) continue;
+
+            const { strike, quote, dteDays, remainingYears } = picked;
+            const risk = Math.max(0.5, Math.abs(entrySpot - leg2Signal.stopLossSpot));
+            const target1Spot = isCall
+              ? Number((entrySpot + Math.max(1.25, risk * 1.5)).toFixed(2))
+              : Number((entrySpot - Math.max(1.25, risk * 1.5)).toFixed(2));
+            const target2Spot = isCall
+              ? Number((target1Spot + risk).toFixed(2))
+              : Number((target1Spot - risk).toFixed(2));
 
             activePosition = {
-              type: "PUT",
-              setupName: "Leg-2 Call Wall / +1σ Bearish Rejection",
+              type: leg2Signal.dir,
+              setupName: leg2Signal.setupName,
               strike,
               entrySpot,
               target1Spot,
               target2Spot,
-              stopLossSpot,
+              stopLossSpot: leg2Signal.stopLossSpot,
               entryAsk: quote.ask,
               tYears: remainingYears,
               iv: atmIv,
               dteDays,
+              seenSmaSide: isCall ? entrySpot >= bar.sma34 : entrySpot <= bar.sma34,
               openedTimeEt: bar.timeEt,
               openedTs: bar.ts,
             };

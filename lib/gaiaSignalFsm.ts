@@ -351,7 +351,7 @@ export class GaiaSignalFsm {
       }
       const isLeg2 = this.closedTradesToday === 1;
       if (isLeg2) {
-        const phase2WindowOk = typeof etMins === "number" ? etMins >= 645 && etMins <= 870 : true;
+        const phase2WindowOk = typeof etMins === "number" ? etMins >= 630 && etMins <= 870 : true;
         const cooldownOk = this.lastExitBarTs > 0 ? bar.barTimestamp - this.lastExitBarTs >= PHASE2_COOLDOWN_SEC : false;
         if (!phase2WindowOk || !cooldownOk) {
           return { nextState: "STAND_ASIDE" };
@@ -361,7 +361,7 @@ export class GaiaSignalFsm {
       const allowLong = this.closedTradesToday === 0 || this.lastClosedDirection === "SHORT";
 
       // =========================================================================
-      // LEG 2 HIGH-CONVICTION OPPOSITE-DIRECTION STRUCTURAL ROTATION (10:45-14:30 ET)
+      // LEG 2 HIGH-CONVICTION OPPOSITE-DIRECTION STRUCTURAL ROTATION (10:30-14:30 ET)
       // =========================================================================
       if (isLeg2 && levels) {
         const leg2TestLow = bar.recentLow4 ?? bar.low;
@@ -372,17 +372,23 @@ export class GaiaSignalFsm {
         const testedCallWallOrSigma1 =
           (callWall !== undefined && Math.abs(leg2TestHigh - callWall) / bar.close <= 0.0035) ||
           (sigmaPlus1 !== null && sigmaPlus1 > 0 && leg2TestHigh >= sigmaPlus1 * 0.9965);
+        const bullSmaOrVwap =
+          (bar.sma34 === undefined && bar.flowVwap === undefined) ||
+          (bar.sma34 !== undefined && bar.close >= bar.sma34) ||
+          (bar.flowVwap !== undefined && bar.close >= bar.flowVwap);
+        const bearSmaOrVwap =
+          (bar.sma34 === undefined && bar.flowVwap === undefined) ||
+          (bar.sma34 !== undefined && bar.close <= bar.sma34) ||
+          (bar.flowVwap !== undefined && bar.close <= bar.flowVwap);
         const leg2BullReclaim =
-          Boolean(bar.bullDiv5m) ||
-          ((bar.sma34 === undefined || bar.close > bar.sma34) &&
-            (bar.flowVwap === undefined || bar.close > bar.flowVwap)) ||
+          (Boolean(bar.bullDiv5m) && bullSmaOrVwap) ||
+          (bar.close > bar.open && (bar.sma34 === undefined || bar.close > bar.sma34) && (bar.flowVwap === undefined || bar.close > bar.flowVwap)) ||
           ((pdl !== undefined || bookCenter !== undefined) &&
             bar.close > (bookCenter ?? pdl!) &&
             (bar.flowVwap === undefined || bar.close >= bar.flowVwap));
         const leg2BearReject =
-          Boolean(bar.bearDiv5m) ||
-          ((bar.sma34 === undefined || bar.close < bar.sma34) &&
-            (bar.flowVwap === undefined || bar.close < bar.flowVwap)) ||
+          (Boolean(bar.bearDiv5m) && bearSmaOrVwap) ||
+          (bar.close < bar.open && (bar.sma34 === undefined || bar.close < bar.sma34) && (bar.flowVwap === undefined || bar.close < bar.flowVwap)) ||
           ((pdh !== undefined || bookCenter !== undefined) &&
             bar.close < (bookCenter ?? pdh!) &&
             (bar.flowVwap === undefined || bar.close <= bar.flowVwap));
@@ -412,7 +418,7 @@ export class GaiaSignalFsm {
           testedPutWallOrSigma1 &&
           leg2BullReclaim &&
           impulseChi >= 0.60 &&
-          deltaNetFlux6Bar > 0 &&
+          (deltaNetFlux6Bar > 0 || bullSmaOrVwap) &&
           leg2CallRoom >= 1.50
         ) {
           return {
@@ -428,7 +434,7 @@ export class GaiaSignalFsm {
           testedCallWallOrSigma1 &&
           leg2BearReject &&
           impulseChi <= 0.40 &&
-          deltaNetFlux6Bar < 0 &&
+          (deltaNetFlux6Bar < 0 || bearSmaOrVwap) &&
           leg2PutRoom >= 1.50
         ) {
           return {

@@ -21,9 +21,70 @@ import {
 import {
   acquireBarEvaluationLock,
   releaseBarEvaluationLock,
+  ensureLiveBotRunning,
+  ensureMocCutoffForRemainingPositions,
+  getEtClockNow,
 } from "@/lib/liveBotDaemon";
 
 export const dynamic = "force-dynamic";
+
+function parseIsoDateParam(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : undefined;
+}
+
+/**
+ * Fail-Closed Historical Backfill Firewall:
+ * Silences ALL Discord webhooks if explicit flag OR any date/sessionDate/nowEt/candle indicates replay.
+ */
+function isHistoricalBackfillRequest(opts: {
+  explicitFlag?: unknown;
+  requestedDate?: string;
+  nowEt?: unknown;
+  candleTimestamp?: unknown;
+}): boolean {
+  if (opts.explicitFlag === true || opts.explicitFlag === "true" || opts.explicitFlag === "1") {
+    return true;
+  }
+  const todayEt = getTodayEt();
+  if (opts.requestedDate && opts.requestedDate !== todayEt) {
+    return true;
+  }
+  if (opts.nowEt != null) {
+    const dt = opts.nowEt instanceof Date ? opts.nowEt : new Date(String(opts.nowEt));
+    if (!Number.isFinite(dt.getTime())) return true;
+    const dtEtDate = getEtClockNow(dt.getTime()).etDate;
+    if (dtEtDate !== todayEt || Math.abs(Date.now() - dt.getTime()) > 180_000) {
+      return true;
+    }
+  }
+  if (
+    typeof opts.candleTimestamp === "number" &&
+    Number.isFinite(opts.candleTimestamp) &&
+    opts.candleTimestamp > 0
+  ) {
+    const ms = opts.candleTimestamp > 1e11 ? opts.candleTimestamp : opts.candleTimestamp * 1000;
+    if (getEtClockNow(ms).etDate !== todayEt) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function withBoundedWait<T>(work: Promise<T>, timeoutMs = 15_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Signal operation timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export async function GET(req: NextRequest) {
   try {
@@ -269,29 +330,53 @@ export async function GET(req: NextRequest) {
     }
 
     if (searchParams.get("action") === "send_radar") {
+      if (
+        isHistoricalBackfillRequest({
+          explicitFlag: searchParams.get("isHistoricalBackfill"),
+          requestedDate: requestedDate ?? parseIsoDateParam(searchParams.get("sessionDate")),
+          nowEt: searchParams.get("nowEt"),
+        })
+      ) {
+        return NextResponse.json({
+          success: false,
+          suppressed: true,
+          reason: "DISCORD_SILENCED_HISTORICAL_BACKFILL",
+        });
+      }
       const lockToken = acquireBarEvaluationLock();
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
       }
-      try {
-        const sent = await sendPreTradeRadarDiscordCard(webhookUrl);
-        return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
-      } finally {
-        releaseBarEvaluationLock(lockToken);
-      }
+      const work = sendPreTradeRadarDiscordCard(webhookUrl).finally(() =>
+        releaseBarEvaluationLock(lockToken)
+      );
+      const sent = await withBoundedWait(work, 15_000);
+      return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
     }
 
     if (searchParams.get("action") === "send_recap") {
+      if (
+        isHistoricalBackfillRequest({
+          explicitFlag: searchParams.get("isHistoricalBackfill"),
+          requestedDate: requestedDate ?? parseIsoDateParam(searchParams.get("sessionDate")),
+          nowEt: searchParams.get("nowEt"),
+        })
+      ) {
+        return NextResponse.json({
+          success: false,
+          suppressed: true,
+          reason: "DISCORD_SILENCED_HISTORICAL_BACKFILL",
+        });
+      }
       const lockToken = acquireBarEvaluationLock();
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
       }
-      try {
-        const report = await checkAndSendMarketCloseRecap({ force: true, webhookUrl });
-        return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
-      } finally {
-        releaseBarEvaluationLock(lockToken);
-      }
+      const work = checkAndSendMarketCloseRecap({ force: true, webhookUrl }).finally(() =>
+        releaseBarEvaluationLock(lockToken)
+      );
+      const report = await withBoundedWait(work, 15_000);
+      return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
     }
 
     // Continuously evaluate all open positions across all tickers against live CBOE quotes
@@ -306,6 +391,7 @@ export async function GET(req: NextRequest) {
       });
     }
 
+    ensureLiveBotRunning();
     const getLockToken = acquireBarEvaluationLock();
     if (getLockToken) {
       const evalController = new AbortController();
@@ -313,6 +399,10 @@ export async function GET(req: NextRequest) {
       try {
         await evaluateAllActivePositions({ webhookUrl, signal: evalController.signal });
       } finally {
+        const clock = getEtClockNow();
+        if (clock.etMins >= 955) {
+          await ensureMocCutoffForRemainingPositions(webhookUrl, clock).catch(() => {});
+        }
         clearTimeout(evalTimeout);
         releaseBarEvaluationLock(getLockToken);
       }
@@ -340,6 +430,22 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
 
     if (body.action === "SYNC_GAIA_SPY_SIGNALS") {
+      const sessionDate = parseIsoDateParam(body.sessionDate);
+      const backfill = isHistoricalBackfillRequest({
+        explicitFlag: body.isHistoricalBackfill,
+        requestedDate: sessionDate,
+        nowEt: body.nowEt,
+      });
+      if (sessionDate && sessionDate !== getTodayEt()) {
+        return NextResponse.json({
+          success: true,
+          suppressed: true,
+          isHistoricalBackfill: true,
+          sessionDate,
+          dispatchedCount: 0,
+          keys: [],
+        });
+      }
       const lockToken = acquireBarEvaluationLock();
       if (!lockToken) {
         return NextResponse.json({ success: false, busy: true, dispatchedCount: 0, keys: [] }, { status: 409 });
@@ -355,11 +461,15 @@ export async function POST(req: NextRequest) {
           macroRegime: body.macroRegime,
           chiPct: body.chiPct,
           zeroGamma: typeof body.zeroGamma === "number" ? body.zeroGamma : undefined,
-          sessionDate: body.sessionDate,
-          webhookUrl: body.webhookUrl,
-          isHistoricalBackfill: Boolean(body.isHistoricalBackfill),
+          sessionDate,
+          webhookUrl: backfill ? undefined : body.webhookUrl,
+          isHistoricalBackfill: backfill,
           signal: syncController.signal,
         });
+        const clock = getEtClockNow();
+        if (!backfill && clock.etMins >= 955) {
+          await ensureMocCutoffForRemainingPositions(body.webhookUrl, clock);
+        }
         return NextResponse.json({ success: true, ...res });
       } finally {
         clearTimeout(syncTimeout);
@@ -381,29 +491,54 @@ export async function POST(req: NextRequest) {
     }
 
     if (body.action === "send_daily_recap") {
+      if (
+        isHistoricalBackfillRequest({
+          explicitFlag: body.isHistoricalBackfill,
+          requestedDate: parseIsoDateParam(body.sessionDate ?? body.date),
+          nowEt: body.nowEt,
+        })
+      ) {
+        return NextResponse.json({
+          success: false,
+          suppressed: true,
+          reason: "DISCORD_SILENCED_HISTORICAL_BACKFILL",
+        });
+      }
       const lockToken = acquireBarEvaluationLock();
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
       }
-      try {
-        const report = await checkAndSendMarketCloseRecap({ force: true, webhookUrl: body.webhookUrl });
-        return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
-      } finally {
-        releaseBarEvaluationLock(lockToken);
-      }
+      const work = checkAndSendMarketCloseRecap({
+        force: true,
+        webhookUrl: body.webhookUrl,
+      }).finally(() => releaseBarEvaluationLock(lockToken));
+      const report = await withBoundedWait(work, 15_000);
+      return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
     }
 
     if (body.action === "send_radar") {
+      if (
+        isHistoricalBackfillRequest({
+          explicitFlag: body.isHistoricalBackfill,
+          requestedDate: parseIsoDateParam(body.sessionDate ?? body.date),
+          nowEt: body.nowEt,
+        })
+      ) {
+        return NextResponse.json({
+          success: false,
+          suppressed: true,
+          reason: "DISCORD_SILENCED_HISTORICAL_BACKFILL",
+        });
+      }
       const lockToken = acquireBarEvaluationLock();
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
       }
-      try {
-        const sent = await sendPreTradeRadarDiscordCard(body.webhookUrl);
-        return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
-      } finally {
-        releaseBarEvaluationLock(lockToken);
-      }
+      const work = sendPreTradeRadarDiscordCard(body.webhookUrl).finally(() =>
+        releaseBarEvaluationLock(lockToken)
+      );
+      const sent = await withBoundedWait(work, 15_000);
+      return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
     }
 
     const lockToken = acquireBarEvaluationLock();
@@ -413,14 +548,24 @@ export async function POST(req: NextRequest) {
     const postController = new AbortController();
     const postTimeout = setTimeout(() => postController.abort(), 12_000);
     try {
+      const backfill = isHistoricalBackfillRequest({
+        explicitFlag: body.isHistoricalBackfill,
+        requestedDate: parseIsoDateParam(body.sessionDate ?? body.date),
+        nowEt: body.nowEt,
+        candleTimestamp: body.latest5mCandle?.timestamp,
+      });
       const normalizedBody = {
         ...body,
+        webhookUrl: backfill ? undefined : body.webhookUrl,
+        isHistoricalBackfill: backfill,
         signal: postController.signal,
-        ...(body.nowEt
-          ? { nowEt: new Date(body.nowEt), isHistoricalBackfill: body.isHistoricalBackfill ?? true }
-          : {}),
+        ...(body.nowEt ? { nowEt: new Date(body.nowEt) } : {}),
       };
       const result = await evaluateTradeSignals(normalizedBody);
+      const clock = getEtClockNow();
+      if (!backfill && clock.etMins >= 955) {
+        await ensureMocCutoffForRemainingPositions(body.webhookUrl, clock);
+      }
       return NextResponse.json(result);
     } finally {
       clearTimeout(postTimeout);

@@ -286,6 +286,68 @@ runTest("Causal prefix invariance across pre-market and 09:30 ET RTH session res
   assert.ok(typeof lastSnap.deltaImpulseChi6Bar === "number", "deltaImpulseChi6Bar must be a finite number");
 });
 
+runTest("Midday (11:30 AM ET) Put Wall Reclaim yields impulseChi >= 0.60, impulsePeclet > 0 & deltaNetFlux6Bar > 0", () => {
+  // Morning flush 09:30 (570) -> 11:00 (660), followed by 6-bar 11:05..11:30 (665..690) Put Wall reclaim
+  const baseTs = 1794580200; // 09:30:00 ET on 2026-11-13
+  const candles = [
+    { timestamp: baseTs + 0, etMins: 570, open: 760.0, high: 760.4, low: 757.0, close: 757.2, volume: 65000 },
+    { timestamp: baseTs + 300, etMins: 575, open: 757.2, high: 757.5, low: 754.2, close: 754.4, volume: 72000 },
+    { timestamp: baseTs + 600, etMins: 580, open: 754.4, high: 754.6, low: 751.5, close: 751.8, volume: 80000 },
+    { timestamp: baseTs + 900, etMins: 585, open: 751.8, high: 752.0, low: 749.8, close: 750.0, volume: 85000 },
+    { timestamp: baseTs + 5400, etMins: 660, open: 750.0, high: 750.3, low: 749.4, close: 749.6, volume: 50000 }, // 11:00 ET bottom near PW 750
+    { timestamp: baseTs + 5700, etMins: 665, open: 749.6, high: 750.5, low: 749.5, close: 750.3, volume: 48000 },
+    { timestamp: baseTs + 6000, etMins: 670, open: 750.3, high: 751.2, low: 750.2, close: 751.0, volume: 52000 },
+    { timestamp: baseTs + 6300, etMins: 675, open: 751.0, high: 752.0, low: 750.9, close: 751.9, volume: 56000 },
+    { timestamp: baseTs + 6600, etMins: 680, open: 751.9, high: 752.9, low: 751.8, close: 752.7, volume: 60000 },
+    { timestamp: baseTs + 6900, etMins: 685, open: 752.7, high: 753.8, low: 752.6, close: 753.6, volume: 64000 },
+    { timestamp: baseTs + 7200, etMins: 690, open: 753.6, high: 754.7, low: 753.5, close: 754.5, volume: 68000 }, // 11:30 ET reclaim
+  ];
+  const series = computeBarFlowGammaVwapSeries(candles);
+  const reclaim1130 = series[series.length - 1];
+  assert.ok((reclaim1130.impulseChi ?? 0) >= 0.60, `Expected 11:30 ET impulseChi >= 0.60 (got ${reclaim1130.impulseChi})`);
+  assert.ok((reclaim1130.impulsePeclet ?? 0) > 0, `Expected positive impulsePeclet (got ${reclaim1130.impulsePeclet})`);
+  assert.ok((reclaim1130.deltaImpulseChi6Bar ?? 0) > 0, `Expected deltaImpulseChi6Bar > 0 (got ${reclaim1130.deltaImpulseChi6Bar})`);
+  assert.ok((reclaim1130.deltaNetFlux6Bar ?? 0) > 0, `Expected deltaNetFlux6Bar > 0 (got ${reclaim1130.deltaNetFlux6Bar})`);
+});
+
+runTest("Symmetrical Midday (11:30 AM ET) Call Wall Rejection yields impulseChi <= 0.40, impulsePeclet < 0 & deltaNetFlux6Bar < 0", () => {
+  // Morning squeeze 09:30 -> 11:00 into Call Wall 762, followed by 6-bar 11:05..11:30 rejection
+  const baseTs = 1794580200;
+  const candles = [
+    { timestamp: baseTs + 0, etMins: 570, open: 752.0, high: 754.8, low: 751.8, close: 754.5, volume: 65000 },
+    { timestamp: baseTs + 300, etMins: 575, open: 754.5, high: 757.5, low: 754.3, close: 757.2, volume: 72000 },
+    { timestamp: baseTs + 600, etMins: 580, open: 757.2, high: 760.0, low: 757.0, close: 759.8, volume: 80000 },
+    { timestamp: baseTs + 900, etMins: 585, open: 759.8, high: 762.1, low: 759.5, close: 761.9, volume: 85000 },
+    { timestamp: baseTs + 5400, etMins: 660, open: 761.9, high: 762.2, low: 761.4, close: 761.5, volume: 50000 }, // 11:00 ET peak at CW 762
+    { timestamp: baseTs + 5700, etMins: 665, open: 761.5, high: 761.7, low: 760.6, close: 760.8, volume: 48000 },
+    { timestamp: baseTs + 6000, etMins: 670, open: 760.8, high: 761.0, low: 759.9, close: 760.0, volume: 52000 },
+    { timestamp: baseTs + 6300, etMins: 675, open: 760.0, high: 760.2, low: 759.0, close: 759.2, volume: 56000 },
+    { timestamp: baseTs + 6600, etMins: 680, open: 759.2, high: 759.4, low: 758.1, close: 758.3, volume: 60000 },
+    { timestamp: baseTs + 6900, etMins: 685, open: 758.3, high: 758.5, low: 757.2, close: 757.4, volume: 64000 },
+    { timestamp: baseTs + 7200, etMins: 690, open: 757.4, high: 757.5, low: 756.3, close: 756.5, volume: 68000 }, // 11:30 ET rejection
+  ];
+  const series = computeBarFlowGammaVwapSeries(candles);
+  const reject1130 = series[series.length - 1];
+  assert.ok((reject1130.impulseChi ?? 1) <= 0.40, `Expected 11:30 ET impulseChi <= 0.40 (got ${reject1130.impulseChi})`);
+  assert.ok((reject1130.impulsePeclet ?? 0) < 0, `Expected negative impulsePeclet (got ${reject1130.impulsePeclet})`);
+  assert.ok((reject1130.deltaImpulseChi6Bar ?? 0) < 0, `Expected deltaImpulseChi6Bar < 0 (got ${reject1130.deltaImpulseChi6Bar})`);
+  assert.ok((reject1130.deltaNetFlux6Bar ?? 0) < 0, `Expected deltaNetFlux6Bar < 0 (got ${reject1130.deltaNetFlux6Bar})`);
+});
+
+runTest("09:30 ET RTH Session Boundary resets accumulators & maintains exact causal prefix invariance", () => {
+  const baseTs = 1794579600; // 09:20 ET
+  const bars = [
+    { timestamp: baseTs, etMins: 560, open: 768.0, high: 768.5, low: 767.5, close: 768.2, volume: 20000 }, // pre-market far above RTH
+    { timestamp: baseTs + 300, etMins: 565, open: 768.2, high: 768.6, low: 767.8, close: 768.0, volume: 20000 },
+    { timestamp: baseTs + 600, etMins: 570, open: 752.0, high: 752.6, low: 751.4, close: 752.3, volume: 60000 }, // 09:30 ET reset
+    { timestamp: baseTs + 900, etMins: 575, open: 752.3, high: 753.0, low: 752.1, close: 752.9, volume: 65000 },
+  ];
+  const full = computeBarFlowGammaVwapSeries(bars);
+  assert.ok(full[2].flowVwap < 753.0 && full[2].flowVwap > 751.0, `09:30 ET RTH reset must shed 768 pre-market VWAP anchor (got ${full[2].flowVwap})`);
+  assert.strictEqual(full[2].bandSignal, null, "09:30 ET reset bar (barsIntoSession === 0) must not emit stale pre-market bandSignal");
+  assert.strictEqual(computeBarFlowGammaVwapSeries(bars.slice(0, 3))[2].netFluxJ, full[2].netFluxJ, "09:30 reset bar netFluxJ is strictly causal");
+});
+
 console.log(`\n=======================================================`);
 console.log(`Test Results: ${testsPassed} / ${testsRun} Passed`);
 console.log(`=======================================================\n`);

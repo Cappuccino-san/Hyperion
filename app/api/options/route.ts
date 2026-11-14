@@ -19,6 +19,8 @@ import {
   ensureLiveBotRunning,
   acquireBarEvaluationLock,
   releaseBarEvaluationLock,
+  ensureMocCutoffForRemainingPositions,
+  getEtClockNow,
 } from "@/lib/liveBotDaemon";
 import { globalTelemetry } from "@/lib/telemetry";
 
@@ -532,9 +534,11 @@ async function attachIntraday(
         // Non-fatal
       }
     } else {
+    const evalController = new AbortController();
+    const evalTimeout = setTimeout(() => evalController.abort(), 12_000);
     try {
       // Guard and evaluate all active positions across all tickers first
-      await evaluateAllActivePositions();
+      await evaluateAllActivePositions({ signal: evalController.signal });
 
       const contracts = contractsCache.get(payload.ticker);
 
@@ -621,6 +625,7 @@ async function attachIntraday(
         filteredKing: tacticalKing,
         bookCenter: tacticalZeroGamma,
         contracts,
+        signal: evalController.signal,
       });
 
       const tickerAlerts = tradeRes.allAlerts.filter(
@@ -649,7 +654,12 @@ async function attachIntraday(
     } catch {
       // Non-fatal
     } finally {
-      releaseBarEvaluationLock();
+      const clock = getEtClockNow();
+      if (clock.etMins >= 955) {
+        await ensureMocCutoffForRemainingPositions(process.env.DISCORD_WEBHOOK_URL, clock).catch(() => {});
+      }
+      clearTimeout(evalTimeout);
+      releaseBarEvaluationLock(hasLock);
     }
   }
 

@@ -488,10 +488,15 @@ export class FlowGammaVwapEngine {
       const newWeight = oldWeight + validWeight;
       this.sumWeight = newWeight;
 
-      const delta = validSpot - (this.runningMean || validSpot);
-      const newMean = (this.runningMean || validSpot) + (validWeight / newWeight) * delta;
-      this.runningM2 += validWeight * delta * (validSpot - newMean);
-      this.runningMean = newMean;
+      if (oldWeight === 0) {
+        this.runningMean = validSpot;
+        this.runningM2 = 0;
+      } else {
+        const delta = validSpot - this.runningMean;
+        const newMean = this.runningMean + (validWeight / newWeight) * delta;
+        this.runningM2 += validWeight * delta * (validSpot - newMean);
+        this.runningMean = newMean;
+      }
 
       this.runningSignedAccel += signedWeight ?? validWeight;
       this.tradeCount += 1;
@@ -588,6 +593,7 @@ function getEtDateAndMinsFromTimestamp(tsRaw: number): { etDate: string; etMins:
       hour: "2-digit",
       minute: "2-digit",
       hour12: false,
+      hourCycle: "h23",
     }).formatToParts(dt);
     const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 0) % 24;
     const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
@@ -631,38 +637,48 @@ export function computeBarFlowGammaVwapSeries(
   let maxCallWeight = -1;
   let putWallCandidate = 0;
   let maxPutWeight = -1;
-  const refOpenSpot = candles[0].open || candles[0].close;
 
-  if (optionsBook && optionsBook.length > 0) {
-    for (const opt of optionsBook) {
-      const gamma = Math.max(0, Number(opt.gamma) || 0);
-      const vol = Math.max(1, Number(opt.volume) || (Number(opt.openInterest) || 0) * 0.05);
-      const prem = Math.max(
-        0.5,
-        Number(opt.last) || (Number(opt.bid || 0) + Number(opt.ask || 0)) / 2 || 1.0
-      );
-      const weight = Math.abs(vol * prem * 100 * gamma * (refOpenSpot * refOpenSpot) * 0.01);
-      if (weight > 0) {
-        const isCall =
-          opt.optionType === "C" ||
-          opt.optionType === "CALL" ||
-          (opt.optionType === undefined && opt.strike >= refOpenSpot);
-        strikeGammaWeights.push({
-          strike: opt.strike,
-          weight,
-          signedBias: isCall ? 1 : -1,
-        });
-        if (opt.strike >= refOpenSpot && weight > maxCallWeight) {
-          maxCallWeight = weight;
-          callWallCandidate = opt.strike;
-        }
-        if (opt.strike <= refOpenSpot && weight > maxPutWeight) {
-          maxPutWeight = weight;
-          putWallCandidate = opt.strike;
+  const rebuildBookAnchors = (refOpenSpot: number): number => {
+    strikeGammaWeights.length = 0;
+    callWallCandidate = 0;
+    maxCallWeight = -1;
+    putWallCandidate = 0;
+    maxPutWeight = -1;
+    let sumW = 0;
+    if (optionsBook && optionsBook.length > 0 && Number.isFinite(refOpenSpot) && refOpenSpot > 0) {
+      for (const opt of optionsBook) {
+        const gamma = Math.max(0, Number(opt.gamma) || 0);
+        const vol = Math.max(1, Number(opt.volume) || (Number(opt.openInterest) || 0) * 0.05);
+        const prem = Math.max(
+          0.5,
+          Number(opt.last) || (Number(opt.bid || 0) + Number(opt.ask || 0)) / 2 || 1.0
+        );
+        const weight = Math.abs(vol * prem * 100 * gamma * (refOpenSpot * refOpenSpot) * 0.01);
+        if (weight > 0) {
+          sumW += weight;
+          const isCall =
+            opt.optionType === "C" ||
+            opt.optionType === "CALL" ||
+            (opt.optionType === undefined && opt.strike >= refOpenSpot);
+          strikeGammaWeights.push({
+            strike: opt.strike,
+            weight,
+            signedBias: isCall ? 1 : -1,
+          });
+          if (opt.strike >= refOpenSpot && weight > maxCallWeight) {
+            maxCallWeight = weight;
+            callWallCandidate = opt.strike;
+          }
+          if (opt.strike <= refOpenSpot && weight > maxPutWeight) {
+            maxPutWeight = weight;
+            putWallCandidate = opt.strike;
+          }
         }
       }
     }
-  }
+    return sumW;
+  };
+  let totalBookWeight = rebuildBookAnchors(candles[0].open || candles[0].close);
 
   // Causal opening spectral calibration helper (uses only bars [sessionStartIdx .. i] <= 3 bars, zero lookahead)
   const buildCausalOpeningSpec = (openSlice: typeof candles) => {
@@ -720,14 +736,13 @@ export function computeBarFlowGammaVwapSeries(
     return { gammaDiff, kappa, baseModes };
   };
 
-  const totalBookWeight = strikeGammaWeights.reduce((s, w) => s + w.weight, 0);
-
   // Causal F_{t_i}-adapted running state (Zero Lookahead Stefan Boundary)
   let runningHigh = -Infinity;
   let runningLow = +Infinity;
   let causalAtr = 0;
   const atrAlpha = 1 / 14;
   let lastRthResetDate = "";
+  let prevEtMins: number | null = null;
   let sessionStartIdx = 0;
   let sessionStartTs = candles[0].timestamp;
   let open930 = candles[0].open || candles[0].close;
@@ -743,6 +758,12 @@ export function computeBarFlowGammaVwapSeries(
     const etDate = parsedEt?.etDate ?? "SESSION";
 
     const barRange = Math.max(0, c.high - c.low);
+    if (prevEtMins !== null && typeof etMins === "number" && etMins < prevEtMins) {
+      lastRthResetDate = "";
+    }
+    if (typeof etMins === "number") {
+      prevEtMins = etMins;
+    }
     const isFirstBarOfRthSession =
       typeof etMins === "number" && etMins >= 570 && lastRthResetDate !== etDate;
     if (isFirstBarOfRthSession) {
@@ -750,6 +771,7 @@ export function computeBarFlowGammaVwapSeries(
       open930 = c.open || c.close;
       if (i > 0) {
         engine.reset(open930);
+        totalBookWeight = rebuildBookAnchors(open930);
         runningHigh = -Infinity;
         runningLow = +Infinity;
         causalAtr = 0;
@@ -833,11 +855,13 @@ export function computeBarFlowGammaVwapSeries(
     );
 
     // Minutes elapsed since session open
-    const tauMinutes = Math.max(
-      1,
+    const tsDeltaMin =
       c.timestamp > sessionStartTs
         ? (c.timestamp - sessionStartTs) / (c.timestamp > 1e11 ? 60000 : 60)
-        : (barsIntoSession + 1) * 5
+        : 0;
+    const tauMinutes = Math.max(
+      1,
+      tsDeltaMin > 0 ? tsDeltaMin + 5 : (barsIntoSession + 1) * 5
     );
 
     // Multi-Horizon Structural Advection Velocity (Session Open + VWAP + Momentum)
@@ -848,22 +872,34 @@ export function computeBarFlowGammaVwapSeries(
     const macroDrive = (c.close - open930) / (2.2 * atrEst);
     // 2. Structural Horizon: Distance from Flow VWAP
     const vwapDrive = (c.close - currentVwap) / (1.2 * atrEst);
-    // 3. Windowed 30m (6-bar), 20m (4-bar) & 10m (2-bar) Impulse Horizon
+    // 3. Multi-Horizon Impulse Inflection (30m displacement + 5m-20m inflection)
     const lb6 = Math.max(sessionStartIdx, i - 6);
     const lb4 = Math.max(sessionStartIdx, i - 4);
+    const lb3 = Math.max(sessionStartIdx, i - 3);
     const lb2 = Math.max(sessionStartIdx, i - 2);
-    const impulseDrive = (
+    const lb1 = Math.max(sessionStartIdx, i - 1);
+    const window30mDrive = (
       0.20 * ((c.close - candles[lb6].close) / atrEst) +
       0.45 * ((c.close - candles[lb4].close) / atrEst) +
       0.35 * ((c.close - candles[lb2].close) / atrEst)
     );
+    const shortImpulseDrive = (
+      0.35 * ((c.close - candles[lb1].close) / atrEst) +
+      0.35 * ((c.close - candles[lb2].close) / atrEst) +
+      0.20 * ((c.close - candles[lb3].close) / atrEst) +
+      0.10 * ((c.close - candles[lb4].close) / atrEst)
+    );
+    const impulseDrive =
+      Math.sign(window30mDrive) === Math.sign(shortImpulseDrive)
+        ? (Math.abs(window30mDrive) >= Math.abs(shortImpulseDrive) ? window30mDrive : shortImpulseDrive)
+        : shortImpulseDrive;
 
-    // Dynamic Impulse Reweighting: when a post-10:45 ET 6-bar impulse reversal opposes the
+    // Dynamic Impulse Reweighting: when a post-10:15 ET impulse reversal opposes the
     // morning macro drift near a structural wall / +-1sigma band, shift advection weight
     // toward impulseDrive so ceilingShareChi responds to institutional short-covering/distribution.
     const isAfternoonImpulseReversal =
       typeof etMins === "number" &&
-      etMins >= 645 &&
+      etMins >= 615 &&
       Math.abs(impulseDrive) >= 0.35 &&
       Math.sign(impulseDrive) !== 0 &&
       Math.sign(impulseDrive) !== Math.sign(macroDrive);
@@ -896,7 +932,7 @@ export function computeBarFlowGammaVwapSeries(
         : "NEGATIVE_GAMMA";
     const muDelta = Math.max(-8.0, Math.min(8.0, combinedDrive * 2.8));
     const sigmaC = Math.max(0.1, Math.log1p(barWeight) * 0.25);
-    const safeGammaImp = Math.max(1e-4, gammaDiff);
+    const safeGammaImp = Math.max(1e-4, 0.85 * W);
     const impulseMuDelta = Math.max(-8.0, Math.min(8.0, impulseDrive * 2.8));
     const impulsePeclet = Number(Math.max(-25, Math.min(25, (impulseMuDelta * W) / safeGammaImp)).toFixed(3));
     const impulseChi = Number(computeCeilingShareChi(impulsePeclet).toFixed(4));
@@ -933,7 +969,7 @@ export function computeBarFlowGammaVwapSeries(
 
     // Tick-Level Band Wick Signal Detection (Image 3 arrows)
     let bandSignal: FlowBandSignal = null;
-    if (i >= 1) {
+    if (barsIntoSession >= 1) {
       if (c.high >= u2 * 0.9997 && c.close < u2) {
         bandSignal = "UPPER_2S_REJECT";
       } else if (c.low <= l2 * 1.0003 && c.close > l2) {

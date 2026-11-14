@@ -612,28 +612,7 @@ export function GaiaView() {
     alerts: storeTradeAlerts,
   });
 
-  const effectiveServerTrades: ServerTradesState = useMemo(() => ({
-    activePositions:
-      serverTrades.activePositions && Object.keys(serverTrades.activePositions).length > 0
-        ? serverTrades.activePositions
-        : storeActivePositions,
-    closedPositions:
-      serverTrades.closedPositions && serverTrades.closedPositions.length > 0
-        ? serverTrades.closedPositions
-        : storeClosedTrades,
-    alerts:
-      serverTrades.alerts && serverTrades.alerts.length > 0
-        ? serverTrades.alerts
-        : storeTradeAlerts,
-  }), [serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts]);
   const [atlasPalette, setAtlasPalette] = useState<"ice" | "polarity">("polarity");
-  const getCurrentBarCountdownStr = (): string => {
-    const now = new Date();
-    const rem = 300 - ((now.getUTCMinutes() % 5) * 60 + now.getUTCSeconds());
-    const m = Math.floor(rem / 60);
-    const s = rem % 60;
-    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-  };
 
   const DIVSYM = useMemo(() => new Set(["SPY", "QQQ", "SPXW", "IWM"]), []);
 
@@ -660,7 +639,7 @@ export function GaiaView() {
   const [pathToKing, setPathToKing] = useState<boolean>(true);
 
   // Chart Layout Metrics (Unified constants across canvas draw & pointer projection)
-  const CHART_PAD_LEFT = 18;
+  const CHART_PAD_LEFT = 24;
   const CHART_RIGHT_AXIS_WIDTH = 84;
   const CHART_PAD_TOP = 18;
   const CHART_PAD_BOTTOM = 32;
@@ -670,6 +649,30 @@ export function GaiaView() {
   const [isReplaying, setIsReplaying] = useState<boolean>(false);
   const [isReplayFrozen, setIsReplayFrozen] = useState<boolean>(false);
   const [replaySpeed, setReplaySpeed] = useState<1 | 2 | 4>(1);
+  const isHistoricalOrReplay = isReplaying || isReplayFrozen || Boolean(selectedSessionIso);
+  const effectiveServerTrades: ServerTradesState = useMemo(() => {
+    if (isHistoricalOrReplay) {
+      return {
+        activePositions: serverTrades.activePositions || {},
+        closedPositions: serverTrades.closedPositions || [],
+        alerts: serverTrades.alerts || [],
+      };
+    }
+    return {
+      activePositions:
+        serverTrades.activePositions && Object.keys(serverTrades.activePositions).length > 0
+          ? serverTrades.activePositions
+          : storeActivePositions,
+      closedPositions:
+        serverTrades.closedPositions && serverTrades.closedPositions.length > 0
+          ? serverTrades.closedPositions
+          : storeClosedTrades,
+      alerts:
+        serverTrades.alerts && serverTrades.alerts.length > 0
+          ? serverTrades.alerts
+          : storeTradeAlerts,
+    };
+  }, [isHistoricalOrReplay, serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts]);
   const storeHeatmapKingNode = useDashboardStore((s) => s.kingNode);
   const storeHeatmapTicker = useDashboardStore((s) => s.activeTicker);
   const isReplayingRef = useRef<boolean>(false);
@@ -701,6 +704,14 @@ export function GaiaView() {
   const [yScale, setYScale] = useState<number>(1.0); // 0.2 .. 10.0
   const [yPanOffset, setYPanOffset] = useState<number>(0); // price points
   const [scopePreset, setScopePreset] = useState<"focus" | "tactical" | "cone">("cone");
+  const resetViewportTo24H = useCallback(() => {
+    setStartHour(0);
+    setXScale(1.0);
+    setXPanOffset(0);
+    setYScale(1.0);
+    setYPanOffset(0);
+    setScopePreset("cone");
+  }, []);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [dragMode, setDragMode] = useState<"pan" | "scaleY" | "scaleX" | "divider" | null>(null);
   const [dragStart, setDragStart] = useState<{
@@ -796,11 +807,12 @@ export function GaiaView() {
         isReplayFrozenRef.current = false;
         setIsReplayFrozen(false);
         setSelectedSessionIso("");
+        resetViewportTo24H();
       }
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
-  }, [loadedTicker, setStoreTicker, fetchOptionsChain]);
+  }, [loadedTicker, setStoreTicker, fetchOptionsChain, resetViewportTo24H]);
 
   // Initial load and sync when global store ticker changes externally
   useEffect(() => {
@@ -814,10 +826,11 @@ export function GaiaView() {
         setIsReplaying(false);
         isReplayFrozenRef.current = false;
         setIsReplayFrozen(false);
+        resetViewportTo24H();
         syncTickerUrlParam(storeTicker);
       }
     }
-  }, [storeTicker, loadedTicker, syncTickerUrlParam]);
+  }, [storeTicker, loadedTicker, syncTickerUrlParam, resetViewportTo24H]);
 
   useEffect(() => {
     if (!urlSyncDoneRef.current && typeof window !== "undefined") {
@@ -856,7 +869,7 @@ export function GaiaView() {
 
   // Instant 800ms tick reactivity for GaiaView livePayload spot & candle tip
   useEffect(() => {
-    if (!liveTickPrice || liveTickPrice <= 0 || isReplaying || isReplayFrozen) return;
+    if (!liveTickPrice || liveTickPrice <= 0 || isReplaying || isReplayFrozen || Boolean(selectedSessionIso)) return;
     setLivePayload((prev) => {
       if (!prev || isReplayingRef.current || isReplayFrozenRef.current) return prev;
       const candles = prev.candles;
@@ -877,7 +890,7 @@ export function GaiaView() {
         candles: updatedCandles,
       };
     });
-  }, [liveTickPrice, liveTickCount]);
+  }, [liveTickPrice, liveTickCount, isReplaying, isReplayFrozen, selectedSessionIso]);
 
   useEffect(() => {
     const sym = loadedTicker.toUpperCase();
@@ -965,6 +978,7 @@ export function GaiaView() {
 
   // Dynamic Trade Signals Engine Hook for Gaia HUD & Canvas Execution Markers
   useEffect(() => {
+    if (isReplaying || isReplayFrozen) return;
     let isMounted = true;
     async function fetchSignals() {
       try {
@@ -984,7 +998,9 @@ export function GaiaView() {
             alerts: data.alerts || [],
           };
           setServerTrades(payload);
-          setStoreServerTrades(payload);
+          if (!selectedSessionIso) {
+            setStoreServerTrades(payload);
+          }
 
           if (Array.isArray(data.alerts)) {
             const mapped: GaiaHudTradeSignal[] = data.alerts
@@ -1015,7 +1031,7 @@ export function GaiaView() {
       isMounted = false;
       clearInterval(interval);
     };
-  }, [loadedTicker, chartSessionDate, setStoreServerTrades]);
+  }, [loadedTicker, chartSessionDate, selectedSessionIso, isReplaying, isReplayFrozen, setStoreServerTrades]);
 
   const flowVwapPoints = useMemo<FlowGammaVwapSnapshot[]>(() => {
     if (!dataset?.candles || dataset.candles.length === 0) return [];
@@ -1042,13 +1058,16 @@ export function GaiaView() {
     if (!dataset) return { yMin: 0, yMax: 100, yAxisTicks: [] };
 
     let anchorPrices: number[] = [];
-    const candleHighs = dataset.candles.map((c) => c.high);
-    const candleLows = dataset.candles.map((c) => c.low);
-    const spot =
-      dataset.candles[dataset.candles.length - 1]?.close ?? dataset.priorClose;
+    const isReplayActive = isReplaying || isReplayFrozen;
+    const maxIdx = isReplayActive ? Math.min(activeBarIndex, dataset.candles.length - 1) : dataset.candles.length - 1;
+    const visibleCandles = dataset.candles.slice(0, maxIdx + 1);
+    const candleHighs = visibleCandles.map((c) => c.high);
+    const candleLows = visibleCandles.map((c) => c.low);
+    const spot = visibleCandles[visibleCandles.length - 1]?.close ?? dataset.priorClose;
 
-    const lastCol = dataset.columnsByBar[dataset.columnsByBar.length - 1];
-    const isLiveSynced = !(isReplaying || isReplayFrozen) && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
+    const lastCol = dataset.columnsByBar[Math.max(0, maxIdx)];
+    const allowLiveStoreOverlay = !isReplayActive && !selectedSessionIso;
+    const isLiveSynced = allowLiveStoreOverlay && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
     const allExpKingStrike =
       isLiveSynced && storeHeatmapKingNode?.allExpKing
         ? storeHeatmapKingNode.allExpKing
@@ -1062,9 +1081,9 @@ export function GaiaView() {
             : storeHeatmapKingNode.allExpKing || lastCol?.filteredKingStrike || 0
         : (lastCol?.filteredKingStrike ?? 0);
     const activeKing = expFilter === "ALL" ? allExpKingStrike : (filteredKingStrike || allExpKingStrike);
-    const apiCallWall = gammaLevels?.callWall ?? 0;
-    const apiPutWall = gammaLevels?.putWall ?? 0;
-    const apiZeroGamma = gammaLevels?.zeroGamma ?? 0;
+    const apiCallWall = allowLiveStoreOverlay ? (gammaLevels?.callWall ?? 0) : 0;
+    const apiPutWall = allowLiveStoreOverlay ? (gammaLevels?.putWall ?? 0) : 0;
+    const apiZeroGamma = allowLiveStoreOverlay ? (gammaLevels?.zeroGamma ?? 0) : 0;
 
     // Include structural gamma walls/kings within ±1.75σ so key pins are never culled
     const maxStructuralReach = Math.max(4.0, dataset.sigma1Move * 1.75);
@@ -1148,6 +1167,7 @@ export function GaiaView() {
     isReplayFrozenRef.current = false;
     setIsReplayFrozen(false);
     setSelectedSessionIso("");
+    resetViewportTo24H();
     syncTickerUrlParam(cleaned);
     if (cleaned !== loadedTicker) {
       setLoadedTicker(cleaned);
@@ -1164,6 +1184,7 @@ export function GaiaView() {
     setIsReplaying(false);
     isReplayFrozenRef.current = false;
     setIsReplayFrozen(false);
+    resetViewportTo24H();
     if (normalizedIso === selectedSessionIso) {
       fetchLiveGaia(loadedTicker, normalizedIso);
     } else {
@@ -1192,8 +1213,12 @@ export function GaiaView() {
   };
 
   const handleResetZoom = () => {
+    setStartHour(0);
+    setXScale(1.0);
+    setXPanOffset(0);
     setYScale(1.0);
     setYPanOffset(0);
+    setScopePreset("cone");
   };
 
   const handleToggleReplay = () => {
@@ -1401,6 +1426,7 @@ export function GaiaView() {
   };
 
   const handleCanvasWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
+    if (!e.ctrlKey && !e.metaKey && !e.altKey) return;
     e.preventDefault();
     if (e.shiftKey) {
       // Shift + Wheel zooms horizontally
@@ -1497,6 +1523,17 @@ export function GaiaView() {
   const safeActiveIdx = dataset
     ? Math.min(activeBarIndex, dataset.candles.length - 1)
     : 0;
+  const getCurrentBarCountdownStr = (): string => {
+    if (isHistoricalOrReplay) {
+      const barLabel = dataset?.candles[safeActiveIdx]?.timeLabel;
+      return barLabel ? barLabel.replace(/\s*ET$/i, "") : "REPLAY";
+    }
+    const now = new Date();
+    const rem = 300 - ((now.getUTCMinutes() % 5) * 60 + now.getUTCSeconds());
+    const m = Math.floor(rem / 60);
+    const s = rem % 60;
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  };
   const displayBarIdx =
     hoverBarIndex !== null
       ? Math.min(safeActiveIdx, hoverBarIndex)
@@ -1569,7 +1606,7 @@ export function GaiaView() {
     ctx.fillRect(0, 0, width, height);
 
     // 1. Reserve 84px right-hand axis gutter for {Strike} — {Concentration %} & countdown badge
-    const padLeft = 18;
+    const padLeft = CHART_PAD_LEFT;
     const rightAxisWidth = 84;
     const outlookRightX = width - rightAxisWidth;
     const padTop = 18;
@@ -1695,14 +1732,15 @@ export function GaiaView() {
       }
     }
     const hasSignedPutBook = maxPutVal < 0;
+    const allowLiveGammaOverlay = !isHistoricalOrReplay;
     const callWallStrike =
-      gammaLevels?.callWall && gammaLevels.callWall > 0
+      allowLiveGammaOverlay && gammaLevels?.callWall && gammaLevels.callWall > 0
         ? gammaLevels.callWall
         : hasSignedPutBook && signedCallStrike > 0
           ? signedCallStrike
           : 0;
     const putWallStrike =
-      gammaLevels?.putWall && gammaLevels.putWall > 0
+      allowLiveGammaOverlay && gammaLevels?.putWall && gammaLevels.putWall > 0
         ? gammaLevels.putWall
         : hasSignedPutBook && signedPutStrike > 0
           ? signedPutStrike
@@ -1710,7 +1748,7 @@ export function GaiaView() {
 
     // Determine Zero Gamma level (store gammaLevels or exact exposure sign-crossing interpolation)
     let zeroGammaLevel =
-      gammaLevels?.zeroGamma && gammaLevels.zeroGamma > 0 ? gammaLevels.zeroGamma : 0;
+      allowLiveGammaOverlay && gammaLevels?.zeroGamma && gammaLevels.zeroGamma > 0 ? gammaLevels.zeroGamma : 0;
     if (zeroGammaLevel <= 0 && dataset.visibleStrikes.length > 1) {
       const ascStrikes = [...dataset.visibleStrikes].sort((a, b) => a - b);
       const refSpot = dataset.candles[safeActiveIdx]?.close ?? dataset.priorClose;
@@ -1863,12 +1901,39 @@ export function GaiaView() {
       mergedLines.push({ ...spec, y });
     }
 
+    // Unified Y-Axis Collision Resolver (>= 15px vertical separation covering Live Spot Pill, Horizontal Levels, and Right Gutter)
+    const curSpot = dataset.candles[safeActiveIdx]?.close ?? dataset.priorClose;
+    const spotX = barToX(safeActiveIdx);
+    const ySpot = priceToY(curSpot);
+    const badgeW = 76;
+    const badgeH = 24;
+    const spotBadgeBy = Math.max(padTop + 1, Math.min(height - padBottom - badgeH - 1, ySpot - badgeH / 2));
+    const spotCenterY = spotBadgeBy + badgeH / 2;
+    const spotHalfH = badgeH / 2;
+    const MIN_LABEL_SEP_PX = 15;
+
+    const hasYCollision = (
+      occupied: Array<{ centerY: number; halfH: number }>,
+      candCenterY: number,
+      candHalfH: number = 5
+    ) =>
+      occupied.some((o) => {
+        const minReq =
+          o.halfH > candHalfH
+            ? o.halfH + MIN_LABEL_SEP_PX
+            : Math.max(MIN_LABEL_SEP_PX, o.halfH + candHalfH + 5);
+        return Math.abs(o.centerY - candCenterY) < minReq;
+      });
+
     ctx.save();
     ctx.font = "bold 9px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textAlign = "right";
     ctx.textBaseline = "bottom";
-    const drawnLevelLabelYs: number[] = [];
-    const minLabelSepPx = 13;
+    const occupiedLevelBoxes: Array<{ centerY: number; halfH: number }> =
+      ySpot >= padTop && ySpot <= height - padBottom
+        ? [{ centerY: spotCenterY, halfH: spotHalfH }]
+        : [];
+    const levelStepOffsets = [-7, 7, -22, 22, -37, 37, -52, 52, -67, 67];
 
     for (const ln of mergedLines) {
       ctx.strokeStyle = ln.stroke;
@@ -1879,23 +1944,33 @@ export function GaiaView() {
       ctx.lineTo(dividerX, ln.y);
       ctx.stroke();
 
-      const candidates = [
-        { anchorY: ln.y - 2, centerY: ln.y - 7, baseline: "bottom" as CanvasTextBaseline },
-        { anchorY: ln.y + 2, centerY: ln.y + 7, baseline: "top" as CanvasTextBaseline },
-        { anchorY: ln.y - 15, centerY: ln.y - 20, baseline: "bottom" as CanvasTextBaseline },
-        { anchorY: ln.y + 15, centerY: ln.y + 20, baseline: "top" as CanvasTextBaseline },
-      ];
+      const candidates = levelStepOffsets.map((dy) => ({
+        anchorY: dy < 0 ? ln.y + dy + 5 : ln.y + dy - 5,
+        centerY: ln.y + dy,
+        baseline: (dy < 0 ? "bottom" : "top") as CanvasTextBaseline,
+      }));
       const chosen = candidates.find(
         (c) =>
           c.centerY >= padTop + 8 &&
           c.centerY <= height - padBottom - 8 &&
-          !drawnLevelLabelYs.some((oy) => Math.abs(oy - c.centerY) < minLabelSepPx)
+          !hasYCollision(occupiedLevelBoxes, c.centerY, 5)
       );
       if (chosen) {
+        if (Math.abs(chosen.centerY - ln.y) > 12) {
+          ctx.save();
+          ctx.setLineDash([]);
+          ctx.strokeStyle = ln.stroke;
+          ctx.lineWidth = 0.75;
+          ctx.beginPath();
+          ctx.moveTo(dividerX - 3, ln.y);
+          ctx.lineTo(dividerX - 3, chosen.centerY);
+          ctx.stroke();
+          ctx.restore();
+        }
         ctx.textBaseline = chosen.baseline;
         ctx.fillStyle = ln.textColor;
         ctx.fillText(ln.label, dividerX - 6, chosen.anchorY);
-        drawnLevelLabelYs.push(chosen.centerY);
+        occupiedLevelBoxes.push({ centerY: chosen.centerY, halfH: 5 });
       }
     }
     ctx.restore();
@@ -2225,18 +2300,32 @@ export function GaiaView() {
     ctx.stroke();
 
     // 3. Render prominent strike labels and track rendered Y positions
-    const drawnStrikeYs: { y: number; strike: number }[] = [];
+    // Reserve Live Spot Pill band FIRST so no strike, pinned King, or price tick overlaps behind it
+    const occupiedGutterBoxes: Array<{ centerY: number; halfH: number; strike?: number }> =
+      ySpot >= padTop && ySpot <= height - padBottom
+        ? [{ centerY: spotCenterY, halfH: spotHalfH }]
+        : [];
     const maxActiveExp = Math.max(
       1,
       ...Object.values((structuralBookCol ?? activeBookCol)!.strikeValues).map((v) => Math.abs(v))
     );
 
-    // Map visible strikes to {Strike} — {Concentration %} labels if within visible Y bounds
-    dataset.visibleStrikes.forEach((strike) => {
+    // Prioritize Kings and highest-concentration strikes first when resolving >= 15px gutter slots
+    const prioritizedStrikes = [...dataset.visibleStrikes].sort((a, b) => {
+      const aKing = a === allExpKingStrike || a === filteredKingStrike ? 1 : 0;
+      const bKing = b === allExpKingStrike || b === filteredKingStrike ? 1 : 0;
+      if (aKing !== bKing) return bKing - aKing;
+      return (
+        Math.abs((structuralBookCol ?? activeBookCol)!.strikeValues[b] ?? 0) -
+        Math.abs((structuralBookCol ?? activeBookCol)!.strikeValues[a] ?? 0)
+      );
+    });
+
+    prioritizedStrikes.forEach((strike) => {
       const rawY = priceToY(strike);
       if (rawY < padTop + 2 || rawY > height - padBottom - 2) return;
       const y = Math.max(padTop + 7, Math.min(height - padBottom - 7, rawY));
-      if (drawnStrikeYs.some((item) => Math.abs(item.y - y) < 11)) return;
+      if (hasYCollision(occupiedGutterBoxes, y, 5)) return;
 
       const val = (structuralBookCol ?? activeBookCol)!.strikeValues[strike] ?? 0;
       const absVal = Math.abs(val);
@@ -2288,7 +2377,7 @@ export function GaiaView() {
         ctx.lineTo(outlookRightX + 5, y);
         ctx.stroke();
 
-        drawnStrikeYs.push({ y, strike });
+        occupiedGutterBoxes.push({ centerY: y, halfH: 5, strike });
       }
     });
 
@@ -2298,15 +2387,30 @@ export function GaiaView() {
       const yMacro = priceToY(pinnedKing);
       if (yMacro < padTop + 6 || yMacro > height - padBottom - 6) {
         const isBelow = yMacro > height - padBottom - 6;
-        const pinY = isBelow ? height - padBottom - 10 : padTop + 10;
-        const arrow = isBelow ? "▼ " : "▲ ";
-        ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
-        ctx.fillStyle = atlasPalette === "ice" ? "#ffffff" : "#facc15";
-        const pct = expFilter === "ALL"
-          ? (structuralBookCol ?? activeBookCol)!.allExpKingConcPct
-          : (structuralBookCol ?? activeBookCol)!.filteredKingConcPct;
-        ctx.fillText(`${arrow}${pinnedKing} · ${expFilter === "ALL" ? "King" : canvasFilterBadgePrefix} ${pct}%`, outlookRightX + 7, pinY);
-        drawnStrikeYs.push({ y: pinY, strike: pinnedKing });
+        const basePinY = isBelow ? height - padBottom - 10 : padTop + 10;
+        const dir = isBelow ? -1 : 1;
+        let pinY: number | null = null;
+        for (let step = 0; step < 5; step++) {
+          const cand = basePinY + dir * step * MIN_LABEL_SEP_PX;
+          if (
+            cand >= padTop + 7 &&
+            cand <= height - padBottom - 7 &&
+            !hasYCollision(occupiedGutterBoxes, cand, 5)
+          ) {
+            pinY = cand;
+            break;
+          }
+        }
+        if (pinY !== null) {
+          const arrow = isBelow ? "▼ " : "▲ ";
+          ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
+          ctx.fillStyle = atlasPalette === "ice" ? "#ffffff" : "#facc15";
+          const pct = expFilter === "ALL"
+            ? (structuralBookCol ?? activeBookCol)!.allExpKingConcPct
+            : (structuralBookCol ?? activeBookCol)!.filteredKingConcPct;
+          ctx.fillText(`${arrow}${pinnedKing} · ${expFilter === "ALL" ? "King" : canvasFilterBadgePrefix} ${pct}%`, outlookRightX + 7, pinY);
+          occupiedGutterBoxes.push({ centerY: pinY, halfH: 5, strike: pinnedKing });
+        }
       }
     }
 
@@ -2314,13 +2418,12 @@ export function GaiaView() {
     yAxisTicks.forEach((tickPrice) => {
       const y = priceToY(tickPrice);
       if (y >= padTop + 4 && y <= height - padBottom - 4) {
-        const hasDrawnNearby = drawnStrikeYs.some(
-          (item) => Math.abs(item.y - y) < 8
-        );
+        const hasDrawnNearby = hasYCollision(occupiedGutterBoxes, y, 5);
         if (!hasDrawnNearby) {
           ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
           ctx.fillStyle = "#cbd5e1"; // Bright high-contrast silver
           ctx.fillText(tickPrice.toFixed(2), outlookRightX + 7, y);
+          occupiedGutterBoxes.push({ centerY: y, halfH: 5 });
 
           // Subtle tick notch on axis line
           ctx.strokeStyle = "rgba(148, 163, 184, 0.4)";
@@ -2334,9 +2437,6 @@ export function GaiaView() {
     });
 
     // Active Spot Badge on Right Axis (with Countdown Clock Timer, e.g. 774.00 02:01)
-    const curSpot = dataset.candles[safeActiveIdx]?.close ?? dataset.priorClose;
-    const spotX = barToX(safeActiveIdx);
-    const ySpot = priceToY(curSpot);
     if (ySpot >= padTop && ySpot <= height - padBottom) {
       // Dotted guide line across from active candle to spot badge
       ctx.save();
@@ -2352,10 +2452,8 @@ export function GaiaView() {
       // Spot Pill with Countdown Timer
       const spotLabel = curSpot.toFixed(2);
       const timerStr = getCurrentBarCountdownStr();
-      const badgeW = 76;
-      const badgeH = 24;
       const bx = outlookRightX + 4;
-      const by = Math.max(padTop + 1, Math.min(height - padBottom - badgeH - 1, ySpot - badgeH / 2));
+      const by = spotBadgeBy;
 
       ctx.save();
       ctx.fillStyle = "#0c101c";
@@ -2525,21 +2623,31 @@ export function GaiaView() {
       }
     });
 
-    // 4. Render Each Tick Mark, Vertical Grid / RTH Boundary Lines & Time Labels
+    // 4. Two-Pass Render: Reserve 9:30 OPEN / 4:00 CLOSE boundaries first so nearby hour ticks never collide with them
     ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textBaseline = "middle";
     const labelY = height - padBottom / 2 + 1;
 
-    let lastDrawnX = -999;
     const minSpacing = 32; // minimum pixels between adjacent labels to prevent overlap
-
-    axisTicks.forEach((tick) => {
+    const rthBoundaryXs = axisTicks
+      .filter((t) => t.isMarketOpen || t.isMarketClose)
+      .map((t) => t.x);
+    let lastDrawnX = -999;
+    const filteredTicks = axisTicks.filter((tick) => {
       const isRthBoundary = tick.isMarketOpen || tick.isMarketClose;
-      if (Math.abs(tick.x - lastDrawnX) < minSpacing) {
-        if (!isRthBoundary) return;
+      if (isRthBoundary) {
+        lastDrawnX = tick.x;
+        return true;
       }
-
+      if (rthBoundaryXs.some((rx) => Math.abs(tick.x - rx) < minSpacing)) return false;
+      if (Math.abs(tick.x - lastDrawnX) < minSpacing) return false;
       lastDrawnX = tick.x;
+      return true;
+    });
+    const drawnRthPillRects: Array<{ x1: number; x2: number }> = [];
+
+    filteredTicks.forEach((tick) => {
+      const isRthBoundary = tick.isMarketOpen || tick.isMarketClose;
 
       // Vertical Grid Line (or crisp #2dd4bf 1.5px RTH Open/Close boundary)
       ctx.save();
@@ -2561,29 +2669,35 @@ export function GaiaView() {
         ctx.font = "bold 9px ui-monospace, SFMono-Regular, Menlo, monospace";
         const tagW = ctx.measureText(tagText).width + 10;
         const tagX = Math.max(padLeft + 2, Math.min(dividerX - tagW - 2, tick.x - tagW / 2));
+        const hasPillOverlap = drawnRthPillRects.some(
+          (r) => !(tagX + tagW + 4 < r.x1 || tagX > r.x2 + 4)
+        );
+        if (!hasPillOverlap) {
+          drawnRthPillRects.push({ x1: tagX, x2: tagX + tagW });
 
-        // Top RTH boundary tag
-        ctx.fillStyle = "rgba(8, 12, 20, 0.88)";
-        ctx.strokeStyle = "rgba(45, 212, 191, 0.45)";
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.roundRect(tagX, padTop + 4, tagW, 15, 4);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = "#2dd4bf";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(tagText, tagX + tagW / 2, padTop + 11.5);
+          // Top RTH boundary tag
+          ctx.fillStyle = "rgba(8, 12, 20, 0.88)";
+          ctx.strokeStyle = "rgba(45, 212, 191, 0.45)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(tagX, padTop + 4, tagW, 15, 4);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = "#2dd4bf";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText(tagText, tagX + tagW / 2, padTop + 11.5);
 
-        // Bottom RTH boundary tag just above axis baseline
-        const botTagY = height - padBottom - 19;
-        ctx.fillStyle = "rgba(8, 12, 20, 0.88)";
-        ctx.beginPath();
-        ctx.roundRect(tagX, botTagY, tagW, 15, 4);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = "#2dd4bf";
-        ctx.fillText(tagText, tagX + tagW / 2, botTagY + 7.5);
+          // Bottom RTH boundary tag just above axis baseline
+          const botTagY = height - padBottom - 19;
+          ctx.fillStyle = "rgba(8, 12, 20, 0.88)";
+          ctx.beginPath();
+          ctx.roundRect(tagX, botTagY, tagW, 15, 4);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = "#2dd4bf";
+          ctx.fillText(tagText, tagX + tagW / 2, botTagY + 7.5);
+        }
       }
       ctx.restore();
 
@@ -2603,7 +2717,8 @@ export function GaiaView() {
         ? "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace"
         : "10px ui-monospace, SFMono-Regular, Menlo, monospace";
       ctx.fillStyle = isRthBoundary ? "#2dd4bf" : "#e2e8f0";
-      ctx.textAlign = tick.x > dividerX - 18 ? "right" : "center";
+      ctx.textAlign =
+        tick.x < padLeft + 18 ? "left" : tick.x > dividerX - 18 ? "right" : "center";
       ctx.fillText(tick.label, tick.x, labelY);
       ctx.restore();
     });
@@ -2705,6 +2820,7 @@ export function GaiaView() {
     precomputedChartTrades,
     gammaLevels?.zeroGamma,
     livePayload,
+    isHistoricalOrReplay,
   ]);
 
   const isSma34Bullish = activeCandle
@@ -3035,13 +3151,14 @@ export function GaiaView() {
           onClick={() => {
             const canvasW = canvasRef.current?.clientWidth || 1050;
             const totalPlotW = Math.max(200, canvasW - CHART_PAD_LEFT - CHART_RIGHT_AXIS_WIDTH);
-            const approxSessionW = totalPlotW * dividerRatio;
+            const dividerX = Math.round(CHART_PAD_LEFT + totalPlotW * dividerRatio);
+            const approxSessionW = dividerX - CHART_PAD_LEFT;
             const axisStartMins = startHour === 0 ? 0 : startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
             const axisEndMins = startHour === 0 ? 1440 : 1020;
             const totalSlots = Math.round((axisEndMins - axisStartMins) / 5);
             const rthOpenSlot = Math.max(0, (570 - axisStartMins) / 5);
             const paddedRthSlots = 82; // 78 RTH bars (9:30-4:00) + 2-slot symmetric margin
-            const nextXScale = totalSlots / paddedRthSlots;
+            const nextXScale = Math.min(4.0, totalSlots / paddedRthSlots);
             const nextStepX = (approxSessionW / totalSlots) * nextXScale;
             const nextXPan = 2 * nextStepX - rthOpenSlot * nextStepX;
             setXScale(nextXScale);
@@ -3065,15 +3182,13 @@ export function GaiaView() {
         </button>
 
         {/* Auto Width Reset Pill (appears when width or divider is customized) */}
-        {(chartWidth !== null || dividerRatio !== (fluxFocusMode ? 0.88 : 0.76) || xScale !== 1.0 || startHour !== 0) && (
+        {(chartWidth !== null || dividerRatio !== (fluxFocusMode ? 0.88 : 0.76) || Math.abs(xScale - 1.0) > 1e-3 || Math.abs(xPanOffset) > 1e-3 || startHour !== 0) && (
           <button
             type="button"
             onClick={() => {
-              setStartHour(0);
               setChartWidth(null);
               setDividerRatio(fluxFocusMode ? 0.88 : 0.76);
-              setXScale(1.0);
-              setXPanOffset(0);
+              resetViewportTo24H();
             }}
             title="Reset horizontal width and divider back to default"
             className="bg-cyan-500/20 border border-cyan-400/50 text-cyan-300 hover:bg-cyan-500/30 rounded-full px-3.5 py-1.5 text-xs font-bold transition cursor-pointer"
@@ -3153,7 +3268,7 @@ export function GaiaView() {
             title="Auto-Fit / Reset Zoom Scale (Double-click canvas)"
             className={cn(
               "px-2.5 py-0.5 rounded-full text-[11px] font-bold transition cursor-pointer",
-              yScale !== 1.0 || yPanOffset !== 0
+              Math.abs(yScale - 1.0) > 1e-3 || Math.abs(yPanOffset) > 1e-3 || Math.abs(xScale - 1.0) > 1e-3 || Math.abs(xPanOffset) > 1e-3 || startHour !== 0
                 ? "bg-cyan-500/20 text-cyan-300 border border-cyan-400/40"
                 : "text-slate-400 hover:text-white"
             )}
@@ -3376,7 +3491,7 @@ export function GaiaView() {
         startHour={startHour}
         xScale={xScale}
         xPanOffset={xPanOffset}
-        containerWidthPx={canvasWidth}
+        containerWidthPx={chartWidth === null ? canvasWidth : undefined}
         onXViewportChange={(s, p) => {
           setXScale(s);
           setXPanOffset(p);
@@ -3388,6 +3503,7 @@ export function GaiaView() {
           setYScale(1.0);
           setYPanOffset(0);
           setDividerRatio(fluxFocusMode ? 0.88 : 0.76);
+          setScopePreset("cone");
         }}
         onSignalsEvaluated={setPrzmHudSignals}
         onSymbolChange={(sym) => {
@@ -3401,6 +3517,7 @@ export function GaiaView() {
           isReplayFrozenRef.current = false;
           setIsReplayFrozen(false);
           setSelectedSessionIso("");
+          resetViewportTo24H();
           syncTickerUrlParam(cleaned);
           if (cleaned !== loadedTicker) {
             setLoadedTicker(cleaned);
@@ -3508,6 +3625,41 @@ export function GaiaView() {
             : ""}
         </div>
 
+        {/* Minimalist MTF Divergence Status Strip (Non-occluding header bar above canvas aligned to CHART_PAD_LEFT=24) */}
+        {dataset && DIVSYM.has(loadedTicker.toUpperCase()) && (
+          <div className="pl-6 flex items-center gap-2 font-mono text-[11px] text-slate-400 select-none">
+            <span className="text-slate-500 font-semibold tracking-wider">MTF:</span>
+            {(() => {
+              const c = dataset.candles[safeActiveIdx] || dataset.candles[dataset.candles.length - 1];
+              const cur = c?.close ?? dataset.priorClose ?? 0;
+              const vwap = flowVwapPoints[safeActiveIdx]?.flowVwap ?? cur;
+              const zg = (!isHistoricalOrReplay && gammaLevels?.zeroGamma && gammaLevels.zeroGamma > 0) ? gammaLevels.zeroGamma : (dataset.priorClose ?? vwap);
+              const slice = (n: number) => {
+                const arr = dataset.candles.slice(Math.max(0, safeActiveIdx - n + 1), safeActiveIdx + 1);
+                return arr.reduce((s, x) => s + x.close, 0) / Math.max(1, arr.length);
+              };
+              const tfs = [
+                { label: "5m", bull: cur >= slice(6) && cur >= vwap },
+                { label: "30m", bull: cur >= slice(12) && cur >= vwap },
+                { label: "2H", bull: cur >= slice(24) && cur >= zg },
+                { label: "1D", bull: cur >= (dataset.priorClose || zg) },
+                { label: "1W", bull: cur >= zg },
+              ];
+              return tfs.map((tf, idx) => (
+                <React.Fragment key={tf.label}>
+                  {idx > 0 && <span className="text-slate-700">|</span>}
+                  <span>
+                    {tf.label}{" "}
+                    <strong className={tf.bull ? "text-emerald-400" : "text-rose-400"}>
+                      {tf.bull ? "▲" : "▼"}
+                    </strong>
+                  </span>
+                </React.Fragment>
+              ));
+            })()}
+          </div>
+        )}
+
         <div
           className="relative w-full overflow-hidden flex items-center justify-center rounded-xl"
           style={{ minHeight: `${chartHeight}px` }}
@@ -3522,7 +3674,7 @@ export function GaiaView() {
             ref={canvasRef}
             role="img"
             tabIndex={0}
-            aria-label={`Interactive intraday chart for ${dataset?.ticker || loadedTicker} on ${dataset?.sessionDate || "current session"}. Showing 5-minute candles starting at ${startHour === 7 ? "7:00 AM" : startHour === 8 ? "8:00 AM" : "9:30 AM"} to 4:00 PM ET with hourly time ticks. Use Left/Right Arrow keys to step through candles, Home/End to jump to open and close, Space to toggle replay, and Plus/Minus to zoom.`}
+            aria-label={`Interactive intraday chart for ${dataset?.ticker || loadedTicker} on ${dataset?.sessionDate || "current session"}. Showing 5-minute candles starting at ${startHour === 0 ? "12:00 AM (24H)" : startHour === 7 ? "7:00 AM" : startHour === 8 ? "8:00 AM" : "9:30 AM"} to ${startHour === 0 ? "12:00 AM" : "4:00 PM"} ET with hourly time ticks. Use Left/Right Arrow keys to step through candles, Home/End to jump to open and close, Space to toggle replay, and Plus/Minus to zoom.`}
             onKeyDown={handleCanvasKeyDown}
             onMouseDown={handleCanvasMouseDown}
             onMouseMove={handleCanvasMouseMove}
@@ -3538,50 +3690,15 @@ export function GaiaView() {
           />
 
           {/* Floating Auto-Fit Reset Button on Canvas when zoomed / panned */}
-          {(yScale !== 1.0 || yPanOffset !== 0 || scopePreset !== "cone") && (
+          {(Math.abs(xScale - 1.0) > 1e-3 || Math.abs(xPanOffset) > 1e-3 || Math.abs(yScale - 1.0) > 1e-3 || Math.abs(yPanOffset) > 1e-3 || startHour !== 0 || scopePreset !== "cone") && (
             <button
               type="button"
               onClick={handleCanvasDoubleClick}
               title="Click to reset window (or double-click canvas)"
               className="absolute bottom-4 right-20 z-20 px-2.5 py-1 rounded-md bg-[#0e131d]/90 border border-cyan-400/50 text-[10px] font-mono font-bold text-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.25)] backdrop-blur-md hover:bg-cyan-500/20 transition flex items-center gap-1.5 cursor-pointer"
             >
-              <span>Auto-Fit · {(yScale * 100).toFixed(0)}%</span>
+              <span>Auto-Fit · {(xScale * 100).toFixed(0)}%X · {(yScale * 100).toFixed(0)}%Y</span>
             </button>
-          )}
-
-          {/* Minimalist MTF Divergence Status Strip (Non-occluding, zero-background header bar) */}
-          {dataset && DIVSYM.has(loadedTicker.toUpperCase()) && (
-            <div className="absolute top-2 left-4 z-10 flex items-center gap-2 font-mono text-[11px] text-slate-400 select-none pointer-events-none">
-              <span className="text-slate-500 font-semibold tracking-wider">MTF:</span>
-              {(() => {
-                const c = dataset.candles[safeActiveIdx] || dataset.candles[dataset.candles.length - 1];
-                const cur = c?.close ?? dataset.priorClose ?? 0;
-                const vwap = (c as any)?.flowVwap ?? (dataset as any).flowVwap ?? cur;
-                const zg = (dataset as any).zeroGamma ?? (dataset as any).zeroGammaLevel ?? dataset.priorClose ?? vwap;
-                const slice = (n: number) => {
-                  const arr = dataset.candles.slice(Math.max(0, safeActiveIdx - n + 1), safeActiveIdx + 1);
-                  return arr.reduce((s, x) => s + x.close, 0) / Math.max(1, arr.length);
-                };
-                const tfs = [
-                  { label: "5m", bull: cur >= slice(6) && cur >= vwap },
-                  { label: "30m", bull: cur >= slice(12) && cur >= vwap },
-                  { label: "2H", bull: cur >= slice(24) && cur >= zg },
-                  { label: "1D", bull: cur >= (dataset.priorClose || zg) },
-                  { label: "1W", bull: cur >= zg },
-                ];
-                return tfs.map((tf, idx) => (
-                  <React.Fragment key={tf.label}>
-                    {idx > 0 && <span className="text-slate-700">|</span>}
-                    <span>
-                      {tf.label}{" "}
-                      <strong className={tf.bull ? "text-emerald-400" : "text-rose-400"}>
-                        {tf.bull ? "▲" : "▼"}
-                      </strong>
-                    </span>
-                  </React.Fragment>
-                ));
-              })()}
-            </div>
           )}
         </div>
 

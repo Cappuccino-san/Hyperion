@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { evaluatePrzmCallLedger, PrzmSignalPoint, PrzmCandlePoint } from "@/components/gaia/PrzmTacticalHud";
 import {
   extractNormalizedTradesForTicker,
@@ -566,9 +568,9 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
     );
   });
 
-  it("24H Upper HUD vs Lower Candlestick Coordinate Projection Parity (< 1e-6 px across all startHours & RTH zoom)", () => {
+  it("24H Upper HUD vs Lower Candlestick Coordinate Projection & padLeft === 24 Parity (< 1e-6 px)", () => {
     const plotW = 920;
-    const padLeft = 18;
+    const padLeft = 24;
     const configurations = [
       { startHour: 0, xScale: 1.0, xPanOffset: 0 },
       { startHour: 0, xScale: 288 / 82, xPanOffset: 2 * ((plotW / 288) * (288 / 82)) - ((570 / 5) * ((plotW / 288) * (288 / 82))) },
@@ -591,15 +593,35 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
         );
       }
     }
+
+    // 24H unzoomed left-origin & non-clipping check
+    const xMidnight = padLeft + 0 + (0 / 1440) * plotW * 1.0;
+    const xOpen930 = padLeft + 0 + (570 / 1440) * plotW * 1.0;
+    const xClose1600 = padLeft + 0 + (960 / 1440) * plotW * 1.0;
+    assert.strictEqual(xMidnight, 24);
+    assert.ok(xOpen930 > 350 && xClose1600 < padLeft + plotW);
+
+    // Source-contract parity across GaiaView, GaiaCallPutBiasHud & TradeExecutionMarkersOverlay
+    const gaiaViewSrc = fs.readFileSync(path.join(process.cwd(), "components/views/GaiaView.tsx"), "utf8");
+    const hudSrc = fs.readFileSync(path.join(process.cwd(), "components/gaia/GaiaCallPutBiasHud.tsx"), "utf8");
+    const overlaySrc = fs.readFileSync(path.join(process.cwd(), "components/chart/TradeExecutionMarkersOverlay.ts"), "utf8");
+    assert.match(gaiaViewSrc, /const CHART_PAD_LEFT\s*=\s*24;/, "GaiaView CHART_PAD_LEFT must equal 24");
+    assert.match(gaiaViewSrc, /const padLeft\s*=\s*(?:24|CHART_PAD_LEFT);/, "GaiaView draw padLeft must equal 24");
+    assert.match(hudSrc, /const padLeft\s*=\s*24;/, "GaiaCallPutBiasHud padLeft must equal 24");
+    assert.match(overlaySrc, /padLeft\s*=\s*24\b/, "TradeExecutionMarkersOverlay default padLeft must equal 24");
   });
 
-  it("Canvas Level Label De-Collision: Staggers nearby levels with >= 13px vertical separation", () => {
+  it("Unified Y-Axis Label + Live Price Pill De-Collision: Enforces >= 15px vertical separation", () => {
     const padTop = 18;
     const height = 420;
     const padBottom = 36;
-    const lineYs = [120, 127, 134, 240, 247]; // Tightly clustered pairs (< 10px apart)
+    const minLabelSepPx = 15;
+    const liveSpotPillCenterY = 123; // Collides with clustered PDL / Put Wall lines
+    const liveSpotBadgeH = 24;
+    const lineYs = [120, 127, 134, 240, 247];
+    const occupiedCenterYs: number[] = [liveSpotPillCenterY];
     const drawnLevelLabelYs: number[] = [];
-    const minLabelSepPx = 13;
+    const minRequiredFromPillCenter = liveSpotBadgeH / 2 + 5; // >= 17px (>= 15px edge clearance)
 
     for (const ly of lineYs) {
       const candidates = [
@@ -607,24 +629,99 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
         { anchorY: ly + 2, centerY: ly + 7 },
         { anchorY: ly - 15, centerY: ly - 20 },
         { anchorY: ly + 15, centerY: ly + 20 },
+        { anchorY: ly - 28, centerY: ly - 33 },
+        { anchorY: ly + 28, centerY: ly + 33 },
       ];
       const chosen = candidates.find(
         (c) =>
           c.centerY >= padTop + 8 &&
           c.centerY <= height - padBottom - 8 &&
-          !drawnLevelLabelYs.some((oy) => Math.abs(oy - c.centerY) < minLabelSepPx)
+          Math.abs(c.centerY - liveSpotPillCenterY) >= Math.max(minLabelSepPx, minRequiredFromPillCenter) &&
+          !occupiedCenterYs.some((oy) => Math.abs(oy - c.centerY) < minLabelSepPx)
       );
-      if (chosen) drawnLevelLabelYs.push(chosen.centerY);
+      if (chosen) {
+        drawnLevelLabelYs.push(chosen.centerY);
+        occupiedCenterYs.push(chosen.centerY);
+      }
     }
 
     assert.strictEqual(drawnLevelLabelYs.length, 5, "All 5 clustered levels should be placed without dropping");
     for (let i = 0; i < drawnLevelLabelYs.length; i++) {
+      assert.ok(
+        Math.abs(drawnLevelLabelYs[i] - liveSpotPillCenterY) >= minLabelSepPx,
+        `Level label ${i} violated >= 15px clearance from live price pill`
+      );
       for (let j = i + 1; j < drawnLevelLabelYs.length; j++) {
         assert.ok(
           Math.abs(drawnLevelLabelYs[i] - drawnLevelLabelYs[j]) >= minLabelSepPx,
-          `Label pair (${i},${j}) violated >= 13px separation`
+          `Label pair (${i},${j}) violated >= 15px separation`
         );
       }
     }
+
+    const gaiaViewSrc = fs.readFileSync(path.join(process.cwd(), "components/views/GaiaView.tsx"), "utf8");
+    assert.match(gaiaViewSrc, /(?:minLabelSepPx|MIN_LABEL_SEP_PX)\s*=\s*15\b/, "GaiaView must enforce 15px minimum label separation");
+    assert.match(gaiaViewSrc, /occupiedLevelBoxes[\s\S]{0,160}spotCenterY/, "GaiaView must reserve live spot pill band against structural labels");
+  });
+
+  it("24H Full Viewport Reset Invariant: Reset restores xScale === 1.0, xPanOffset === 0, startHour === 0", () => {
+    const gaiaViewSrc = fs.readFileSync(path.join(process.cwd(), "components/views/GaiaView.tsx"), "utf8");
+    const hudSrc = fs.readFileSync(path.join(process.cwd(), "components/gaia/GaiaCallPutBiasHud.tsx"), "utf8");
+
+    assert.match(gaiaViewSrc, /const handleCanvasDoubleClick[\s\S]{0,220}setStartHour\(0\)[\s\S]{0,120}setXScale\(1\.0\)[\s\S]{0,80}setXPanOffset\(0\)/);
+    assert.match(gaiaViewSrc, /const handleResetZoom[\s\S]{0,180}setStartHour\(0\)[\s\S]{0,120}setXScale\(1\.0\)[\s\S]{0,80}setXPanOffset\(0\)/);
+    assert.match(
+      gaiaViewSrc,
+      /(?:xScale\s*!==\s*1\.0|Math\.abs\(xScale\s*-\s*1\.0\)\s*>\s*1e-3)[\s\S]{0,120}(?:xPanOffset\s*!==\s*0|Math\.abs\(xPanOffset\)\s*>\s*1e-3)[\s\S]{0,180}startHour\s*!==\s*0/,
+      "GaiaView Auto-Fit pill visibility must track xScale, xPanOffset & startHour"
+    );
+    assert.match(
+      hudSrc,
+      /onClick=\{[^}]*handleReset\(\)[^}]*\}[\s\S]{0,120}title="Auto-fit all candles in session"/,
+      "GaiaCallPutBiasHud Fit Data button must invoke handleReset() (calls onResetViewport -> startHour=0)"
+    );
+  });
+
+  it("Replay Time-Travel Isolation: evaluatePrzmCallLedger hides future signals/trades & masks future exits (> replayBarTsSec)", () => {
+    const t0 = 1794580200; // 09:30 ET
+    const replayCursorTs = t0 + 600; // 09:40 ET
+    const candles: PrzmCandlePoint[] = [
+      { time: "9:35 AM", timestamp: t0 + 300, open: 755.0, high: 755.5, low: 754.5, close: 755.2, volume: 10000, vwap: 755.0, flowVwap: 755.0 },
+      { time: "9:40 AM", timestamp: t0 + 600, open: 755.2, high: 756.0, low: 755.0, close: 755.8, volume: 10000, vwap: 755.2, flowVwap: 755.2 },
+    ];
+    const signals: PrzmSignalPoint[] = [
+      {
+        id: "sig-past-open-until-later",
+        index: 0,
+        time: "9:35 AM",
+        price: 755.2,
+        type: "LONG",
+        timestamp: t0 + 300,
+        exitTimestamp: t0 + 900, // Closed in future relative to replayCursorTs
+        exitPrice: 754.0,
+        isClosed: true,
+      },
+      {
+        id: "sig-future",
+        index: 2,
+        time: "9:45 AM",
+        price: 753.0,
+        type: "SHORT",
+        timestamp: t0 + 900, // Beyond replayCursorTs
+        isClosed: false,
+      },
+    ];
+    const serverTrades = {
+      closedPositions: [
+        { id: "srv-no-ts", ticker: "SPY", contractType: "PUT", status: "CLOSED", btoSpotPrice: 755.0, closedSpotPrice: 753.0, openedAt: "10:00 AM" },
+        { id: "srv-future", ticker: "SPY", contractType: "PUT", status: "CLOSED", btoSpotPrice: 755.0, closedSpotPrice: 753.0, openedAt: "9:45 AM", openedTs: t0 + 900, closedTs: t0 + 1200 },
+      ],
+      activePositions: {},
+      alerts: [],
+    };
+    const summary = evaluatePrzmCallLedger(signals, candles, 755.8, "LONG", serverTrades, "SPY", replayCursorTs);
+    assert.strictEqual(summary.entries.length, 1, "Future signals & missing-ts/future server trades must be excluded in replay");
+    assert.strictEqual(summary.entries[0].id, "sig-past-open-until-later");
+    assert.strictEqual(summary.entries[0].status, "OPEN", "Trade whose exit is after replayCursorTs must stay OPEN in replay");
   });
 });

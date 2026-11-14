@@ -401,7 +401,7 @@ export function drawTradeExecutionMarkers(
     serverTrades,
     fsmSignals,
     precomputedTrades,
-    padLeft = 18,
+    padLeft = 24,
     plotRightX = 9999,
     padTop = 18,
     plotBottomY = 9999,

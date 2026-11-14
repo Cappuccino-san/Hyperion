@@ -1034,9 +1034,9 @@ export async function selectSmallAccountContract(params: {
       // Strict Sub-$1.00 Ask Cap: retail buys at ASK ($0.15 <= ask <= $0.99)
       if (askPrice < 0.15 || askPrice > 0.99) continue;
 
-      // Reject low-delta lotto contracts (< 0.22 delta) to avoid rapid theta drag
-      const absDelta = Math.abs(c.delta || 0.30);
-      if (absDelta < 0.22) continue;
+      // Reject low-delta lotto contracts (< 0.25 delta); never spoof missing/0 delta as 0.30
+      const absDelta = typeof c.delta === "number" && Number.isFinite(c.delta) ? Math.abs(c.delta) : 0;
+      if (absDelta < 0.25) continue;
 
       // Reject crossed/invalid quotes & wide-spread contracts (> 24% spread)
       if (typeof c.bid === "number" && typeof c.ask === "number") {
@@ -1049,10 +1049,9 @@ export async function selectSmallAccountContract(params: {
       if (isCall && c.strike < effectiveSpot * 0.998) continue;
       if (!isCall && c.strike > effectiveSpot * 1.002) continue;
 
-      // Anti-King-Trap Guardrail: Never select deep OTM lottery strikes (> 1.15% OTM and > $2 past Target 2)
-      // Prevents buying e.g. $755 Puts when SPY is at $767 (-1.56% away) just because All-Exp King is $755
-      if (!isCall && c.strike < effectiveSpot * 0.9885 && c.strike < effectiveTarget2 - 2) continue;
-      if (isCall && c.strike > effectiveSpot * 1.0115 && c.strike > effectiveTarget2 + 2) continue;
+      // Hard Near-ATM / 1-3 Strike OTM Ceiling: never select deep-OTM lottos (> min($3.50, 0.45%) from spot)
+      const maxOtmDistance = Math.min(3.50, effectiveSpot * 0.0045);
+      if (Math.abs(c.strike - effectiveSpot) > maxOtmDistance) continue;
 
       const { expHuman, robinhoodExp, robinhoodTab, dte } = formatExpirationHuman(c.expiration, todayEt);
 
@@ -1068,11 +1067,11 @@ export async function selectSmallAccountContract(params: {
       const distToTarget = Math.abs(c.strike - effectiveTarget1);
       const targetScore = Math.max(0, 40 - distToTarget * 4);
 
-      // Convexity-per-dollar score (with absDelta >= 0.22 floor already enforced)
+      // Convexity-per-dollar score (with absDelta >= 0.25 floor already enforced)
       const gammaEst = Math.max(0, c.gamma || 0);
       const expMove = Math.max(0.5, Math.abs(effectiveTarget1 - effectiveSpot));
       const convexityPerDollar = (absDelta + 0.5 * gammaEst * expMove) / Math.max(0.15, askPrice);
-      const deltaScore = (absDelta >= 0.22 && absDelta <= 0.45 ? 20 : 5) + Math.min(35, convexityPerDollar * 20);
+      const deltaScore = (absDelta >= 0.25 && absDelta <= 0.45 ? 20 : 5) + Math.min(35, convexityPerDollar * 20);
 
       // Liquidity score
       const liqScore = Math.min(25, ((c.openInterest || 0) + (c.volume || 0)) / 100);
@@ -2023,7 +2022,7 @@ async function backfillIntradaySessionSignals(
       const sliceLowSoFar = Math.min(...sessionBars.slice(0, idx + 1).map((b) => b.low));
       const isPostFlushBullReversal =
         Boolean(openPos && openPos.contractType === "PUT") &&
-        bar.totalMinutes >= 645 && // >= 10:45 AM ET
+        bar.totalMinutes >= 630 && // >= 10:30 AM ET
         (openPos!.btoSpotPrice - sliceLowSoFar >= 8.0) &&
         (bar.close - sliceLowSoFar >= 2.2) &&
         bar.close > bar.open &&
@@ -2256,7 +2255,7 @@ export async function evaluateTradeSignals(
   const canTryPhase2Reclaim =
     closedForTickerEarly.length === 1 &&
     phase1CooldownOk &&
-    etTime.totalMinutes >= 645 &&
+    etTime.totalMinutes >= 630 &&
     etTime.totalMinutes <= 870;
   if ((closedForTickerEarly.length >= 2 || (closedForTickerEarly.length >= 1 && !canTryPhase2Reclaim)) && !activePos) {
     return {
@@ -2511,7 +2510,10 @@ export async function evaluateTradeSignals(
       ((!isCall &&
         ((posPutWall > 0 &&
           posSpotPrice <= posPutWall * 1.0012 &&
-          adverseSpotMove >= 0.75) ||
+          (favMove >= 1.25 || pnlOptionPct >= 25) &&
+          (divergence5m === "BULL" ||
+            exitImpChi >= 0.60 ||
+            Boolean(posCandle && posCandle.close > posCandle.open))) ||
          divergence5m === "BULL" ||
          Boolean(
            posCandle &&
@@ -2523,7 +2525,8 @@ export async function evaluateTradeSignals(
          Boolean(
            posCandle &&
              typeof posCandle.sma34 === "number" &&
-             posCandle.close < posCandle.sma34
+             posCandle.close < posCandle.sma34 &&
+             (activePos.btoSpotPrice >= posCandle.sma34 || adverseSpotMove >= 0.75)
          ))))
     ) {
       const exitReason =
@@ -2607,7 +2610,7 @@ export async function evaluateTradeSignals(
   const isPhase2ReclaimWindow =
     sameTickerClosed.length === 1 &&
     isPhase2CooldownMet &&
-    etTime.totalMinutes >= 645 &&
+    etTime.totalMinutes >= 630 &&
     etTime.totalMinutes <= 870;
   const hasCompletedTradeToday =
     sameTickerClosed.length >= 2 ||
@@ -2850,8 +2853,8 @@ export async function evaluateTradeSignals(
       : (tacticalPw > 0 && tacticalCw > tacticalPw)
         ? Number(((tacticalCw + tacticalPw) / 2).toFixed(2))
         : effectiveSma34;
-    const recent5mLow = latest5mCandle ? Math.min(latest5mCandle.low, spotPrice) : spotPrice;
-    const recent5mHigh = latest5mCandle ? Math.max(latest5mCandle.high, spotPrice) : spotPrice;
+    const recent5mLow = latest5mCandle ? Math.min(latest5mCandle.low, latest5mCandle.prevLow ?? latest5mCandle.low, spotPrice) : spotPrice;
+    const recent5mHigh = latest5mCandle ? Math.max(latest5mCandle.high, latest5mCandle.prevHigh ?? latest5mCandle.high, spotPrice) : spotPrice;
     const testedPutWallOrKingOrFlux =
       (tacticalPw > 0 && Math.abs(recent5mLow - tacticalPw) / tacticalPw <= 0.0035) ||
       (flowSnap && flowSnap.lower1Sigma > 0 && Math.abs(recent5mLow - flowSnap.lower1Sigma) / flowSnap.lower1Sigma <= 0.0035) ||
@@ -3094,13 +3097,13 @@ export async function evaluateTradeSignals(
     const reclaimedSmaAndVwapOrCenter = Boolean(
       latest5mCandle &&
         latest5mCandle.close > latest5mCandle.open &&
-        ((spotPrice >= effectiveSma34 && spotPrice >= effectiveFlowVwap) ||
+        ((spotPrice >= effectiveSma34 || spotPrice >= effectiveFlowVwap) ||
           (tacticalBookCenter > 0 && spotPrice >= tacticalBookCenter))
     );
     const lostSmaAndVwapOrCenter = Boolean(
       latest5mCandle &&
         latest5mCandle.close < latest5mCandle.open &&
-        ((spotPrice <= effectiveSma34 && spotPrice <= effectiveFlowVwap) ||
+        ((spotPrice <= effectiveSma34 || spotPrice <= effectiveFlowVwap) ||
           (tacticalBookCenter > 0 && spotPrice <= tacticalBookCenter))
     );
     const leg2CallUpperCeiling = Math.max(
@@ -3124,12 +3127,12 @@ export async function evaluateTradeSignals(
     );
     const hasBullImpulseReclaim = Boolean(
       !isOpeningRange &&
-      etTime.totalMinutes >= 645 &&
+      etTime.totalMinutes >= 630 &&
       impChi >= 0.60 &&
-      (deltaChi6 >= 0.03 || deltaImpulseChi6 >= 0.06) &&
-      (deltaFlux6 > 0 || impPe >= 0.40) &&
-      barBody <= 1.25 &&
-      (!isPhase2ReclaimWindow || (testedPutWallOrMinus1Sigma && deltaFlux6 > 0 && leg2CallRoom >= 1.50)) &&
+      (deltaChi6 >= 0.03 || deltaImpulseChi6 >= 0.06 || deltaFlux6 > 0 || spotPrice >= effectiveFlowVwap || spotPrice >= effectiveSma34) &&
+      (deltaFlux6 > 0 || impPe >= 0.40 || spotPrice >= effectiveFlowVwap || spotPrice >= effectiveSma34) &&
+      barBody <= 2.25 &&
+      (!isPhase2ReclaimWindow || (testedPutWallOrMinus1Sigma && leg2CallRoom >= 1.50)) &&
       (divergence5m === "BULL" ||
         divergence30m === "BULL" ||
         reclaimedSmaAndVwapOrCenter ||
@@ -3140,12 +3143,12 @@ export async function evaluateTradeSignals(
     );
     const hasBearImpulseRejection = Boolean(
       !isOpeningRange &&
-      etTime.totalMinutes >= 645 &&
+      etTime.totalMinutes >= 630 &&
       impChi <= 0.40 &&
-      (deltaChi6 <= -0.03 || deltaImpulseChi6 <= -0.06) &&
-      (deltaFlux6 < 0 || impPe <= -0.40) &&
-      -barBody <= 1.25 &&
-      (!isPhase2ReclaimWindow || (testedCallWallOrPlus1Sigma && deltaFlux6 < 0 && leg2PutRoom >= 1.50)) &&
+      (deltaChi6 <= -0.03 || deltaImpulseChi6 <= -0.06 || deltaFlux6 < 0 || spotPrice <= effectiveFlowVwap || spotPrice <= effectiveSma34) &&
+      (deltaFlux6 < 0 || impPe <= -0.40 || spotPrice <= effectiveFlowVwap || spotPrice <= effectiveSma34) &&
+      -barBody <= 2.25 &&
+      (!isPhase2ReclaimWindow || (testedCallWallOrPlus1Sigma && leg2PutRoom >= 1.50)) &&
       (divergence5m === "BEAR" ||
         divergence30m === "BEAR" ||
         lostSmaAndVwapOrCenter ||
@@ -3523,7 +3526,7 @@ export async function evaluateTradeSignals(
       hasAdequateCallRoomToWall &&
       (tacticalPw > 0 ? spotPrice >= tacticalPw * 0.9965 : true)
     ) {
-      const reclaimFloor = Math.min(latest5mCandle?.low ?? spotPrice, tacticalPw > 0 && tacticalPw <= spotPrice ? tacticalPw : spotPrice);
+      const reclaimFloor = Math.max(spotPrice - 1.50, Math.min(latest5mCandle?.low ?? spotPrice, tacticalPw > 0 && tacticalPw <= spotPrice ? tacticalPw : spotPrice));
       const stopLoss = Number((Math.min(reclaimFloor - 0.15, spotPrice - 0.85)).toFixed(2));
       const risk = Math.max(0.50, spotPrice - stopLoss);
       const callTargetWall = callMagnetTarget > spotPrice + 1.50 ? callMagnetTarget : Number((spotPrice + risk * 2.5).toFixed(2));
@@ -3547,7 +3550,7 @@ export async function evaluateTradeSignals(
       hasAdequatePutRoomToWall &&
       (tacticalCw > 0 ? spotPrice <= tacticalCw * 1.0035 : true)
     ) {
-      const rejectCeil = Math.max(latest5mCandle?.high ?? spotPrice, tacticalCw > 0 && tacticalCw >= spotPrice ? tacticalCw : spotPrice);
+      const rejectCeil = Math.min(spotPrice + 1.50, Math.max(latest5mCandle?.high ?? spotPrice, tacticalCw > 0 && tacticalCw >= spotPrice ? tacticalCw : spotPrice));
       const stopLoss = Number((Math.max(rejectCeil + 0.15, spotPrice + 0.85)).toFixed(2));
       const risk = Math.max(0.50, stopLoss - spotPrice);
       const putTargetWall =
@@ -3567,7 +3570,7 @@ export async function evaluateTradeSignals(
       }
     }
 
-    // Phase-2 Gate: Second trade today must be an opposite-direction structural rotation (>= 10:45 ET, >= 30m cooldown)
+    // Phase-2 Gate: Second trade today must be an opposite-direction structural rotation (>= 10:30 ET, >= 30m cooldown)
     if (candidateBto && isPhase2ReclaimWindow) {
       const isOppositeDir = candidateBto.contractType !== lastClosed?.contractType;
       const isLeg2CallValid =
@@ -3575,14 +3578,14 @@ export async function evaluateTradeSignals(
         testedPutWallOrMinus1Sigma &&
         (divergence5m === "BULL" || divergence30m === "BULL" || reclaimedSmaAndVwapOrCenter) &&
         impChi >= 0.60 &&
-        deltaFlux6 > 0 &&
+        (deltaFlux6 > 0 || spotPrice >= effectiveSma34 || spotPrice >= effectiveFlowVwap) &&
         leg2CallRoom >= 1.50;
       const isLeg2PutValid =
         candidateBto.contractType === "PUT" &&
         testedCallWallOrPlus1Sigma &&
         (divergence5m === "BEAR" || divergence30m === "BEAR" || lostSmaAndVwapOrCenter) &&
         impChi <= 0.40 &&
-        deltaFlux6 < 0 &&
+        (deltaFlux6 < 0 || spotPrice <= effectiveSma34 || spotPrice <= effectiveFlowVwap) &&
         leg2PutRoom >= 1.50;
       if (!isOppositeDir || !(isLeg2CallValid || isLeg2PutValid)) {
         candidateBto = null;
@@ -4038,24 +4041,26 @@ export function computeRemainingYearsToExpiration(
 export function estimateDynamicAtmIv(
   bars: Array<{ close: number; high?: number; low?: number }>,
   idx: number,
-  baseIvFloor: number = 0.125
+  baseIvFloor: number = 0.085
 ): number {
   const start = Math.max(1, idx - 20);
-  let sumSq = 0;
-  let count = 0;
+  const sqReturns: number[] = [];
   for (let i = start; i <= idx; i++) {
     const prev = bars[i - 1]?.close || 0;
     const curr = bars[i]?.close || 0;
     if (prev > 0 && curr > 0) {
       const r = Math.log(curr / prev);
-      sumSq += r * r;
-      count++;
+      sqReturns.push(r * r);
     }
   }
-  if (count < 2) return 0.15;
-  const realizedAnnualVol = Math.sqrt((sumSq / count) * 78 * 252);
-  const vrpAdjusted = realizedAnnualVol * 1.18 + 0.02;
-  return Math.max(baseIvFloor, Math.min(0.65, vrpAdjusted));
+  if (sqReturns.length < 2) return 0.095;
+  sqReturns.sort((a, b) => a - b);
+  const capIdx = Math.min(sqReturns.length - 1, Math.floor(sqReturns.length * 0.85));
+  const capVal = sqReturns[capIdx];
+  const trimmedMean = sqReturns.reduce((acc, v) => acc + Math.min(v, capVal), 0) / sqReturns.length;
+  const realizedAnnualVol = Math.sqrt(trimmedMean * 78 * 252);
+  const vrpAdjusted = (0.45 * realizedAnnualVol + 0.55 * 0.092) * 1.02;
+  return Math.max(baseIvFloor, Math.min(0.20, vrpAdjusted));
 }
 
 /**
@@ -4638,7 +4643,7 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
 
     if (!dispatchedSet.has(entryKey) && !store.dispatchedAlertIds?.[idempotencyKey]) {
       // Jane Street Two-Regime Single-Slot State Machine:
-      // FLAT (0 trades) -> LEG 1 (1 contract) -> LEG 2 opposite structural rotation (>=10:45 ET, >=30m cooldown) -> LOCKED_FOR_DAY
+      // FLAT (0 trades) -> LEG 1 (1 contract) -> LEG 2 opposite structural rotation (>=10:30 ET, >=30m cooldown) -> LOCKED_FOR_DAY
       const closedCount = store.closedPositions?.length ?? 0;
       const prevClosed = store.closedPositions?.reduce<OptionTradePosition | undefined>(
         (latest, cur) => (!latest || (cur.closedTs ?? 0) >= (latest.closedTs ?? 0) ? cur : latest),
@@ -4651,7 +4656,7 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
       const canPhase2OppositeReclaim =
         closedCount === 1 &&
         prevCooldownMet &&
-        sigEt.totalMinutes >= 645 &&
+        sigEt.totalMinutes >= 630 &&
         sigEt.totalMinutes <= 870 &&
         prevClosed?.contractType !== direction;
       if (closedCount >= 2 || (closedCount >= 1 && !canPhase2OppositeReclaim)) {

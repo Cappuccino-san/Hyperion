@@ -189,6 +189,61 @@ export function formatExposure(
  * Exact Black-Scholes Greeks & Theoretical Prices (Gamma, Vanna, Charm, Delta, Call/Put Price)
  * r = 0.0475, q = 0.0
  */
+function resolveSafeIv(
+  rawIv: number | null | undefined,
+  fallbackIv = 0.25
+): number {
+  const safeFallback =
+    Number.isFinite(fallbackIv) && fallbackIv > 0.02
+      ? Math.max(0.02, Math.min(3.5, fallbackIv > 4 ? fallbackIv / 100 : fallbackIv))
+      : 0.25;
+  if (rawIv == null || !Number.isFinite(rawIv) || rawIv <= 0) {
+    return safeFallback;
+  }
+  const normalized = rawIv > 4 ? rawIv / 100 : rawIv;
+  if (!Number.isFinite(normalized) || normalized <= 0.02) {
+    return safeFallback;
+  }
+  return Math.max(0.02, Math.min(3.5, normalized));
+}
+
+function isValidIsoDate(iso: string | null | undefined): iso is string {
+  if (typeof iso !== "string") return false;
+  const s = iso.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  return Number.isFinite(Date.parse(`${s}T12:00:00Z`));
+}
+
+function getEtClockParts(now: Date = new Date()): {
+  nowEtIso: string;
+  isWeekday: boolean;
+  mins: number;
+} {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    weekday: "short",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+  const parts = fmt.formatToParts(now);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  const year = get("year") || "1970";
+  const month = get("month") || "01";
+  const day = get("day") || "01";
+  const weekday = get("weekday");
+  const hour = Number(get("hour") || 0) % 24;
+  const minute = Number(get("minute") || 0);
+  return {
+    nowEtIso: `${year}-${month}-${day}`,
+    isWeekday: weekday !== "Sat" && weekday !== "Sun",
+    mins: hour * 60 + minute,
+  };
+}
+
 export function computeBlackScholesGreeks(
   S: number,
   K: number,
@@ -197,30 +252,46 @@ export function computeBlackScholesGreeks(
   r = 0.0475,
   q = 0.0
 ) {
-  const effectiveT = Math.max(5 / (252 * 390), T);
-  const effectiveSigma = Math.max(0.02, Math.min(3.5, sigma));
+  if (!Number.isFinite(S) || !Number.isFinite(K) || S <= 0 || K <= 0) {
+    return {
+      gamma: 0,
+      vanna: 0,
+      charmCall: 0,
+      charmPut: 0,
+      deltaCall: 0,
+      deltaPut: 0,
+      callPrice: 0,
+      putPrice: 0,
+    };
+  }
+  const safeR = Number.isFinite(r) ? r : 0.0475;
+  const safeQ = Number.isFinite(q) ? q : 0.0;
+  const finiteT = Number.isFinite(T) ? T : 5 / (252 * 390);
+  const finiteSigma = Number.isFinite(sigma) && sigma > 0 ? sigma : 0.25;
+  const effectiveT = Math.max(5 / (252 * 390), finiteT);
+  const effectiveSigma = Math.max(0.02, Math.min(3.5, finiteSigma));
   const sqrtT = Math.sqrt(effectiveT);
 
   const d1 =
     (Math.log(Math.max(1e-4, S / K)) +
-      (r - q + 0.5 * effectiveSigma * effectiveSigma) * effectiveT) /
+      (safeR - safeQ + 0.5 * effectiveSigma * effectiveSigma) * effectiveT) /
     (effectiveSigma * sqrtT);
   const d2 = d1 - effectiveSigma * sqrtT;
 
   const pdfD1 = normPDF(d1);
-  const discountQ = Math.exp(-q * effectiveT);
-  const discountR = Math.exp(-r * effectiveT);
+  const discountQ = Math.exp(-safeQ * effectiveT);
+  const discountR = Math.exp(-safeR * effectiveT);
 
   const gamma = (discountQ * pdfD1) / (S * effectiveSigma * sqrtT);
   const vanna = -discountQ * pdfD1 * (d2 / effectiveSigma); // dDelta / dVol
 
   const charmCall =
-    q * discountQ * normCDF(d1) -
+    safeQ * discountQ * normCDF(d1) -
     discountQ *
       pdfD1 *
-      ((2 * (r - q) * effectiveT - d2 * effectiveSigma * sqrtT) /
+      ((2 * (safeR - safeQ) * effectiveT - d2 * effectiveSigma * sqrtT) /
         (2 * effectiveT * effectiveSigma * sqrtT));
-  const charmPut = charmCall - q * discountQ;
+  const charmPut = charmCall - safeQ * discountQ;
 
   const deltaCall = discountQ * normCDF(d1);
   const deltaPut = -discountQ * normCDF(-d1);
@@ -273,60 +344,39 @@ export function getActiveExpirationSelection(allRawExpirations: string[]): {
   hasZeroDte: boolean;
   activeExpirations: string[];
 } {
-  const sorted = Array.from(new Set(allRawExpirations)).sort();
+  const { nowEtIso, isWeekday, mins } = getEtClockParts();
+  const sorted = Array.from(
+    new Set(
+      allRawExpirations
+        .map((s) => s?.trim())
+        .filter((s): s is string => isValidIsoDate(s))
+    )
+  ).sort();
   if (sorted.length === 0) {
-    const fallbackToday = new Date().toLocaleDateString("en-CA", {
-      timeZone: "America/New_York",
-    });
     return {
-      referenceDate: fallbackToday,
+      referenceDate: nowEtIso,
       hasZeroDte: false,
       activeExpirations: [],
     };
   }
 
-  const nowEt = new Date(
-    new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
-  );
-  const nowEtIso = new Date().toLocaleDateString("en-CA", {
-    timeZone: "America/New_York",
-  });
-  const dayOfWeek = nowEt.getDay();
-  const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
-  const mins = nowEt.getHours() * 60 + nowEt.getMinutes();
   const isRegularSession = isWeekday && mins >= 570 && mins < 960;
 
-  const earliest = sorted[0];
-  const hasZeroDte =
-    earliest === nowEtIso && isRegularSession;
-
-  if (hasZeroDte) {
+  // Strict Expired-Contract Firewall: always purge exp < todayEt (and exp === todayEt post-close/weekend)
+  if (isWeekday && mins < 960) {
     const active = sorted.filter((exp) => exp >= nowEtIso);
     return {
-      referenceDate: earliest,
-      hasZeroDte: true,
-      activeExpirations: active.length > 0 ? active : sorted,
+      referenceDate: nowEtIso,
+      hasZeroDte: isRegularSession && active[0] === nowEtIso,
+      activeExpirations: active,
     };
   }
 
-  // Outside regular session:
-  // Before 9:30 AM ET on a weekday, today's expiration (if earliest === nowEtIso) is the upcoming session
-  if (isWeekday && mins < 570 && earliest === nowEtIso) {
-    const active = sorted.filter((exp) => exp >= nowEtIso);
-    return {
-      referenceDate: earliest,
-      hasZeroDte: false,
-      activeExpirations: active.length > 0 ? active : sorted,
-    };
-  }
-
-  // After 4:00 PM ET close or on weekends, any expiration <= nowEtIso is already settled
-  const settledCutoff = earliest <= nowEtIso ? earliest : nowEtIso;
-  const postCloseActive = sorted.filter((exp) => exp > settledCutoff);
+  const postCloseActive = sorted.filter((exp) => exp > nowEtIso);
   return {
-    referenceDate: settledCutoff,
+    referenceDate: nowEtIso,
     hasZeroDte: false,
-    activeExpirations: postCloseActive.length > 0 ? postCloseActive : sorted,
+    activeExpirations: postCloseActive,
   };
 }
 
@@ -355,10 +405,11 @@ function formatExpirationColumn(
 ): ExpirationColumnSpec {
   const refTime = new Date(`${referenceDateStr}T00:00:00Z`).getTime();
   const expTime = new Date(`${isoDate}T00:00:00Z`).getTime();
-  const diffDays = Math.max(
-    0,
-    Math.round((expTime - refTime) / (1000 * 60 * 60 * 24))
-  );
+  const rawDiff =
+    Number.isFinite(expTime) && Number.isFinite(refTime)
+      ? Math.round((expTime - refTime) / (1000 * 60 * 60 * 24))
+      : 0;
+  const diffDays = Math.max(0, rawDiff);
 
   const dateObj = new Date(`${isoDate}T12:00:00Z`);
   const dayNum = dateObj.getUTCDate();
@@ -407,12 +458,14 @@ function computeExpirationExpectedMove(
   dteDays: number,
   contractsForExp: NormalizedOptionContract[]
 ): ExpectedMoveHorizon | null {
-  if (!expIso) return null;
+  if (!expIso || !Number.isFinite(spotPrice) || spotPrice <= 0) return null;
+  const safeBaseIv = resolveSafeIv(impliedVolatility, 0.25);
 
   // Find ATM strike closest to spotPrice
   let atmStrike = spotPrice;
   let bestDist = Infinity;
   for (const c of contractsForExp) {
+    if (!Number.isFinite(c.strike) || c.strike <= 0) continue;
     const d = Math.abs(c.strike - spotPrice);
     if (d < bestDist) {
       bestDist = d;
@@ -422,13 +475,12 @@ function computeExpirationExpectedMove(
 
   let callMid = 0;
   let putMid = 0;
-  let callIv = impliedVolatility;
-  let putIv = impliedVolatility;
+  let callIv = safeBaseIv;
+  let putIv = safeBaseIv;
 
   for (const c of contractsForExp) {
     if (Math.abs(c.strike - atmStrike) > 1e-3) continue;
-    const rawIv =
-      c.iv > 0.02 ? (c.iv > 4 ? c.iv / 100 : c.iv) : impliedVolatility;
+    const rawIv = resolveSafeIv(c.iv, safeBaseIv);
     const mid =
       c.bid !== undefined && c.ask !== undefined && c.bid > 0 && c.ask > 0
         ? (c.bid + c.ask) / 2
@@ -444,7 +496,8 @@ function computeExpirationExpectedMove(
     }
   }
 
-  const T = Math.max(1 / 365, (dteDays + 0.5) / 365);
+  const safeDte = Number.isFinite(dteDays) ? Math.max(0, dteDays) : 0;
+  const T = Math.max(1 / 365, (safeDte + 0.5) / 365);
   if (callMid <= 0) {
     callMid = computeBlackScholesGreeks(spotPrice, atmStrike, T, callIv).callPrice;
   }
@@ -496,18 +549,23 @@ export function computeOptionsAnalytics(params: {
     openGexMap = null,
   } = params;
 
-  const preset = getTickerPreset(ticker);
-  const safeIv =
-    impliedVolatility != null && Number.isFinite(impliedVolatility) && impliedVolatility > 0
-      ? impliedVolatility
-      : (preset?.impliedVolatility ?? 0.25);
+  const safeSpot = Number.isFinite(spotPrice) && spotPrice > 0 ? spotPrice : 0;
+  const safePrevClose =
+    Number.isFinite(previousClose) && previousClose > 0 ? previousClose : safeSpot;
+  const { nowEtIso: todayEtIso, mins: currentEtMinutes } = getEtClockParts();
+  const preset = getTickerPreset(ticker, safeSpot > 0 ? safeSpot : undefined);
+  const presetIv = resolveSafeIv(preset?.impliedVolatility, 0.25);
+  const safeIv = resolveSafeIv(impliedVolatility, presetIv);
 
-  // Full book aggregation: keep all valid positive strikes with open interest or volume
+  // Full book aggregation: keep all valid positive non-expired strikes with finite OI or volume
   const validContracts = contracts.filter(
     (c) =>
       c.strike > 0 &&
       Number.isFinite(c.strike) &&
-      (c.openInterest > 0 || c.volume > 0)
+      isValidIsoDate(c.expiration) &&
+      c.expiration >= todayEtIso &&
+      ((Number.isFinite(c.openInterest) && c.openInterest > 0) ||
+        (Number.isFinite(c.volume) && c.volume > 0))
   );
 
   // Collect all active (unsettled) expirations using unified ET market-hours check
@@ -539,7 +597,10 @@ export function computeOptionsAnalytics(params: {
   expirations.forEach((exp) => {
     isoToColId.set(exp.isoDate, exp.id);
     const expTime = new Date(`${exp.isoDate}T00:00:00Z`).getTime();
-    const days = Math.max(0, (expTime - refTime) / (1000 * 60 * 60 * 24));
+    const days =
+      Number.isFinite(expTime) && Number.isFinite(refTime)
+        ? Math.max(0, (expTime - refTime) / (1000 * 60 * 60 * 24))
+        : 0;
     isoToDays.set(exp.isoDate, days);
   });
 
@@ -555,7 +616,7 @@ export function computeOptionsAnalytics(params: {
 
   let detectedStep = preset.strikeStep;
   const atmStrikes = uniqueStrikesAsc.filter(
-    (s) => Math.abs(s - spotPrice) <= spotPrice * 0.03
+    (s) => Math.abs(s - safeSpot) <= Math.max(1, safeSpot) * 0.03
   );
   if (atmStrikes.length >= 3) {
     const diffs: number[] = [];
@@ -626,16 +687,11 @@ export function computeOptionsAnalytics(params: {
 
     const days = isoToDays.get(contract.expiration) ?? 0;
     const T = Math.max(1 / 365, days / 365);
-    const contractIv =
-      contract.iv > 0.02
-        ? contract.iv > 4
-          ? contract.iv / 100
-          : contract.iv
-        : safeIv;
+    const contractIv = resolveSafeIv(contract.iv, safeIv);
 
     // Calibrated Gamma Greeks (r = 0.0460, q = 0.0, calendar T = days / 365)
     const bs = computeBlackScholesGreeks(
-      spotPrice,
+      safeSpot,
       strikeKey,
       T,
       contractIv,
@@ -646,7 +702,7 @@ export function computeOptionsAnalytics(params: {
     // Untouched VEX (Vanna) calculation preserving exact $5.99B match
     const T_vex = Math.max(1 / 365, (days + 0.5) / 365);
     const bsVex = computeBlackScholesGreeks(
-      spotPrice,
+      safeSpot,
       strikeKey,
       T_vex,
       contractIv,
@@ -655,9 +711,12 @@ export function computeOptionsAnalytics(params: {
     );
 
     const oi =
-      contract.openInterest > 0
+      Number.isFinite(contract.openInterest) && contract.openInterest > 0
         ? contract.openInterest
-        : Math.round(contract.volume * 0.35);
+        : Number.isFinite(contract.volume) && contract.volume > 0
+          ? Math.round(contract.volume * 0.35)
+          : 0;
+    if (oi <= 0) continue;
 
     if (contract.optionType === "C") {
       cell.callOI += oi;
@@ -684,11 +743,11 @@ export function computeOptionsAnalytics(params: {
   let totalNetDexMillions = 0;
   let totalNetCharmMillions = 0;
 
-  let bestCallWallStrike = spotPrice + detectedStep * 5;
-  let bestCallWallGamma = -1;
+  let bestCallWallStrike = safeSpot + detectedStep * 5;
+  let bestCallWallGamma = 0;
 
-  let bestPutWallStrike = spotPrice - detectedStep * 5;
-  let bestPutWallGamma = -1;
+  let bestPutWallStrike = safeSpot - detectedStep * 5;
+  let bestPutWallGamma = 0;
 
   const computedRowsAsc: ComputedStrikeRow[] = [];
 
@@ -724,22 +783,22 @@ export function computeOptionsAnalytics(params: {
 
       // GEX ($M per 1% Spot Move): ((callOI * callGamma) - (putOI * putGamma)) * 100 * (S * S) * 0.01 / 1e6
       const callGexM =
-        (cell.callGammaOI * 100 * (spotPrice * spotPrice) * 0.01) / 1e6;
+        (cell.callGammaOI * 100 * (safeSpot * safeSpot) * 0.01) / 1e6;
       const putGexM =
-        (cell.putGammaOI * 100 * (spotPrice * spotPrice) * 0.01) / 1e6;
+        (cell.putGammaOI * 100 * (safeSpot * safeSpot) * 0.01) / 1e6;
       const cellGexM = callGexM - putGexM;
 
       // VEX ($M per 1% IV Point Move): ((callOI * callVanna) - (putOI * putVanna)) * 100 * S * 0.01 / 1e6
       const cellVexM =
-        ((cell.callVannaOI - cell.putVannaOI) * 100 * spotPrice * 0.01) / 1e6;
+        ((cell.callVannaOI - cell.putVannaOI) * 100 * safeSpot * 0.01) / 1e6;
 
       // DEX ($M Delta Notional): ((callOI * callDelta) + (putOI * putDelta)) * 100 * S / 1e6
       const cellDexM =
-        ((cell.callDeltaOI + cell.putDeltaOI) * 100 * spotPrice) / 1e6;
+        ((cell.callDeltaOI + cell.putDeltaOI) * 100 * safeSpot) / 1e6;
 
       // Charm ($M Daily Delta Decay): ((callOI * charmCall) - (putOI * charmPut)) * 100 * S * (1 / 252) / 1e6
       const cellCharmM =
-        ((cell.callCharmOI - cell.putCharmOI) * 100 * spotPrice * (1 / 252)) / 1e6;
+        ((cell.callCharmOI - cell.putCharmOI) * 100 * safeSpot * (1 / 252)) / 1e6;
 
       gex[exp.id] = Number(cellGexM.toFixed(4));
       callGex[exp.id] = Number(callGexM.toFixed(4));
@@ -784,14 +843,14 @@ export function computeOptionsAnalytics(params: {
       }
     }
 
-    // Call Wall: Strike >= spotPrice with largest positive Call-only Gamma across all active expirations
-    if (strike >= spotPrice && rowCallGamma > bestCallWallGamma) {
+    // Call Wall: Strike >= safeSpot with largest positive Call-only Gamma across all active expirations
+    if (strike >= safeSpot && rowCallGamma > bestCallWallGamma) {
       bestCallWallGamma = rowCallGamma;
       bestCallWallStrike = strike;
     }
 
-    // Put Wall: Strike <= spotPrice with largest Put-only Gamma across all active expirations
-    if (strike <= spotPrice && rowPutGamma > bestPutWallGamma) {
+    // Put Wall: Strike <= safeSpot with largest Put-only Gamma across all active expirations
+    if (strike <= safeSpot && rowPutGamma > bestPutWallGamma) {
       bestPutWallGamma = rowPutGamma;
       bestPutWallStrike = strike;
     }
@@ -826,9 +885,10 @@ export function computeOptionsAnalytics(params: {
   const secondRow = sortedByAllExpGex[1] ?? sortedByAllExpGex[0];
 
   const allExpKing = kingRow ? kingRow.strike : preset.kingPreset.allExpKing;
+  const rawKingAbsGex = kingRow ? Math.abs(kingRow.totalNetGex) : 0;
   const kingValue = kingRow
-    ? Math.max(0.1, Math.abs(kingRow.totalNetGex))
-    : preset.kingPreset.kingValue;
+    ? Math.max(0.1, rawKingAbsGex)
+    : Math.max(0, preset.kingPreset.kingValue);
   const secondLargestStrike = secondRow
     ? secondRow.strike
     : preset.kingPreset.secondLargestStrike;
@@ -952,14 +1012,17 @@ export function computeOptionsAnalytics(params: {
   const weeklyDate = bestWeekPeakColDate;
 
   // 5. King Strength (0–100) & Contested flag (second-largest within 10% of King)
-  const leadScore = (1 - secondLargestValue / kingValue) * 50;
-  const shareScore =
-    Math.min(1, (kingValue / Math.max(0.1, totalBoardGamma)) / 0.25) * 50;
+  const hasLiveGamma =
+    Boolean(kingRow) && totalBoardGamma > 1e-6 && rawKingAbsGex > 0 && kingValue > 0;
+  const leadScore = hasLiveGamma ? (1 - secondLargestValue / kingValue) * 50 : 0;
+  const shareScore = hasLiveGamma
+    ? Math.min(1, (kingValue / Math.max(0.1, totalBoardGamma)) / 0.25) * 50
+    : 0;
   const kingStrength = Math.round(
     Math.min(100, Math.max(0, leadScore + shareScore))
   );
   const isContested =
-    kingValue >= 1 && secondLargestValue >= kingValue * 0.9;
+    hasLiveGamma && kingValue >= 1 && secondLargestValue >= kingValue * 0.9;
 
   // 6. True Interpolated Zero γ (Gamma Flip) Solver across ±15% around spot
   interface ZgContractItem {
@@ -972,36 +1035,24 @@ export function computeOptionsAnalytics(params: {
   }
   const zgContracts: ZgContractItem[] = [];
   for (const c of selectedContracts) {
+    if (!Number.isFinite(c.strike) || c.strike <= 0 || c.expiration < todayEtIso) continue;
     const oi =
-      c.openInterest > 0 ? c.openInterest : Math.round(c.volume * 0.35);
+      Number.isFinite(c.openInterest) && c.openInterest > 0
+        ? c.openInterest
+        : Number.isFinite(c.volume) && c.volume > 0
+          ? Math.round(c.volume * 0.35)
+          : 0;
     if (oi <= 0) continue;
     const days = isoToDays.get(c.expiration) ?? 0;
     let T: number;
     if (days === 0) {
-      // For 0DTE, compute true intraday fraction to 16:00 ET close using timezone-aware ET formatting
-      const now = new Date();
-      const etFormatter = new Intl.DateTimeFormat("en-US", {
-        timeZone: "America/New_York",
-        hour12: false,
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-      const parts = etFormatter.formatToParts(now);
-      const etHour = Number(parts.find((p) => p.type === "hour")?.value ?? 9);
-      const etMin = Number(parts.find((p) => p.type === "minute")?.value ?? 30);
-      const currentEtMinutes = etHour * 60 + etMin;
       const closeEtMinutes = 16 * 60; // 16:00 ET
       const remainingMin = Math.max(5, Math.min(390, closeEtMinutes - currentEtMinutes));
       T = remainingMin / (252 * 390);
     } else {
       T = Math.max(1 / 365, days / 365);
     }
-    const iv =
-      c.iv > 0.02
-        ? c.iv > 4
-          ? c.iv / 100
-          : c.iv
-        : safeIv;
+    const iv = resolveSafeIv(c.iv, safeIv);
     zgContracts.push({
       strike: c.strike,
       T,
@@ -1014,26 +1065,36 @@ export function computeOptionsAnalytics(params: {
 
   // Test hypothetical spot prices from 0.85 * spotPrice to 1.15 * spotPrice on a 41-point grid
   const testSpotCount = 41;
-  const minSpot = 0.85 * spotPrice;
-  const maxSpot = 1.15 * spotPrice;
+  const minSpot = 0.85 * safeSpot;
+  const maxSpot = 1.15 * safeSpot;
   const spotStepSize = (maxSpot - minSpot) / (testSpotCount - 1);
   const zgRate = 0.045;
   const zgDividend = 0.012;
 
   const solveZeroGamma = (contractsToSolve: ZgContractItem[]) => {
+    if (safeSpot <= 0) {
+      return { zeroGamma: 0, hasZeroGammaFlip: false };
+    }
+    if (contractsToSolve.length === 0) {
+      return { zeroGamma: Number(safeSpot.toFixed(2)), hasZeroGammaFlip: false };
+    }
     const curve: { s: number; netGex: number }[] = [];
     for (let i = 0; i < testSpotCount; i++) {
       const s = minSpot + i * spotStepSize;
+      if (!Number.isFinite(s) || s <= 0) continue;
       let totalGexAtS = 0;
       for (const item of contractsToSolve) {
-        const sqrtT = Math.sqrt(item.T);
+        if (!Number.isFinite(item.strike) || item.strike <= 0 || item.oi <= 0) continue;
+        const safeT = Math.max(5 / (252 * 390), Number.isFinite(item.T) ? item.T : 1 / 365);
+        const safeContractIv = resolveSafeIv(item.iv, safeIv);
+        const sqrtT = Math.sqrt(safeT);
         const d1 =
           (Math.log(s / item.strike) +
-            (zgRate - zgDividend + 0.5 * item.iv * item.iv) * item.T) /
-          (item.iv * sqrtT);
+            (zgRate - zgDividend + 0.5 * safeContractIv * safeContractIv) * safeT) /
+          (safeContractIv * sqrtT);
         const pdfD1 = normPDF(d1);
-        const discountQ = Math.exp(-zgDividend * item.T);
-        const gamma = (discountQ * pdfD1) / (s * item.iv * sqrtT);
+        const discountQ = Math.exp(-zgDividend * safeT);
+        const gamma = (discountQ * pdfD1) / (s * safeContractIv * sqrtT);
 
         const sign = item.isCall ? 1 : -1;
         totalGexAtS += (sign * item.oi * gamma * 100 * (s * s) * 0.01) / 1e6;
@@ -1060,12 +1121,12 @@ export function computeOptionsAnalytics(params: {
             : (p1.s + p2.s) / 2;
         crossings.push({
           zeroPrice,
-          distToSpot: Math.abs(zeroPrice - spotPrice),
+          distToSpot: Math.abs(zeroPrice - safeSpot),
         });
       }
     }
 
-    let zgPrice = spotPrice;
+    let zgPrice = safeSpot;
     let flip = false;
     if (crossings.length > 0) {
       crossings.sort((a, b) => a.distToSpot - b.distToSpot);
@@ -1075,7 +1136,10 @@ export function computeOptionsAnalytics(params: {
       const minPoint = [...curve].sort(
         (a, b) => Math.abs(a.netGex) - Math.abs(b.netGex)
       )[0];
-      zgPrice = Number((minPoint?.s ?? spotPrice).toFixed(2));
+      zgPrice =
+        minPoint && Math.abs(minPoint.netGex) > 1e-12
+          ? Number(minPoint.s.toFixed(2))
+          : Number(safeSpot.toFixed(2));
       flip = false;
     }
     return { zeroGamma: zgPrice, hasZeroGammaFlip: flip };
@@ -1087,10 +1151,10 @@ export function computeOptionsAnalytics(params: {
   const computeLevelsForCols = (targetCols: ExpirationColumnSpec[]) => {
     const targetIsoSet = new Set(targetCols.map((c) => c.isoDate));
 
-    let bestCwStrike = spotPrice + detectedStep * 5;
-    let bestCwGamma = -1;
-    let bestPwStrike = spotPrice - detectedStep * 5;
-    let bestPwGamma = -1;
+    let bestCwStrike = safeSpot + detectedStep * 5;
+    let bestCwGamma = 0;
+    let bestPwStrike = safeSpot - detectedStep * 5;
+    let bestPwGamma = 0;
 
     for (const row of computedRowsAsc) {
       let callSum = 0;
@@ -1099,11 +1163,11 @@ export function computeOptionsAnalytics(params: {
         callSum += row.callGex?.[col.id] ?? 0;
         putSum += row.putGex?.[col.id] ?? 0;
       }
-      if (row.strike >= spotPrice && callSum > bestCwGamma) {
+      if (row.strike >= safeSpot && callSum > bestCwGamma) {
         bestCwGamma = callSum;
         bestCwStrike = row.strike;
       }
-      if (row.strike <= spotPrice && putSum > bestPwGamma) {
+      if (row.strike <= safeSpot && putSum > bestPwGamma) {
         bestPwGamma = putSum;
         bestPwStrike = row.strike;
       }
@@ -1179,7 +1243,7 @@ export function computeOptionsAnalytics(params: {
   const dailyEm = dailyExpIso
     ? computeExpirationExpectedMove(
         dailyExpIso,
-        spotPrice,
+        safeSpot,
         safeIv,
         isoToDays.get(dailyExpIso) ?? 1,
         contractsByExp.get(dailyExpIso) ?? []
@@ -1189,7 +1253,7 @@ export function computeOptionsAnalytics(params: {
   const weeklyEm = weeklyExpIso
     ? computeExpirationExpectedMove(
         weeklyExpIso,
-        spotPrice,
+        safeSpot,
         safeIv,
         isoToDays.get(weeklyExpIso) ?? 5,
         contractsByExp.get(weeklyExpIso) ?? []
@@ -1199,7 +1263,7 @@ export function computeOptionsAnalytics(params: {
   const monthlyEm = monthlyExpIso
     ? computeExpirationExpectedMove(
         monthlyExpIso,
-        spotPrice,
+        safeSpot,
         safeIv,
         isoToDays.get(monthlyExpIso) ?? 21,
         contractsByExp.get(monthlyExpIso) ?? []
@@ -1258,8 +1322,8 @@ export function computeOptionsAnalytics(params: {
         hour: "numeric",
         minute: "2-digit",
       }) + " ET",
-    spotPrice: Number(spotPrice.toFixed(2)),
-    previousClose: Number(previousClose.toFixed(2)),
+    spotPrice: Number(safeSpot.toFixed(2)),
+    previousClose: Number(safePrevClose.toFixed(2)),
     impliedVolatility: Number(safeIv.toFixed(4)),
     strikeStep: detectedStep,
     extendedQuote,

@@ -602,11 +602,14 @@ async function fetchLiveOptionsBuckets(
     selectedIsoSet.has(o.expiration)
   );
   const sortedExpirations = selectedIsoDates;
-  const nextExpIso = sortedExpirations[0];
+  const nextExpIso = sortedExpirations[0] ?? referenceDate;
   const refTimeMs = new Date(`${referenceDate}T00:00:00Z`).getTime();
 
   // Compute the Friday closing out the Monday-Friday trading week of nextExpIso
-  const nextExpDateObj = new Date(`${nextExpIso}T12:00:00Z`);
+  const parsedNextExp = new Date(`${nextExpIso}T12:00:00Z`);
+  const nextExpDateObj = Number.isFinite(parsedNextExp.getTime())
+    ? parsedNextExp
+    : new Date(`${referenceDate}T12:00:00Z`);
   const nextExpDow = nextExpDateObj.getUTCDay(); // 1 = Monday .. 5 = Friday
   const daysToWeekFriday = nextExpDow <= 5 ? 5 - nextExpDow : 6;
   const weekFridayIso = new Date(

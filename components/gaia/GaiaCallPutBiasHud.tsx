@@ -285,7 +285,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
   // Dynamic Trade Signals Engine Hook: Polls /api/signals only when parent does not supply serverTradesProp
   useEffect(() => {
-    if (serverTradesProp !== undefined) return;
+    if (serverTradesProp !== undefined || isReplayMode) return;
     let isMounted = true;
     async function syncServerTrades() {
       try {
@@ -318,7 +318,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       isMounted = false;
       clearInterval(interval);
     };
-  }, [activeSymbol, sessionDate, serverTradesProp]);
+  }, [activeSymbol, sessionDate, serverTradesProp, isReplayMode]);
 
   // Chart Container & Dynamic Axis Scaling / Pan State
   const svgWrapperRef = useRef<HTMLDivElement | null>(null);
@@ -458,7 +458,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     }
 
     return cloned;
-  }, [candles, bars, rawLiveSpot, liveTickPrice, liveTickCount, activeSymbol]);
+  }, [candles, bars, rawLiveSpot, liveTickPrice, liveTickCount, activeSymbol, isReplayMode]);
 
   // 2. Compute Bar-by-Bar Flow VWAP & Spectral Flux Series (preferring canonical parent series)
   const pdeSeries = useMemo(() => {
@@ -490,7 +490,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         ? measuredSvgWidth
         : 980;
   const svgHeight = 440;
-  const padLeft = 18;
+  const padLeft = 24;
   const padRight = 84; // Room for right Y-axis price labels
   const padTop = 36;
   const chartBottom = 265;
@@ -502,8 +502,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const histHalfH = (histBottom - histTop) / 2;
 
   const fullPlotW = svgWidth - padLeft - padRight;
-  const clampedDivider = Math.max(0.4, Math.min(1, dividerRatio));
-  const plotW = fullPlotW * clampedDivider;
+  const clampedDivider = Math.max(0.35, Math.min(1, dividerRatio));
+  const dividerX = Math.round(padLeft + fullPlotW * clampedDivider);
+  const plotW = dividerX - padLeft;
   const plotH = chartBottom - padTop;
 
   const axisStartMins = startHour === 0 ? 0 : startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
@@ -800,7 +801,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         impulsePeclet: pt.impulsePe,
         impulseChi: pt.impulseChi,
         deltaNetFlux6Bar: pt.deltaNetFlux6Bar,
-        netGex: typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
+        netGex: !isReplayMode && typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
         flowVwap: pt.flowVwap,
         prevFlowVwap: prevPt?.flowVwap,
         sigmaMinus1: pt.lower1Sigma,
@@ -820,19 +821,19 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     const wallPts = rthPts.length > 0 ? rthPts : enrichedPoints;
     const sessionLow = wallPts.length > 0 ? Math.min(...wallPts.map((p) => p.low)) : 0;
     const sessionHigh = wallPts.length > 0 ? Math.max(...wallPts.map((p) => p.high)) : 0;
-    const resolvedPutWall = (gammaLevels?.putWall && gammaLevels.putWall > 0)
+    const resolvedPutWall = (!isReplayMode && gammaLevels?.putWall && gammaLevels.putWall > 0)
       ? gammaLevels.putWall
       : (sessionLow > 0 ? Math.floor(sessionLow) : 0);
-    const resolvedCallWall = (gammaLevels?.callWall && gammaLevels.callWall > 0)
+    const resolvedCallWall = (!isReplayMode && gammaLevels?.callWall && gammaLevels.callWall > 0)
       ? gammaLevels.callWall
       : (sessionHigh > 0 ? Math.round((sessionLow + sessionHigh) / 2 + 1.5) : 0);
     const bookCenter = Number(((resolvedCallWall + resolvedPutWall) / 2).toFixed(2));
     const { snapshot } = fsm.commitSeries(bars, {
       macroRegime: activeRegime,
       callDominancePct: activeChiPct,
-      netGex: typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
+      netGex: !isReplayMode && typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
       structuralLevels: {
-        zeroGamma: gammaLevels?.zeroGamma || Number((sessionHigh + 2.5).toFixed(1)),
+        zeroGamma: (!isReplayMode && gammaLevels?.zeroGamma) || Number((sessionHigh + 2.5).toFixed(1)),
         callWall: resolvedCallWall,
         putWall: resolvedPutWall,
         bookCenter,
@@ -931,7 +932,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
     signals.sort((a, b) => a.barIndex - b.barIndex);
     return { signals, committedState: snapshot.committedState };
-  }, [enrichedPoints, activeRegime, activeChiPct, gammaLevels?.zeroGamma, gammaLevels?.callWall, gammaLevels?.putWall, netMetrics?.netGex]);
+  }, [enrichedPoints, activeRegime, activeChiPct, isReplayMode, gammaLevels?.zeroGamma, gammaLevels?.callWall, gammaLevels?.putWall, netMetrics?.netGex]);
 
   const { signals: intrinsicSignals, committedState: fsmCommittedState } = fsmEvaluation;
 
@@ -1131,7 +1132,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         zeroGamma: typeof gammaLevels?.zeroGamma === "number" && gammaLevels.zeroGamma > 0 ? gammaLevels.zeroGamma : undefined,
       }),
     }).catch(() => {});
-  }, [activeSymbol, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, latestPt?.impulseChi, gammaLevels?.zeroGamma]);
+  }, [isReplayMode, activeSymbol, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, latestPt?.impulseChi, gammaLevels?.zeroGamma]);
 
   const invalidateSvgCtm = useCallback(() => {
     cachedInverseCtmRef.current = null;
@@ -1258,6 +1259,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   };
 
   const handleWheel = (e: React.WheelEvent<SVGSVGElement>) => {
+    if (!e.ctrlKey && !e.metaKey && !e.altKey) return;
     e.preventDefault();
     const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
     if (e.shiftKey) {
@@ -1280,6 +1282,18 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     setYPanOffset(0);
     setHoverIndex(null);
   };
+
+  // De-conflicted right Y-axis badge centers (>= 25px center separation for Spot & Flow VWAP pills)
+  const spotBadgeCenterY = Math.max(padTop + 10, Math.min(chartBottom - 10, yForPrice(priceDomain.current)));
+  const rawVwapBadgeY = latestPt ? Math.max(padTop + 9, Math.min(chartBottom - 9, yForPrice(latestPt.flowVwap))) : null;
+  const vwapBadgeCenterY =
+    rawVwapBadgeY === null
+      ? null
+      : Math.abs(rawVwapBadgeY - spotBadgeCenterY) < 25
+        ? (rawVwapBadgeY >= spotBadgeCenterY
+            ? Math.min(chartBottom - 9, spotBadgeCenterY + 25)
+            : Math.max(padTop + 9, spotBadgeCenterY - 25))
+        : rawVwapBadgeY;
 
   return (
     <div
@@ -1368,16 +1382,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         {/* Dynamic Scale & Time Scope Toolbar */}
         <div className="flex items-center gap-2 font-mono text-xs">
           <button
-            onClick={() => {
-              if (onXViewportChange) {
-                onXViewportChange(1.0, 0);
-              } else {
-                setInternalXScale(1.0);
-                setInternalXPanOffset(0);
-              }
-              setYScale(1.0);
-              setYPanOffset(0);
-            }}
+            onClick={() => handleReset()}
             title="Auto-fit all candles in session"
             className="px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition cursor-pointer text-[11px]"
           >
@@ -1387,7 +1392,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             onClick={() => {
               const rthOpenSlot = Math.max(0, (570 - axisStartMins) / 5);
               const paddedRthSlots = 82;
-              const nextScale = totalSessionSlots / paddedRthSlots;
+              const nextScale = Math.min(4.0, totalSessionSlots / paddedRthSlots);
               const nextStepX = (plotW / Math.max(1, totalSessionSlots)) * nextScale;
               const nextPan = 2 * nextStepX - rthOpenSlot * nextStepX;
               if (onXViewportChange) {
@@ -1411,7 +1416,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                   ? enrichedPoints[enrichedPoints.length - 1].etMins
                   : RTH_CLOSE_MINS;
               const windowSpan = 150;
-              const nextScale = axisSpanMins / windowSpan;
+              const nextScale = Math.min(4.0, axisSpanMins / windowSpan);
               const startFocus = Math.max(axisStartMins, Math.min(axisEndMins - windowSpan, latestMins - 135));
               const nextPan = -(((startFocus - axisStartMins) / axisSpanMins) * plotW * nextScale);
               if (onXViewportChange) {
@@ -1520,42 +1525,51 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           </defs>
 
           {/* Horizontal Price Grid Lines & Right Y-Axis Numerical Labels (unclipped so right-axis labels remain visible) */}
-          {priceTicks.map((pt, idx) => {
-          const vwapVal = (enrichedPoints.length > 0 ? (enrichedPoints[enrichedPoints.length - 1].flowVwap ?? 0) : 0);
-          const hideTickLabel = Math.abs(pt.y - yForPrice(activeSpotPrice)) < 16 || (vwapVal > 0 && Math.abs(pt.y - yForPrice(vwapVal)) < 16);
-          return (
-          <g key={`price-tick-${idx}`}>
-              <line
-                x1={padLeft}
-                y1={pt.y}
-                x2={svgWidth - padRight}
-                y2={pt.y}
-                stroke="#172033"
-                strokeWidth="1"
-                strokeDasharray="4 6"
-              />
-              {!hideTickLabel && <text
-                x={svgWidth - padRight + 8}
-                y={pt.y + 4}
-                fill="rgba(255, 255, 255, 0.45)"
-                fontSize="11"
-                fontFamily="monospace"
-              >
-                ${pt.label}
-              </text>}
-          </g>
-          );
-        })}
+          {(() => {
+            let lastTickY = -999;
+            return priceTicks.map((pt, idx) => {
+              const nearSpot = Math.abs(pt.y - spotBadgeCenterY) < 25;
+              const nearVwap = vwapBadgeCenterY !== null && Math.abs(pt.y - vwapBadgeCenterY) < 24;
+              const nearPrev = Math.abs(pt.y - lastTickY) < 15;
+              const hideTickLabel = nearSpot || nearVwap || nearPrev;
+              if (!hideTickLabel) lastTickY = pt.y;
+              return (
+                <g key={`price-tick-${idx}`}>
+                  <line
+                    x1={padLeft}
+                    y1={pt.y}
+                    x2={svgWidth - padRight}
+                    y2={pt.y}
+                    stroke="#172033"
+                    strokeWidth="1"
+                    strokeDasharray="4 6"
+                  />
+                  {!hideTickLabel && (
+                    <text
+                      x={svgWidth - padRight + 8}
+                      y={pt.y + 4}
+                      fill="rgba(255, 255, 255, 0.45)"
+                      fontSize="11"
+                      fontFamily="monospace"
+                    >
+                      ${pt.label}
+                    </text>
+                  )}
+                </g>
+              );
+            });
+          })()}
 
           {/* Vertical Time Axis Milestone Labels (unclipped at bottom edge, hidden outside plot corridor) */}
           {timeTicks.map((t, idx) => {
             if (t.x < padLeft - 4 || t.x > padLeft + plotW + 4) return null;
+            const anchor = t.x < padLeft + 22 ? "start" : t.x > padLeft + plotW - 22 ? "end" : "middle";
             return (
               <text
                 key={`time-label-${idx}`}
                 x={t.x}
                 y={svgHeight - 12}
-                textAnchor="middle"
+                textAnchor={anchor}
                 fill={t.isRthOpen ? "#2dd4bf" : "rgba(255, 255, 255, 0.45)"}
                 fontSize="10"
                 fontFamily="monospace"
@@ -1884,16 +1898,16 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           </g>
 
           {/* Right Y-Axis Live Spot Badge */}
-          <g transform={`translate(${svgWidth - padRight + 4}, ${yForPrice(priceDomain.current) - 10})`}>
+          <g transform={`translate(${svgWidth - padRight + 4}, ${spotBadgeCenterY - 10})`}>
             <rect width="72" height="20" rx="4" fill="#00F5D4" fillOpacity="0.18" stroke="#00F5D4" strokeWidth="1.2" />
             <text x="36" y="14" textAnchor="middle" fill="#00F5D4" fontSize="11" fontFamily="monospace" fontWeight="bold">
               ${priceDomain.current.toFixed(2)}
             </text>
           </g>
 
-          {/* Right Y-Axis Flow VWAP Badge */}
-          {latestPt && (
-            <g transform={`translate(${svgWidth - padRight + 4}, ${yForPrice(latestPt.flowVwap) - 10})`}>
+          {/* Right Y-Axis Flow VWAP Badge (De-conflicted from Spot Badge) */}
+          {latestPt && vwapBadgeCenterY !== null && (
+            <g transform={`translate(${svgWidth - padRight + 4}, ${vwapBadgeCenterY - 9})`}>
               <rect width="72" height="18" rx="3" fill="#f59e0b" fillOpacity="0.15" stroke="#f59e0b" strokeWidth="1" />
               <text x="36" y="13" textAnchor="middle" fill="#f59e0b" fontSize="10" fontFamily="monospace" fontWeight="bold">
                 ${latestPt.flowVwap.toFixed(2)}
