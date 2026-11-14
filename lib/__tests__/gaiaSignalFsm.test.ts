@@ -435,4 +435,85 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
     });
     assert.strictEqual(microReversalExits.length, 0, "Zero <2-bar or <$0.75 reversal micro-scalps permitted");
   });
+
+  it("Two-Regime Leg 2: Winning morning SHORT does not lock day; >= 30m cooldown + Put Wall / -1σ Bullish Reclaim opens LONG, then LOCKED_FOR_DAY at 2 closed trades", () => {
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [
+      // Bar 0 (09:35 ET, 575): Opening Short Flush off Zero Gamma 758 -> entry ~756.0
+      { barTimestamp: 1000, open: 757.2, high: 757.5, low: 755.8, close: 756.0, chi: 0.25, bias: -0.45, netFlux: -0.35, peclet: -2.2, flowVwap: 756.8, sma34: 757.0, etMins: 575, isClosed: true },
+      // Bar 1 (09:40 ET, 580)
+      { barTimestamp: 1300, open: 756.0, high: 756.1, low: 753.0, close: 753.2, chi: 0.20, bias: -0.50, netFlux: -0.40, peclet: -2.5, flowVwap: 755.5, sma34: 756.2, etMins: 580, isClosed: true },
+      // Bar 2 (09:50 ET, 590): Holds then sweeps Put Wall 750 -> big winning SHORT (> +0.5% spot = +100%+ option profit)
+      { barTimestamp: 1900, open: 753.2, high: 753.3, low: 750.1, close: 750.4, chi: 0.22, bias: -0.45, netFlux: -0.32, peclet: -2.0, flowVwap: 754.0, sma34: 754.5, etMins: 590, isClosed: true },
+      // Bar 3 (10:15 ET, 615): Reversal >= $0.75 closes Leg-1 winning SHORT at 751.80
+      { barTimestamp: 3400, open: 750.5, high: 752.0, low: 750.4, close: 751.8, chi: 0.56, bias: 0.15, netFlux: 0.10, peclet: 0.4, flowVwap: 751.5, sma34: 751.6, etMins: 615, isClosed: true },
+      // Bar 4 (10:35 ET, 635 -> +1200s < 1800s cooldown, < 10:45 ET): Attempted reclaim must stay STAND_ASIDE
+      { barTimestamp: 4600, open: 750.2, high: 751.4, low: 749.9, close: 751.2, recentLow4: 749.9, chi: 0.58, impulseChi: 0.68, deltaNetFlux6Bar: 0.18, bias: 0.30, netFlux: 0.22, peclet: 0.8, impulsePeclet: 1.5, flowVwap: 751.0, sma34: 751.1, bullDiv5m: true, etMins: 635, isClosed: true },
+      // Bar 5 (11:30 ET, 690 -> +3600s >= 1800s cooldown, >= 10:45 ET): Put Wall 750 / -1σ Bullish Reclaim with impulseChi=0.68 & deltaNetFlux6Bar > 0 opens Leg-2 LONG
+      { barTimestamp: 7000, open: 750.3, high: 751.9, low: 750.1, close: 751.7, recentLow4: 750.1, chi: 0.59, impulseChi: 0.68, deltaNetFlux6Bar: 0.20, bias: 0.35, netFlux: 0.25, peclet: 1.0, impulsePeclet: 1.6, flowVwap: 751.2, sma34: 751.4, sigmaMinus1: 750.2, sigmaPlus1: 754.0, bullDiv5m: true, etMins: 690, isClosed: true },
+      // Bar 6 (13:00 ET, 780): Reaches Call Wall / King reversal and closes Leg-2 LONG -> LOCKED_FOR_DAY (2 closed)
+      { barTimestamp: 12400, open: 754.2, high: 754.5, low: 750.5, close: 750.7, chi: 0.32, bias: -0.35, netFlux: -0.25, peclet: -1.8, flowVwap: 753.0, sma34: 752.8, etMins: 780, isClosed: true },
+      // Bar 7 (13:45 ET, 825): Third entry attempt strictly blocked by LOCKED_FOR_DAY
+      { barTimestamp: 15100, open: 750.7, high: 753.0, low: 750.1, close: 752.8, recentLow4: 750.1, chi: 0.85, impulseChi: 0.82, deltaNetFlux6Bar: 0.30, bias: 0.45, netFlux: 0.35, peclet: 2.2, impulsePeclet: 2.0, flowVwap: 751.5, sma34: 751.8, bullDiv5m: true, etMins: 825, isClosed: true },
+    ];
+
+    const { snapshot, newlyCommitted } = fsm.commitSeries(bars, {
+      macroRegime: "PUT",
+      callDominancePct: 35,
+      structuralLevels: { putWall: 750, callWall: 760, zeroGamma: 758, bookCenter: 755 },
+    });
+
+    const entries = newlyCommitted.filter((s) => s.toState === "LONG" || s.toState === "SHORT");
+    const exits = newlyCommitted.filter((s) => s.toState === "STAND_ASIDE");
+    assert.strictEqual(entries.length, 2, `Expected exactly 2 entries (Leg-1 SHORT + Leg-2 LONG), got ${entries.length}`);
+    assert.strictEqual(entries[0].toState, "SHORT");
+    assert.strictEqual(entries[1].toState, "LONG");
+    assert.strictEqual(entries[1].barTimestamp, 7000, "Leg-2 LONG must wait until >= 10:45 ET & >= 1800s cooldown");
+    assert.ok(entries[1].reason.startsWith("LEG2_"), `Expected LEG2_ reason prefix, got ${entries[1].reason}`);
+    assert.strictEqual(exits.length, 2, "Both Leg-1 and Leg-2 must close cleanly");
+    assert.strictEqual(snapshot.committedState, "STAND_ASIDE", "Session ends FLAT / LOCKED_FOR_DAY after 2 closed trades");
+  });
+
+  it("Symmetric Leg-2 SHORT: Winning morning LONG allows afternoon Call Wall / +1σ Bearish Rejection", () => {
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [
+      // Bar 0 (09:35 ET, 575): Opening LONG above Zero Gamma 756
+      { barTimestamp: 1000, open: 757.0, high: 759.0, low: 756.8, close: 758.5, chi: 0.84, bias: 0.42, netFlux: 0.32, peclet: 2.2, flowVwap: 757.2, sma34: 757.0, etMins: 575, isClosed: true },
+      // Bar 1 (10:15 ET, 615): Reaches Call Wall 762 & reverses >= $0.75 to close winning LONG
+      { barTimestamp: 3400, open: 761.8, high: 762.1, low: 759.8, close: 760.0, recentHigh3: 762.1, chi: 0.38, bias: -0.25, netFlux: -0.18, peclet: -1.1, flowVwap: 760.5, sma34: 760.8, etMins: 615, isClosed: true },
+      // Bar 2 (11:30 ET, 690 -> +3600s >= 1800s cooldown): Tests Call Wall 762 / +1σ with bearDiv5m, impulseChi <= 0.40, deltaNetFlux6Bar < 0, room >= $1.50 to ZG 756 / PW 750
+      { barTimestamp: 7000, open: 761.9, high: 762.0, low: 760.2, close: 760.4, recentHigh3: 762.0, chi: 0.41, impulseChi: 0.32, deltaNetFlux6Bar: -0.22, bias: -0.35, netFlux: -0.24, peclet: -0.9, impulsePeclet: -1.6, flowVwap: 760.9, sma34: 761.0, sigmaPlus1: 761.8, sigmaMinus1: 758.0, bearDiv5m: true, etMins: 690, isClosed: true },
+    ];
+
+    const { newlyCommitted } = fsm.commitSeries(bars, {
+      macroRegime: "CALL",
+      callDominancePct: 60,
+      structuralLevels: { putWall: 750, callWall: 762, zeroGamma: 756, bookCenter: 756 },
+    });
+
+    const entries = newlyCommitted.filter((s) => s.toState === "LONG" || s.toState === "SHORT");
+    assert.strictEqual(entries.length, 2, `Expected 2 entries (Leg-1 LONG + Leg-2 SHORT), got ${entries.length}`);
+    assert.strictEqual(entries[0].toState, "LONG");
+    assert.strictEqual(entries[1].toState, "SHORT");
+    assert.strictEqual(entries[1].reason, "LEG2_CALL_WALL_BEAR_REJECTION_PUT");
+  });
+
+  it("Positive-Gamma Regime (netGex > 0, spot > Zero Γ, |Pe| < 1.5) prioritizes Wall-to-Wall sweep bounce", () => {
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [
+      // Morning positive-gamma sweep to Put Wall 752 / -1σ 752.4 with bullDiv5m and reclaim of Flow VWAP / SMA 34 -> LONG to Book Center
+      { barTimestamp: 1000, open: 752.2, high: 753.6, low: 751.9, close: 753.4, recentLow4: 751.9, chi: 0.49, impulseChi: 0.54, bias: 0.12, netFlux: 0.08, peclet: 0.6, netGex: 1_800_000, flowVwap: 753.1, sma34: 753.0, sigmaMinus1: 752.4, sigmaPlus1: 756.5, bullDiv5m: true, etMins: 585, isClosed: true },
+    ];
+
+    const { newlyCommitted } = fsm.commitSeries(bars, {
+      macroRegime: "CALL",
+      callDominancePct: 50,
+      netGex: 1_800_000,
+      structuralLevels: { putWall: 752, callWall: 758, zeroGamma: 750, bookCenter: 755 },
+    });
+
+    assert.strictEqual(newlyCommitted.length, 1);
+    assert.strictEqual(newlyCommitted[0].toState, "LONG");
+    assert.strictEqual(newlyCommitted[0].reason, "POSITIVE_GAMMA_PUT_WALL_BOUNCE_CALL");
+  });
 });

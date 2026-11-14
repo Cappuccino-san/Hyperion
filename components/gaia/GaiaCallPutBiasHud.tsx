@@ -84,8 +84,13 @@ interface EnrichedPoint {
   close: number;
   flowVwap: number;
   sigma: number;
+  upper1Sigma: number;
+  lower1Sigma: number;
   chi: number;
   pe: number;
+  impulseChi: number;
+  impulsePe: number;
+  deltaNetFlux6Bar: number;
   netFlux: number;
   bias: number; // in [-1, +1]
   regime: "CALL" | "PUT";
@@ -265,6 +270,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const liveTickPrice = useDashboardStore((s) => s.liveTickPrice);
   const liveTickCount = useDashboardStore((s) => s.liveTickCount);
   const gammaLevels = useDashboardStore((s) => s.gammaLevels);
+  const netMetrics = useDashboardStore((s) => s.netMetrics);
   const rawLiveSpot = typeof liveSpot === "number" && liveSpot > 0 ? liveSpot : typeof spot === "number" && spot > 0 ? spot : null;
 
   const [internalServerTrades, setInternalServerTrades] = useState<ServerTradeData>(
@@ -478,10 +484,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
   // Dimensions & Coordinates (1:1 CSS Pixel & Left-Anchored Time Domain Parity with GaiaView)
   const svgWidth =
-    measuredSvgWidth > 200
-      ? measuredSvgWidth
-      : containerWidthPx && containerWidthPx > 200
-        ? containerWidthPx
+    containerWidthPx && containerWidthPx > 200
+      ? containerWidthPx
+      : measuredSvgWidth > 200
+        ? measuredSvgWidth
         : 980;
   const svgHeight = 440;
   const padLeft = 18;
@@ -625,9 +631,14 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       const snap: FlowGammaVwapSnapshot | undefined = pdeSeries[i];
       const chi = typeof snap?.ceilingShareChi === "number" && Number.isFinite(snap.ceilingShareChi) ? snap.ceilingShareChi : 0.5;
       const pe = typeof snap?.pecletNumber === "number" && Number.isFinite(snap.pecletNumber) ? snap.pecletNumber : 0.0;
+      const impulseChi = typeof snap?.impulseChi === "number" && Number.isFinite(snap.impulseChi) ? snap.impulseChi : chi;
+      const impulsePe = typeof snap?.impulsePeclet === "number" && Number.isFinite(snap.impulsePeclet) ? snap.impulsePeclet : pe;
+      const deltaNetFlux6Bar = typeof snap?.deltaNetFlux6Bar === "number" && Number.isFinite(snap.deltaNetFlux6Bar) ? snap.deltaNetFlux6Bar : 0.0;
       const netFlux = typeof snap?.netFluxJ === "number" && Number.isFinite(snap.netFluxJ) ? snap.netFluxJ : 0.0;
       const fvwap = typeof snap?.flowVwap === "number" && Number.isFinite(snap.flowVwap) ? snap.flowVwap : c.close;
       const sigma = typeof snap?.sigma === "number" && Number.isFinite(snap.sigma) ? snap.sigma : Math.max(c.close * 0.0015, 0.35);
+      const upper1Sigma = typeof snap?.upper1Sigma === "number" && Number.isFinite(snap.upper1Sigma) ? snap.upper1Sigma : fvwap + sigma;
+      const lower1Sigma = typeof snap?.lower1Sigma === "number" && Number.isFinite(snap.lower1Sigma) ? snap.lower1Sigma : fvwap - sigma;
 
       const bias = Math.max(-1, Math.min(1, Math.tanh(1.8 * (2 * chi - 1) + 0.35 * pe + 0.015 * netFlux)));
       const regime: "CALL" | "PUT" = bias >= 0 ? "CALL" : "PUT";
@@ -644,8 +655,13 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         close: c.close,
         flowVwap: fvwap,
         sigma,
+        upper1Sigma,
+        lower1Sigma,
         chi,
         pe,
+        impulseChi,
+        impulsePe,
+        deltaNetFlux6Bar,
         netFlux,
         bias,
         regime,
@@ -763,9 +779,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       const slice34 = enrichedPoints.slice(Math.max(0, i - 33), i + 1);
       const sma34 = slice34.reduce((acc, p) => acc + p.close, 0) / Math.max(1, slice34.length);
       const recentHigh3 = Math.max(...enrichedPoints.slice(Math.max(0, i - 3), i + 1).map((p) => p.high));
+      const recentHigh4 = Math.max(...enrichedPoints.slice(Math.max(0, i - 4), i + 1).map((p) => p.high));
       const recentLow4 = Math.min(...enrichedPoints.slice(Math.max(0, i - 4), i + 1).map((p) => p.low));
       const fluxLowerExtremity = (pt.flowVwap ?? pt.close) - 1.25 * (pt.sigma ?? 1.0);
+      const fluxUpperExtremity = (pt.flowVwap ?? pt.close) + 1.25 * (pt.sigma ?? 1.0);
       const bullDiv5m = recentLow4 <= fluxLowerExtremity && pt.close > pt.open && (prevPt ? pt.close > prevPt.close : false);
+      const bearDiv5m = recentHigh4 >= fluxUpperExtremity && pt.close < pt.open && (prevPt ? pt.close < prevPt.close : false);
       return {
         barTimestamp: tsSec,
         open: pt.open,
@@ -778,13 +797,20 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         netFlux: pt.netFlux,
         prevNetFlux: prevPt?.netFlux,
         peclet: pt.pe,
+        impulsePeclet: pt.impulsePe,
+        impulseChi: pt.impulseChi,
+        deltaNetFlux6Bar: pt.deltaNetFlux6Bar,
+        netGex: typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
         flowVwap: pt.flowVwap,
         prevFlowVwap: prevPt?.flowVwap,
+        sigmaMinus1: pt.lower1Sigma,
+        sigmaPlus1: pt.upper1Sigma,
         vwapSlope,
         sma34,
         recentHigh3,
         recentLow4,
         bullDiv5m,
+        bearDiv5m,
         etMins: pt.etMins,
         isClosed: i < enrichedPoints.length - 1,
       };
@@ -804,6 +830,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     const { snapshot } = fsm.commitSeries(bars, {
       macroRegime: activeRegime,
       callDominancePct: activeChiPct,
+      netGex: typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
       structuralLevels: {
         zeroGamma: gammaLevels?.zeroGamma || Number((sessionHigh + 2.5).toFixed(1)),
         callWall: resolvedCallWall,
@@ -904,7 +931,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
     signals.sort((a, b) => a.barIndex - b.barIndex);
     return { signals, committedState: snapshot.committedState };
-  }, [enrichedPoints, activeRegime, activeChiPct]);
+  }, [enrichedPoints, activeRegime, activeChiPct, gammaLevels?.zeroGamma, gammaLevels?.callWall, gammaLevels?.putWall, netMetrics?.netGex]);
 
   const { signals: intrinsicSignals, committedState: fsmCommittedState } = fsmEvaluation;
 
@@ -1100,10 +1127,11 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         activeFsmState: fsmCommittedState,
         macroRegime: activeRegime,
         chiPct: activeChiPct,
+        impulseChi: latestPt?.impulseChi,
         zeroGamma: typeof gammaLevels?.zeroGamma === "number" && gammaLevels.zeroGamma > 0 ? gammaLevels.zeroGamma : undefined,
       }),
     }).catch(() => {});
-  }, [activeSymbol, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, gammaLevels?.zeroGamma]);
+  }, [activeSymbol, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, latestPt?.impulseChi, gammaLevels?.zeroGamma]);
 
   const invalidateSvgCtm = useCallback(() => {
     cachedInverseCtmRef.current = null;

@@ -79,6 +79,7 @@ export interface FlowGammaVwapSnapshot {
   deltaChi6Bar?: number;      // chi[i] - chi[i-6]
   deltaImpulseChi6Bar?: number; // impulseChi[i] - impulseChi[i-6]
   deltaNetFlux6Bar?: number;  // netFluxJ[i] - netFluxJ[i-6]
+  gammaRegime?: "POSITIVE_GAMMA" | "NEGATIVE_GAMMA";
   fluxAlpha?: number;         // A(T) cumulative integrated ceiling flux
   fluxRegime?: FluxRegime;
   bandSignal?: FlowBandSignal;
@@ -568,6 +569,8 @@ export class FlowGammaVwapEngine {
 export interface StructuralFlowNodes {
   floorNode?: number;   // Put Wall / p_F
   ceilingNode?: number; // Call Wall / p_C
+  zeroGamma?: number;   // Dealer Zero-Gamma flip level
+  netGex?: number;      // Signed Net GEX ($M)
 }
 
 /**
@@ -855,7 +858,42 @@ export function computeBarFlowGammaVwapSeries(
       0.35 * ((c.close - candles[lb2].close) / atrEst)
     );
 
-    const combinedDrive = 0.45 * macroDrive + 0.35 * vwapDrive + 0.20 * impulseDrive;
+    // Dynamic Impulse Reweighting: when a post-10:45 ET 6-bar impulse reversal opposes the
+    // morning macro drift near a structural wall / +-1sigma band, shift advection weight
+    // toward impulseDrive so ceilingShareChi responds to institutional short-covering/distribution.
+    const isAfternoonImpulseReversal =
+      typeof etMins === "number" &&
+      etMins >= 645 &&
+      Math.abs(impulseDrive) >= 0.35 &&
+      Math.sign(impulseDrive) !== 0 &&
+      Math.sign(impulseDrive) !== Math.sign(macroDrive);
+    const nearBoundaryOrBand =
+      Math.abs(c.close - floorNode) / Math.max(1, c.close) <= 0.005 ||
+      Math.abs(ceilingNode - c.close) / Math.max(1, c.close) <= 0.005 ||
+      Math.abs(c.close - currentVwap) >= 0.8 * atrEst;
+    const combinedDrive =
+      isAfternoonImpulseReversal && nearBoundaryOrBand
+        ? 0.20 * macroDrive + 0.35 * vwapDrive + 0.45 * impulseDrive
+        : 0.45 * macroDrive + 0.35 * vwapDrive + 0.20 * impulseDrive;
+
+    const netSignedBookGex = strikeGammaWeights.reduce(
+      (acc, s) => acc + s.weight * s.signedBias,
+      0
+    );
+    const resolvedNetGex =
+      typeof structuralNodes?.netGex === "number"
+        ? structuralNodes.netGex
+        : strikeGammaWeights.length > 0
+          ? netSignedBookGex
+          : 0;
+    const resolvedZeroGamma =
+      structuralNodes?.zeroGamma && structuralNodes.zeroGamma > 0
+        ? structuralNodes.zeroGamma
+        : currentVwap;
+    const gammaRegime: "POSITIVE_GAMMA" | "NEGATIVE_GAMMA" =
+      resolvedNetGex > 0 && spot > resolvedZeroGamma
+        ? "POSITIVE_GAMMA"
+        : "NEGATIVE_GAMMA";
     const muDelta = Math.max(-8.0, Math.min(8.0, combinedDrive * 2.8));
     const sigmaC = Math.max(0.1, Math.log1p(barWeight) * 0.25);
     const safeGammaImp = Math.max(1e-4, gammaDiff);
@@ -940,6 +978,7 @@ export function computeBarFlowGammaVwapSeries(
       deltaNetFlux6Bar: barsIntoSession >= 6 && results[i - 6]?.netFluxJ !== undefined
         ? Number((pdeState.netFluxJ - results[i - 6].netFluxJ!).toFixed(2))
         : 0,
+      gammaRegime,
       fluxAlpha: pdeState.fluxAlpha,
       fluxRegime: pdeState.fluxRegime,
       bandSignal,

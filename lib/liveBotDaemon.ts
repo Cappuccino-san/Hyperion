@@ -172,10 +172,9 @@ export async function runLiveBotTick(): Promise<void> {
           return;
         }
 
-        // 2. Hard daily ceiling: max 2 closed trades/day (1 primary + 1 gated opposite-regime Phase-2)
+        // 2. Hard daily ceiling: max 2 closed trades/day (1 primary + 1 gated opposite-direction Leg-2)
         const closedLen = store.closedPositions?.length ?? 0;
-        const isPhase1Winner = closedLen === 1 && (store.closedPositions[0]?.pnlOptionPct ?? 0) > 12;
-        if (closedLen >= 2 || isPhase1Winner) {
+        if (closedLen >= 2) {
           botState.lastStatus = "LOCKED_FOR_DAY";
           return;
         }

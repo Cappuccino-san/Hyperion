@@ -1104,6 +1104,171 @@ async function runTestSuite() {
     assert(allQqqTrades.length <= 2, `78-bar RTH session total trades <= 2 (got ${allQqqTrades.length})`);
     assert(callCount10D <= 1 && putCount10D <= 1, `78-bar RTH session <= 1 same-direction trade (CALL=${callCount10D}, PUT=${putCount10D})`);
     assert(microReversalScalps10D.length === 0, `78-bar RTH session zero <10% reversal micro-scalps (got ${microReversalScalps10D.length})`);
+
+    // Enforce >= 30m cooldown and >= 10m hold on any reversal exit across the 78-bar session
+    const sortedQqq = [...allQqqTrades].sort((a, b) => (a.openedTs ?? 0) - (b.openedTs ?? 0));
+    if (sortedQqq.length === 2 && sortedQqq[0].closedTs && sortedQqq[1].openedTs) {
+      assert(
+        sortedQqq[1].openedTs - sortedQqq[0].closedTs >= 1800,
+        `78-bar RTH session Leg-2 cooldown >= 1800s (got ${sortedQqq[1].openedTs - sortedQqq[0].closedTs}s)`
+      );
+    }
+    for (const qt of finalStore10D.closedPositions.filter((p) => p.ticker === "QQQ")) {
+      if ((qt.exitReason || "").includes("REVERSAL") && qt.closedTs && qt.openedTs) {
+        assert(
+          qt.closedTs - qt.openedTs >= 600,
+          `78-bar RTH session reversal exit held >= 10m (600s) (got ${qt.closedTs - qt.openedTs}s)`
+        );
+      }
+    }
+
+    // 10D-TwoRegime: Verify winning Leg 1 (+35% > 12%) allows gated opposite-direction Leg 2 (>= 30m cooldown, Put Wall / -1σ Bullish Reclaim), while blocking < 30m & 3rd trade
+    const leg1ExitTs = rthStartEpoch + 3600; // 10:30 AM ET
+    saveTradeStore({
+      date: sessionDate10D,
+      activePositions: {},
+      closedPositions: [
+        {
+          id: "qqq-leg1-win",
+          ticker: "QQQ",
+          contractType: "PUT",
+          contractLabel: "QQQ 20991231 498P",
+          strike: 498,
+          expiration: "2099-12-31",
+          setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
+          status: "CLOSED",
+          btoSpotPrice: 499.0,
+          btoOptionMid: 0.65,
+          contractsQty: 1,
+          remainingQty: 0,
+          totalOutlay: 65,
+          target1Spot: 497.0,
+          target2Spot: 495.0,
+          stopLossSpot: 500.0,
+          openedAt: "09:35 AM",
+          openedTs: rthStartEpoch + 300,
+          closedAt: "10:30 AM",
+          closedTs: leg1ExitTs,
+          pnlOptionPct: 35.4,
+          exitReason: "MOMENTUM REVERSAL PROFIT LOCK",
+        },
+      ],
+      alerts: [],
+      prevSpotPrices: { QQQ: 495.5 },
+    });
+
+    const leg2Chain: NormalizedOptionContract[] = [
+      { symbol: "QQQ20991231C00496000", strike: 496, expiration: "2099-12-31", optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 1200, openInterest: 3000, iv: 0.20, delta: 0.38, gamma: 0.05, vega: 0.03, percentChange: 0 },
+      { symbol: "QQQ20991231P00495000", strike: 495, expiration: "2099-12-31", optionType: "P", bid: 0.68, ask: 0.72, last: 0.70, volume: 1200, openInterest: 3000, iv: 0.20, delta: -0.35, gamma: 0.05, vega: 0.03, percentChange: 0 },
+    ];
+
+    // Before 30m cooldown (10:50 AM = +1200s): strictly blocked even with strong reclaim confluence
+    await evaluateTradeSignals({
+      ticker: "QQQ",
+      spotPrice: 495.8,
+      prevSpotPrice: 495.2,
+      callWall: 506.0,
+      putWall: 495.0,
+      zeroGamma: 500.0,
+      priorClose: 499.0,
+      premarketFlowVwap: 495.5,
+      divergence5m: "BULL",
+      contracts: leg2Chain,
+      nowEt: new Date((leg1ExitTs + 1200) * 1000),
+      latest5mCandle: {
+        open: 495.2,
+        high: 496.0,
+        low: 494.9,
+        close: 495.8,
+        sma34: 495.4,
+        flowSnapshot: {
+          timestamp: leg1ExitTs + 1200,
+          spot: 495.8,
+          flowVwap: 495.5,
+          ceilingShareChi: 0.58,
+          impulseChi: 0.68,
+          pecletNumber: 0.8,
+          impulsePeclet: 1.4,
+          netFluxJ: 0.22,
+          deltaChi6Bar: 0.12,
+          deltaImpulseChi6Bar: 0.18,
+          deltaNetFlux6Bar: 0.15,
+          upper1s: 496.8,
+          lower1s: 494.2,
+          upper2s: 498.0,
+          lower2s: 493.0,
+          upper1Sigma: 496.8,
+          lower1Sigma: 494.2,
+          upper2Sigma: 498.0,
+          lower2Sigma: 493.0,
+          sigma: 1.0,
+          variance: 1.0,
+          cumGammaWeight: 100,
+          totalWeight: 100,
+          signedGammaAcceleration: 0,
+          count: 10,
+          bandSignal: null,
+        },
+      },
+    });
+    assert(
+      !loadTradeStore().activePositions["QQQ"],
+      "10D-TwoRegime: Leg-2 must be blocked before 30m (1800s) cooldown elapses"
+    );
+
+    // At 11:15 AM (+2700s >= 1800s cooldown) after Put Wall 495 test + impulseChi >= 0.60 + deltaNetFlux6Bar > 0 + >= $1.50 room to Zero Γ 500: Leg-2 CALL enters!
+    const leg2Res = await evaluateTradeSignals({
+      ticker: "QQQ",
+      spotPrice: 495.8,
+      prevSpotPrice: 495.2,
+      callWall: 506.0,
+      putWall: 495.0,
+      zeroGamma: 500.0,
+      priorClose: 499.0,
+      premarketFlowVwap: 495.5,
+      divergence5m: "BULL",
+      contracts: leg2Chain,
+      nowEt: new Date((leg1ExitTs + 2700) * 1000),
+      latest5mCandle: {
+        open: 495.2,
+        high: 496.0,
+        low: 494.9,
+        close: 495.8,
+        sma34: 495.4,
+        flowSnapshot: {
+          timestamp: leg1ExitTs + 2700,
+          spot: 495.8,
+          flowVwap: 495.5,
+          ceilingShareChi: 0.58,
+          impulseChi: 0.68,
+          pecletNumber: 0.8,
+          impulsePeclet: 1.4,
+          netFluxJ: 0.22,
+          deltaChi6Bar: 0.12,
+          deltaImpulseChi6Bar: 0.18,
+          deltaNetFlux6Bar: 0.15,
+          upper1s: 496.8,
+          lower1s: 494.2,
+          upper2s: 498.0,
+          lower2s: 493.0,
+          upper1Sigma: 496.8,
+          lower1Sigma: 494.2,
+          upper2Sigma: 498.0,
+          lower2Sigma: 493.0,
+          sigma: 1.0,
+          variance: 1.0,
+          cumGammaWeight: 100,
+          totalWeight: 100,
+          signedGammaAcceleration: 0,
+          count: 10,
+          bandSignal: null,
+        },
+      },
+    });
+    assert(
+      leg2Res.activePosition?.contractType === "CALL",
+      `10D-TwoRegime: Winning Leg-1 PUT must permit gated opposite Leg-2 CALL after >= 30m cooldown (got ${leg2Res.activePosition?.contractType ?? "none"})`
+    );
   } finally {
     saveTradeStore(storeBackup10D);
   }

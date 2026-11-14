@@ -201,6 +201,7 @@ export interface TradeEvaluationParams {
   isHistoricalBackfill?: boolean;
   priorClose?: number;
   premarketFlowVwap?: number;
+  netGex?: number;
   signal?: AbortSignal;
 }
 
@@ -2240,19 +2241,20 @@ export async function evaluateTradeSignals(
     (p) => p.ticker === positionKey || p.ticker === normalizedTicker
   );
 
-  // Gated Single-Slot / Phase-2 Opposite-Regime State Machine:
-  // Phase 1: Max 1 trade (09:35-14:30 ET). Lock if winner (>12%) or >= 2 closed trades.
-  // Phase 2: At most 1 opposite-direction trade (10:45-14:30 ET, >=30m cooldown).
-  const phase1Closed = closedForTickerEarly[0];
-  const phase1WinnerLocked =
-    closedForTickerEarly.length === 1 && (phase1Closed?.pnlOptionPct ?? 0) > 12;
+  // Jane Street Two-Regime Single-Slot State Machine:
+  // Leg 1 (09:35-14:30 ET): Max 1 primary structural trade.
+  // Leg 2 (10:45-14:30 ET): At most 1 opposite-direction structural trade (>= 30m cooldown), regardless of Leg-1 PnL.
+  // Permanently locks LOCKED_FOR_DAY once closedForTickerEarly.length >= 2.
+  const phase1Closed = closedForTickerEarly.reduce<OptionTradePosition | undefined>(
+    (latest, cur) => (!latest || (cur.closedTs ?? 0) >= (latest.closedTs ?? 0) ? cur : latest),
+    undefined
+  );
   const phase1CooldownOk =
     closedForTickerEarly.length === 1 &&
     typeof phase1Closed?.closedTs === "number" &&
     nowTs - phase1Closed.closedTs >= 1800;
   const canTryPhase2Reclaim =
     closedForTickerEarly.length === 1 &&
-    !phase1WinnerLocked &&
     phase1CooldownOk &&
     etTime.totalMinutes >= 645 &&
     etTime.totalMinutes <= 870;
@@ -2588,22 +2590,22 @@ export async function evaluateTradeSignals(
   }
 
   // --------------------------------------------------------------------------
-  // STEP B: EVALUATE BTO ENTRY RULES (Single-Slot Automaton: 1 Trade Max Per Day)
+  // STEP B: EVALUATE BTO ENTRY RULES (Two-Regime Single-Slot Automaton: <= 2/day, <= 1/dir)
   // --------------------------------------------------------------------------
   const positionTickerForCheck = normalizedTicker === "SPXW" || normalizedTicker === "SPX" ? "SPY" : normalizedTicker;
   const sameTickerClosed = store.closedPositions.filter(
     (p) => p.ticker === positionTickerForCheck || p.ticker === normalizedTicker
   );
-  const lastClosed = sameTickerClosed[0];
-  const isPhase1WinnerLocked =
-    sameTickerClosed.length === 1 && (lastClosed?.pnlOptionPct ?? 0) > 12;
+  const lastClosed = sameTickerClosed.reduce<OptionTradePosition | undefined>(
+    (latest, cur) => (!latest || (cur.closedTs ?? 0) >= (latest.closedTs ?? 0) ? cur : latest),
+    undefined
+  );
   const isPhase2CooldownMet =
     sameTickerClosed.length === 1 &&
     typeof lastClosed?.closedTs === "number" &&
     nowTs - lastClosed.closedTs >= 1800;
   const isPhase2ReclaimWindow =
     sameTickerClosed.length === 1 &&
-    !isPhase1WinnerLocked &&
     isPhase2CooldownMet &&
     etTime.totalMinutes >= 645 &&
     etTime.totalMinutes <= 870;
@@ -2754,6 +2756,15 @@ export async function evaluateTradeSignals(
       zeroGamma > 0
         ? zeroGamma
         : Math.max(effectiveFlowVwap, effectiveSma34);
+    const resolvedNetGex =
+      typeof params.netGex === "number" && Number.isFinite(params.netGex) ? params.netGex : undefined;
+    const isPositiveGammaRegime =
+      effectiveZeroGamma > 0 &&
+      spotPrice > effectiveZeroGamma &&
+      (resolvedNetGex !== undefined
+        ? resolvedNetGex > 0
+        : flowSnap?.gammaRegime === "POSITIVE_GAMMA" ||
+          (Math.abs(currentPe) < 1.5 && currentChi >= 0.45 && currentChi <= 0.55));
 
     // --- Setup 1A: Flux Exhaustion & Late-Chase Guard ---
     const fluxSigma =
@@ -2840,8 +2851,10 @@ export async function evaluateTradeSignals(
         ? Number(((tacticalCw + tacticalPw) / 2).toFixed(2))
         : effectiveSma34;
     const recent5mLow = latest5mCandle ? Math.min(latest5mCandle.low, spotPrice) : spotPrice;
+    const recent5mHigh = latest5mCandle ? Math.max(latest5mCandle.high, spotPrice) : spotPrice;
     const testedPutWallOrKingOrFlux =
       (tacticalPw > 0 && Math.abs(recent5mLow - tacticalPw) / tacticalPw <= 0.0035) ||
+      (flowSnap && flowSnap.lower1Sigma > 0 && Math.abs(recent5mLow - flowSnap.lower1Sigma) / flowSnap.lower1Sigma <= 0.0035) ||
       (activeKingNode > 0 && recent5mLow <= activeKingNode && spotPrice >= activeKingNode) ||
       (effectiveFlowVwap > 0 && (recent5mLow - effectiveFlowVwap) / fluxSigma <= -1.20);
     const reclaimedKingOrSma =
@@ -2886,6 +2899,7 @@ export async function evaluateTradeSignals(
       if (
         !candidateBto &&
         isMiddayReclaimWindow &&
+        (!isPositiveGammaRegime || Math.abs(currentPe) >= 1.5) &&
         reclaimedZeroGammaAndVwap &&
         hasPositiveFluxImpulse &&
         hasAdequateCallRoomToWall &&
@@ -2911,13 +2925,19 @@ export async function evaluateTradeSignals(
     if (!candidateBto && flowSnap && latest5mCandle) {
       const bandSig = flowSnap.bandSignal;
 
-      // 1B. Gaia Call Regime: Flow VWAP -2σ or -1σ Wick Bounce (Bullish χ >= 50%)
+      // 1B. Gaia Call Regime: Flow VWAP -2σ or -1σ Wick Bounce / Positive-Gamma Sweep Reclaim
       if (
-        (bandSig === "LOWER_2S_BOUNCE" || (bandSig === "LOWER_1S_BOUNCE" && currentChi >= 0.52)) &&
-        currentChi >= 0.48 &&
+        (bandSig === "LOWER_2S_BOUNCE" ||
+          (bandSig === "LOWER_1S_BOUNCE" && currentChi >= 0.52) ||
+          (isPositiveGammaRegime &&
+            Math.abs(currentPe) < 1.5 &&
+            (spotPrice <= flowSnap.lower1Sigma * 1.0015 || recent5mLow <= flowSnap.lower1Sigma) &&
+            divergence5m === "BULL" &&
+            spotPrice >= effectiveFlowVwap)) &&
+        currentChi >= 0.45 &&
         hasAdequateCallRoomToWall &&
         latest5mCandle.close > latest5mCandle.open &&
-        flowSnap.flowVwap > spotPrice + 0.20
+        (flowSnap.flowVwap > spotPrice + 0.20 || (isPositiveGammaRegime && spotPrice >= flowSnap.flowVwap))
       ) {
         const floorStopRef =
           bandSig === "LOWER_2S_BOUNCE"
@@ -2939,14 +2959,20 @@ export async function evaluateTradeSignals(
           };
         }
       }
-      // 1C. Gaia Put Regime: Flow VWAP +2σ or +1σ Wick Rejection (Bearish χ <= 50%)
+      // 1C. Gaia Put Regime: Flow VWAP +2σ or +1σ Wick Rejection / Positive-Gamma Sweep Rejection
       else if (
-        (bandSig === "UPPER_2S_REJECT" || (bandSig === "UPPER_1S_REJECT" && currentChi <= 0.48)) &&
-        currentChi <= 0.52 &&
+        (bandSig === "UPPER_2S_REJECT" ||
+          (bandSig === "UPPER_1S_REJECT" && currentChi <= 0.48) ||
+          (isPositiveGammaRegime &&
+            Math.abs(currentPe) < 1.5 &&
+            (spotPrice >= flowSnap.upper1Sigma * 0.9985 || recent5mHigh >= flowSnap.upper1Sigma) &&
+            divergence5m === "BEAR" &&
+            spotPrice <= effectiveFlowVwap)) &&
+        currentChi <= 0.55 &&
         hasAdequatePutRoomToWall &&
         latest5mCandle.close < latest5mCandle.open &&
         latest5mCandle.close <= latest5mCandle.sma34 &&
-        flowSnap.flowVwap < spotPrice - 0.20
+        (flowSnap.flowVwap < spotPrice - 0.20 || (isPositiveGammaRegime && spotPrice <= flowSnap.flowVwap))
       ) {
         const ceilStopRef =
           bandSig === "UPPER_2S_REJECT"
@@ -2968,8 +2994,9 @@ export async function evaluateTradeSignals(
           };
         }
       }
-      // 1D. Gaia Flux Field Advection Breakout (High Péclet Momentum)
+      // 1D. Gaia Flux Field Advection Breakout (High Péclet Momentum; deferred in Positive Gamma low-|Pe| chop)
       else if (
+        (!isPositiveGammaRegime || Math.abs(currentPe) >= 1.5) &&
         currentChi >= 0.58 &&
         currentPe >= 0.85 &&
         currentNetFlux > 0 &&
@@ -2992,6 +3019,7 @@ export async function evaluateTradeSignals(
           };
         }
       } else if (
+        (!isPositiveGammaRegime || Math.abs(currentPe) >= 1.5) &&
         currentChi <= 0.42 &&
         currentPe <= -0.85 &&
         currentNetFlux < 0 &&
@@ -3045,6 +3073,55 @@ export async function evaluateTradeSignals(
     const impChi = typeof flowSnap?.impulseChi === "number" ? flowSnap.impulseChi : currentChi;
     const impPe = typeof flowSnap?.impulsePeclet === "number" ? flowSnap.impulsePeclet : currentPe;
     const barBody = latest5mCandle ? latest5mCandle.close - latest5mCandle.open : 0;
+    const minus1Sigma =
+      flowSnap && typeof flowSnap.lower1Sigma === "number" && flowSnap.lower1Sigma > 0 ? flowSnap.lower1Sigma : 0;
+    const plus1Sigma =
+      flowSnap && typeof flowSnap.upper1Sigma === "number" && flowSnap.upper1Sigma > 0 ? flowSnap.upper1Sigma : 0;
+    const testedPutWallOrMinus1Sigma =
+      (tacticalPw > 0 && Math.abs(recent5mLow - tacticalPw) / tacticalPw <= 0.0035) ||
+      (minus1Sigma > 0 &&
+        (Math.abs(recent5mLow - minus1Sigma) / minus1Sigma <= 0.0035 ||
+          (recent5mLow <= minus1Sigma && spotPrice >= minus1Sigma * 0.9985))) ||
+      flowSnap?.bandSignal === "LOWER_1S_BOUNCE" ||
+      flowSnap?.bandSignal === "LOWER_2S_BOUNCE";
+    const testedCallWallOrPlus1Sigma =
+      (tacticalCw > 0 && Math.abs(recent5mHigh - tacticalCw) / tacticalCw <= 0.0035) ||
+      (plus1Sigma > 0 &&
+        (Math.abs(recent5mHigh - plus1Sigma) / plus1Sigma <= 0.0035 ||
+          (recent5mHigh >= plus1Sigma && spotPrice <= plus1Sigma * 1.0015))) ||
+      flowSnap?.bandSignal === "UPPER_1S_REJECT" ||
+      flowSnap?.bandSignal === "UPPER_2S_REJECT";
+    const reclaimedSmaAndVwapOrCenter = Boolean(
+      latest5mCandle &&
+        latest5mCandle.close > latest5mCandle.open &&
+        ((spotPrice >= effectiveSma34 && spotPrice >= effectiveFlowVwap) ||
+          (tacticalBookCenter > 0 && spotPrice >= tacticalBookCenter))
+    );
+    const lostSmaAndVwapOrCenter = Boolean(
+      latest5mCandle &&
+        latest5mCandle.close < latest5mCandle.open &&
+        ((spotPrice <= effectiveSma34 && spotPrice <= effectiveFlowVwap) ||
+          (tacticalBookCenter > 0 && spotPrice <= tacticalBookCenter))
+    );
+    const leg2CallUpperCeiling = Math.max(
+      effectiveZeroGamma > spotPrice ? effectiveZeroGamma : 0,
+      tacticalCw > spotPrice ? tacticalCw : 0,
+      activeKingNode > spotPrice ? activeKingNode : 0
+    );
+    const leg2CallRoom = leg2CallUpperCeiling > spotPrice ? leg2CallUpperCeiling - spotPrice : callRoomToWall;
+    const putFloorCandidates = [effectiveZeroGamma, tacticalPw, activeKingNode].filter(
+      (v): v is number => typeof v === "number" && v > 0 && v < spotPrice
+    );
+    const leg2PutLowerTarget =
+      tacticalPw > 0 && tacticalPw < spotPrice - 1.50
+        ? tacticalPw
+        : putFloorCandidates.length > 0
+          ? Math.min(...putFloorCandidates)
+          : Number((spotPrice - Math.max(2.50, fluxSigma * 2.2)).toFixed(2));
+    const leg2PutRoom = Math.max(
+      effectiveZeroGamma > 0 && effectiveZeroGamma < spotPrice ? spotPrice - effectiveZeroGamma : 0,
+      tacticalPw > 0 && tacticalPw < spotPrice ? spotPrice - tacticalPw : 0
+    );
     const hasBullImpulseReclaim = Boolean(
       !isOpeningRange &&
       etTime.totalMinutes >= 645 &&
@@ -3052,15 +3129,54 @@ export async function evaluateTradeSignals(
       (deltaChi6 >= 0.03 || deltaImpulseChi6 >= 0.06) &&
       (deltaFlux6 > 0 || impPe >= 0.40) &&
       barBody <= 1.25 &&
+      (!isPhase2ReclaimWindow || (testedPutWallOrMinus1Sigma && deltaFlux6 > 0 && leg2CallRoom >= 1.50)) &&
       (divergence5m === "BULL" ||
         divergence30m === "BULL" ||
+        reclaimedSmaAndVwapOrCenter ||
         (latest5mCandle &&
           latest5mCandle.close > latest5mCandle.open &&
           (latest5mCandle.close >= latest5mCandle.sma34 ||
             (flowSnap && typeof flowSnap.flowVwap === "number" && latest5mCandle.close >= flowSnap.flowVwap))))
     );
+    const hasBearImpulseRejection = Boolean(
+      !isOpeningRange &&
+      etTime.totalMinutes >= 645 &&
+      impChi <= 0.40 &&
+      (deltaChi6 <= -0.03 || deltaImpulseChi6 <= -0.06) &&
+      (deltaFlux6 < 0 || impPe <= -0.40) &&
+      -barBody <= 1.25 &&
+      (!isPhase2ReclaimWindow || (testedCallWallOrPlus1Sigma && deltaFlux6 < 0 && leg2PutRoom >= 1.50)) &&
+      (divergence5m === "BEAR" ||
+        divergence30m === "BEAR" ||
+        lostSmaAndVwapOrCenter ||
+        (latest5mCandle &&
+          latest5mCandle.close < latest5mCandle.open &&
+          (latest5mCandle.close <= latest5mCandle.sma34 ||
+            (flowSnap && typeof flowSnap.flowVwap === "number" && latest5mCandle.close <= flowSnap.flowVwap))))
+    );
+    const hasPositiveGammaPutSweepBounce = Boolean(
+      !isOpeningRange &&
+      isPositiveGammaRegime &&
+      Math.abs(currentPe) < 1.5 &&
+      testedPutWallOrMinus1Sigma &&
+      divergence5m === "BULL" &&
+      spotPrice >= effectiveFlowVwap &&
+      latest5mCandle &&
+      latest5mCandle.close >= latest5mCandle.sma34
+    );
+    const hasPositiveGammaCallSweepReject = Boolean(
+      !isOpeningRange &&
+      isPositiveGammaRegime &&
+      Math.abs(currentPe) < 1.5 &&
+      testedCallWallOrPlus1Sigma &&
+      divergence5m === "BEAR" &&
+      spotPrice <= effectiveFlowVwap &&
+      latest5mCandle &&
+      latest5mCandle.close <= latest5mCandle.sma34
+    );
     const isCounterTrendCallBlocked = Boolean(
-      !hasBullImpulseReclaim && (
+      !hasBullImpulseReclaim &&
+      !hasPositiveGammaPutSweepBounce && (
       (zeroGamma > 0 && spotPrice < zeroGamma) ||
       (flowSnap && typeof flowSnap.flowVwap === "number" && spotPrice < flowSnap.flowVwap) ||
       (latest5mCandle && typeof latest5mCandle.sma34 === "number" && spotPrice < latest5mCandle.sma34) ||
@@ -3150,9 +3266,9 @@ export async function evaluateTradeSignals(
     }
 
     // --- SETUP 2: BTO PUTS — Resistance Rejection / Bearish Reversal ---
-    const prevClosedTrade = store.closedPositions[store.closedPositions.length - 1];
-    if (candidateBto && store.closedPositions.length === 1 && prevClosedTrade && candidateBto.contractType === prevClosedTrade.contractType) {
-      candidateBto = null; // Phase 2 must be an opposite-regime structural rotation (e.g. Morning Put Flush -> Midday Put Wall Call Reclaim)
+    const prevClosedTrade = lastClosed;
+    if (candidateBto && sameTickerClosed.length === 1 && prevClosedTrade && candidateBto.contractType === prevClosedTrade.contractType) {
+      candidateBto = null; // Leg 2 must be an opposite-regime structural rotation
     }
     if (!candidateBto) {
       const baseCallRejectRef =
@@ -3194,11 +3310,14 @@ export async function evaluateTradeSignals(
       // Invariant 2A: Counter-Trend Put Block (isBullishRegimeLocked)
       // When price is holding above SMA34 with an overhead Tactical King magnet,
       // or price is in a strong bullish trend with Higher-Highs, or Gaia Call Regime (chi >= 55%), strictly block counter-trend Puts!
-      const isBullishRegimeLocked = Boolean(
-        (filteredKing && filteredKing > spotPrice && latest5mCandle && latest5mCandle.close >= latest5mCandle.sma34) ||
-        (latest5mCandle && latest5mCandle.close > latest5mCandle.sma34 && divergence5m === "BULL") ||
-        currentChi >= 0.55
-      );
+      const isBullishRegimeLocked =
+        !hasBearImpulseRejection &&
+        !hasPositiveGammaCallSweepReject &&
+        Boolean(
+          (filteredKing && filteredKing > spotPrice && latest5mCandle && latest5mCandle.close >= latest5mCandle.sma34) ||
+          (latest5mCandle && latest5mCandle.close > latest5mCandle.sma34 && divergence5m === "BULL") ||
+          currentChi >= 0.55
+        );
 
       const isBearConfirmation =
         !isBullishRegimeLocked &&
@@ -3402,7 +3521,7 @@ export async function evaluateTradeSignals(
       !candidateBto &&
       hasBullImpulseReclaim &&
       hasAdequateCallRoomToWall &&
-      (tacticalPw > 0 ? spotPrice >= tacticalPw * 0.997 : true)
+      (tacticalPw > 0 ? spotPrice >= tacticalPw * 0.9965 : true)
     ) {
       const reclaimFloor = Math.min(latest5mCandle?.low ?? spotPrice, tacticalPw > 0 && tacticalPw <= spotPrice ? tacticalPw : spotPrice);
       const stopLoss = Number((Math.min(reclaimFloor - 0.15, spotPrice - 0.85)).toFixed(2));
@@ -3421,15 +3540,53 @@ export async function evaluateTradeSignals(
       }
     }
 
-    // Phase-2 Gate: Second trade today must be an opposite-regime reclaim (CALL reclaim requires impulseChi confirmation)
+    // --- SETUP 5B: Windowed Impulse Flux & Divergence Rejection [BTO PUT] ---
     if (
-      candidateBto &&
-      isPhase2ReclaimWindow &&
-      (candidateBto.contractType === lastClosed?.contractType ||
-        (candidateBto.contractType === "CALL" &&
-          !(impChi >= 0.60 && (deltaChi6 >= 0.03 || deltaImpulseChi6 >= 0.06))))
+      !candidateBto &&
+      hasBearImpulseRejection &&
+      hasAdequatePutRoomToWall &&
+      (tacticalCw > 0 ? spotPrice <= tacticalCw * 1.0035 : true)
     ) {
-      candidateBto = null;
+      const rejectCeil = Math.max(latest5mCandle?.high ?? spotPrice, tacticalCw > 0 && tacticalCw >= spotPrice ? tacticalCw : spotPrice);
+      const stopLoss = Number((Math.max(rejectCeil + 0.15, spotPrice + 0.85)).toFixed(2));
+      const risk = Math.max(0.50, stopLoss - spotPrice);
+      const putTargetWall =
+        leg2PutLowerTarget > 0 && spotPrice - leg2PutLowerTarget >= 1.50
+          ? leg2PutLowerTarget
+          : Number((spotPrice - risk * 2.5).toFixed(2));
+      if (spotPrice - putTargetWall >= risk * 1.5) {
+        const target1 = Number((spotPrice - Math.max(1.25, risk * 1.5)).toFixed(2));
+        const target2 = Number(Math.min(target1 - 0.50, putTargetWall + 0.10).toFixed(2));
+        candidateBto = {
+          contractType: "PUT",
+          setupName: "Impulse Flux & Divergence Rejection [BTO PUT]",
+          stopLossSpot: stopLoss,
+          target1Spot: target1,
+          target2Spot: target2,
+        };
+      }
+    }
+
+    // Phase-2 Gate: Second trade today must be an opposite-direction structural rotation (>= 10:45 ET, >= 30m cooldown)
+    if (candidateBto && isPhase2ReclaimWindow) {
+      const isOppositeDir = candidateBto.contractType !== lastClosed?.contractType;
+      const isLeg2CallValid =
+        candidateBto.contractType === "CALL" &&
+        testedPutWallOrMinus1Sigma &&
+        (divergence5m === "BULL" || divergence30m === "BULL" || reclaimedSmaAndVwapOrCenter) &&
+        impChi >= 0.60 &&
+        deltaFlux6 > 0 &&
+        leg2CallRoom >= 1.50;
+      const isLeg2PutValid =
+        candidateBto.contractType === "PUT" &&
+        testedCallWallOrPlus1Sigma &&
+        (divergence5m === "BEAR" || divergence30m === "BEAR" || lostSmaAndVwapOrCenter) &&
+        impChi <= 0.40 &&
+        deltaFlux6 < 0 &&
+        leg2PutRoom >= 1.50;
+      if (!isOppositeDir || !(isLeg2CallValid || isLeg2PutValid)) {
+        candidateBto = null;
+      }
     }
 
     // --- GATE: Minimum R:R Ratio Check >= 1.5 (evaluated against clamped entry spot for exact parity) ---
@@ -4480,18 +4637,19 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
     const entryKey = `${resolvedDate}:SPY:ENTRY:${slot}:${idempotencyKey}`;
 
     if (!dispatchedSet.has(entryKey) && !store.dispatchedAlertIds?.[idempotencyKey]) {
-      // Gated Single-Slot / Phase-2 Opposite-Regime State Machine:
-      // FLAT (0 trades) -> ACTIVE (1 contract) -> optional Phase-2 opposite reclaim (>=10:45 ET, >=30m cooldown, Phase1 <=12%) -> LOCKED_FOR_DAY
+      // Jane Street Two-Regime Single-Slot State Machine:
+      // FLAT (0 trades) -> LEG 1 (1 contract) -> LEG 2 opposite structural rotation (>=10:45 ET, >=30m cooldown) -> LOCKED_FOR_DAY
       const closedCount = store.closedPositions?.length ?? 0;
-      const prevClosed = store.closedPositions?.[closedCount - 1];
-      const prevWinnerLocked = closedCount === 1 && (prevClosed?.pnlOptionPct ?? 0) > 12;
+      const prevClosed = store.closedPositions?.reduce<OptionTradePosition | undefined>(
+        (latest, cur) => (!latest || (cur.closedTs ?? 0) >= (latest.closedTs ?? 0) ? cur : latest),
+        undefined
+      );
       const prevCooldownMet =
         closedCount === 1 &&
         typeof prevClosed?.closedTs === "number" &&
         eventTs - prevClosed.closedTs >= 1800;
       const canPhase2OppositeReclaim =
         closedCount === 1 &&
-        !prevWinnerLocked &&
         prevCooldownMet &&
         sigEt.totalMinutes >= 645 &&
         sigEt.totalMinutes <= 870 &&

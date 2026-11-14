@@ -459,6 +459,7 @@ async function run10DaySniperAudit() {
 
     let tradeCountToday = 0;
     let firstTradeType: "CALL" | "PUT" | null = null;
+    let lastExitTs: number | null = null;
     let overlappingToday = 0;
 
     // Determine morning opening range high/low (first 15m)
@@ -582,18 +583,27 @@ async function run10DaySniperAudit() {
             tradeCountToday,
           });
 
+          lastExitTs = bar.ts;
           activePosition = null;
         }
       }
 
-      // --- STEP 2: EVALUATE ENTRY (Phase 1 or Gated Phase-2 Opposite-Regime Call Reclaim >= 10:45 AM ET) ---
+      // --- STEP 2: EVALUATE ENTRY (Leg 1 or Symmetric Gated Leg-2 Opposite-Regime Rotation >= 10:45 AM ET, >= 30m cooldown) ---
+      const cooldownMet = lastExitTs !== null && bar.ts - lastExitTs >= 1800;
       const canPhase2CallReclaim =
         tradeCountToday === 1 &&
         firstTradeType === "PUT" &&
+        cooldownMet &&
+        bar.totalMinutes >= 645 &&
+        bar.totalMinutes <= 870;
+      const canPhase2PutReject =
+        tradeCountToday === 1 &&
+        firstTradeType === "CALL" &&
+        cooldownMet &&
         bar.totalMinutes >= 645 &&
         bar.totalMinutes <= 870;
 
-      if (!activePosition && (tradeCountToday === 0 || canPhase2CallReclaim) && bar.totalMinutes >= 575 && bar.totalMinutes <= 870) {
+      if (!activePosition && (tradeCountToday === 0 || canPhase2CallReclaim || canPhase2PutReject) && bar.totalMinutes >= 575 && bar.totalMinutes <= 870) {
         if (tradeCountToday === 0) {
           // Causal Tactical King projection: on 2026-10-26, institutional GEX pinned the King at 767.00
           const explicitKing = date === "2026-10-26" ? 767 : undefined;
@@ -687,23 +697,47 @@ async function run10DaySniperAudit() {
 
             firstTradeType = activePosition.type;
             tradeCountToday++;
+            if (tradeCountToday > 2) totalMultiTradeViolations++;
           }
-        } else if (canPhase2CallReclaim) {
+        } else if (canPhase2CallReclaim || canPhase2PutReject) {
           const flowSnap = sessionFlow[idx];
           const impChi = flowSnap?.impulseChi ?? 0.5;
           const dChi6 = flowSnap?.deltaChi6Bar ?? 0;
           const dImpChi6 = flowSnap?.deltaImpulseChi6Bar ?? 0;
           const dFlux6 = flowSnap?.deltaNetFlux6Bar ?? 0;
           const fvwap = flowSnap?.flowVwap ?? bar.close;
+          const lower1S = flowSnap?.lower1Sigma ?? 0;
+          const upper1S = flowSnap?.upper1Sigma ?? 0;
+          const sigma = flowSnap?.sigma ?? Math.max(bar.close * 0.0015, 0.35);
           const barBody = bar.close - bar.open;
+          const priorBars = sessionBars.slice(0, idx + 1);
+          const causalPutWall = Math.floor(Math.min(...priorBars.map((b) => b.low)));
+          const causalCallWall = Math.ceil(Math.max(...priorBars.map((b) => b.high)));
+          const recent4Bars = sessionBars.slice(Math.max(0, idx - 3), idx + 1);
+          const recentLow4 = Math.min(...recent4Bars.map((b) => b.low));
+          const recentHigh4 = Math.max(...recent4Bars.map((b) => b.high));
+          const bullDiv5m = recentLow4 <= fvwap - 1.25 * sigma && bar.close > bar.open;
+          const bearDiv5m = recentHigh4 >= fvwap + 1.25 * sigma && bar.close < bar.open;
+
+          const testedPutWallOrMinus1S =
+            (causalPutWall > 0 && Math.abs(recentLow4 - causalPutWall) / causalPutWall <= 0.0035) ||
+            (lower1S > 0 && (Math.abs(recentLow4 - lower1S) / lower1S <= 0.0035 || recentLow4 <= lower1S));
+          const testedCallWallOrPlus1S =
+            (causalCallWall > 0 && Math.abs(recentHigh4 - causalCallWall) / causalCallWall <= 0.0035) ||
+            (upper1S > 0 && (Math.abs(recentHigh4 - upper1S) / upper1S <= 0.0035 || recentHigh4 >= upper1S));
+
+          const bullRoom = causalCallWall - bar.close;
+          const bearRoom = bar.close - causalPutWall;
+
           if (
+            canPhase2CallReclaim &&
+            testedPutWallOrMinus1S &&
             impChi >= 0.60 &&
             (dChi6 >= 0.03 || dImpChi6 >= 0.06) &&
             dFlux6 > 0 &&
-            bar.close > bar.open &&
             barBody <= 1.25 &&
-            bar.close >= fvwap &&
-            bar.close >= bar.sma34
+            bullRoom >= 1.50 &&
+            (bullDiv5m || (bar.close > bar.open && bar.close >= fvwap && bar.close >= bar.sma34))
           ) {
             const entrySpot = bar.close;
             const etDow = new Date(`${date}T12:00:00Z`).getUTCDay();
@@ -732,15 +766,14 @@ async function run10DaySniperAudit() {
                 break;
               }
             }
-            const recentLow = Math.min(...sessionBars.slice(Math.max(0, idx - 3), idx + 1).map((b) => b.low));
-            const stopLossSpot = Number(Math.min(recentLow - 0.15, entrySpot - 0.85).toFixed(2));
+            const stopLossSpot = Number(Math.min(recentLow4 - 0.15, entrySpot - 0.85).toFixed(2));
             const risk = Math.max(0.5, entrySpot - stopLossSpot);
             const target1Spot = Number((entrySpot + Math.max(1.25, risk * 1.5)).toFixed(2));
             const target2Spot = Number((target1Spot + risk).toFixed(2));
 
             activePosition = {
               type: "CALL",
-              setupName: "Phase-2 Impulse Call Reclaim",
+              setupName: "Leg-2 Put Wall / -1σ Bullish Reclaim",
               strike,
               entrySpot,
               target1Spot,
@@ -754,6 +787,66 @@ async function run10DaySniperAudit() {
               openedTs: bar.ts,
             };
             tradeCountToday++;
+            if (tradeCountToday > 2) totalMultiTradeViolations++;
+          } else if (
+            canPhase2PutReject &&
+            testedCallWallOrPlus1S &&
+            impChi <= 0.40 &&
+            (dChi6 <= -0.03 || dImpChi6 <= -0.06) &&
+            dFlux6 < 0 &&
+            -barBody <= 1.25 &&
+            bearRoom >= 1.50 &&
+            (bearDiv5m || (bar.close < bar.open && bar.close <= fvwap && bar.close <= bar.sma34))
+          ) {
+            const entrySpot = bar.close;
+            const etDow = new Date(`${date}T12:00:00Z`).getUTCDay();
+            const dteDays = bar.totalMinutes >= 690 ? (etDow === 5 ? 3 : 1) : 0;
+            const remainingYears = computeRemainingYearsToExpiration(bar.ts * 1000, dteDays);
+            const atmIv = estimateDynamicAtmIv(unifiedBars, idx);
+            let strike = Math.floor(entrySpot);
+            let quote = priceOptionWithSkew({
+              spot: entrySpot,
+              strike,
+              direction: "SHORT",
+              remainingYears,
+              atmIv,
+            });
+            for (let k = Math.floor(entrySpot); k >= Math.floor(entrySpot) - 35; k--) {
+              const q = priceOptionWithSkew({
+                spot: entrySpot,
+                strike: k,
+                direction: "SHORT",
+                remainingYears,
+                atmIv,
+              });
+              if (q.ask <= 0.95) {
+                strike = k;
+                quote = q;
+                break;
+              }
+            }
+            const stopLossSpot = Number(Math.max(recentHigh4 + 0.15, entrySpot + 0.85).toFixed(2));
+            const risk = Math.max(0.5, stopLossSpot - entrySpot);
+            const target1Spot = Number((entrySpot - Math.max(1.25, risk * 1.5)).toFixed(2));
+            const target2Spot = Number((target1Spot - risk).toFixed(2));
+
+            activePosition = {
+              type: "PUT",
+              setupName: "Leg-2 Call Wall / +1σ Bearish Rejection",
+              strike,
+              entrySpot,
+              target1Spot,
+              target2Spot,
+              stopLossSpot,
+              entryAsk: quote.ask,
+              tYears: remainingYears,
+              iv: atmIv,
+              dteDays,
+              openedTimeEt: bar.timeEt,
+              openedTs: bar.ts,
+            };
+            tradeCountToday++;
+            if (tradeCountToday > 2) totalMultiTradeViolations++;
           }
         }
       }

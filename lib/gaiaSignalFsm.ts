@@ -65,6 +65,12 @@ export interface GaiaBarData {
   bias: number;
   netFlux: number;
   peclet: number;
+  impulsePeclet?: number;
+  impulseChi?: number;
+  deltaNetFlux6Bar?: number;
+  netGex?: number;
+  sigmaMinus1?: number | null;
+  sigmaPlus1?: number | null;
   flowVwap?: number;
   prevFlowVwap?: number;
   vwapSlope?: number;
@@ -87,6 +93,7 @@ export interface GaiaMacroContext {
   macroRegime: "CALL" | "PUT";
   sessionBiasScore?: number; // SES driver (-99 to +99)
   callDominancePct?: number; // Header chi% (0 to 100)
+  netGex?: number;
   structuralLevels?: GaiaStructuralLevels;
 }
 
@@ -225,7 +232,6 @@ export class GaiaSignalFsm {
   private closedTradesToday: number = 0;
   private lastClosedDirection: "LONG" | "SHORT" | null = null;
   private lastExitBarTs: number = 0;
-  private phase1WinnerLocked: boolean = false;
 
   constructor(initialState: GaiaFsmState = "STAND_ASIDE") {
     this.committedState = initialState;
@@ -246,7 +252,6 @@ export class GaiaSignalFsm {
     this.closedTradesToday = 0;
     this.lastClosedDirection = null;
     this.lastExitBarTs = 0;
-    this.phase1WinnerLocked = false;
   }
 
   /**
@@ -312,6 +317,16 @@ export class GaiaSignalFsm {
     const pdh = levels?.pdh && levels.pdh > 0 ? levels.pdh : undefined;
     const pdl = levels?.pdl && levels.pdl > 0 ? levels.pdl : undefined;
     const sigma1dLower = levels?.sigma1dLower && levels.sigma1dLower > 0 ? levels.sigma1dLower : undefined;
+    const sigma1dUpper = levels?.sigma1dUpper && levels.sigma1dUpper > 0 ? levels.sigma1dUpper : undefined;
+    const sigmaMinus1 = bar.sigmaMinus1 ?? bar.lowerBand1 ?? sigma1dLower ?? null;
+    const sigmaPlus1 = bar.sigmaPlus1 ?? bar.upperBand1 ?? sigma1dUpper ?? null;
+    const impulseChi = bar.impulseChi ?? bar.chi;
+    const deltaNetFlux6Bar = bar.deltaNetFlux6Bar ?? bar.netFlux;
+    const netGex = bar.netGex ?? macro?.netGex;
+    const isPositiveGamma =
+      (netGex === undefined || netGex > 0) &&
+      zg !== undefined &&
+      bar.close > zg;
 
     // Overhead & Underlying Wall Proximity Computation
     const overheadCandidates = [callWall, zg].filter(
@@ -331,10 +346,11 @@ export class GaiaSignalFsm {
       if (!isWithinEntryWindow) {
         return { nextState: "STAND_ASIDE" };
       }
-      if (this.closedTradesToday >= 2 || this.phase1WinnerLocked) {
+      if (this.closedTradesToday >= 2) {
         return { nextState: "STAND_ASIDE" };
       }
-      if (this.closedTradesToday === 1) {
+      const isLeg2 = this.closedTradesToday === 1;
+      if (isLeg2) {
         const phase2WindowOk = typeof etMins === "number" ? etMins >= 645 && etMins <= 870 : true;
         const cooldownOk = this.lastExitBarTs > 0 ? bar.barTimestamp - this.lastExitBarTs >= PHASE2_COOLDOWN_SEC : false;
         if (!phase2WindowOk || !cooldownOk) {
@@ -345,18 +361,160 @@ export class GaiaSignalFsm {
       const allowLong = this.closedTradesToday === 0 || this.lastClosedDirection === "SHORT";
 
       // =========================================================================
+      // LEG 2 HIGH-CONVICTION OPPOSITE-DIRECTION STRUCTURAL ROTATION (10:45-14:30 ET)
+      // =========================================================================
+      if (isLeg2 && levels) {
+        const leg2TestLow = bar.recentLow4 ?? bar.low;
+        const leg2TestHigh = bar.recentHigh3 ?? bar.high;
+        const testedPutWallOrSigma1 =
+          (putWall !== undefined && Math.abs(leg2TestLow - putWall) / bar.close <= 0.0035) ||
+          (sigmaMinus1 !== null && sigmaMinus1 > 0 && leg2TestLow <= sigmaMinus1 * 1.0035);
+        const testedCallWallOrSigma1 =
+          (callWall !== undefined && Math.abs(leg2TestHigh - callWall) / bar.close <= 0.0035) ||
+          (sigmaPlus1 !== null && sigmaPlus1 > 0 && leg2TestHigh >= sigmaPlus1 * 0.9965);
+        const leg2BullReclaim =
+          Boolean(bar.bullDiv5m) ||
+          ((bar.sma34 === undefined || bar.close > bar.sma34) &&
+            (bar.flowVwap === undefined || bar.close > bar.flowVwap)) ||
+          ((pdl !== undefined || bookCenter !== undefined) &&
+            bar.close > (bookCenter ?? pdl!) &&
+            (bar.flowVwap === undefined || bar.close >= bar.flowVwap));
+        const leg2BearReject =
+          Boolean(bar.bearDiv5m) ||
+          ((bar.sma34 === undefined || bar.close < bar.sma34) &&
+            (bar.flowVwap === undefined || bar.close < bar.flowVwap)) ||
+          ((pdh !== undefined || bookCenter !== undefined) &&
+            bar.close < (bookCenter ?? pdh!) &&
+            (bar.flowVwap === undefined || bar.close <= bar.flowVwap));
+        const leg2CallTarget =
+          callWall && callWall > bar.close + 1.50
+            ? callWall
+            : zg && zg > bar.close + 1.50
+              ? zg
+              : undefined;
+        const leg2PutTarget =
+          putWall && bar.close - putWall >= 1.50
+            ? putWall
+            : zg && bar.close - zg >= 1.50
+              ? zg
+              : undefined;
+        const leg2CallRoom = Math.max(
+          zg !== undefined ? zg - bar.close : 0,
+          callWall !== undefined ? callWall - bar.close : 0
+        );
+        const leg2PutRoom = Math.max(
+          zg !== undefined ? bar.close - zg : 0,
+          putWall !== undefined ? bar.close - putWall : 0
+        );
+
+        if (
+          allowLong &&
+          testedPutWallOrSigma1 &&
+          leg2BullReclaim &&
+          impulseChi >= 0.60 &&
+          deltaNetFlux6Bar > 0 &&
+          leg2CallRoom >= 1.50
+        ) {
+          return {
+            nextState: "LONG",
+            reason: "LEG2_PUT_WALL_BULL_RECLAIM_CALL",
+            targetWall: leg2CallTarget ?? Number((bar.close + Math.max(2.0, 2.0 * dispersion.atr)).toFixed(2)),
+            stopPrice: Number((leg2TestLow - 0.15).toFixed(2)),
+          };
+        }
+
+        if (
+          allowShort &&
+          testedCallWallOrSigma1 &&
+          leg2BearReject &&
+          impulseChi <= 0.40 &&
+          deltaNetFlux6Bar < 0 &&
+          leg2PutRoom >= 1.50
+        ) {
+          return {
+            nextState: "SHORT",
+            reason: "LEG2_CALL_WALL_BEAR_REJECTION_PUT",
+            targetWall: leg2PutTarget ?? Number((bar.close - Math.max(2.0, 2.0 * dispersion.atr)).toFixed(2)),
+            stopPrice: Number((leg2TestHigh + 0.15).toFixed(2)),
+          };
+        }
+
+        return { nextState: "STAND_ASIDE" };
+      }
+
+      // =========================================================================
+      // DYNAMIC GEX/VEX PRIORITY: POSITIVE-GAMMA WALL-TO-WALL MEAN REVERSION
+      // =========================================================================
+      if (isPositiveGamma && Math.abs(bar.peclet) < 1.5 && levels) {
+        const pgTestLow = bar.recentLow4 ?? Math.min(bar.low, bar.open);
+        const pgTestHigh = bar.recentHigh3 ?? Math.max(bar.high, bar.open);
+        const sweptLowerWall =
+          (putWall !== undefined && Math.abs(pgTestLow - putWall) / bar.close <= 0.0035) ||
+          (sigmaMinus1 !== null && sigmaMinus1 > 0 && pgTestLow <= sigmaMinus1 * 1.0035);
+        const sweptUpperWall =
+          (callWall !== undefined && Math.abs(pgTestHigh - callWall) / bar.close <= 0.0035) ||
+          (sigmaPlus1 !== null && sigmaPlus1 > 0 && pgTestHigh >= sigmaPlus1 * 0.9965);
+        const reclaimedMean =
+          (bar.flowVwap === undefined || bar.close >= bar.flowVwap) ||
+          (bar.sma34 === undefined || bar.close > bar.sma34);
+        const rejectedMean =
+          (bar.flowVwap === undefined || bar.close <= bar.flowVwap) ||
+          (bar.sma34 === undefined || bar.close < bar.sma34);
+        const pgCallTarget = bookCenter && bookCenter > bar.close + 1.25 ? bookCenter : (callWall ?? zg ?? bar.close + 2.5);
+        const pgPutTarget = bookCenter && bar.close - bookCenter >= 1.25 ? bookCenter : (putWall ?? zg ?? bar.close - 2.5);
+        const pgCallDest = callWall && callWall > pgCallTarget ? callWall : pgCallTarget;
+        const pgPutDest = putWall && putWall < pgPutTarget ? putWall : pgPutTarget;
+
+        if (
+          allowLong &&
+          !callBlockedByWall &&
+          sweptLowerWall &&
+          Boolean(bar.bullDiv5m) &&
+          reclaimedMean &&
+          pgCallDest - bar.close >= MIN_REWARD_RISK * unitRisk
+        ) {
+          return {
+            nextState: "LONG",
+            reason: "POSITIVE_GAMMA_PUT_WALL_BOUNCE_CALL",
+            targetWall: pgCallDest,
+            stopPrice: Number((pgTestLow - 0.10).toFixed(2)),
+          };
+        }
+
+        if (
+          allowShort &&
+          !putBlockedByWall &&
+          sweptUpperWall &&
+          Boolean(bar.bearDiv5m) &&
+          rejectedMean &&
+          bar.close - pgPutDest >= MIN_REWARD_RISK * unitRisk
+        ) {
+          return {
+            nextState: "SHORT",
+            reason: "POSITIVE_GAMMA_CALL_WALL_REJECTION_PUT",
+            targetWall: pgPutDest,
+            stopPrice: Number((pgTestHigh + 0.10).toFixed(2)),
+          };
+        }
+      }
+
+      // =========================================================================
       // HIGH-CONVICTION BTO PUT EVALUATION (Setups P-A & P-B)
       // =========================================================================
       if (allowShort && !putBlockedByWall && levels) {
-        // Setup P-A (Upper Wall / Zero-Gamma / PDH Rejection)
+        // Setup P-A (Upper Wall / +1sigma / Zero-Gamma / PDH Rejection)
         const testHigh = bar.recentHigh3 ?? Math.max(bar.high, bar.open);
-        const nearUpper = [zg, callWall, pdh].some(
-          (lvl) => typeof lvl === "number" && Math.abs(testHigh - lvl) / lvl <= 0.0020
+        const nearUpper = [zg, callWall, pdh, sigmaPlus1].some(
+          (lvl) => typeof lvl === "number" && lvl > 0 && Math.abs(testHigh - lvl) / lvl <= 0.0035
         );
         const belowFlowAndSma =
           (bar.flowVwap === undefined || bar.close < bar.flowVwap) &&
           (bar.sma34 === undefined || bar.close < bar.sma34);
-        const negativeFluxConfirm = bar.netFlux < 0 || bar.chi < 0.45 || Boolean(bar.bearDiv5m);
+        const negativeFluxConfirm =
+          (bar.peclet <= -1.5 && bar.chi < 0.45 && bar.netFlux < 0) ||
+          bar.netFlux < 0 ||
+          bar.chi < 0.45 ||
+          Boolean(bar.bearDiv5m);
         const downsideTarget = putWall ?? bookCenter ?? bar.close - 2.50;
         const downsideRoom = (bar.close - downsideTarget) >= MIN_REWARD_RISK * unitRisk;
 
@@ -581,7 +739,11 @@ export class GaiaSignalFsm {
           return { nextState: "STAND_ASIDE", reason: "STRUCTURAL_STOP_LOSS", fillPrice: bar.close };
         }
         // If macro flips to BEAR, neutralize ONLY non-structural equilibrium trades
-        const isStructuralLong = this.activeSetupReason.startsWith("STRUCTURAL_CALL") || this.activeSetupReason.includes("FLUX");
+        const isStructuralLong =
+          this.activeSetupReason.startsWith("STRUCTURAL_CALL") ||
+          this.activeSetupReason.startsWith("LEG2_") ||
+          this.activeSetupReason.startsWith("POSITIVE_GAMMA_") ||
+          this.activeSetupReason.includes("FLUX");
         if (minHoldMet && adverseMove >= MIN_REVERSAL_ADVERSE_DOLLARS && !isStructuralLong && !solidBullFlux && isBearMacro && !isBullMacro) {
           return { nextState: "STAND_ASIDE", reason: "MACRO_REGIME_BEAR_FLIP" };
         }
@@ -657,7 +819,11 @@ export class GaiaSignalFsm {
           return { nextState: "STAND_ASIDE", reason: "STRUCTURAL_STOP_LOSS", fillPrice: bar.close };
         }
         // If macro flips to BULL, neutralize ONLY non-structural equilibrium trades
-        const isStructuralShort = this.activeSetupReason.startsWith("STRUCTURAL_PUT") || this.activeSetupReason.includes("FLUX");
+        const isStructuralShort =
+          this.activeSetupReason.startsWith("STRUCTURAL_PUT") ||
+          this.activeSetupReason.startsWith("LEG2_") ||
+          this.activeSetupReason.startsWith("POSITIVE_GAMMA_") ||
+          this.activeSetupReason.includes("FLUX");
         if (minHoldMet && adverseMove >= MIN_REVERSAL_ADVERSE_DOLLARS && !isStructuralShort && !solidBearFlux && isBullMacro && !isBearMacro) {
           return { nextState: "STAND_ASIDE", reason: "MACRO_REGIME_BULL_FLIP" };
         }
@@ -755,9 +921,6 @@ export class GaiaSignalFsm {
       this.closedTradesToday += 1;
       this.lastClosedDirection = fromState;
       this.lastExitBarTs = bar.barTimestamp;
-      if (this.closedTradesToday === 1 && entryPrice > 0 && realizedPnl / entryPrice > 0.0025) {
-        this.phase1WinnerLocked = true; // Lock day on strong Phase 1 spot winner
-      }
       this.barsHeld = 0;
       this.currentEntryPrice = 0;
       this.localExtremePrice = 0;

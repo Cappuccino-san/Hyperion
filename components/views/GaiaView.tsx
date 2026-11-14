@@ -1176,14 +1176,18 @@ export function GaiaView() {
     setExpFilter("ALL");
     setSelectedDateExp("");
     setPathToKing(true);
+    setStartHour(0);
     isReplayingRef.current = false;
     setIsReplaying(false);
     isReplayFrozenRef.current = false;
     setIsReplayFrozen(false);
     setActiveBarIndex(maxBarIdx);
     setHoverBarIndex(null);
+    setXScale(1.0);
+    setXPanOffset(0);
     setYScale(1.0);
     setYPanOffset(0);
+    setDividerRatio(fluxFocusMode ? 0.88 : 0.76);
     setScopePreset("cone");
   };
 
@@ -1410,6 +1414,7 @@ export function GaiaView() {
   };
 
   const handleCanvasDoubleClick = () => {
+    setStartHour(0);
     setYScale(1.0);
     setYPanOffset(0);
     setXScale(1.0);
@@ -1449,6 +1454,7 @@ export function GaiaView() {
       setYScale((s) => Math.max(0.2, s * 0.82));
     } else if (e.key === "0") {
       e.preventDefault();
+      setStartHour(0);
       setYScale(1.0);
       setYPanOffset(0);
       setXScale(1.0);
@@ -1599,9 +1605,9 @@ export function GaiaView() {
     };
 
     const minsToX = (etMins: number): number => {
-      const stepX = (sessionWidth / totalSessionSlots) * xScale;
-      const slotIdx = (etMins - axisStartMins) / 5;
-      return padLeft + xPanOffset + slotIdx * stepX;
+      const clampedMins = Math.max(axisStartMins, Math.min(axisEndMins, etMins));
+      const rawRatio = (clampedMins - axisStartMins) / Math.max(5, axisEndMins - axisStartMins);
+      return padLeft + xPanOffset + rawRatio * sessionWidth * xScale;
     };
 
     // Subtle horizontal grid lines at the price axis ticks
@@ -3059,10 +3065,11 @@ export function GaiaView() {
         </button>
 
         {/* Auto Width Reset Pill (appears when width or divider is customized) */}
-        {(chartWidth !== null || dividerRatio !== (fluxFocusMode ? 0.88 : 0.76) || xScale !== 1.0) && (
+        {(chartWidth !== null || dividerRatio !== (fluxFocusMode ? 0.88 : 0.76) || xScale !== 1.0 || startHour !== 0) && (
           <button
             type="button"
             onClick={() => {
+              setStartHour(0);
               setChartWidth(null);
               setDividerRatio(fluxFocusMode ? 0.88 : 0.76);
               setXScale(1.0);
@@ -3375,10 +3382,12 @@ export function GaiaView() {
           setXPanOffset(p);
         }}
         onResetViewport={() => {
+          setStartHour(0);
           setXScale(1.0);
           setXPanOffset(0);
           setYScale(1.0);
           setYPanOffset(0);
+          setDividerRatio(fluxFocusMode ? 0.88 : 0.76);
         }}
         onSignalsEvaluated={setPrzmHudSignals}
         onSymbolChange={(sym) => {
