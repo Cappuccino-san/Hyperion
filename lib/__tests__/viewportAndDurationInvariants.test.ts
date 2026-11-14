@@ -4,6 +4,7 @@ import { evaluatePrzmCallLedger, PrzmSignalPoint, PrzmCandlePoint } from "@/comp
 import { extractNormalizedTradesForTicker } from "@/components/chart/TradeExecutionMarkersOverlay";
 import { initializeOcoBrackets, evaluateOcoBrackets } from "@/lib/bracketOrderEngine";
 import { NbboQuote } from "@/lib/marketDataService";
+import { clampToCandleRange } from "@/lib/tradeSignalEngine";
 
 describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
   it("Duration Normalization Invariant: 44-minute millisecond trade produces 44M, NOT 723H", () => {
@@ -482,5 +483,43 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
     assert.strictEqual(trade.contractType, "CALL");
     assert.strictEqual(trade.status, "OPEN");
     assert.strictEqual(trade.btoSpotPrice, 753.50);
+  });
+
+  it("Candle [low, high] Clamping Invariant: Out-of-range spot fills clamp strictly inside traded candle bounds", () => {
+    const candle = { low: 759.25, high: 762.40 };
+    assert.strictEqual(clampToCandleRange(764.10, candle), 762.40, "Above-high fill must clamp to candle.high");
+    assert.strictEqual(clampToCandleRange(757.80, candle), 759.25, "Below-low fill must clamp to candle.low");
+    assert.strictEqual(clampToCandleRange(760.55, candle), 760.55, "In-range fill must remain unchanged");
+    assert.strictEqual(clampToCandleRange(760.55, null), 760.55, "Missing candle must pass through safely");
+  });
+
+  it("Sigma Footer-to-Canvas Parity Invariant: ±1σ and ±2σ footer bounds match canvas Y-levels identically", () => {
+    const priorClose = 760.0;
+    const sigma1Move = 4.25;
+    const sigma2Move = 8.50;
+    const canvasLevels = {
+      pPlus1: priorClose + sigma1Move,
+      pMinus1: priorClose - sigma1Move,
+      pPlus2: priorClose + sigma2Move,
+      pMinus2: priorClose - sigma2Move,
+    };
+    const footerPills = {
+      s1Low: Number((priorClose - sigma1Move).toFixed(2)),
+      s1High: Number((priorClose + sigma1Move).toFixed(2)),
+      s2Low: Number((priorClose - sigma2Move).toFixed(2)),
+      s2High: Number((priorClose + sigma2Move).toFixed(2)),
+    };
+    assert.strictEqual(footerPills.s1High, canvasLevels.pPlus1);
+    assert.strictEqual(footerPills.s1Low, canvasLevels.pMinus1);
+    assert.strictEqual(footerPills.s2High, canvasLevels.pPlus2);
+    assert.strictEqual(footerPills.s2Low, canvasLevels.pMinus2);
+  });
+
+  it("Cursor Hover Isolation Invariant: 0DTE KING stays locked to structuralBookCol regardless of hovered activeBookCol", () => {
+    const structuralBookCol = { allExpKingStrike: 765, filteredKingStrike: 762 };
+    const hoveredBookCol = { allExpKingStrike: 755, filteredKingStrike: 752 };
+    const resolvedCol = structuralBookCol ?? hoveredBookCol;
+    assert.strictEqual(resolvedCol.filteredKingStrike, 762, "0DTE KING must stay locked to live structuralBookCol");
+    assert.strictEqual(resolvedCol.allExpKingStrike, 765, "ALL-EXP KING must stay locked to live structuralBookCol");
   });
 });

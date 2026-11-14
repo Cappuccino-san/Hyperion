@@ -17,6 +17,10 @@ import {
   getPreTradeRadarData,
   sendPreTradeRadarDiscordCard,
 } from "@/lib/tradeRadar";
+import {
+  acquireBarEvaluationLock,
+  releaseBarEvaluationLock,
+} from "@/lib/liveBotDaemon";
 
 export const dynamic = "force-dynamic";
 
@@ -253,7 +257,13 @@ export async function GET(req: NextRequest) {
     }
 
     // Continuously evaluate all open positions across all tickers against live CBOE quotes
-    await evaluateAllActivePositions({ webhookUrl });
+    if (acquireBarEvaluationLock()) {
+      try {
+        await evaluateAllActivePositions({ webhookUrl });
+      } finally {
+        releaseBarEvaluationLock();
+      }
+    }
 
     const activePositions = getActivePositions();
     const closedPositions = getClosedPositions(ticker);
@@ -276,18 +286,26 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
 
     if (body.action === "SYNC_GAIA_SPY_SIGNALS") {
-      const res = await syncGaiaSpySignalsToDiscord({
-        ticker: body.ticker || "SPY",
-        signals: Array.isArray(body.signals) ? body.signals : [],
-        spotPrice: Number(body.spotPrice) || 0,
-        activeFsmState: body.activeFsmState,
-        macroRegime: body.macroRegime,
-        chiPct: body.chiPct,
-        zeroGamma: typeof body.zeroGamma === "number" ? body.zeroGamma : undefined,
-        sessionDate: body.sessionDate,
-        webhookUrl: body.webhookUrl,
-      });
-      return NextResponse.json({ success: true, ...res });
+      if (!acquireBarEvaluationLock()) {
+        return NextResponse.json({ success: false, busy: true, dispatchedCount: 0, keys: [] }, { status: 409 });
+      }
+      try {
+        const res = await syncGaiaSpySignalsToDiscord({
+          ticker: body.ticker || "SPY",
+          signals: Array.isArray(body.signals) ? body.signals : [],
+          spotPrice: Number(body.spotPrice) || 0,
+          activeFsmState: body.activeFsmState,
+          macroRegime: body.macroRegime,
+          chiPct: body.chiPct,
+          zeroGamma: typeof body.zeroGamma === "number" ? body.zeroGamma : undefined,
+          sessionDate: body.sessionDate,
+          webhookUrl: body.webhookUrl,
+          isHistoricalBackfill: Boolean(body.isHistoricalBackfill),
+        });
+        return NextResponse.json({ success: true, ...res });
+      } finally {
+        releaseBarEvaluationLock();
+      }
     }
 
     if (body.action === "clear") {
@@ -305,8 +323,15 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
     }
 
-    const result = await evaluateTradeSignals(body);
-    return NextResponse.json(result);
+    if (!acquireBarEvaluationLock()) {
+      return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
+    }
+    try {
+      const result = await evaluateTradeSignals(body);
+      return NextResponse.json(result);
+    } finally {
+      releaseBarEvaluationLock();
+    }
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: errorMsg }, { status: 500 });

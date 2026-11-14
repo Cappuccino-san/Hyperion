@@ -204,11 +204,6 @@ interface DivergencePayload {
   levels: { King: number; "Call wall": number; "Put wall": number };
 }
 
-function divWhen(t: number, intraday?: boolean): string {
-  const d = new Date(t * 1000).toISOString();
-  return intraday ? `${d.slice(5, 10)} ${d.slice(11, 16)}` : d.slice(0, 10);
-}
-
 /**
  * Computes the complete Gaia chart view dataset strictly from the live API payload.
  */
@@ -692,6 +687,8 @@ export function GaiaView() {
   const [activeBarIndex, setActiveBarIndex] = useState<number>(0);
   const [hoverBarIndex, setHoverBarIndex] = useState<number | null>(null);
   const [isReplaying, setIsReplaying] = useState<boolean>(false);
+  const storeHeatmapKingNode = useDashboardStore((s) => s.kingNode);
+  const storeHeatmapTicker = useDashboardStore((s) => s.activeTicker);
   const isReplayingRef = useRef<boolean>(false);
   useEffect(() => { isReplayingRef.current = isReplaying; }, [isReplaying]);
   const [openDivTf, setOpenDivTf] = useState<string | null>(null);
@@ -1309,6 +1306,22 @@ export function GaiaView() {
 
   const activeCandle = dataset?.candles[displayBarIdx];
   const activeBookCol = dataset?.columnsByBar[displayBarIdx];
+  const liveBarIdx = dataset && dataset.candles.length > 0 ? dataset.candles.length - 1 : 0;
+  const structuralBarIdx = isReplaying ? Math.min(safeActiveIdx, liveBarIdx) : liveBarIdx;
+  const structuralBookCol = dataset?.columnsByBar[structuralBarIdx] ?? activeBookCol;
+  const isLiveHeatmapSynced = !isReplaying && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
+  const liveAllExpKingStrike =
+    isLiveHeatmapSynced && storeHeatmapKingNode && storeHeatmapKingNode.allExpKing > 0
+      ? storeHeatmapKingNode.allExpKing
+      : structuralBookCol?.allExpKingStrike ?? 0;
+  const liveFilteredKingStrike =
+    isLiveHeatmapSynced && storeHeatmapKingNode
+      ? expFilter === "0DTE" && storeHeatmapKingNode.zeroDteKing
+        ? storeHeatmapKingNode.zeroDteKing
+        : expFilter === "WEEK" && storeHeatmapKingNode.weeklyKing
+          ? storeHeatmapKingNode.weeklyKing
+          : storeHeatmapKingNode.allExpKing || structuralBookCol?.filteredKingStrike || 0
+      : structuralBookCol?.filteredKingStrike ?? 0;
   const mtfDivergence = dataset?.mtfByBar[safeActiveIdx] ?? {
     tf5m: "NO",
     tf30m: "NO",
@@ -1445,10 +1458,10 @@ export function GaiaView() {
     }
 
     const colStepX = sessionWidth / totalSessionSlots;
-    const allExpKingStrike = activeBookCol.allExpKingStrike;
+    const allExpKingStrike = liveAllExpKingStrike || structuralBookCol?.allExpKingStrike || 0;
     const yAllExpKing = priceToY(allExpKingStrike);
     const isFiltered = expFilter !== "ALL";
-    const filteredKingStrike = activeBookCol.filteredKingStrike;
+    const filteredKingStrike = liveFilteredKingStrike || structuralBookCol?.filteredKingStrike || 0;
     const yFilteredKing = priceToY(filteredKingStrike);
     const outlookEndX = outlookRightX - 18;
 
@@ -1459,7 +1472,7 @@ export function GaiaView() {
     let maxCallVal = 0;
     let maxPutVal = 0;
     for (const s of dataset.visibleStrikes) {
-      const val = activeBookCol.strikeValues[s] ?? 0;
+      const val = (structuralBookCol ?? activeBookCol)!.strikeValues[s] ?? 0;
       if (val > maxCallVal) {
         maxCallVal = val;
         signedCallStrike = s;
@@ -1493,8 +1506,8 @@ export function GaiaView() {
       for (let i = 0; i < ascStrikes.length - 1; i++) {
         const s1 = ascStrikes[i];
         const s2 = ascStrikes[i + 1];
-        const v1 = activeBookCol.strikeValues[s1] ?? 0;
-        const v2 = activeBookCol.strikeValues[s2] ?? 0;
+        const v1 = (structuralBookCol ?? activeBookCol)!.strikeValues[s1] ?? 0;
+        const v2 = (structuralBookCol ?? activeBookCol)!.strikeValues[s2] ?? 0;
         if ((v1 <= 0 && v2 >= 0) || (v1 >= 0 && v2 <= 0)) {
           const denom = Math.abs(v1) + Math.abs(v2);
           const cross = denom > 0 ? s1 + (Math.abs(v1) / denom) * (s2 - s1) : (s1 + s2) / 2;
@@ -1522,6 +1535,8 @@ export function GaiaView() {
 
     const dayPlus1 = dataset.priorClose + dataset.sigma1Move;
     const dayMinus1 = dataset.priorClose - dataset.sigma1Move;
+    const dayPlus2 = dataset.priorClose + dataset.sigma2Move;
+    const dayMinus2 = dataset.priorClose - dataset.sigma2Move;
     const pdhPrice =
       (livePayload as (GaiaLivePayload & { pdh?: number }) | null)?.pdh ??
       dataset.priorClose;
@@ -1538,7 +1553,7 @@ export function GaiaView() {
         stroke: "rgba(250, 204, 21, 0.75)",
         dash: [4, 4],
         lineWidth: 1.25,
-        label: `KING ${allExpKingStrike}`,
+        label: `ALL-EXP KING ${allExpKingStrike}`,
         textColor: "#facc15",
         priority: 100,
       });
@@ -1549,7 +1564,7 @@ export function GaiaView() {
         stroke: "rgba(250, 204, 21, 0.75)",
         dash: [4, 4],
         lineWidth: 1.25,
-        label: `KING ${filteredKingStrike}`,
+        label: `0DTE KING ${filteredKingStrike}`,
         textColor: "#facc15",
         priority: 95,
       });
@@ -1594,12 +1609,14 @@ export function GaiaView() {
       });
     }
 
-    // 5. Expected Move Bounds (+1σ / -1σ / PDH / PDL)
+    // 5. Expected Move Bounds (+1σ / -1σ / +2σ / -2σ / PDH / PDL)
     const mutedRefLevels: Array<{ price: number; tag: string }> = [
-      { price: dayPlus1, tag: "+1σ" },
-      { price: dayMinus1, tag: "-1σ" },
-      { price: pdhPrice, tag: "PDH" },
-      { price: pdlPrice, tag: "PDL" },
+      { price: dayPlus1, tag: `+1σ ${dayPlus1.toFixed(1)}` },
+      { price: dayMinus1, tag: `-1σ ${dayMinus1.toFixed(1)}` },
+      { price: dayPlus2, tag: `+2σ ${dayPlus2.toFixed(1)}` },
+      { price: dayMinus2, tag: `-2σ ${dayMinus2.toFixed(1)}` },
+      { price: pdhPrice, tag: `PDH ${pdhPrice.toFixed(1)}` },
+      { price: pdlPrice, tag: `PDL ${pdlPrice.toFixed(1)}` },
     ];
     for (const ref of mutedRefLevels) {
       if (ref.price > 0) {
@@ -1706,7 +1723,7 @@ export function GaiaView() {
     const activeExpectedBand = activeSigma1 * 1.5;
 
     const rankedCandidateStrikes = dataset.visibleStrikes.map((s) => {
-      const activeVal = activeBookCol.strikeValues[s] ?? 0;
+      const activeVal = (structuralBookCol ?? activeBookCol)!.strikeValues[s] ?? 0;
       const isKing = s === allExpKingStrike || s === filteredKingStrike;
       const isCallWall = s === callWallStrike;
       const isPutWall = s === putWallStrike;
@@ -1985,7 +2002,7 @@ export function GaiaView() {
     const drawnStrikeYs: { y: number; strike: number }[] = [];
     const maxActiveExp = Math.max(
       1,
-      ...Object.values(activeBookCol.strikeValues).map((v) => Math.abs(v))
+      ...Object.values((structuralBookCol ?? activeBookCol)!.strikeValues).map((v) => Math.abs(v))
     );
 
     // Map visible strikes to {Strike} — {Concentration %} labels if within visible Y bounds
@@ -1993,11 +2010,11 @@ export function GaiaView() {
       const y = priceToY(strike);
       if (y < padTop + 6 || y > height - padBottom - 6) return;
 
-      const val = activeBookCol.strikeValues[strike] ?? 0;
+      const val = (structuralBookCol ?? activeBookCol)!.strikeValues[strike] ?? 0;
       const absVal = Math.abs(val);
       const concPct = Math.round((absVal / maxActiveExp) * 100);
-      const isAllExpKing = strike === activeBookCol.allExpKingStrike;
-      const isFilteredKing = strike === activeBookCol.filteredKingStrike;
+      const isAllExpKing = strike === allExpKingStrike;
+      const isFilteredKing = strike === filteredKingStrike;
       const isKing = isAllExpKing || isFilteredKing;
 
       // Show if concPct >= 15% or is King
@@ -2056,7 +2073,7 @@ export function GaiaView() {
         const arrow = isBelow ? "▼ " : "▲ ";
         ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
         ctx.fillStyle = atlasPalette === "ice" ? "#ffffff" : "#facc15";
-        ctx.fillText(`${arrow}${allExpKingStrike} · King ${activeBookCol.allExpKingConcPct}%`, outlookRightX + 7, pinY);
+        ctx.fillText(`${arrow}${allExpKingStrike} · King ${(structuralBookCol ?? activeBookCol)!.allExpKingConcPct}%`, outlookRightX + 7, pinY);
       }
     }
 
@@ -2394,6 +2411,11 @@ export function GaiaView() {
     xPanOffset,
     startHour,
     activeBookCol,
+    structuralBookCol,
+    liveAllExpKingStrike,
+    liveFilteredKingStrike,
+    gammaLevels?.callWall,
+    gammaLevels?.putWall,
     exposureMode,
     expFilter,
     canvasFilterBadgePrefix,
@@ -2841,41 +2863,43 @@ export function GaiaView() {
       )}
 
       {/* 2D. Pre-Chart Telemetry & Legend Strip */}
-      {dataset && activeCandle && activeBookCol && (
+      {dataset && activeCandle && activeBookCol && (() => {
+        const headerBookCol = structuralBookCol ?? activeBookCol;
+        return (
         <div className="space-y-2 pt-0.5">
           {/* 1. Dual Pre-Chart King Pill Badges */}
           <div className="flex flex-wrap items-center gap-2">
             <span className="bg-yellow-500/15 border border-yellow-500/80 text-[#fde047] rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
-              All-exp King {activeBookCol.allExpKingStrike} ·{" "}
-              {formatPct(activeBookCol.allExpKingConcPct)}%
+              All-exp King {liveAllExpKingStrike} ·{" "}
+              {formatPct(headerBookCol.allExpKingConcPct)}%
             </span>
             {(exposureMode === "VEX" || exposureMode === "Combined") && (
               <span className="bg-amber-500/15 border border-amber-400/80 text-[#fde047] rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
-                VEX King (multi-day) {activeBookCol.allExpKingStrike}
+                VEX King (multi-day) {liveAllExpKingStrike}
               </span>
             )}
-            {(expFilter !== "ALL" || activeBookCol.allExpKingStrike !== activeBookCol.filteredKingStrike) && (
+            {(expFilter !== "ALL" || liveAllExpKingStrike !== liveFilteredKingStrike) && (
               <span className="bg-[#151b28] border border-cyan-500/60 text-[#38bdf8] rounded-full px-3.5 py-1 text-xs font-bold inline-flex items-center">
                 {expFilter === "ALL" || expFilter === "NEXT"
                   ? has0DteActive
-                    ? `0DTE King ${activeBookCol.filteredKingStrike} · ${formatPct(activeBookCol.filteredKingConcPct)}%`
-                    : `Next exp King ${activeBookCol.filteredKingStrike}${nextExpShortDate ? ` (${nextExpShortDate})` : ""} · ${formatPct(activeBookCol.filteredKingConcPct)}%`
+                    ? `0DTE King ${liveFilteredKingStrike} · ${formatPct(headerBookCol.filteredKingConcPct)}%`
+                    : `Next exp King ${liveFilteredKingStrike}${nextExpShortDate ? ` (${nextExpShortDate})` : ""} · ${formatPct(headerBookCol.filteredKingConcPct)}%`
                   : expFilter === "WEEK"
-                    ? `Week King ${activeBookCol.filteredKingStrike} · ${formatPct(activeBookCol.filteredKingConcPct)}%`
-                    : `${expFilter} King ${activeBookCol.filteredKingStrike} · ${formatPct(activeBookCol.filteredKingConcPct)}%`}
+                    ? `Week King ${liveFilteredKingStrike} · ${formatPct(headerBookCol.filteredKingConcPct)}%`
+                    : `${expFilter} King ${liveFilteredKingStrike} · ${formatPct(headerBookCol.filteredKingConcPct)}%`}
               </span>
             )}
-            {activeBookCol.allExpKingStrike !== activeBookCol.filteredKingStrike &&
-              ((activeBookCol.allExpKingConcPct < 15 && activeBookCol.filteredKingConcPct >= 20) ||
-                Math.abs(activeBookCol.allExpKingStrike - activeCandle.close) > dataset.sigma1Move * 1.05) && (
+            {liveAllExpKingStrike !== liveFilteredKingStrike &&
+              ((headerBookCol.allExpKingConcPct < 15 && headerBookCol.filteredKingConcPct >= 20) ||
+                Math.abs(liveAllExpKingStrike - activeCandle.close) > dataset.sigma1Move * 1.05) && (
                 <span className="bg-amber-950/50 border border-amber-500/50 text-amber-200 rounded-full px-3.5 py-1 text-[11px] font-semibold inline-flex items-center gap-1.5">
                   <span className="text-amber-400 font-bold">⚠️ King Trap Guardrail:</span>
                   <span>
-                    All-exp {activeBookCol.allExpKingStrike} is distant ({formatPct(activeBookCol.allExpKingConcPct)}% share) · Active Intraday Pin is{" "}
+                    All-exp {liveAllExpKingStrike} is distant ({formatPct(headerBookCol.allExpKingConcPct)}% share) · Active Intraday Pin is{" "}
                     <strong className="text-cyan-300">
-                      ${activeBookCol.filteredKingStrike} ({formatPct(activeBookCol.filteredKingConcPct)}%)
+                      ${liveFilteredKingStrike} ({formatPct(headerBookCol.filteredKingConcPct)}%)
                     </strong>
-                    {activeCandle.close >= activeCandle.sma34 && activeBookCol.allExpKingStrike < activeCandle.close
+                    {activeCandle.close >= activeCandle.sma34 && liveAllExpKingStrike < activeCandle.close
                       ? " — Avoid shorting HOD / deep OTM Puts above SMA34"
                       : ""}
                   </span>
@@ -2996,7 +3020,8 @@ export function GaiaView() {
             </span>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* 2E. Live Gaia Call/Put Bias & Every Call Today HUD */}
       <GaiaCallPutBiasHud
@@ -3007,8 +3032,11 @@ export function GaiaView() {
           high: c.high,
           low: c.low,
           close: c.close,
+          volume: (c as GaiaIntradayCandle & { volume?: number }).volume,
           timeLabel: c.timeLabel,
         }))}
+        flowVwapPoints={flowVwapPoints.slice(0, safeActiveIdx + 1)}
+        sigma1Move={dataset?.sigma1Move}
         liveSpot={activeCandle ? activeCandle.close : null}
         tradeSignals={hudTradeSignals}
         serverTrades={effectiveServerTrades}
@@ -3315,5 +3343,4 @@ export function GaiaView() {
   );
 }
 
-export const AntaeusView = GaiaView;
 export default GaiaView;

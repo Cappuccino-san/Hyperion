@@ -12,6 +12,7 @@ interface LiveBotGlobalState {
   intervalId: ReturnType<typeof setInterval> | null;
   isPolling: boolean;
   isEvaluatingLiveBar: boolean;
+  lockAcquiredAtMs: number;
   startedAtMs: number;
   lastPollAtMs: number;
   lastStatus: string;
@@ -53,7 +54,7 @@ function isWithinRthWindow(nowMs: number = Date.now()): boolean {
   const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
   const etMins = hour * 60 + minute;
 
-  return etMins >= 9 * 60 + 30 && etMins <= 16 * 60;
+  return etMins >= 9 * 60 + 30 && etMins < 16 * 60;
 }
 
 function getBotState(): LiveBotGlobalState {
@@ -62,6 +63,7 @@ function getBotState(): LiveBotGlobalState {
       intervalId: null,
       isPolling: false,
       isEvaluatingLiveBar: false,
+      lockAcquiredAtMs: 0,
       startedAtMs: Date.now(),
       lastPollAtMs: 0,
       lastStatus: "IDLE",
@@ -79,14 +81,19 @@ export function isEvaluatingLiveBar(): boolean {
 
 export function acquireBarEvaluationLock(): boolean {
   const state = getBotState();
-  if (state.isEvaluatingLiveBar) return false;
+  const nowMs = Date.now();
+  if (state.isEvaluatingLiveBar && nowMs - state.lockAcquiredAtMs < 30_000) {
+    return false;
+  }
   state.isEvaluatingLiveBar = true;
+  state.lockAcquiredAtMs = nowMs;
   return true;
 }
 
 export function releaseBarEvaluationLock(): void {
   const state = getBotState();
   state.isEvaluatingLiveBar = false;
+  state.lockAcquiredAtMs = 0;
 }
 
 export async function runLiveBotTick(): Promise<void> {

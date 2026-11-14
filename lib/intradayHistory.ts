@@ -430,30 +430,3 @@ export async function recordIntradaySnapshot(params: {
     officialLevels: tickerData.officialLevels,
   };
 }
-
-export async function getIntradayHistoryAndAlerts(ticker: string): Promise<{
-  history: IntradayHistoryPoint[];
-  alerts: IntradayAlert[];
-  officialLevels?: {
-    callWall: number;
-    callWallGex?: number;
-    putWall: number;
-    putWallGex?: number;
-    zeroGamma: number;
-    hasZeroGammaFlip?: boolean;
-  };
-}> {
-  const sym = ticker.trim().toUpperCase();
-  const store = loadStore();
-
-  if (!store.tickers[sym] || store.tickers[sym].history.length < 2) {
-    await backfillFromTerraShade(sym, store);
-  }
-
-  const tickerData = store.tickers[sym] ?? { history: [], alerts: [] };
-  return {
-    history: tickerData.history,
-    alerts: tickerData.alerts,
-    officialLevels: tickerData.officialLevels,
-  };
-}

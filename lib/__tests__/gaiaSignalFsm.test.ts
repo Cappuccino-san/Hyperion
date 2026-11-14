@@ -16,7 +16,7 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
       { barTimestamp: 1300, open: 760.2, high: 760.8, low: 759.8, close: 760.5, chi: 0.51, bias: 0.03, netFlux: 0.01, peclet: 0.4, etMins: 555, isClosed: true },
       { barTimestamp: 1600, open: 760.5, high: 761.2, low: 760.0, close: 760.9, chi: 0.53, bias: 0.08, netFlux: 0.04, peclet: 0.6, etMins: 560, isClosed: true },
       { barTimestamp: 1900, open: 760.9, high: 761.5, low: 760.4, close: 761.0, chi: 0.52, bias: 0.06, netFlux: 0.03, peclet: 0.5, etMins: 565, isClosed: true },
-      { barTimestamp: 2200, open: 761.0, high: 763.5, low: 760.8, close: 763.0, chi: 0.65, bias: 0.35, netFlux: 0.25, peclet: 2.1, etMins: 570, isClosed: true },
+      { barTimestamp: 2200, open: 761.0, high: 763.5, low: 760.8, close: 763.0, chi: 0.65, bias: 0.35, netFlux: 0.25, peclet: 2.1, etMins: 575, isClosed: true },
     ];
 
     const { newlyCommitted, snapshot } = fsm.commitSeries(bars, {
@@ -40,7 +40,7 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
       { barTimestamp: 1300, open: 765.0, high: 765.2, low: 764.2, close: 764.5, chi: 0.49, bias: -0.03, netFlux: -0.01, peclet: 0.4, etMins: 555, isClosed: true },
       { barTimestamp: 1600, open: 764.5, high: 764.8, low: 763.8, close: 764.0, chi: 0.47, bias: -0.08, netFlux: -0.04, peclet: 0.6, etMins: 560, isClosed: true },
       { barTimestamp: 1900, open: 764.0, high: 764.2, low: 763.2, close: 763.5, chi: 0.48, bias: -0.06, netFlux: -0.03, peclet: 0.5, etMins: 565, isClosed: true },
-      { barTimestamp: 2200, open: 763.5, high: 763.8, low: 761.0, close: 761.5, chi: 0.35, bias: -0.38, netFlux: -0.28, peclet: 2.4, etMins: 570, isClosed: true },
+      { barTimestamp: 2200, open: 763.5, high: 763.8, low: 761.0, close: 761.5, chi: 0.35, bias: -0.38, netFlux: -0.28, peclet: 2.4, etMins: 575, isClosed: true },
     ];
 
     const { newlyCommitted, snapshot } = fsm.commitSeries(bars, {
@@ -81,9 +81,9 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
 
     const bars: GaiaBarData[] = [
       // 1. Long breakout
-      { barTimestamp: 1000, open: 760, high: 763, low: 759.5, close: 762.5, chi: 0.65, bias: 0.30, netFlux: 0.20, peclet: 1.8, etMins: 570, isClosed: true },
+      { barTimestamp: 1000, open: 760, high: 763, low: 759.5, close: 762.5, chi: 0.65, bias: 0.30, netFlux: 0.20, peclet: 1.8, etMins: 575, isClosed: true },
       // 2. Bar 2: Shallow adverse pullback bar holding well inside 1.5 * ATR
-      { barTimestamp: 1300, open: 762.5, high: 762.8, low: 761.0, close: 761.2, chi: 0.48, bias: -0.05, netFlux: -0.05, peclet: 0.9, etMins: 575, isClosed: true },
+      { barTimestamp: 1300, open: 762.5, high: 762.8, low: 761.0, close: 761.2, chi: 0.48, bias: -0.05, netFlux: -0.05, peclet: 0.9, etMins: 580, isClosed: true },
     ];
 
     // Evaluate up to Bar 2
@@ -106,7 +106,7 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
       bias: -0.25,
       netFlux: -0.20,
       peclet: 1.5,
-      etMins: 580,
+      etMins: 585,
       isClosed: true,
     };
 
@@ -137,7 +137,7 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
       bias: 0.32,
       netFlux: 0.22,
       peclet: 1.9,
-      etMins: 570,
+      etMins: 575,
       isClosed: true,
     };
 
@@ -202,12 +202,12 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
 
     // Bars representing Nov 4 rally from $762.88 to $768.55 with 96% Call Dominance
     const bars: GaiaBarData[] = [
-      { barTimestamp: 1000, open: 762.0, high: 763.5, low: 761.8, close: 762.88, chi: 0.96, bias: 0.85, netFlux: 0.45, peclet: 25.0, etMins: 570, isClosed: true },
-      { barTimestamp: 1300, open: 762.88, high: 765.0, low: 762.5, close: 764.50, chi: 0.95, bias: 0.82, netFlux: 0.40, peclet: 24.0, etMins: 575, isClosed: true },
+      { barTimestamp: 1000, open: 762.0, high: 763.5, low: 761.8, close: 762.88, chi: 0.96, bias: 0.85, netFlux: 0.45, peclet: 25.0, etMins: 575, isClosed: true },
+      { barTimestamp: 1300, open: 762.88, high: 765.0, low: 762.5, close: 764.50, chi: 0.95, bias: 0.82, netFlux: 0.40, peclet: 24.0, etMins: 580, isClosed: true },
       // Minor 1-bar pullback pause
-      { barTimestamp: 1600, open: 764.50, high: 764.8, low: 763.9, close: 764.10, chi: 0.92, bias: 0.70, netFlux: 0.15, peclet: 18.0, etMins: 580, isClosed: true },
+      { barTimestamp: 1600, open: 764.50, high: 764.8, low: 763.9, close: 764.10, chi: 0.92, bias: 0.70, netFlux: 0.15, peclet: 18.0, etMins: 585, isClosed: true },
       // Continuation to highs
-      { barTimestamp: 1900, open: 764.10, high: 768.8, low: 764.0, close: 768.55, chi: 0.96, bias: 0.90, netFlux: 0.50, peclet: 25.0, etMins: 585, isClosed: true },
+      { barTimestamp: 1900, open: 764.10, high: 768.8, low: 764.0, close: 768.55, chi: 0.96, bias: 0.90, netFlux: 0.50, peclet: 25.0, etMins: 590, isClosed: true },
     ];
 
     const { newlyCommitted, snapshot } = fsm.commitSeries(bars, {
@@ -282,5 +282,28 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
 
     assert.notStrictEqual(sig2, null, "LONG entry admitted when price clears accelerating Flow VWAP");
     assert.strictEqual(sig2?.toState, "LONG");
+  });
+
+  it("Flux-Field Primary Entry/Exit: Strong Call flux (chi > 0.85, netFlux > 0) enters LONG, holds on aligned flux, and exits on adverse flux reversal", () => {
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [
+      { barTimestamp: 1000, open: 760.0, high: 760.5, low: 759.5, close: 760.1, chi: 0.52, bias: 0.04, netFlux: 0.02, peclet: 0.4, etMins: 565, isClosed: true },
+      { barTimestamp: 1300, open: 760.1, high: 762.8, low: 760.0, close: 762.4, chi: 0.89, bias: 0.42, netFlux: 0.35, peclet: 2.6, etMins: 575, isClosed: true },
+      // Aligned flux pull-in: holds LONG
+      { barTimestamp: 1600, open: 762.4, high: 762.6, low: 761.5, close: 761.9, chi: 0.86, bias: 0.25, netFlux: 0.18, peclet: 1.9, etMins: 580, isClosed: true },
+      // Adverse flux flip + ATR breach: exits to STAND_ASIDE
+      { barTimestamp: 1900, open: 761.9, high: 762.0, low: 757.2, close: 757.6, chi: 0.12, bias: -0.38, netFlux: -0.31, peclet: 2.3, etMins: 585, isClosed: true },
+    ];
+
+    const { newlyCommitted, snapshot } = fsm.commitSeries(bars, {
+      macroRegime: "CALL",
+      callDominancePct: 72,
+    });
+
+    assert.strictEqual(newlyCommitted.length, 2, "Expected 1 LONG entry and 1 STAND_ASIDE exit");
+    assert.strictEqual(newlyCommitted[0].toState, "LONG");
+    assert.strictEqual(newlyCommitted[1].fromState, "LONG");
+    assert.strictEqual(newlyCommitted[1].toState, "STAND_ASIDE");
+    assert.strictEqual(snapshot.committedState, "STAND_ASIDE");
   });
 });

@@ -605,6 +605,8 @@ export function computeBarFlowGammaVwapSeries(
   const refOpenSpot = candles[0].open || candles[0].close;
 
   if (optionsBook && optionsBook.length > 0) {
+  // RTH_SESSION_RESET_GUARD: Track RTH open transition (09:30 ET) to reset pre-market variance skew
+  let hasResetForRth = false;
     for (const opt of optionsBook) {
       const gamma = Math.max(0, Number(opt.gamma) || 0);
       const vol = Math.max(1, Number(opt.volume) || (Number(opt.openInterest) || 0) * 0.05);

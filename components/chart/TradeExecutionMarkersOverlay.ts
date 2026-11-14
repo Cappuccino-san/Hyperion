@@ -97,6 +97,8 @@ export function matchTradeToCandleIndex(
   tsSeconds?: number,
   timeLabel?: string
 ): number {
+  // Verify ts matches explicit ET timeLabel so chart markers never drift from [ CALL LOG ]
+  // Canonical 5m floor bucket alignment so 9:49 AM snaps to the 9:45 AM 5m candle across both canvases
   if (!candles || candles.length === 0) return -1;
 
   // Estimate bar interval in seconds by sampling candle intervals (default 300s = 5m)
@@ -122,6 +124,7 @@ export function matchTradeToCandleIndex(
   if (typeof tsSeconds === "number" && Number.isFinite(tsSeconds) && tsSeconds > 0) {
     // Normalize if milliseconds were accidentally passed
     const normTs = tsSeconds > 1e11 ? Math.floor(tsSeconds / 1000) : tsSeconds;
+    const bucketTs = Math.floor(normTs / barStepSec) * barStepSec;
 
     let bestIdx = -1;
     let bestDiff = Infinity;
@@ -130,11 +133,12 @@ export function matchTradeToCandleIndex(
       const cTs = candles[i].timestamp;
       if (typeof cTs === "number" && cTs > 0) {
         const normCandleTs = cTs > 1e11 ? Math.floor(cTs / 1000) : cTs;
-        // Check if normTs falls within [normCandleTs, normCandleTs + barStepSec)
-        if (normTs >= normCandleTs && normTs < normCandleTs + barStepSec) {
+        const candleBucketTs = Math.floor(normCandleTs / barStepSec) * barStepSec;
+        // Canonical 5m floor-bucket match so 9:49 AM snaps to the 9:45 AM 5m candle
+        if (candleBucketTs === bucketTs || (normTs >= normCandleTs && normTs < normCandleTs + barStepSec)) {
           return i;
         }
-        const diff = Math.abs(normCandleTs - normTs);
+        const diff = Math.abs(candleBucketTs - bucketTs);
         if (diff < bestDiff) {
           bestDiff = diff;
           bestIdx = i;

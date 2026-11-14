@@ -71,11 +71,6 @@ export interface StrikeRowData {
 
 const METRIC_OPTIONS: ExposureMetric[] = ["GEX", "VEX", "DEX", "Charm"];
 
-function seededStrikeHash(seed: number): number {
-  const x = Math.sin(seed * 91.3458 + 17.13) * 47853.5453;
-  return x - Math.floor(x);
-}
-
 /**
  * TerraShade Signed Heatmap Color Scale:
  * Negative runs blue to purple (HNEG), positive runs dark green to lime (HPOS), zero is slate (HZERO).

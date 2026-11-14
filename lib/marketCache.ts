@@ -15,11 +15,3 @@ export const optionsMemoryCache: Map<string, CacheEntry> =
     string,
     CacheEntry
   >());
-
-export function getMemoryCacheEntries(): { ticker: string; timestamp: number }[] {
-  const result: { ticker: string; timestamp: number }[] = [];
-  optionsMemoryCache.forEach((entry, ticker) => {
-    result.push({ ticker, timestamp: entry.timestamp });
-  });
-  return result;
-}

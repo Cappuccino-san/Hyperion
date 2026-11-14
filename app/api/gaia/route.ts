@@ -644,7 +644,10 @@ async function fetchLiveOptionsBuckets(
     calculatedMove > 0
       ? calculatedMove
       : Number((priorClose * atmIv * Math.sqrt(1 / 252)).toFixed(2));
-  const sigma2Move = Number((sigma1Move * 2).toFixed(2));
+  // CANONICAL_SIGMA_FLOOR: Enforce realistic 1-day SPY/index expected move (~0.68% of spot, ~$5.15 on SPY)
+    const sigmaFloor1d = Number(((priorClose || 757) * 0.0068).toFixed(2));
+    const resolvedSigma1 = Math.max(sigma1Move, sigmaFloor1d);
+    const sigma2Move = Number((resolvedSigma1 * 2).toFixed(2));
 
   // Determine strike step near spot
   const atmStrikes = Array.from(
@@ -806,7 +809,7 @@ async function fetchLiveOptionsBuckets(
     dataSource: "CBOE_MARKET_DATA",
     spotPrice: liveSpot,
     impliedVolatility: Number(iv30Decimal.toFixed(4)),
-    sigma1Move,
+    sigma1Move: resolvedSigma1,
     sigma2Move,
     strikeStep,
     has0DteActive: hasZeroDte,
@@ -1064,7 +1067,7 @@ export async function GET(request: NextRequest) {
       priorClose: Number(priorClose.toFixed(2)),
       spotPrice: liveBook.spotPrice,
       impliedVolatility: liveBook.impliedVolatility,
-      sigma1Move: liveBook.sigma1Move,
+      sigma1Move: Math.max(liveBook.sigma1Move, Number(((priorClose || liveBook.spotPrice || 757) * 0.0068).toFixed(2))),
       sigma2Move: liveBook.sigma2Move,
       strikeStep: liveBook.strikeStep,
       candles,

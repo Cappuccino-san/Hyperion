@@ -162,16 +162,6 @@ export const normCDF = (x: number): number => {
   return 0.5 * (1.0 + sign * y);
 };
 
-// Prevent divide-by-zero on 0DTE by clamping minimum time to 5 trading minutes
-export const getFractionalYearT = (
-  dteDays: number,
-  minutesLeftToday = 120
-): number => {
-  const minTradingYear = 5 / (252 * 390);
-  if (dteDays <= 0) return Math.max(minTradingYear, minutesLeftToday / (252 * 390));
-  return (dteDays + minutesLeftToday / 390) / 252;
-};
-
 /**
  * Shared helper to auto-scale exposure numbers in $B, $M, or $K
  */

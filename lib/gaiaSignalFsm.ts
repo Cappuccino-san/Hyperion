@@ -62,6 +62,10 @@ export interface GaiaBarData {
   flowVwap?: number;
   prevFlowVwap?: number;
   vwapSlope?: number;
+  upperBand1?: number;
+  lowerBand1?: number;
+  upperBand2?: number;
+  lowerBand2?: number;
   sma34?: number;
   prevSma34?: number;
   prevChi?: number;
@@ -209,6 +213,8 @@ export class GaiaSignalFsm {
   private activeTargetWall: number = 0;
   private activeStopPrice: number = 0;
   private activeSetupReason: string = "";
+  private prevBarLow: number = 0;
+  private prevBarHigh: number = 0;
 
   constructor(initialState: GaiaFsmState = "STAND_ASIDE") {
     this.committedState = initialState;
@@ -223,6 +229,8 @@ export class GaiaSignalFsm {
     this.activeTargetWall = 0;
     this.activeStopPrice = 0;
     this.activeSetupReason = "";
+    this.prevBarLow = 0;
+    this.prevBarHigh = 0;
   }
 
   /**
@@ -256,7 +264,7 @@ export class GaiaSignalFsm {
     // 3. Strict Entry Window (09:30 open bar / 09:35 closed bar through 14:30 ET)
     const isWithinEntryWindow = typeof etMins === "number"
       ? (etMins >= GAIA_ENTRY_START_MINS && etMins <= GAIA_ENTRY_CUTOFF_MINS)
-      : true;
+      : false;
 
     // Excursion from structural equilibrium (chi=0.5, flux=0.0)
     const eChi = (bar.chi - 0.50) / dispersion.sigmaChi;
@@ -333,7 +341,19 @@ export class GaiaSignalFsm {
           };
         }
 
-        // Setup P-B (Zero-Gamma / Book Center Breakdown Flush)
+        // Setup P-C (Pre-Market Upper Flux Field / Zero-Gamma Rejection + Bearish Opening Lean)
+      if (!putBlockedByWall && typeof etMins === "number" && etMins >= GAIA_ENTRY_START_MINS && etMins <= 630) {
+        const rejectedOverhead = (zg !== undefined && bar.close < zg) &&
+          (callWall !== undefined && bar.close < callWall);
+        const bearishLean = (bar.flowVwap !== undefined && bar.close < bar.flowVwap) &&
+          bar.netFlux < 0 && bar.chi <= 0.45 && isBearMacro;
+        const downsideRoom = (bar.close - (putWall ?? bar.close - 2.50)) >= 1.25 * unitRisk;
+        if (rejectedOverhead && bearishLean && downsideRoom) {
+          return { nextState: "SHORT", reason: "PREMARKET_FLUX_REJECTION_PUT", targetWall: putWall };
+        }
+      }
+
+      // Setup P-B (Zero-Gamma / Book Center Breakdown Flush)
         if (zg !== undefined && bar.close < zg && bookCenter !== undefined) {
           const brokeCenter = bar.close < bookCenter && (bar.sma34 === undefined || bar.close < bar.sma34);
           const downsideRoomFlush = (bar.close - (putWall ?? bar.close - 2.50)) >= MIN_REWARD_RISK * unitRisk;
@@ -353,7 +373,30 @@ export class GaiaSignalFsm {
       // HIGH-CONVICTION BTO CALL EVALUATION (Setups C-A & C-B)
       // =========================================================================
       if (!callBlockedByWall && levels) {
-        // Setup C-A (Put Wall / PDL Reversal + Reclaim)
+        // Primary Flux-Field Call Entry (Lower -1.5sigma Flux Exhaustion + Cyan Boundary Flux Flip & Flow VWAP Reclaim)
+      if (!callBlockedByWall && !bar.bearDiv5m) {
+        const vwapRef = bar.flowVwap ?? bookCenter ?? bar.sma34;
+        const fluxDistSigma = vwapRef !== undefined && dispersion.atr > 0 ? (bar.close - vwapRef) / Math.max(0.75, dispersion.atr) : 0;
+        const testLow = bar.recentLow4 ?? bar.low;
+        const touchedLowerFluxOrWall =
+          (bar.lowerBand2 !== undefined && testLow <= bar.lowerBand2 * 1.0008) ||
+          (bar.lowerBand1 !== undefined && testLow <= bar.lowerBand1 && bar.close > bar.lowerBand1) ||
+          (vwapRef !== undefined && (testLow - vwapRef) / Math.max(0.75, dispersion.atr) <= -1.25) ||
+          [putWall, pdl].some((lvl) => typeof lvl === "number" && Math.abs(testLow - lvl) / lvl <= 0.0030);
+        const cyanFluxFlip = bar.netFlux > 0 && (bar.peclet >= 0.40 || bar.chi >= 0.48 || (bar.prevChi !== undefined && bar.chi - bar.prevChi >= 0.06));
+        const reclaimedEquilibrium = (vwapRef !== undefined && bar.close >= vwapRef) || (bar.sma34 !== undefined && bar.close > bar.sma34);
+        const upsideRoom = ((callWall ?? zg ?? (vwapRef ? vwapRef + 2.0 * Math.max(0.85, dispersion.atr) : bar.close + 2.50)) - bar.close) >= 1.25 * unitRisk;
+        if (touchedLowerFluxOrWall && cyanFluxFlip && reclaimedEquilibrium && fluxDistSigma < 1.25 && upsideRoom) {
+          const upperFluxTarget = vwapRef ? Number((vwapRef + 2.0 * Math.max(0.85, dispersion.atr)).toFixed(2)) : undefined;
+          return {
+            nextState: "LONG",
+            reason: "FLUX_FIELD_EXTREMITY_RECLAIM_CALL",
+            targetWall: callWall && callWall > bar.close + 1.0 ? callWall : upperFluxTarget,
+          };
+        }
+      }
+
+      // Setup C-A (Put Wall / PDL Reversal + Reclaim)
         const testLow = bar.recentLow4 ?? Math.min(bar.low, bar.open);
         const nearLower = [putWall, pdl, sigma1dLower].some(
           (lvl) => typeof lvl === "number" && Math.abs(testLow - lvl) / lvl <= 0.0025
@@ -449,6 +492,13 @@ export class GaiaSignalFsm {
     }
 
     if (currentState === "LONG") {
+      const clampFill = (p: number) => Number(Math.max(bar.low, Math.min(bar.high, p)).toFixed(2));
+      const solidBullFlux = bar.netFlux > 0 && bar.chi > 0.85;
+      const fluxDecelerating = bar.prevNetFlux !== undefined && bar.netFlux <= bar.prevNetFlux;
+      const upperFluxBand = bar.upperBand2 ?? (bar.flowVwap !== undefined ? bar.flowVwap + 1.95 * Math.max(0.85, dispersion.atr) : undefined);
+      if ((upperFluxBand !== undefined && bar.high >= upperFluxBand && (fluxDecelerating || !solidBullFlux)) || (bar.netFlux < 0 && bar.peclet <= -0.75 && bar.flowVwap !== undefined && bar.close < bar.flowVwap)) {
+        return { nextState: "STAND_ASIDE", reason: "UPPER_FLUX_FIELD_TARGET_OR_FLUX_FLIP", fillPrice: bar.close };
+      }
       const entryP = entryPriceRef || this.currentEntryPrice || bar.close;
       const targetW = targetWallRef || this.activeTargetWall;
 
@@ -457,7 +507,7 @@ export class GaiaSignalFsm {
         return {
           nextState: "STAND_ASIDE",
           reason: "STRUCTURAL_TARGET_HIT",
-          fillPrice: targetW - TARGET_TOUCH_DOLLARS,
+          fillPrice: clampFill(targetW - TARGET_TOUCH_DOLLARS),
         };
       }
 
@@ -469,12 +519,13 @@ export class GaiaSignalFsm {
 
         // Stage 2 Ratchet (75% progress): Trail under prior 5m low
         if (progress >= 0.75) {
-          const trailStop = (bar.low < bar.open ? bar.low : bar.open) - 0.05;
+          const refLow = this.prevBarLow > 0 ? this.prevBarLow : bar.open;
+          const trailStop = Number((refLow - 0.05).toFixed(2));
           if (bar.close < trailStop) {
             return {
               nextState: "STAND_ASIDE",
               reason: "PROFIT_RATCHET_STAGE2_TRAIL_STOP",
-              fillPrice: trailStop,
+              fillPrice: clampFill(trailStop),
             };
           }
         } else if (progress >= 0.50) {
@@ -484,14 +535,14 @@ export class GaiaSignalFsm {
             return {
               nextState: "STAND_ASIDE",
               reason: "PROFIT_RATCHET_STAGE1_BE10",
-              fillPrice: be10Stop,
+              fillPrice: clampFill(be10Stop),
             };
           }
         }
       }
 
       // Reversal to SHORT strictly impossible unless macro regime has actively rotated to BEAR
-      if (isBearMacro && !isBullMacro && eChi <= -1.0 && eFlux <= -0.6) {
+      if (isWithinEntryWindow && isBearMacro && !isBullMacro && eChi <= -1.0 && eFlux <= -0.6) {
         return { nextState: "SHORT", reason: "MACRO_REVERSAL_TO_SHORT" };
       }
 
@@ -500,8 +551,8 @@ export class GaiaSignalFsm {
           return { nextState: "STAND_ASIDE", reason: "STRUCTURAL_STOP_LOSS", fillPrice: bar.close };
         }
         // If macro flips to BEAR, neutralize ONLY non-structural equilibrium trades
-        const isStructuralLong = this.activeSetupReason.startsWith("STRUCTURAL_CALL");
-        if (!isStructuralLong && isBearMacro && !isBullMacro) {
+        const isStructuralLong = this.activeSetupReason.startsWith("STRUCTURAL_CALL") || this.activeSetupReason.includes("FLUX");
+        if (!isStructuralLong && !solidBullFlux && isBearMacro && !isBullMacro) {
           return { nextState: "STAND_ASIDE", reason: "MACRO_REGIME_BEAR_FLIP" };
         }
 
@@ -518,6 +569,13 @@ export class GaiaSignalFsm {
     }
 
     if (currentState === "SHORT") {
+      const clampFill = (p: number) => Number(Math.max(bar.low, Math.min(bar.high, p)).toFixed(2));
+      const solidBearFlux = bar.netFlux < 0 && bar.chi < 0.15;
+      const fluxDecelerating = bar.prevNetFlux !== undefined && bar.netFlux >= bar.prevNetFlux;
+      const lowerFluxBand = bar.lowerBand2 ?? (bar.flowVwap !== undefined ? bar.flowVwap - 1.95 * Math.max(0.85, dispersion.atr) : undefined);
+      if ((lowerFluxBand !== undefined && bar.low <= lowerFluxBand && (fluxDecelerating || !solidBearFlux)) || (bar.netFlux > 0 && bar.peclet >= 0.75 && bar.flowVwap !== undefined && bar.close > bar.flowVwap)) {
+        return { nextState: "STAND_ASIDE", reason: "LOWER_FLUX_FIELD_TARGET_OR_FLUX_FLIP", fillPrice: bar.close };
+      }
       const entryP = entryPriceRef || this.currentEntryPrice || bar.close;
       const targetW = targetWallRef || this.activeTargetWall;
 
@@ -526,7 +584,7 @@ export class GaiaSignalFsm {
         return {
           nextState: "STAND_ASIDE",
           reason: "STRUCTURAL_TARGET_HIT",
-          fillPrice: targetW + TARGET_TOUCH_DOLLARS,
+          fillPrice: clampFill(targetW + TARGET_TOUCH_DOLLARS),
         };
       }
 
@@ -538,12 +596,13 @@ export class GaiaSignalFsm {
 
         // Stage 2 Ratchet (75% progress): Trail above prior 5m high
         if (progress >= 0.75) {
-          const trailStop = (bar.high > bar.open ? bar.high : bar.open) + 0.05;
+          const refHigh = this.prevBarHigh > 0 ? this.prevBarHigh : bar.open;
+          const trailStop = Number((refHigh + 0.05).toFixed(2));
           if (bar.close > trailStop) {
             return {
               nextState: "STAND_ASIDE",
               reason: "PROFIT_RATCHET_STAGE2_TRAIL_STOP",
-              fillPrice: trailStop,
+              fillPrice: clampFill(trailStop),
             };
           }
         } else if (progress >= 0.50) {
@@ -553,14 +612,14 @@ export class GaiaSignalFsm {
             return {
               nextState: "STAND_ASIDE",
               reason: "PROFIT_RATCHET_STAGE1_BE10",
-              fillPrice: be10Stop,
+              fillPrice: clampFill(be10Stop),
             };
           }
         }
       }
 
       // Reversal to LONG strictly impossible unless macro regime has actively rotated to BULL
-      if (isBullMacro && !isBearMacro && eChi >= 1.0 && eFlux >= 0.6) {
+      if (isWithinEntryWindow && isBullMacro && !isBearMacro && eChi >= 1.0 && eFlux >= 0.6) {
         return { nextState: "LONG", reason: "MACRO_REVERSAL_TO_LONG" };
       }
 
@@ -569,8 +628,8 @@ export class GaiaSignalFsm {
           return { nextState: "STAND_ASIDE", reason: "STRUCTURAL_STOP_LOSS", fillPrice: bar.close };
         }
         // If macro flips to BULL, neutralize ONLY non-structural equilibrium trades
-        const isStructuralShort = this.activeSetupReason.startsWith("STRUCTURAL_PUT");
-        if (!isStructuralShort && isBullMacro && !isBearMacro) {
+        const isStructuralShort = this.activeSetupReason.startsWith("STRUCTURAL_PUT") || this.activeSetupReason.includes("FLUX");
+        if (!isStructuralShort && !solidBearFlux && isBullMacro && !isBearMacro) {
           return { nextState: "STAND_ASIDE", reason: "MACRO_REGIME_BULL_FLIP" };
         }
 
@@ -631,6 +690,8 @@ export class GaiaSignalFsm {
       this.currentEntryPrice,
       this.activeTargetWall
     );
+    this.prevBarLow = bar.low;
+    this.prevBarHigh = bar.high;
     const { nextState, reason, fillPrice, targetWall, stopPrice } = transition;
 
     if (nextState === this.committedState) {

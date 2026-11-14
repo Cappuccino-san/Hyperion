@@ -8,7 +8,7 @@
 
 // Minutes from midnight ET
 export const RTH_OPEN_MINS = 570; // 09:30 ET
-export const ENTRY_START_MINS = 570; // 09:30 ET candle open / 09:35 ET closed
+export const ENTRY_START_MINS = 575; // 09:35 ET (first 5m candle closed)
 export const ENTRY_CUTOFF_MINS = 870; // 14:30 ET (no late-day chasing)
 export const EOD_FORCE_FLAT_MINS = 955; // 15:55 ET (hard MOC flat)
 export const RTH_CLOSE_MINS = 960; // 16:00 ET (after-hours firewall)

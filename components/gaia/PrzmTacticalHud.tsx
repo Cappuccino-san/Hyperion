@@ -837,11 +837,16 @@ export const PrzmTheCallStrip: React.FC<{
       </span>
       <div className="flex-1 flex items-center gap-[2px] h-3.5">
         {series.map((bar, idx) => {
+          const rawTs = Number(bar.timestamp ?? 0);
+          const barSec = rawTs > 1e11 ? Math.floor(rawTs / 1000) : rawTs;
+          const isFuture = barSec > 0 && barSec > Math.floor(Date.now() / 1000);
           const refVwap = bar.flowVwap || bar.vwap || bar.close;
           const spread = bar.close - refVwap;
           const bandSpan = Math.max(0.15, ((bar.upperBand ?? refVwap + 1.25) - (bar.lowerBand ?? refVwap - 1.25)) * 0.12);
           let bg = "bg-[#8B5CF6]/70";
-          if (spread > bandSpan * 0.35) {
+          if (isFuture) {
+            bg = "bg-slate-800/40";
+          } else if (spread > bandSpan * 0.35) {
             bg = "bg-[#00F5D4] shadow-[0_0_4px_rgba(0,245,212,0.35)]";
           } else if (spread < -bandSpan * 0.35) {
             bg = "bg-[#FF2A55] shadow-[0_0_4px_rgba(255,42,85,0.35)]";

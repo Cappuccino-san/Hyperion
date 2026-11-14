@@ -50,6 +50,8 @@ export interface GaiaCallPutBiasHudProps {
   ticker?: string;
   candles?: GaiaHudCandle[];
   bars?: GaiaHudCandle[];
+  flowVwapPoints?: FlowGammaVwapSnapshot[];
+  sigma1Move?: number;
   liveSpot?: number | null;
   spot?: number | null;
   tradeSignals?: GaiaHudTradeSignal[];
@@ -224,21 +226,13 @@ function formatTimeEt(epochMs: number): { short: string; full: string; isMajor: 
   return { short, full, isMajor, isRthOpen };
 }
 
-function computeEmaSeries(closes: number[], period: number): number[] {
-  if (closes.length === 0) return [];
-  const k = 2 / (period + 1);
-  const out = [closes[0]];
-  for (let i = 1; i < closes.length; i++) {
-    out.push(closes[i] * k + out[i - 1] * (1 - k));
-  }
-  return out;
-}
-
 export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   symbol,
   ticker,
   candles,
   bars,
+  flowVwapPoints,
+  sigma1Move,
   liveSpot,
   spot,
   tradeSignals = [],
@@ -328,11 +322,11 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       return {
         ...c,
         timestamp: ts,
-        open: Number(c.open) || Number(c.close) || 750,
-        high: Number(c.high) || Number(c.close) || 750,
-        low: Number(c.low) || Number(c.close) || 750,
-        close: Number(c.close) || 750,
-        volume: Number(c.volume) || 10000,
+        open: Number(c.open) || Number(c.close) || 0,
+        high: Number(c.high) || Number(c.close) || 0,
+        low: Number(c.low) || Number(c.close) || 0,
+        close: Number(c.close) || 0,
+        volume: Number(c.volume) || 0,
         timeLabel: c.timeLabel || formatTimeEt(ts).full,
       };
     });
@@ -388,9 +382,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     return cloned;
   }, [candles, bars, rawLiveSpot, liveTickPrice, liveTickCount, activeSymbol]);
 
-  // 2. Compute Bar-by-Bar Flow VWAP & Spectral Flux Series
+  // 2. Compute Bar-by-Bar Flow VWAP & Spectral Flux Series (preferring canonical parent series)
   const pdeSeries = useMemo(() => {
     if (effectiveCandles.length === 0) return [];
+    if (flowVwapPoints && flowVwapPoints.length === effectiveCandles.length) {
+      return flowVwapPoints;
+    }
     try {
       return computeBarFlowGammaVwapSeries(
         effectiveCandles.map((c) => ({
@@ -405,7 +402,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     } catch {
       return [];
     }
-  }, [effectiveCandles]);
+  }, [effectiveCandles, flowVwapPoints]);
 
   // Dimensions & Coordinates
   const svgWidth = 980;
@@ -427,8 +424,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   // Raw Price Extrema & Dynamic Adjusted Y-Domain
   const priceDomain = useMemo(() => {
     if (effectiveCandles.length === 0) {
-      const sp = rawLiveSpot || (activeSymbol === "SPY" ? 759.75 : 502.5);
-      return { min: sp - 2, max: sp + 2, current: sp, span: 4 };
+      const sp = rawLiveSpot || 0;
+      return { min: Math.max(0, sp - 2), max: sp + 2, current: sp, span: 4 };
     }
     let min = Infinity;
     let max = -Infinity;
@@ -622,17 +619,21 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   }, [enrichedPoints, chartBottom]);
 
   // Intrinsic daily Straddle Expected Move (100% decoupled from viewport zoom/pan priceDomain.span)
-  // Calibrated to institutional 0DTE ATM straddle ratio (~0.475% of 9:30 Open, e.g. ~$3.62 on SPY @ $760)
+  // Calibrated to institutional 0DTE ATM straddle ratio (preferring canonical sigma1Move prop)
   const intrinsicExpectedMove = useMemo(() => {
-    if (!enrichedPoints || enrichedPoints.length === 0) return 3.62;
+    if (typeof sigma1Move === "number" && Number.isFinite(sigma1Move) && sigma1Move > 0) {
+      return sigma1Move;
+    }
+    if (!enrichedPoints || enrichedPoints.length === 0) return 0;
     const open930Idx = enrichedPoints.findIndex((b) => b.etMins >= 570);
     const anchorIdx = open930Idx >= 0 ? open930Idx : 0;
     const open930 =
       enrichedPoints[anchorIdx]?.open > 0
         ? enrichedPoints[anchorIdx].open
-        : enrichedPoints[anchorIdx]?.close ?? 759.42;
+        : enrichedPoints[anchorIdx]?.close ?? 0;
+    if (open930 <= 0) return 0;
     return Math.max(open930 * 0.003, Math.min(open930 * 0.015, open930 * 0.00475));
-  }, [enrichedPoints]);
+  }, [enrichedPoints, sigma1Move]);
 
   // STAGE 1: Pure Data-Space Signal Engine (Strictly Viewport-Invariant: S ⊥ V)
   // Never recomputes when the user zooms or pans the X/Y axes.
@@ -647,7 +648,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     const open930 =
       enrichedPoints[anchorIdx]?.open > 0
         ? enrichedPoints[anchorIdx].open
-        : enrichedPoints[anchorIdx]?.close ?? 759.42;
+        : enrichedPoints[anchorIdx]?.close ?? 0;
 
     const expectedMove = intrinsicExpectedMove;
     const putTrigger = Number((open930 - 0.25 * expectedMove).toFixed(2));
@@ -936,14 +937,14 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   // Structural Metrics (Open 9:30 & Straddle Expected Move) - Strictly Viewport-Invariant
   const structuralMetrics = useMemo(() => {
     if (!enrichedPoints || enrichedPoints.length === 0) {
-      return { open930: 759.42, expectedMove: 3.62 };
+      return { open930: 0, expectedMove: 0 };
     }
     const open930Idx = enrichedPoints.findIndex((b) => b.etMins >= 570);
     const anchorIdx = open930Idx >= 0 ? open930Idx : 0;
     const open930 =
       enrichedPoints[anchorIdx]?.open > 0
         ? enrichedPoints[anchorIdx].open
-        : enrichedPoints[anchorIdx]?.close ?? 759.42;
+        : enrichedPoints[anchorIdx]?.close ?? 0;
 
     const expectedMove = intrinsicExpectedMove;
     return { open930, expectedMove };
@@ -954,7 +955,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       ? liveTickPrice
       : typeof rawLiveSpot === "number" && rawLiveSpot > 0
       ? rawLiveSpot
-      : effectiveCandles[effectiveCandles.length - 1]?.close ?? 759.92;
+      : effectiveCandles[effectiveCandles.length - 1]?.close ?? 0;
 
   const przmSeries: PrzmCandlePoint[] = useMemo(() => {
     return enrichedPoints.map((pt) => ({
@@ -964,14 +965,14 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       high: pt.high,
       low: pt.low,
       close: pt.close,
-      volume: 50000,
+      volume: effectiveCandles[pt.index]?.volume ?? 0,
       vwap: pt.flowVwap,
       flowVwap: pt.flowVwap,
       upperBand: pt.flowVwap + pt.sigma,
       lowerBand: pt.flowVwap - pt.sigma,
       boundaryFlux: pt.netFlux,
     }));
-  }, [enrichedPoints]);
+  }, [enrichedPoints, effectiveCandles]);
 
   // Auto-sync active Gaia SPY signals directly to Discord trade-signals engine
   const lastSyncedGaiaSigFingerprint = useRef<string>("");
@@ -1722,12 +1723,18 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             </text>
 
             {enrichedPoints.map((pt, i) => {
+              const rawSlotTs = Number((pt as any)?.ts ?? (pt as any)?.timestamp ?? (pt as any)?.startSec ?? 0);
+              const normSlotTs = rawSlotTs > 1e11 ? Math.floor(rawSlotTs / 1000) : rawSlotTs;
+              const latestActualRaw = Array.isArray(enrichedPoints) && enrichedPoints.length > 0 ? Number(enrichedPoints[enrichedPoints.length - 1]?.timestamp ?? 0) : 0;
+              const latestActualSec = latestActualRaw > 1e11 ? Math.floor(latestActualRaw / 1000) : latestActualRaw;
+              const nowSec = Math.floor(Date.now() / 1000);
+              const slotIsFuture = normSlotTs > 0 && (normSlotTs > nowSec || (latestActualSec > 0 && normSlotTs > latestActualSec));
               if (pt.baseX < padLeft || pt.baseX > svgWidth - padRight) return null;
               const slotW = (plotW / 120) * xScale;
               const tickW = Math.max(2, slotW - 1.8);
               const isCall = pt.regime === "CALL";
-              const col = isCall ? "#00F5D4" : "#FF2A55";
-              const op = Math.max(0.4, Math.min(1.0, 0.45 + Math.abs(pt.bias) * 0.55));
+              const col = slotIsFuture ? "rgba(148, 163, 184, 0.25)" : isCall ? "#00F5D4" : "#FF2A55";
+              const op = slotIsFuture ? 0.22 : Math.max(0.4, Math.min(1.0, 0.45 + Math.abs(pt.bias) * 0.55));
               return (
                 <rect
                   key={`tick-${i}`}
