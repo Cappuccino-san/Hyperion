@@ -592,4 +592,39 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
       }
     }
   });
+
+  it("Canvas Level Label De-Collision: Staggers nearby levels with >= 13px vertical separation", () => {
+    const padTop = 18;
+    const height = 420;
+    const padBottom = 36;
+    const lineYs = [120, 127, 134, 240, 247]; // Tightly clustered pairs (< 10px apart)
+    const drawnLevelLabelYs: number[] = [];
+    const minLabelSepPx = 13;
+
+    for (const ly of lineYs) {
+      const candidates = [
+        { anchorY: ly - 2, centerY: ly - 7 },
+        { anchorY: ly + 2, centerY: ly + 7 },
+        { anchorY: ly - 15, centerY: ly - 20 },
+        { anchorY: ly + 15, centerY: ly + 20 },
+      ];
+      const chosen = candidates.find(
+        (c) =>
+          c.centerY >= padTop + 8 &&
+          c.centerY <= height - padBottom - 8 &&
+          !drawnLevelLabelYs.some((oy) => Math.abs(oy - c.centerY) < minLabelSepPx)
+      );
+      if (chosen) drawnLevelLabelYs.push(chosen.centerY);
+    }
+
+    assert.strictEqual(drawnLevelLabelYs.length, 5, "All 5 clustered levels should be placed without dropping");
+    for (let i = 0; i < drawnLevelLabelYs.length; i++) {
+      for (let j = i + 1; j < drawnLevelLabelYs.length; j++) {
+        assert.ok(
+          Math.abs(drawnLevelLabelYs[i] - drawnLevelLabelYs[j]) >= minLabelSepPx,
+          `Label pair (${i},${j}) violated >= 13px separation`
+        );
+      }
+    }
+  });
 });

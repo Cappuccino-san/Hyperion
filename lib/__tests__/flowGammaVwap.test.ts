@@ -280,7 +280,10 @@ runTest("Causal prefix invariance across pre-market and 09:30 ET RTH session res
     assert.strictEqual(a.pecletNumber, b.pecletNumber, `peclet diverged on prefix k=${k}`);
     assert.strictEqual(a.impulseChi, b.impulseChi, `impulseChi diverged on prefix k=${k}`);
     assert.strictEqual(a.deltaChi6Bar, b.deltaChi6Bar, `deltaChi6Bar diverged on prefix k=${k}`);
+    assert.strictEqual(a.deltaImpulseChi6Bar, b.deltaImpulseChi6Bar, `deltaImpulseChi6Bar diverged on prefix k=${k}`);
   }
+  const lastSnap = fullSeries[fullSeries.length - 1];
+  assert.ok(typeof lastSnap.deltaImpulseChi6Bar === "number", "deltaImpulseChi6Bar must be a finite number");
 });
 
 console.log(`\n=======================================================`);

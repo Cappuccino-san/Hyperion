@@ -1839,7 +1839,8 @@ export function GaiaView() {
     ctx.font = "bold 9px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textAlign = "right";
     ctx.textBaseline = "bottom";
-    const occupiedLabelYs: number[] = [];
+    const drawnLevelLabelYs: number[] = [];
+    const minLabelSepPx = 13;
 
     for (const ln of mergedLines) {
       ctx.strokeStyle = ln.stroke;
@@ -1850,13 +1851,23 @@ export function GaiaView() {
       ctx.lineTo(dividerX, ln.y);
       ctx.stroke();
 
-      const collides = occupiedLabelYs.some((oy) => Math.abs(oy - ln.y) < 11);
-      if (!collides) {
-        const drawBelow = ln.y - 12 < padTop + 2;
-        ctx.textBaseline = drawBelow ? "top" : "bottom";
+      const candidates = [
+        { anchorY: ln.y - 2, centerY: ln.y - 7, baseline: "bottom" as CanvasTextBaseline },
+        { anchorY: ln.y + 2, centerY: ln.y + 7, baseline: "top" as CanvasTextBaseline },
+        { anchorY: ln.y - 15, centerY: ln.y - 20, baseline: "bottom" as CanvasTextBaseline },
+        { anchorY: ln.y + 15, centerY: ln.y + 20, baseline: "top" as CanvasTextBaseline },
+      ];
+      const chosen = candidates.find(
+        (c) =>
+          c.centerY >= padTop + 8 &&
+          c.centerY <= height - padBottom - 8 &&
+          !drawnLevelLabelYs.some((oy) => Math.abs(oy - c.centerY) < minLabelSepPx)
+      );
+      if (chosen) {
+        ctx.textBaseline = chosen.baseline;
         ctx.fillStyle = ln.textColor;
-        ctx.fillText(ln.label, dividerX - 6, drawBelow ? ln.y + 2 : ln.y - 2);
-        occupiedLabelYs.push(ln.y);
+        ctx.fillText(ln.label, dividerX - 6, chosen.anchorY);
+        drawnLevelLabelYs.push(chosen.centerY);
       }
     }
     ctx.restore();
@@ -3307,6 +3318,11 @@ export function GaiaView() {
       })()}
 
       {/* 2E. Live Gaia Call/Put Bias & Every Call Today HUD */}
+      {(() => {
+        const replayBar = dataset?.candles?.[safeActiveIdx];
+        const replayTsRaw = Number(replayBar?.timestamp ?? 0);
+        const replayBarTsSec = replayTsRaw > 1e11 ? Math.floor(replayTsRaw / 1000) : replayTsRaw;
+        return (
       <GaiaCallPutBiasHud
         symbol={loadedTicker}
         candles={dataset?.candles?.slice(0, safeActiveIdx + 1).map((c) => ({
@@ -3325,6 +3341,8 @@ export function GaiaView() {
         serverTrades={effectiveServerTrades}
         dividerRatio={dividerRatio}
         isReplayMode={isReplaying || isReplayFrozen}
+        replayBarTsSec={replayBarTsSec > 0 ? replayBarTsSec : undefined}
+        replayBarClose={replayBar?.close}
         startHour={startHour}
         xScale={xScale}
         xPanOffset={xPanOffset}
@@ -3359,6 +3377,8 @@ export function GaiaView() {
           }
         }}
       />
+        );
+      })()}
 
       {/* 3 & 4A. Core Chart Canvas Card + Interactive Session Replay Bar */}
       <div

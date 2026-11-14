@@ -20,7 +20,7 @@ import {
   parseEtTimeSeconds,
   OcoBracketConfig,
 } from "../lib/bracketOrderEngine";
-import { computeFluxDecay } from "../lib/flowGammaVwap";
+import { computeFluxDecay, computeBarFlowGammaVwapSeries } from "../lib/flowGammaVwap";
 import { dispatchBrokerOrder, BrokerOrderRequest } from "../lib/brokerExecution";
 import {
   selectSmallAccountContract,
@@ -1145,6 +1145,25 @@ async function runTestSuite() {
   assert(
     crossedPick === null,
     "Crossed-quote contract (bid > ask) must strictly be rejected by selectSmallAccountContract"
+  );
+
+  // Verify deltaImpulseChi6Bar captures positive impulse turn even when session chi is low
+  const impBounceBars = [
+    { timestamp: 1794580500, open: 758, high: 758.5, low: 756, close: 756.2, volume: 10000 },
+    { timestamp: 1794580800, open: 756.2, high: 756.4, low: 754, close: 754.1, volume: 12000 },
+    { timestamp: 1794581100, open: 754.1, high: 754.3, low: 752, close: 752.2, volume: 14000 },
+    { timestamp: 1794581400, open: 752.2, high: 752.4, low: 750, close: 750.3, volume: 15000 },
+    { timestamp: 1794581700, open: 750.3, high: 750.5, low: 749.2, close: 749.4, volume: 16000 },
+    { timestamp: 1794582000, open: 749.4, high: 749.8, low: 748.8, close: 749.1, volume: 18000 },
+    { timestamp: 1794582300, open: 749.1, high: 750.6, low: 749.0, close: 750.5, volume: 22000 },
+    { timestamp: 1794582600, open: 750.5, high: 751.8, low: 750.4, close: 751.7, volume: 24000 },
+    { timestamp: 1794582900, open: 751.7, high: 753.0, low: 751.6, close: 752.9, volume: 25000 },
+  ];
+  const impBounceSeries = computeBarFlowGammaVwapSeries(impBounceBars);
+  const lastBounceSnap = impBounceSeries[impBounceSeries.length - 1];
+  assert(
+    typeof lastBounceSnap?.deltaImpulseChi6Bar === "number" && lastBounceSnap.deltaImpulseChi6Bar > 0,
+    "deltaImpulseChi6Bar must turn strictly positive on afternoon V-reclaim"
   );
 
   // ===========================================================================

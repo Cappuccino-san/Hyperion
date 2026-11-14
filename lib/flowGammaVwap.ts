@@ -77,6 +77,7 @@ export interface FlowGammaVwapSnapshot {
   impulsePeclet?: number;     // 30-min (6-bar) windowed Pe_impulse
   impulseChi?: number;        // chi(Pe_impulse) in (0, 1) unaffected by morning session lag
   deltaChi6Bar?: number;      // chi[i] - chi[i-6]
+  deltaImpulseChi6Bar?: number; // impulseChi[i] - impulseChi[i-6]
   deltaNetFlux6Bar?: number;  // netFluxJ[i] - netFluxJ[i-6]
   fluxAlpha?: number;         // A(T) cumulative integrated ceiling flux
   fluxRegime?: FluxRegime;
@@ -932,6 +933,9 @@ export function computeBarFlowGammaVwapSeries(
       impulseChi,
       deltaChi6Bar: barsIntoSession >= 6 && results[i - 6]?.ceilingShareChi !== undefined
         ? Number((pdeState.ceilingShareChi - results[i - 6].ceilingShareChi!).toFixed(4))
+        : 0,
+      deltaImpulseChi6Bar: barsIntoSession >= 6 && results[i - 6]?.impulseChi !== undefined
+        ? Number((impulseChi - results[i - 6].impulseChi!).toFixed(4))
         : 0,
       deltaNetFlux6Bar: barsIntoSession >= 6 && results[i - 6]?.netFluxJ !== undefined
         ? Number((pdeState.netFluxJ - results[i - 6].netFluxJ!).toFixed(2))

@@ -138,9 +138,11 @@ export function evaluatePrzmCallLedger(
   liveSpot: number,
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE",
   serverTrades?: ServerTradeData,
-  ticker = "SPY"
+  ticker = "SPY",
+  replayBarTsSec?: number
 ): PrzmLedgerSummary {
   const normTicker = (ticker || "SPY").trim().toUpperCase();
+  const hasReplayCutoff = typeof replayBarTsSec === "number" && replayBarTsSec > 0;
   const storeState = serverTrades === undefined ? useDashboardStore.getState() : null;
   const rawClosed =
     Array.isArray(serverTrades?.closedPositions)
@@ -212,6 +214,11 @@ export function evaluatePrzmCallLedger(
 
   for (const pos of serverClosed) {
     if (!pos || !pos.id || String(pos.id).startsWith("test-")) continue;
+    const openedSec = pos.openedTs ? toEpochSeconds(pos.openedTs) : 0;
+    if (hasReplayCutoff && openedSec > replayBarTsSec!) continue;
+    const closedSec = pos.closedTs ? toEpochSeconds(pos.closedTs) : 0;
+    const isStillOpenInReplay = hasReplayCutoff && (closedSec === 0 || closedSec > replayBarTsSec!);
+
     const isShort = isShortOrPutTrade(pos);
     const isCall = !isShort;
     const type: "LONG" | "SHORT" = isShort ? "SHORT" : "LONG";
@@ -231,6 +238,31 @@ export function evaluatePrzmCallLedger(
     const exitBar = exitBucket > 0 ? series.find((b) => Math.floor(toEpochSeconds(b.timestamp) / 300) * 300 === exitBucket) : undefined;
     const clampedBto = entryBar && btoSpot > 0 ? Math.max(entryBar.low, Math.min(entryBar.high, btoSpot)) : btoSpot;
     const clampedClosed = exitBar && closedSpot > 0 ? Math.max(exitBar.low, Math.min(exitBar.high, closedSpot)) : closedSpot;
+
+    if (isStillOpenInReplay) {
+      const currentSpot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : clampedBto;
+      const delta = Number((isCall ? currentSpot - clampedBto : clampedBto - currentSpot).toFixed(2));
+      const heldMin =
+        openedSec > 0 && replayBarTsSec! > openedSec
+          ? Math.max(1, Math.round((replayBarTsSec! - openedSec) / 60))
+          : 5;
+      serverEntries.push({
+        id: pos.id,
+        timeFormatted: pos.openedTs ? formatPrzmTime(pos.openedAt, pos.openedTs) : (pos.openedAt || ""),
+        type,
+        contractType: isCall ? "CALL" : "PUT",
+        entryPrice: clampedBto,
+        status: "OPEN",
+        delta,
+        heldMinutes: heldMin,
+        heldLabel: formatHeldDuration(heldMin),
+        index: 0,
+        contractLabel: (pos.contractLabel || (pos as any).optionSymbol),
+        isServerTrade: true,
+      });
+      continue;
+    }
+
     const delta = Number((isCall ? clampedClosed - clampedBto : clampedBto - clampedClosed).toFixed(2));
     const isWin =
       pos.pnlOptionPct > 0 ||
@@ -273,6 +305,8 @@ export function evaluatePrzmCallLedger(
 
   for (const pos of serverActive) {
     if (!pos || !pos.id) continue;
+    const openedSec = pos.openedTs ? toEpochSeconds(pos.openedTs) : 0;
+    if (hasReplayCutoff && openedSec > replayBarTsSec!) continue;
     const isShort = isShortOrPutTrade(pos);
     const isCall = !isShort;
     const type: "LONG" | "SHORT" = isShort ? "SHORT" : "LONG";
@@ -321,7 +355,13 @@ export function evaluatePrzmCallLedger(
     };
   }
 
-  const sorted = [...signals].sort((a, b) => a.index - b.index);
+  const sorted = [...signals]
+    .filter((s) => {
+      if (!hasReplayCutoff) return true;
+      const barTs = toEpochSeconds(series[s.index]?.timestamp ?? s.timestamp);
+      return barTs === 0 || barTs <= replayBarTsSec!;
+    })
+    .sort((a, b) => a.index - b.index);
   const lastBarIdx = series.length > 0 ? series.length - 1 : 0;
   const lastBarTsSec = series.length > 0 ? toEpochSeconds(series[lastBarIdx]?.timestamp) : 0;
   const nowSec = Math.floor(Date.now() / 1000);
@@ -480,31 +520,38 @@ export const PrzmTopDeck: React.FC<{
   straddleEm?: number;
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
   serverTrades?: ServerTradeData;
-}> = ({ ticker, liveSpot, series, signals, open930, straddleEm, activeFsmState, serverTrades }) => {
+  isReplayMode?: boolean;
+  replayBarTsSec?: number;
+}> = ({ ticker, liveSpot, series, signals, open930, straddleEm, activeFsmState, serverTrades, isReplayMode = false, replayBarTsSec }) => {
   const ledger = useMemo(
-    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, ticker),
-    [signals, series, liveSpot, activeFsmState, serverTrades, ticker]
+    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, ticker, replayBarTsSec),
+    [signals, series, liveSpot, activeFsmState, serverTrades, ticker, replayBarTsSec]
   );
 
   // Live 1-second clock for "TO THE BELL" radial dial
   const [nowDate, setNowDate] = useState<Date>(() => new Date());
   useEffect(() => {
+    if (isReplayMode) return;
     const id = setInterval(() => setNowDate(new Date()), 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [isReplayMode]);
 
   // Compute RTH (09:30 -> 16:00 ET = 390 mins) progress & countdown
   const bellMetrics = useMemo(() => {
     try {
+      const refDate =
+        isReplayMode && typeof replayBarTsSec === "number" && replayBarTsSec > 0
+          ? new Date(replayBarTsSec * 1000)
+          : nowDate;
       const parts = new Intl.DateTimeFormat("en-US", {
         timeZone: "America/New_York",
         hour: "numeric",
         minute: "numeric",
         second: "numeric",
         hour12: false,
-      }).formatToParts(nowDate);
+      }).formatToParts(refDate);
 
-      const hr = parseInt(parts.find((p) => p.type === "hour")?.value ?? "12", 10);
+      const hr = parseInt(parts.find((p) => p.type === "hour")?.value ?? "12", 10) % 24;
       const min = parseInt(parts.find((p) => p.type === "minute")?.value ?? "0", 10);
       const sec = parseInt(parts.find((p) => p.type === "second")?.value ?? "0", 10);
       const etMins = hr * 60 + min + sec / 60;
@@ -513,7 +560,6 @@ export const PrzmTopDeck: React.FC<{
       const rthClose = 16 * 60; // 960
       const totalRth = 390;
 
-      // If currently inside live Regular Trading Hours
       if (etMins >= rthOpen && etMins < rthClose) {
         const elapsed = etMins - rthOpen;
         const rem = Math.max(0, Math.ceil(rthClose - etMins));
@@ -522,54 +568,44 @@ export const PrzmTopDeck: React.FC<{
         const progress = Math.min(1, Math.max(0, elapsed / totalRth));
         return {
           centerLabel: `${remH}h${String(remM).padStart(2, "0")}`,
-          subLabel: "9:30 > 4:00",
+          subLabel: isReplayMode ? "REPLAY 9:30>4:00" : "9:30 > 4:00",
           progress,
           litTicks: Math.max(1, Math.round(progress * 48)),
-          isLiveRth: true,
+          isLiveRth: !isReplayMode,
+          isOffHours: false,
         };
       }
 
-      // If outside live RTH, inspect the latest candle time in the chart
-      const lastCandle = series[series.length - 1];
-      if (lastCandle?.time) {
-        const m = lastCandle.time.match(/^(\d{1,2}):(\d{2})/);
-        if (m) {
-          const barMins = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
-          if (barMins >= rthOpen && barMins < rthClose - 5) {
-            const elapsed = barMins - rthOpen;
-            const rem = Math.max(0, rthClose - barMins);
-            const remH = Math.floor(rem / 60);
-            const remM = rem % 60;
-            const progress = Math.min(1, Math.max(0.05, elapsed / totalRth));
-            return {
-              centerLabel: `${remH}h${String(remM).padStart(2, "0")}`,
-              subLabel: "9:30 > 4:00",
-              progress,
-              litTicks: Math.max(1, Math.round(progress * 48)),
-              isLiveRth: false,
-            };
-          }
-        }
+      if (etMins < rthOpen) {
+        return {
+          centerLabel: "PRE-MKT",
+          subLabel: isReplayMode ? "REPLAY PRE-MKT" : "04:00 > 9:30",
+          progress: 0,
+          litTicks: 0,
+          isLiveRth: false,
+          isOffHours: true,
+        };
       }
 
-      // Session complete / After-hours state
       return {
-        centerLabel: "0h00",
+        centerLabel: "AFTER HRS",
+        subLabel: isReplayMode ? "REPLAY POST-MKT" : "16:00 > 20:00",
+        progress: 1,
+        litTicks: 48,
+        isLiveRth: false,
+        isOffHours: true,
+      };
+    } catch {
+      return {
+        centerLabel: "AFTER HRS",
         subLabel: "9:30 > 4:00",
         progress: 1,
         litTicks: 48,
         isLiveRth: false,
-      };
-    } catch {
-      return {
-        centerLabel: "1h35",
-        subLabel: "9:30 > 4:00",
-        progress: 0.75,
-        litTicks: 36,
-        isLiveRth: false,
+        isOffHours: true,
       };
     }
-  }, [nowDate, series]);
+  }, [nowDate, isReplayMode, replayBarTsSec]);
 
   // Compute the 5 multi-timeframe Drivers (SES, 30M, 10M, STDY, PX)
   const drivers = useMemo(() => {
@@ -754,7 +790,9 @@ export const PrzmTopDeck: React.FC<{
               textAnchor="middle"
               dominantBaseline="central"
               fill="#F8FAFC"
-              className="font-mono font-black text-[23px] tracking-tight"
+              className={`font-mono font-black tracking-tight ${
+                bellMetrics.isOffHours ? "text-[14px]" : "text-[23px]"
+              }`}
             >
               {bellMetrics.centerLabel}
             </text>
@@ -836,8 +874,10 @@ export const PrzmTopDeck: React.FC<{
  */
 export const PrzmTheCallStrip: React.FC<{
   series: PrzmCandlePoint[];
-}> = ({ series }) => {
+  replayBarTsSec?: number;
+}> = ({ series, replayBarTsSec }) => {
   if (!series.length) return null;
+  const refNowSec = typeof replayBarTsSec === "number" && replayBarTsSec > 0 ? replayBarTsSec : Math.floor(Date.now() / 1000);
 
   return (
     <div className="mt-2 px-2 py-1.5 rounded-lg bg-[#0d0e1a]/90 border border-slate-800/70 flex items-center gap-3">
@@ -848,7 +888,7 @@ export const PrzmTheCallStrip: React.FC<{
         {series.map((bar, idx) => {
           const rawTs = Number(bar.timestamp ?? 0);
           const barSec = rawTs > 1e11 ? Math.floor(rawTs / 1000) : rawTs;
-          const isFuture = barSec > 0 && barSec > Math.floor(Date.now() / 1000);
+          const isFuture = barSec > 0 && barSec > refNowSec;
           const refVwap = bar.flowVwap || bar.vwap || bar.close;
           const spread = bar.close - refVwap;
           const bandSpan = Math.max(0.15, ((bar.upperBand ?? refVwap + 1.25) - (bar.lowerBand ?? refVwap - 1.25)) * 0.12);
@@ -883,10 +923,11 @@ export const PrzmCallLogDeck: React.FC<{
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
   serverTrades?: ServerTradeData;
   ticker?: string;
-}> = ({ signals, series, liveSpot, activeFsmState, serverTrades, ticker = "SPY" }) => {
+  replayBarTsSec?: number;
+}> = ({ signals, series, liveSpot, activeFsmState, serverTrades, ticker = "SPY", replayBarTsSec }) => {
   const ledger = useMemo(
-    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, ticker),
-    [signals, series, liveSpot, activeFsmState, serverTrades, ticker]
+    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, ticker, replayBarTsSec),
+    [signals, series, liveSpot, activeFsmState, serverTrades, ticker, replayBarTsSec]
   );
 
   return (

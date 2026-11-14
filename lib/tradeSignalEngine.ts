@@ -2996,16 +2996,24 @@ export async function evaluateTradeSignals(
     // below Flow VWAP, below 5m SMA34, or market is in a Put regime (chi < 50% / macroRegime === "PUT").
     // Enforces opening-range firewall (< 9:45 AM ET) when indicators are unpopulated or in negative gamma.
     const deltaChi6 = typeof flowSnap?.deltaChi6Bar === "number" ? flowSnap.deltaChi6Bar : 0;
+    const deltaImpulseChi6 = typeof flowSnap?.deltaImpulseChi6Bar === "number" ? flowSnap.deltaImpulseChi6Bar : 0;
     const deltaFlux6 = typeof flowSnap?.deltaNetFlux6Bar === "number" ? flowSnap.deltaNetFlux6Bar : 0;
     const impChi = typeof flowSnap?.impulseChi === "number" ? flowSnap.impulseChi : currentChi;
     const impPe = typeof flowSnap?.impulsePeclet === "number" ? flowSnap.impulsePeclet : currentPe;
+    const barBody = latest5mCandle ? latest5mCandle.close - latest5mCandle.open : 0;
     const hasBullImpulseReclaim = Boolean(
       !isOpeningRange &&
       etTime.totalMinutes >= 645 &&
-      impChi >= 0.65 &&
-      deltaChi6 >= 0.04 &&
+      impChi >= 0.60 &&
+      (deltaChi6 >= 0.03 || deltaImpulseChi6 >= 0.06) &&
       (deltaFlux6 > 0 || impPe >= 0.40) &&
-      (divergence5m === "BULL" || divergence30m === "BULL" || (latest5mCandle && latest5mCandle.close > latest5mCandle.open))
+      barBody <= 1.25 &&
+      (divergence5m === "BULL" ||
+        divergence30m === "BULL" ||
+        (latest5mCandle &&
+          latest5mCandle.close > latest5mCandle.open &&
+          (latest5mCandle.close >= latest5mCandle.sma34 ||
+            (flowSnap && typeof flowSnap.flowVwap === "number" && latest5mCandle.close >= flowSnap.flowVwap))))
     );
     const isCounterTrendCallBlocked = Boolean(
       !hasBullImpulseReclaim && (
@@ -3369,11 +3377,11 @@ export async function evaluateTradeSignals(
       }
     }
 
-    // Phase-2 Gate: Second trade today must be an opposite-regime CALL reclaim with impulseChi >= 0.65 && deltaChi6Bar >= 0.04
+    // Phase-2 Gate: Second trade today must be an opposite-regime CALL reclaim with impulseChi >= 0.60 && (deltaChi6Bar >= 0.03 || deltaImpulseChi6Bar >= 0.06)
     if (
       candidateBto &&
       isPhase2CallReclaimWindow &&
-      !(candidateBto.contractType === "CALL" && impChi >= 0.65 && deltaChi6 >= 0.04)
+      !(candidateBto.contractType === "CALL" && impChi >= 0.60 && (deltaChi6 >= 0.03 || deltaImpulseChi6 >= 0.06))
     ) {
       candidateBto = null;
     }
@@ -4401,7 +4409,7 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
 
     const isImpulseCallReclaim =
       !isOpeningRangeSig &&
-      ((params.impulseChi ?? 0) >= 0.65 ||
+      ((params.impulseChi ?? 0) >= 0.60 ||
         Boolean(sig.label?.includes("Impulse") || sig.tag?.includes("IMPULSE")));
     const isHardBearishFlux = (store.chiPct ?? 50) < 45 || effectiveMacro === "PUT" || store.activeFsmState === "SHORT";
     if (

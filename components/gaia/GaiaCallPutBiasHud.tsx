@@ -62,6 +62,8 @@ export interface GaiaCallPutBiasHudProps {
   dividerRatio?: number;
   className?: string;
   isReplayMode?: boolean;
+  replayBarTsSec?: number;
+  replayBarClose?: number;
   startHour?: number;
   xScale?: number;
   xPanOffset?: number;
@@ -247,6 +249,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   dividerRatio = 1,
   className = "",
   isReplayMode = false,
+  replayBarTsSec,
+  replayBarClose,
   startHour = 0,
   xScale: controlledXScale,
   xPanOffset: controlledXPanOffset,
@@ -1035,8 +1039,15 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     return { open930, expectedMove };
   }, [enrichedPoints, intrinsicExpectedMove]);
 
+  const lastCandleTsRaw = Number(effectiveCandles[effectiveCandles.length - 1]?.timestamp ?? 0);
+  const lastCandleTsSec = lastCandleTsRaw > 1e11 ? Math.floor(lastCandleTsRaw / 1000) : lastCandleTsRaw;
+  const effectiveReplayTsSec =
+    isReplayMode ? (typeof replayBarTsSec === "number" && replayBarTsSec > 0 ? replayBarTsSec : lastCandleTsSec) : 0;
+
   const activeSpotPrice =
-    !isReplayMode && typeof liveTickPrice === "number" && liveTickPrice > 0
+    isReplayMode && typeof replayBarClose === "number" && replayBarClose > 0
+      ? replayBarClose
+      : !isReplayMode && typeof liveTickPrice === "number" && liveTickPrice > 0
       ? liveTickPrice
       : !isReplayMode && typeof rawLiveSpot === "number" && rawLiveSpot > 0
       ? rawLiveSpot
@@ -1253,6 +1264,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         straddleEm={structuralMetrics.expectedMove}
         activeFsmState={fsmCommittedState}
         serverTrades={internalServerTrades}
+        isReplayMode={isReplayMode}
+        replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined}
       />
 
       {/* Background Micro-Grid */}
@@ -1883,14 +1896,16 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
               const normSlotTs = rawSlotTs > 1e11 ? Math.floor(rawSlotTs / 1000) : rawSlotTs;
               const latestActualRaw = Array.isArray(enrichedPoints) && enrichedPoints.length > 0 ? Number(enrichedPoints[enrichedPoints.length - 1]?.timestamp ?? 0) : 0;
               const latestActualSec = latestActualRaw > 1e11 ? Math.floor(latestActualRaw / 1000) : latestActualRaw;
-              const nowSec = Math.floor(Date.now() / 1000);
+              const nowSec = effectiveReplayTsSec > 0 ? effectiveReplayTsSec : Math.floor(Date.now() / 1000);
               const slotIsFuture = normSlotTs > 0 && (normSlotTs > nowSec || (latestActualSec > 0 && normSlotTs > latestActualSec));
               if (pt.baseX < padLeft || pt.baseX > padLeft + plotW + 2) return null;
               const slotW = (plotW / Math.max(1, totalSessionSlots)) * currentXScale;
               const tickW = Math.max(2, slotW - 1.8);
               const isCall = pt.regime === "CALL";
+              const isExtendedHours = pt.etMins < 570 || pt.etMins >= 960;
               const col = slotIsFuture ? "rgba(148, 163, 184, 0.25)" : isCall ? "#00F5D4" : "#FF2A55";
-              const op = slotIsFuture ? 0.22 : Math.max(0.4, Math.min(1.0, 0.45 + Math.abs(pt.bias) * 0.55));
+              const baseOp = slotIsFuture ? 0.22 : Math.max(0.4, Math.min(1.0, 0.45 + Math.abs(pt.bias) * 0.55));
+              const op = !slotIsFuture && isExtendedHours ? Number((baseOp * 0.55).toFixed(2)) : baseOp;
               return (
                 <rect
                   key={`tick-${i}`}
@@ -1940,7 +1955,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
               const isPos = val >= 0;
               const y = isPos ? histZeroY - barH : histZeroY;
               const col = isPos ? "#00F5D4" : "#FF2A55";
-              const op = Math.max(0.45, Math.min(0.95, 0.45 + Math.abs(val) * 0.5));
+              const isExtendedHours = pt.etMins < 570 || pt.etMins >= 960;
+              const baseOp = Math.max(0.45, Math.min(0.95, 0.45 + Math.abs(val) * 0.5));
+              const op = isExtendedHours ? Number((baseOp * 0.55).toFixed(2)) : baseOp;
 
               return (
                 <rect
@@ -2040,7 +2057,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       </div>
 
       {/* PRZM The Call Continuous Segmented Regime Strip */}
-      <PrzmTheCallStrip series={przmSeries} />
+      <PrzmTheCallStrip series={przmSeries} replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined} />
 
       {/* PRZM Bottom Deck: Call Log Ledger & 100% Scoreboard */}
       <PrzmCallLogDeck
@@ -2050,6 +2067,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         activeFsmState={fsmCommittedState}
         serverTrades={internalServerTrades}
         ticker={activeSymbol}
+        replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined}
       />
     </div>
   );

@@ -25,6 +25,7 @@ import {
   saveTradeStore,
   DailyTradeStore,
 } from "../lib/tradeSignalEngine";
+import { computeBarFlowGammaVwapSeries } from "../lib/flowGammaVwap";
 
 interface BacktestDayResult {
   date: string;
@@ -429,6 +430,15 @@ async function run10DaySniperAudit() {
       close: b.close,
       volume: 10000,
     }));
+    const sessionFlow = computeBarFlowGammaVwapSeries(
+      sessionBars.map((b) => ({
+        timestamp: b.ts,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+      }))
+    );
 
     // Single-Slot Automaton daily state
     let activePosition: {
@@ -442,11 +452,13 @@ async function run10DaySniperAudit() {
       entryAsk: number;
       tYears: number;
       iv: number;
+      dteDays?: number;
       openedTimeEt: string;
       openedTs: number;
     } | null = null;
 
     let tradeCountToday = 0;
+    let firstTradeType: "CALL" | "PUT" | null = null;
     let overlappingToday = 0;
 
     // Determine morning opening range high/low (first 15m)
@@ -510,7 +522,7 @@ async function run10DaySniperAudit() {
 
         if (exitTriggered) {
           // Reprice option via Black-Scholes with exact remaining time and bid/ask crossing (sell at bid)
-          const exitRemainingYears = computeRemainingYearsToExpiration(bar.ts * 1000, 0);
+          const exitRemainingYears = computeRemainingYearsToExpiration(bar.ts * 1000, activePosition.dteDays ?? 0);
           const exitQuote = priceOptionWithSkew({
             spot: exitSpot,
             strike: activePosition.strike,
@@ -574,30 +586,138 @@ async function run10DaySniperAudit() {
         }
       }
 
-      // --- STEP 2: EVALUATE ENTRY IF NO ACTIVE POSITION AND NO COMPLETED TRADE TODAY ---
-      if (!activePosition && tradeCountToday === 0 && bar.totalMinutes >= 575 && bar.totalMinutes <= 870) {
-        // Causal Tactical King projection: on 2026-10-26, institutional GEX pinned the King at 767.00
-        const explicitKing = date === "2026-10-26" ? 767 : undefined;
-        const candidate = evaluateUnifiedSniperSetup(unifiedBars, idx, explicitKing);
+      // --- STEP 2: EVALUATE ENTRY (Phase 1 or Gated Phase-2 Opposite-Regime Call Reclaim >= 10:45 AM ET) ---
+      const canPhase2CallReclaim =
+        tradeCountToday === 1 &&
+        firstTradeType === "PUT" &&
+        bar.totalMinutes >= 645 &&
+        bar.totalMinutes <= 870;
 
-        if (candidate) {
-          const isCall = candidate.direction === "LONG";
-          const entrySpot = bar.close;
+      if (!activePosition && (tradeCountToday === 0 || canPhase2CallReclaim) && bar.totalMinutes >= 575 && bar.totalMinutes <= 870) {
+        if (tradeCountToday === 0) {
+          // Causal Tactical King projection: on 2026-10-26, institutional GEX pinned the King at 767.00
+          const explicitKing = date === "2026-10-26" ? 767 : undefined;
+          const candidate = evaluateUnifiedSniperSetup(unifiedBars, idx, explicitKing);
 
-          const remainingYears = computeRemainingYearsToExpiration(bar.ts * 1000, 0);
-          const atmIv = candidate.features.atmIv;
+          if (candidate) {
+            const isCall = candidate.direction === "LONG";
+            const entrySpot = bar.close;
 
-          // Institutional Small-Account Invariant: Select sub-$1.00 contract (Ask <= $0.95, Outlay <= $100)
-          let strike = candidate.strike;
-          let quote = priceOptionWithSkew({
-            spot: entrySpot,
-            strike,
-            direction: candidate.direction,
-            remainingYears,
-            atmIv,
-          });
+            const remainingYears = computeRemainingYearsToExpiration(bar.ts * 1000, 0);
+            const atmIv = candidate.features.atmIv;
 
-          if (isCall) {
+            // Institutional Small-Account Invariant: Select sub-$1.00 contract (Ask <= $0.95, Outlay <= $100)
+            let strike = candidate.strike;
+            let quote = priceOptionWithSkew({
+              spot: entrySpot,
+              strike,
+              direction: candidate.direction,
+              remainingYears,
+              atmIv,
+            });
+
+            if (isCall) {
+              for (let k = Math.ceil(entrySpot); k <= Math.ceil(entrySpot) + 35; k++) {
+                const q = priceOptionWithSkew({
+                  spot: entrySpot,
+                  strike: k,
+                  direction: "LONG",
+                  remainingYears,
+                  atmIv,
+                });
+                if (q.ask <= 0.95) {
+                  strike = k;
+                  quote = q;
+                  break;
+                }
+              }
+            } else {
+              for (let k = Math.floor(entrySpot); k >= Math.floor(entrySpot) - 35; k--) {
+                const q = priceOptionWithSkew({
+                  spot: entrySpot,
+                  strike: k,
+                  direction: "SHORT",
+                  remainingYears,
+                  atmIv,
+                });
+                if (q.ask <= 0.95) {
+                  strike = k;
+                  quote = q;
+                  break;
+                }
+              }
+            }
+
+            // Bid/ask crossing on entry: market buy at ask
+            const entryAsk = quote.ask;
+            const contractsQty = 1; // Strict 1-contract sniper limit
+            const outlay = Number((entryAsk * 100 * contractsQty).toFixed(2));
+
+            if (contractsQty !== 1) totalContractsQuantityViolations++;
+            if (outlay > 100) totalOutlayViolations++;
+
+            // Structural stops anchored below session opening low (calls) or above opening high (puts)
+            const rawStopSpot = isCall
+              ? Math.min(bar.low, openingLow) * 0.9985
+              : Math.max(bar.high, openingHigh) * 1.0015;
+            const stopLossSpot = Number(rawStopSpot.toFixed(2));
+            const risk = Math.max(0.65, Math.abs(entrySpot - stopLossSpot));
+            const target1Spot = isCall
+              ? Number((entrySpot + risk * 1.5).toFixed(2))
+              : Number((entrySpot - risk * 1.5).toFixed(2));
+            const target2Spot = isCall
+              ? Number((entrySpot + risk * 2.5).toFixed(2))
+              : Number((entrySpot - risk * 2.5).toFixed(2));
+
+            activePosition = {
+              type: isCall ? "CALL" : "PUT",
+              setupName: candidate.setupName,
+              strike,
+              entrySpot,
+              target1Spot,
+              target2Spot,
+              stopLossSpot,
+              entryAsk,
+              tYears: remainingYears,
+              iv: atmIv,
+              dteDays: 0,
+              openedTimeEt: bar.timeEt,
+              openedTs: bar.ts,
+            };
+
+            firstTradeType = activePosition.type;
+            tradeCountToday++;
+          }
+        } else if (canPhase2CallReclaim) {
+          const flowSnap = sessionFlow[idx];
+          const impChi = flowSnap?.impulseChi ?? 0.5;
+          const dChi6 = flowSnap?.deltaChi6Bar ?? 0;
+          const dImpChi6 = flowSnap?.deltaImpulseChi6Bar ?? 0;
+          const dFlux6 = flowSnap?.deltaNetFlux6Bar ?? 0;
+          const fvwap = flowSnap?.flowVwap ?? bar.close;
+          const barBody = bar.close - bar.open;
+          if (
+            impChi >= 0.60 &&
+            (dChi6 >= 0.03 || dImpChi6 >= 0.06) &&
+            dFlux6 > 0 &&
+            bar.close > bar.open &&
+            barBody <= 1.25 &&
+            bar.close >= fvwap &&
+            bar.close >= bar.sma34
+          ) {
+            const entrySpot = bar.close;
+            const etDow = new Date(`${date}T12:00:00Z`).getUTCDay();
+            const dteDays = bar.totalMinutes >= 690 ? (etDow === 5 ? 3 : 1) : 0;
+            const remainingYears = computeRemainingYearsToExpiration(bar.ts * 1000, dteDays);
+            const atmIv = estimateDynamicAtmIv(unifiedBars, idx);
+            let strike = Math.ceil(entrySpot);
+            let quote = priceOptionWithSkew({
+              spot: entrySpot,
+              strike,
+              direction: "LONG",
+              remainingYears,
+              atmIv,
+            });
             for (let k = Math.ceil(entrySpot); k <= Math.ceil(entrySpot) + 35; k++) {
               const q = priceOptionWithSkew({
                 spot: entrySpot,
@@ -612,60 +732,29 @@ async function run10DaySniperAudit() {
                 break;
               }
             }
-          } else {
-            for (let k = Math.floor(entrySpot); k >= Math.floor(entrySpot) - 35; k--) {
-              const q = priceOptionWithSkew({
-                spot: entrySpot,
-                strike: k,
-                direction: "SHORT",
-                remainingYears,
-                atmIv,
-              });
-              if (q.ask <= 0.95) {
-                strike = k;
-                quote = q;
-                break;
-              }
-            }
+            const recentLow = Math.min(...sessionBars.slice(Math.max(0, idx - 3), idx + 1).map((b) => b.low));
+            const stopLossSpot = Number(Math.min(recentLow - 0.15, entrySpot - 0.85).toFixed(2));
+            const risk = Math.max(0.5, entrySpot - stopLossSpot);
+            const target1Spot = Number((entrySpot + Math.max(1.25, risk * 1.5)).toFixed(2));
+            const target2Spot = Number((target1Spot + risk).toFixed(2));
+
+            activePosition = {
+              type: "CALL",
+              setupName: "Phase-2 Impulse Call Reclaim",
+              strike,
+              entrySpot,
+              target1Spot,
+              target2Spot,
+              stopLossSpot,
+              entryAsk: quote.ask,
+              tYears: remainingYears,
+              iv: atmIv,
+              dteDays,
+              openedTimeEt: bar.timeEt,
+              openedTs: bar.ts,
+            };
+            tradeCountToday++;
           }
-
-          // Bid/ask crossing on entry: market buy at ask
-          const entryAsk = quote.ask;
-          const contractsQty = 1; // Strict 1-contract sniper limit
-          const outlay = Number((entryAsk * 100 * contractsQty).toFixed(2));
-
-          if (contractsQty !== 1) totalContractsQuantityViolations++;
-          if (outlay > 100) totalOutlayViolations++;
-
-          // Structural stops anchored below session opening low (calls) or above opening high (puts)
-          const rawStopSpot = isCall
-            ? Math.min(bar.low, openingLow) * 0.9985
-            : Math.max(bar.high, openingHigh) * 1.0015;
-          const stopLossSpot = Number(rawStopSpot.toFixed(2));
-          const risk = Math.max(0.65, Math.abs(entrySpot - stopLossSpot));
-          const target1Spot = isCall
-            ? Number((entrySpot + risk * 1.5).toFixed(2))
-            : Number((entrySpot - risk * 1.5).toFixed(2));
-          const target2Spot = isCall
-            ? Number((entrySpot + risk * 2.5).toFixed(2))
-            : Number((entrySpot - risk * 2.5).toFixed(2));
-
-          activePosition = {
-            type: isCall ? "CALL" : "PUT",
-            setupName: candidate.setupName,
-            strike,
-            entrySpot,
-            target1Spot,
-            target2Spot,
-            stopLossSpot,
-            entryAsk,
-            tYears: remainingYears,
-            iv: atmIv,
-            openedTimeEt: bar.timeEt,
-            openedTs: bar.ts,
-          };
-
-          tradeCountToday++;
         }
       }
     }
