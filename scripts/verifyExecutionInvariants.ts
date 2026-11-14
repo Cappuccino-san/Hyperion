@@ -39,6 +39,7 @@ import {
   acquireBarEvaluationLock,
   releaseBarEvaluationLock,
   isEvaluatingLiveBar,
+  stopLiveBot,
 } from "../lib/liveBotDaemon";
 import { NormalizedOptionContract } from "../lib/optionsExposure";
 
@@ -104,16 +105,16 @@ async function runTestSuite() {
   // ===========================================================================
   console.log("1. Verifying Capital Outlay & Position Sizing Invariants (Strict <= $100 Rule)...");
 
-  // Sub-test 1.1: Asks <= $0.50 size exactly 2 contracts with outlay <= $100
+  // Sub-test 1.1: Strict 1-Contract Sniper Rule (Asks <= $1.00 always size exactly 1 contract)
   const sizeCheap = calculateSmallAccountSize(0.35);
   assert(sizeCheap.allowed === true, "Ask $0.35 allowed");
-  assert(sizeCheap.contractsQty === 2, "Ask $0.35 sized at 2 contracts");
-  assert(sizeCheap.totalOutlay === 70.0, "Ask $0.35 total outlay is $70.00 (<= $100)");
+  assert(sizeCheap.contractsQty === 1, "Ask $0.35 sized at 1 contract");
+  assert(sizeCheap.totalOutlay === 35.0, "Ask $0.35 total outlay is $35.00 (<= $100)");
 
   const sizeFifty = calculateSmallAccountSize(0.50);
   assert(sizeFifty.allowed === true, "Ask $0.50 allowed");
-  assert(sizeFifty.contractsQty === 2, "Ask $0.50 sized at exactly 2 contracts");
-  assert(sizeFifty.totalOutlay === 100.0, "Ask $0.50 total outlay is exactly $100.00");
+  assert(sizeFifty.contractsQty === 1, "Ask $0.50 sized at strictly 1 contract");
+  assert(sizeFifty.totalOutlay === 50.0, "Ask $0.50 total outlay is $50.00 (<= $100)");
 
   // Sub-test 1.2: Asks between $0.51 and $1.00 size exactly 1 contract with outlay <= $100
   const sizeMid = calculateSmallAccountSize(0.75);
@@ -144,7 +145,7 @@ async function runTestSuite() {
       if (result.totalOutlay > MAX_SMALL_ACCOUNT_BUDGET) {
         monteCarloOutlayViolations++;
       }
-      if (result.contractsQty !== 1 && result.contractsQty !== 2) {
+      if (result.contractsQty !== 1) {
         monteCarloQuantityViolations++;
       }
     }
@@ -155,7 +156,7 @@ async function runTestSuite() {
   );
   assert(
     monteCarloQuantityViolations === 0,
-    "500-Scenario Monte Carlo: Sizing strictly constrained to {1, 2} contracts"
+    "500-Scenario Monte Carlo: Sizing strictly constrained to {1} contract"
   );
 
   // ===========================================================================
@@ -365,7 +366,7 @@ async function runTestSuite() {
     ticker: "SPY",
     symbol: "SPY261023C00768000",
     action: "BUY_TO_OPEN",
-    contractsQty: 2,
+    contractsQty: 1,
     orderType: "MARKET",
     quote: createMockNbbo({ bid: 0.40, ask: 0.42 }),
     nowEt: regularHoursTime,
@@ -373,7 +374,7 @@ async function runTestSuite() {
 
   const fillSlip = await dispatchBrokerOrder(brokerOrder);
   assert(fillSlip.status === "FILLED", "Broker order dispatch returns status FILLED");
-  assert(fillSlip.filledQty === 2, "Broker confirms filled quantity = 2");
+  assert(fillSlip.filledQty === 1, "Broker confirms filled quantity = 1");
   assert(
     fillSlip.filledPrice >= 0.42,
     `Broker filled at Ask or higher ($${fillSlip.filledPrice} >= $0.42) with LOB slippage`
@@ -385,6 +386,11 @@ async function runTestSuite() {
   assert(
     fillSlip.ledgerSignature.length > 0,
     `Cryptographic ledger signature generated: ${fillSlip.ledgerSignature.slice(0, 30)}...`
+  );
+  const rejectedMultiQtySlip = await dispatchBrokerOrder({ ...brokerOrder, contractsQty: 2 });
+  assert(
+    rejectedMultiQtySlip.status === "REJECTED",
+    "Broker strictly REJECTS multi-contract order (contractsQty: 2 violates 1-contract sniper rule)"
   );
 
   // ===========================================================================
@@ -733,8 +739,20 @@ async function runTestSuite() {
   let successfullyProcessedTicks = 0;
   let lockedOutInvocations = 0;
 
-  // Release any leftover lock before starting test
-  releaseBarEvaluationLock();
+  // Reset daemon lock state cleanly before starting concurrency test, then verify wrong-token firewall
+  stopLiveBot();
+  const sentinelToken = acquireBarEvaluationLock();
+  assert(sentinelToken > 0 && isEvaluatingLiveBar() === true, "Sentinel lock token acquired cleanly");
+  releaseBarEvaluationLock(999999999);
+  assert(
+    isEvaluatingLiveBar() === true,
+    "Wrong token MUST NOT release active bar evaluation lock"
+  );
+  releaseBarEvaluationLock(sentinelToken);
+  assert(
+    isEvaluatingLiveBar() === false,
+    "Matching token cleanly releases active bar evaluation lock"
+  );
 
   const parallelInvocations: Promise<void>[] = [];
   for (let i = 0; i < 500; i++) {
@@ -743,8 +761,8 @@ async function runTestSuite() {
         // Microtask jitter to interleave async yields
         await new Promise((resolve) => setTimeout(resolve, Math.floor(rng10B() * 4)));
 
-        const lockAcquired = acquireBarEvaluationLock();
-        if (!lockAcquired) {
+        const lockToken = acquireBarEvaluationLock();
+        if (!lockToken) {
           lockedOutInvocations++;
           return;
         }
@@ -761,7 +779,7 @@ async function runTestSuite() {
           successfullyProcessedTicks++;
         } finally {
           activeConcurrentExecutions--;
-          releaseBarEvaluationLock();
+          releaseBarEvaluationLock(lockToken);
         }
       })()
     );
@@ -1013,11 +1031,11 @@ async function runTestSuite() {
   assert(crossedQuote.allowed === false, "Crossed market (bid > ask) must strictly be rejected");
   assert(crossedQuote.rejectionReason === "INVALID_QUOTE", "Crossed market rejection reason must be INVALID_QUOTE");
 
-  // 2. Exact $100.00 capital boundary free of IEEE-754 float drift
+  // 2. Strict 1-contract sniper sizing at $0.50 ask
   const exactTwo = calculatePositionSize(0.50, 0.48);
   assert(exactTwo.allowed === true, "Ask $0.50 must be allowed");
-  assert(exactTwo.contractsQty === 2, "Ask $0.50 must size exactly 2 contracts");
-  assert(exactTwo.totalOutlay === 100.0, "Ask $0.50 total outlay must equal exactly $100.00");
+  assert(exactTwo.contractsQty === 1, "Ask $0.50 must size strictly 1 contract (sniper rule)");
+  assert(exactTwo.totalOutlay === 50.0, "Ask $0.50 total outlay must equal $50.00");
 
   const overTwoUnderOne = calculatePositionSize(0.51, 0.49);
   assert(overTwoUnderOne.allowed === true, "Ask $0.51 must be allowed");
@@ -1062,6 +1080,72 @@ async function runTestSuite() {
   const fluxDecayResult = computeFluxDecay(0.8, -500, 300);
   assert(fluxDecayResult <= 0.8, "Negative dt tick cannot amplify Flux decay above base chi");
   assert(fluxDecayResult >= 0, "Flux decay remains non-negative for positive chi");
+
+  // 6. Expired Contract & Crossed-Quote Firewall inside selectSmallAccountContract (no date-rewinding)
+  const expiredOnlyChain: NormalizedOptionContract[] = [
+    {
+      symbol: "SPY20200103C00500000",
+      strike: 500,
+      expiration: "2020-01-03",
+      optionType: "C",
+      bid: 0.45,
+      ask: 0.48,
+      last: 0.46,
+      volume: 500,
+      openInterest: 2000,
+      iv: 0.22,
+      delta: 0.35,
+      gamma: 0.08,
+      vega: 0.03,
+      percentChange: 0,
+    },
+  ];
+  const expiredPick = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "CALL",
+    spotPrice: 500,
+    target1Spot: 502,
+    target2Spot: 504,
+    stopLossSpot: 499,
+    contracts: expiredOnlyChain,
+  });
+  assert(
+    expiredPick === null,
+    "Expired contract batch must return null (no maxExp todayEt date-rewinding)"
+  );
+
+  const crossedQuoteChain: NormalizedOptionContract[] = [
+    {
+      symbol: "SPY20991231C00755000",
+      strike: 755,
+      expiration: "2099-12-31",
+      optionType: "C",
+      bid: 0.60,
+      ask: 0.50, // Crossed market: bid > ask
+      last: 0.55,
+      volume: 600,
+      openInterest: 2500,
+      iv: 0.25,
+      delta: 0.35,
+      gamma: 0.05,
+      vega: 0.03,
+      percentChange: 0,
+    },
+  ];
+  const crossedPick = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "CALL",
+    spotPrice: 754,
+    target1Spot: 757,
+    target2Spot: 760,
+    stopLossSpot: 752.5,
+    contracts: crossedQuoteChain,
+    nowEt: new Date("2099-12-31T15:00:00Z"),
+  });
+  assert(
+    crossedPick === null,
+    "Crossed-quote contract (bid > ask) must strictly be rejected by selectSmallAccountContract"
+  );
 
   // ===========================================================================
   // FINAL REPORT

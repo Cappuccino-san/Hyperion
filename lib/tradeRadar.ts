@@ -5,7 +5,6 @@ import {
   loadTradeStore,
   saveTradeStore,
   TradeLifecycleAlert,
-  DEFAULT_DISCORD_WEBHOOK_URL,
   getTodayEt,
 } from "./tradeSignalEngine";
 import { computeOptionsAnalytics } from "./optionsExposure";
@@ -403,8 +402,11 @@ export async function getPreTradeRadarData(): Promise<TradeRadarPayload> {
  */
 export async function sendPreTradeRadarDiscordCard(customWebhookUrl?: string): Promise<boolean> {
   const webhookUrl =
-    (customWebhookUrl || process.env.DISCORD_WEBHOOK_URL)?.trim() ||
-    DEFAULT_DISCORD_WEBHOOK_URL;
+    (customWebhookUrl || process.env.DISCORD_WEBHOOK_URL)?.trim() || "";
+  if (!webhookUrl) {
+    console.warn("[TradeRadar] Skipping radar Discord dispatch: DISCORD_WEBHOOK_URL is not configured.");
+    return false;
+  }
 
   try {
     const radar = await getPreTradeRadarData();
@@ -453,7 +455,7 @@ export async function sendPreTradeRadarDiscordCard(customWebhookUrl?: string): P
       fields,
       timestamp: new Date().toISOString(),
       footer: {
-        text: "Hyperion Terminal · Live Trade Signal Radar (1-2 Contracts Max)",
+        text: "Hyperion Terminal · Live Trade Signal Radar (1 Contract Max)",
       },
     };
 

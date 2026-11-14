@@ -347,7 +347,7 @@ export class GaiaSignalFsm {
           (callWall !== undefined && bar.close < callWall);
         const bearishLean = (bar.flowVwap !== undefined && bar.close < bar.flowVwap) &&
           bar.netFlux < 0 && bar.chi <= 0.45 && isBearMacro;
-        const downsideRoom = (bar.close - (putWall ?? bar.close - 2.50)) >= 1.25 * unitRisk;
+        const downsideRoom = (bar.close - (putWall ?? bar.close - 2.50)) >= MIN_REWARD_RISK * unitRisk;
         if (rejectedOverhead && bearishLean && downsideRoom) {
           return { nextState: "SHORT", reason: "PREMARKET_FLUX_REJECTION_PUT", targetWall: putWall };
         }
@@ -385,7 +385,7 @@ export class GaiaSignalFsm {
           [putWall, pdl].some((lvl) => typeof lvl === "number" && Math.abs(testLow - lvl) / lvl <= 0.0030);
         const cyanFluxFlip = bar.netFlux > 0 && (bar.peclet >= 0.40 || bar.chi >= 0.48 || (bar.prevChi !== undefined && bar.chi - bar.prevChi >= 0.06));
         const reclaimedEquilibrium = (vwapRef !== undefined && bar.close >= vwapRef) || (bar.sma34 !== undefined && bar.close > bar.sma34);
-        const upsideRoom = ((callWall ?? zg ?? (vwapRef ? vwapRef + 2.0 * Math.max(0.85, dispersion.atr) : bar.close + 2.50)) - bar.close) >= 1.25 * unitRisk;
+        const upsideRoom = ((callWall ?? zg ?? (vwapRef ? vwapRef + 2.0 * Math.max(0.85, dispersion.atr) : bar.close + 2.50)) - bar.close) >= MIN_REWARD_RISK * unitRisk;
         if (touchedLowerFluxOrWall && cyanFluxFlip && reclaimedEquilibrium && fluxDistSigma < 1.25 && upsideRoom) {
           const upperFluxTarget = vwapRef ? Number((vwapRef + 2.0 * Math.max(0.85, dispersion.atr)).toFixed(2)) : undefined;
           return {
@@ -516,11 +516,12 @@ export class GaiaSignalFsm {
         const totalDist = targetW - entryP;
         const peakGain = Math.max(0, (trackedLocalExtreme || bar.high) - entryP);
         const progress = peakGain / totalDist;
+        const be10Stop = entryP + totalDist * 0.10;
 
-        // Stage 2 Ratchet (75% progress): Trail under prior 5m low
+        // Stage 2 Ratchet (75% progress): Trail under prior 5m low with Stage-1 BE+10% floor
         if (progress >= 0.75) {
           const refLow = this.prevBarLow > 0 ? this.prevBarLow : bar.open;
-          const trailStop = Number((refLow - 0.05).toFixed(2));
+          const trailStop = Number(Math.max(be10Stop, refLow - 0.05).toFixed(2));
           if (bar.close < trailStop) {
             return {
               nextState: "STAND_ASIDE",
@@ -530,7 +531,6 @@ export class GaiaSignalFsm {
           }
         } else if (progress >= 0.50) {
           // Stage 1 Ratchet (50% progress): Lock Breakeven + 10%
-          const be10Stop = entryP + totalDist * 0.10;
           if (bar.close < be10Stop) {
             return {
               nextState: "STAND_ASIDE",
@@ -541,9 +541,9 @@ export class GaiaSignalFsm {
         }
       }
 
-      // Reversal to SHORT strictly impossible unless macro regime has actively rotated to BEAR
-      if (isWithinEntryWindow && isBearMacro && !isBullMacro && eChi <= -1.0 && eFlux <= -0.6) {
-        return { nextState: "SHORT", reason: "MACRO_REVERSAL_TO_SHORT" };
+      // Reversal to SHORT strictly impossible unless macro regime has actively rotated to BEAR and Put Wall clears >= $1.25
+      if (isWithinEntryWindow && !putBlockedByWall && isBearMacro && !isBullMacro && eChi <= -1.0 && eFlux <= -0.6) {
+        return { nextState: "SHORT", reason: "MACRO_REVERSAL_TO_SHORT", targetWall: putWall };
       }
 
       // Structural Stop Check for Setup C-A / C-B
@@ -593,11 +593,12 @@ export class GaiaSignalFsm {
         const totalDist = entryP - targetW;
         const peakGain = Math.max(0, entryP - (trackedLocalExtreme || bar.low));
         const progress = peakGain / totalDist;
+        const be10Stop = entryP - totalDist * 0.10;
 
-        // Stage 2 Ratchet (75% progress): Trail above prior 5m high
+        // Stage 2 Ratchet (75% progress): Trail above prior 5m high with Stage-1 BE+10% floor
         if (progress >= 0.75) {
           const refHigh = this.prevBarHigh > 0 ? this.prevBarHigh : bar.open;
-          const trailStop = Number((refHigh + 0.05).toFixed(2));
+          const trailStop = Number(Math.min(be10Stop, refHigh + 0.05).toFixed(2));
           if (bar.close > trailStop) {
             return {
               nextState: "STAND_ASIDE",
@@ -607,7 +608,6 @@ export class GaiaSignalFsm {
           }
         } else if (progress >= 0.50) {
           // Stage 1 Ratchet (50% progress): Lock Breakeven + 10%
-          const be10Stop = entryP - totalDist * 0.10;
           if (bar.close > be10Stop) {
             return {
               nextState: "STAND_ASIDE",
@@ -618,9 +618,9 @@ export class GaiaSignalFsm {
         }
       }
 
-      // Reversal to LONG strictly impossible unless macro regime has actively rotated to BULL
-      if (isWithinEntryWindow && isBullMacro && !isBearMacro && eChi >= 1.0 && eFlux >= 0.6) {
-        return { nextState: "LONG", reason: "MACRO_REVERSAL_TO_LONG" };
+      // Reversal to LONG strictly impossible unless macro regime has actively rotated to BULL and Call Wall clears >= $1.25
+      if (isWithinEntryWindow && !callBlockedByWall && isBullMacro && !isBearMacro && eChi >= 1.0 && eFlux >= 0.6) {
+        return { nextState: "LONG", reason: "MACRO_REVERSAL_TO_LONG", targetWall: callWall };
       }
 
       // Structural Stop Check for Setup P-A / P-B
@@ -659,8 +659,12 @@ export class GaiaSignalFsm {
   ): GaiaCommittedSignal | null {
     if (!bar.isClosed) return null;
 
-    // RTH Gate: Pre-market bars (etMins < 570) are strictly gated from committing signals
-    if (bar.etMins !== undefined && bar.etMins < 570) {
+    // RTH Gate: Pre-market (etMins < 570) and post-close (etMins >= 960) bars are strictly gated
+    const resolvedEtMins = resolveGaiaBarEtMinutes(bar);
+    if (
+      typeof resolvedEtMins === "number" &&
+      (resolvedEtMins < GAIA_RTH_OPEN_MINS || resolvedEtMins >= GAIA_RTH_CLOSE_MINS)
+    ) {
       return null;
     }
 
@@ -728,6 +732,7 @@ export class GaiaSignalFsm {
       this.localExtremePrice = bar.close;
       this.activeTargetWall = targetWall || 0;
       this.activeStopPrice = stopPrice || 0;
+      this.activeSetupReason = reason || "";
     } else if (fromState === "SHORT" && nextState === "LONG") {
       entryPrice = this.currentEntryPrice;
       exitPrice = fillPrice ?? bar.close;
@@ -736,6 +741,7 @@ export class GaiaSignalFsm {
       this.localExtremePrice = bar.close;
       this.activeTargetWall = targetWall || 0;
       this.activeStopPrice = stopPrice || 0;
+      this.activeSetupReason = reason || "";
     } else {
       this.localExtremePrice = 0;
       this.activeTargetWall = 0;

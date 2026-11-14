@@ -56,7 +56,8 @@ class InstitutionalSimulatedBroker {
     const isBuy = request.action === "BUY_TO_OPEN";
     const simAction = isBuy ? "BUY" : "SELL";
 
-    // 1. Position Sizing & Budget Check for Buys
+    // 1. Position Sizing, Quantity (1-contract strict) & Budget Check for Buys
+    let effectiveQty = request.contractsQty;
     if (isBuy) {
       const sizing = calculateSmallAccountSize(request.quote.ask);
       if (!sizing.allowed) {
@@ -66,13 +67,21 @@ class InstitutionalSimulatedBroker {
           sizing.rejectionReason || "BUDGET_EXCEEDED"
         );
       }
+      if (request.contractsQty !== 1) {
+        return this.createRejectedSlip(
+          request,
+          "INSTITUTIONAL_SIMULATOR",
+          `CONTRACT_QTY_VIOLATION: Attempted ${request.contractsQty} contracts (strictly 1 allowed)`
+        );
+      }
+      effectiveQty = sizing.contractsQty;
     }
 
     // 2. Microstructure LOB Execution (BUY on Ask, SELL on Bid)
     const execResult: ExecutionFillResult = executeNbboOrder({
       action: simAction,
       quote: request.quote,
-      quantity: request.contractsQty,
+      quantity: effectiveQty,
       orderType: request.orderType,
       limitPrice: request.limitPrice,
       nowEt: request.nowEt,
@@ -184,7 +193,7 @@ class RobinhoodApiClient {
         },
         body: JSON.stringify({
           account: process.env.ROBINHOOD_ACCOUNT_NUMBER,
-          direction: "credit",
+          direction: isBuy ? "debit" : "credit",
           time_in_force: "gfd",
           trigger: "immediate",
           type: request.orderType.toLowerCase(),

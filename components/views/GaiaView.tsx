@@ -747,7 +747,7 @@ export function GaiaView() {
   const [dividerRatio, setDividerRatio] = useState<number>(0.88); // 0.88 in Flux Focus (88% Candlesticks) .. 0.65 in Expanded Outlook
   const [xScale, setXScale] = useState<number>(1.0); // 0.5 .. 4.0 horizontal candle zoom
   const [xPanOffset, setXPanOffset] = useState<number>(0); // horizontal pan px
-  const [startHour, setStartHour] = useState<number>(7); // 7 = 7:00 AM Premkt (default), 8 = 8:00 AM, 9 = 9:30 AM RTH
+  const [startHour, setStartHour] = useState<number>(0); // 0 = 24H Full Day (default), 7 = 7:00 AM Premkt, 8 = 8:00 AM, 9 = 9:30 AM RTH
   const [yScale, setYScale] = useState<number>(1.0); // 0.2 .. 10.0
   const [yPanOffset, setYPanOffset] = useState<number>(0); // price points
   const [scopePreset, setScopePreset] = useState<"focus" | "tactical" | "cone">("cone");
@@ -768,7 +768,7 @@ export function GaiaView() {
     yScale: 1.0,
     xPan: 0,
     xScale: 1.0,
-    dividerRatio: 0.76,
+    dividerRatio: 0.88,
   });
   const [hoverCursor, setHoverCursor] = useState<{ x: number; y: number } | null>(null);
 
@@ -908,7 +908,7 @@ export function GaiaView() {
   useEffect(() => {
     if (!liveTickPrice || liveTickPrice <= 0 || isReplaying || isReplayFrozen) return;
     setLivePayload((prev) => {
-      if (!prev) return prev;
+      if (!prev || isReplayingRef.current || isReplayFrozenRef.current) return prev;
       const candles = prev.candles;
       if (!candles || candles.length === 0) return prev;
       const lastCandle = candles[candles.length - 1];
@@ -1026,14 +1026,14 @@ export function GaiaView() {
       dataset.candles[dataset.candles.length - 1]?.close ?? dataset.priorClose;
 
     const lastCol = dataset.columnsByBar[dataset.columnsByBar.length - 1];
-    const isLiveSynced = !isReplaying && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
+    const isLiveSynced = !(isReplaying || isReplayFrozen) && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
     const allExpKingStrike =
       isLiveSynced && storeHeatmapKingNode?.allExpKing
         ? storeHeatmapKingNode.allExpKing
         : (lastCol?.allExpKingStrike ?? 0);
     const filteredKingStrike =
       isLiveSynced && storeHeatmapKingNode
-        ? expFilter === "0DTE" && storeHeatmapKingNode.zeroDteKing
+        ? (expFilter === "0DTE" || expFilter === "NEXT") && storeHeatmapKingNode.zeroDteKing
           ? storeHeatmapKingNode.zeroDteKing
           : expFilter === "WEEK" && storeHeatmapKingNode.weeklyKing
             ? storeHeatmapKingNode.weeklyKing
@@ -1330,7 +1330,7 @@ export function GaiaView() {
         const pricePerPx = (yMax - yMin) / Math.max(1, plotHeight);
         setYPanOffset(dragStart.yPan + dy * pricePerPx);
 
-        if (xScale > 1.0) {
+        if (xScale > 1.0 || dragStart.xPan !== 0) {
           const dx = mouseX - dragStart.x;
           setXPanOffset(dragStart.xPan + dx);
         }
@@ -1343,12 +1343,9 @@ export function GaiaView() {
       return;
     }
 
-    const axisStartMins = startHour === 7 ? 0 : startHour === 8 ? 480 : 570;
-    const axisEndMins = startHour === 7 ? 1440 : 1020;
-    const totalSessionSlots = Math.max(
-      Math.round((axisEndMins - axisStartMins) / 5),
-      dataset.candles.length
-    );
+    const axisStartMins = startHour === 0 ? 0 : startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
+    const axisEndMins = startHour === 0 ? 1440 : 1020;
+    const totalSessionSlots = Math.round((axisEndMins - axisStartMins) / 5);
     const stepX = (sessionWidth / totalSessionSlots) * xScale;
     let bestBarIdx = 0;
     let bestDist = Infinity;
@@ -1395,7 +1392,7 @@ export function GaiaView() {
     setYPanOffset(0);
     setXScale(1.0);
     setXPanOffset(0);
-    setDividerRatio(0.76);
+    setDividerRatio(fluxFocusMode ? 0.88 : 0.76);
     setScopePreset("cone");
   };
 
@@ -1434,7 +1431,7 @@ export function GaiaView() {
       setYPanOffset(0);
       setXScale(1.0);
       setXPanOffset(0);
-      setDividerRatio(0.76);
+      setDividerRatio(fluxFocusMode ? 0.88 : 0.76);
       setScopePreset("cone");
     }
   };
@@ -1480,16 +1477,16 @@ export function GaiaView() {
   const activeCandle = dataset?.candles[displayBarIdx];
   const activeBookCol = dataset?.columnsByBar[displayBarIdx];
   const liveBarIdx = dataset && dataset.candles.length > 0 ? dataset.candles.length - 1 : 0;
-  const structuralBarIdx = isReplaying ? Math.min(safeActiveIdx, liveBarIdx) : liveBarIdx;
+  const structuralBarIdx = (isReplaying || isReplayFrozen) ? Math.min(safeActiveIdx, liveBarIdx) : liveBarIdx;
   const structuralBookCol = dataset?.columnsByBar[structuralBarIdx] ?? activeBookCol;
-  const isLiveHeatmapSynced = !isReplaying && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
+  const isLiveHeatmapSynced = !(isReplaying || isReplayFrozen) && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
   const liveAllExpKingStrike =
     isLiveHeatmapSynced && storeHeatmapKingNode && storeHeatmapKingNode.allExpKing > 0
       ? storeHeatmapKingNode.allExpKing
       : structuralBookCol?.allExpKingStrike ?? 0;
   const liveFilteredKingStrike =
     isLiveHeatmapSynced && storeHeatmapKingNode
-      ? expFilter === "0DTE" && storeHeatmapKingNode.zeroDteKing
+      ? (expFilter === "0DTE" || expFilter === "NEXT") && storeHeatmapKingNode.zeroDteKing
         ? storeHeatmapKingNode.zeroDteKing
         : expFilter === "WEEK" && storeHeatmapKingNode.weeklyKing
           ? storeHeatmapKingNode.weeklyKing
@@ -1555,12 +1552,9 @@ export function GaiaView() {
     // Left Zone (custom width via dividerRatio) & Right Zone (outlook Zone)
     const dividerX = Math.round(padLeft + totalPlotWidth * dividerRatio);
     const sessionWidth = dividerX - padLeft;
-    const axisStartMins = startHour === 7 ? 0 : startHour === 8 ? 480 : 570;
-    const axisEndMins = startHour === 7 ? 1440 : 1020;
-    const totalSessionSlots = Math.max(
-      Math.round((axisEndMins - axisStartMins) / 5),
-      dataset.candles.length
-    );
+    const axisStartMins = startHour === 0 ? 0 : startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
+    const axisEndMins = startHour === 0 ? 1440 : 1020;
+    const totalSessionSlots = Math.round((axisEndMins - axisStartMins) / 5);
 
     const { yMin, yMax, yAxisTicks } = priceBounds;
     const priceToY = (price: number): number => {
@@ -2440,7 +2434,7 @@ export function GaiaView() {
 
     // Generate 24h 3-hour milestone schedule (00:00 to 24:00 ET) in full-day mode, or hourly for filtered sessions
     const milestoneSchedule: { h: number; m: number; label: string; isMarketOpen?: boolean; isMarketClose?: boolean }[] =
-      startHour === 7
+      startHour === 0
         ? [
             { h: 0, m: 0, label: "12:00" },
             { h: 3, m: 0, label: "3:00" },
@@ -2906,7 +2900,28 @@ export function GaiaView() {
         <div className="bg-[#151b28] border border-[#232d42] rounded-full p-1 flex items-center gap-1 font-mono text-xs">
           <button
             type="button"
-            onClick={() => setStartHour(7)}
+            onClick={() => {
+              setStartHour(0);
+              setXScale(1.0);
+              setXPanOffset(0);
+            }}
+            title="Full 24-Hour ET Day (00:00 – 24:00 ET)"
+            className={cn(
+              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
+              startHour === 0
+                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
+                : "text-slate-300 hover:text-white"
+            )}
+          >
+            24H Full Day
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setStartHour(7);
+              setXScale(1.0);
+              setXPanOffset(0);
+            }}
             title="Start session at 7:00 AM ET (Early pre-market volume & catalyst discovery)"
             className={cn(
               "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
@@ -2919,7 +2934,11 @@ export function GaiaView() {
           </button>
           <button
             type="button"
-            onClick={() => setStartHour(8)}
+            onClick={() => {
+              setStartHour(8);
+              setXScale(1.0);
+              setXPanOffset(0);
+            }}
             title="Start session at 8:00 AM ET (Regular pre-market session)"
             className={cn(
               "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
@@ -2932,7 +2951,11 @@ export function GaiaView() {
           </button>
           <button
             type="button"
-            onClick={() => setStartHour(9)}
+            onClick={() => {
+              setStartHour(9);
+              setXScale(1.0);
+              setXPanOffset(0);
+            }}
             title="Start session at 9:30 AM ET (Regular Trading Hours only)"
             className={cn(
               "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
@@ -2974,12 +2997,9 @@ export function GaiaView() {
             const canvasW = canvasRef.current?.clientWidth || 1050;
             const totalPlotW = Math.max(200, canvasW - CHART_PAD_LEFT - CHART_RIGHT_AXIS_WIDTH);
             const approxSessionW = totalPlotW * dividerRatio;
-            const axisStartMins = startHour === 7 ? 0 : startHour === 8 ? 480 : 570;
-            const axisEndMins = startHour === 7 ? 1440 : 1020;
-            const totalSlots = Math.max(
-              Math.round((axisEndMins - axisStartMins) / 5),
-              dataset?.candles.length ?? 0
-            );
+            const axisStartMins = startHour === 0 ? 0 : startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
+            const axisEndMins = startHour === 0 ? 1440 : 1020;
+            const totalSlots = Math.round((axisEndMins - axisStartMins) / 5);
             const rthOpenSlot = Math.max(0, (570 - axisStartMins) / 5);
             const paddedRthSlots = 82; // 78 RTH bars (9:30-4:00) + 2-slot symmetric margin
             const nextXScale = totalSlots / paddedRthSlots;
@@ -3006,12 +3026,12 @@ export function GaiaView() {
         </button>
 
         {/* Auto Width Reset Pill (appears when width or divider is customized) */}
-        {(chartWidth !== null || dividerRatio !== 0.76 || xScale !== 1.0) && (
+        {(chartWidth !== null || dividerRatio !== (fluxFocusMode ? 0.88 : 0.76) || xScale !== 1.0) && (
           <button
             type="button"
             onClick={() => {
               setChartWidth(null);
-              setDividerRatio(0.76);
+              setDividerRatio(fluxFocusMode ? 0.88 : 0.76);
               setXScale(1.0);
               setXPanOffset(0);
             }}
@@ -3304,6 +3324,21 @@ export function GaiaView() {
         tradeSignals={hudTradeSignals}
         serverTrades={effectiveServerTrades}
         dividerRatio={dividerRatio}
+        isReplayMode={isReplaying || isReplayFrozen}
+        startHour={startHour}
+        xScale={xScale}
+        xPanOffset={xPanOffset}
+        containerWidthPx={canvasWidth}
+        onXViewportChange={(s, p) => {
+          setXScale(s);
+          setXPanOffset(p);
+        }}
+        onResetViewport={() => {
+          setXScale(1.0);
+          setXPanOffset(0);
+          setYScale(1.0);
+          setYPanOffset(0);
+        }}
         onSignalsEvaluated={setPrzmHudSignals}
         onSymbolChange={(sym) => {
           const cleaned = sym.trim().toUpperCase() || "SPY";

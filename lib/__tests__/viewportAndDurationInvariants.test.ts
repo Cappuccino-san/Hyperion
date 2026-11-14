@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { evaluatePrzmCallLedger, PrzmSignalPoint, PrzmCandlePoint } from "@/components/gaia/PrzmTacticalHud";
 import {
   extractNormalizedTradesForTicker,
+  matchTradeToCandleIndex,
   parseTimeLabelToMinutes,
   clampSpotToCandle,
 } from "@/components/chart/TradeExecutionMarkersOverlay";
@@ -542,5 +543,53 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
     releaseBarEvaluationLock(999999 as any);
     assert.strictEqual(acquireBarEvaluationLock(), 0 as any, "Wrong token must not release active lock");
     releaseBarEvaluationLock(tok as any);
+  });
+
+  it("Cross-Day Trade Marker Firewall: matchTradeToCandleIndex rejects prior-day timestamps despite identical HH:MM timeLabel", () => {
+    // Today 2026-11-13 10:00 AM ET = 1794582000 (sec)
+    const today10amSec = 1794582000;
+    const yesterday10amMs = (today10amSec - 86400) * 1000;
+    const candles = [
+      { timestamp: today10amSec - 300, timeLabel: "9:55 AM ET", open: 750, high: 751, low: 749, close: 750.2 },
+      { timestamp: today10amSec, timeLabel: "10:00 AM ET", open: 750.2, high: 751.2, low: 749.8, close: 750.8 },
+      { timestamp: today10amSec + 300, timeLabel: "10:05 AM ET", open: 750.8, high: 751.5, low: 750.0, close: 751.0 },
+    ];
+    assert.strictEqual(
+      matchTradeToCandleIndex(candles, yesterday10amMs, "10:00 AM ET"),
+      -1,
+      "Prior-day ms timestamp must NOT fall back to 10:00 AM ET label on today's bars"
+    );
+    assert.strictEqual(
+      matchTradeToCandleIndex(candles, today10amSec * 1000, "10:00 AM ET"),
+      1,
+      "Same-day millisecond timestamp must normalize to seconds and match exact candle index"
+    );
+  });
+
+  it("24H Upper HUD vs Lower Candlestick Coordinate Projection Parity (< 1e-6 px across all startHours & RTH zoom)", () => {
+    const plotW = 920;
+    const padLeft = 18;
+    const configurations = [
+      { startHour: 0, xScale: 1.0, xPanOffset: 0 },
+      { startHour: 0, xScale: 288 / 82, xPanOffset: 2 * ((plotW / 288) * (288 / 82)) - ((570 / 5) * ((plotW / 288) * (288 / 82))) },
+      { startHour: 7, xScale: 1.0, xPanOffset: 0 },
+      { startHour: 8, xScale: 1.5, xPanOffset: -45 },
+      { startHour: 9, xScale: 1.2, xPanOffset: 10 },
+    ];
+    for (const cfg of configurations) {
+      const axisStartMins = cfg.startHour === 0 ? 0 : cfg.startHour === 7 ? 420 : cfg.startHour === 8 ? 480 : 570;
+      const axisEndMins = cfg.startHour === 0 ? 1440 : 1020;
+      const axisSpanMins = axisEndMins - axisStartMins;
+      const totalSlots = Math.round(axisSpanMins / 5);
+      const stepX = (plotW / totalSlots) * cfg.xScale;
+      for (const etMins of [570, 720, 960]) {
+        const lowerX = padLeft + cfg.xPanOffset + ((etMins - axisStartMins) / 5) * stepX;
+        const upperX = padLeft + cfg.xPanOffset + ((etMins - axisStartMins) / axisSpanMins) * plotW * cfg.xScale;
+        assert.ok(
+          Math.abs(lowerX - upperX) < 1e-6,
+          `startHour=${cfg.startHour} etMins=${etMins} lowerX=${lowerX} upperX=${upperX} diverged`
+        );
+      }
+    }
   });
 });

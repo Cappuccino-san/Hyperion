@@ -108,8 +108,10 @@ export function matchTradeToCandleIndex(
     const intervals: number[] = [];
     const limit = Math.min(candles.length - 1, 10);
     for (let k = 0; k < limit; k++) {
-      const dt0 = candles[k].timestamp || 0;
-      const dt1 = candles[k + 1].timestamp || 0;
+      const rawDt0 = candles[k].timestamp || 0;
+      const rawDt1 = candles[k + 1].timestamp || 0;
+      const dt0 = rawDt0 > 1e11 ? Math.floor(rawDt0 / 1000) : rawDt0;
+      const dt1 = rawDt1 > 1e11 ? Math.floor(rawDt1 / 1000) : rawDt1;
       const step = Math.abs(dt1 - dt0);
       if (step >= 60 && step <= 3600) {
         intervals.push(step);
@@ -149,6 +151,10 @@ export function matchTradeToCandleIndex(
 
     if (bestIdx !== -1 && bestDiff <= Math.round(barStepSec * 1.5)) {
       return bestIdx;
+    }
+    // Never fall through to time-of-day label fallback across different trading sessions/days
+    if (bestIdx !== -1 && bestDiff > 4 * 3600) {
+      return -1;
     }
   }
 

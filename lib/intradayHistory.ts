@@ -29,7 +29,7 @@ export interface IntradayAlert {
 const RTH_START_MINS = 9 * 60 + 30; // 09:30 ET
 const RTH_END_MINS = 16 * 60;       // 16:00 ET (exclusive)
 const MAX_RTH_SNAPSHOTS = 1600;     // Covers full 6.5h RTH session at 15s cadence
-const MAX_EXT_SNAPSHOTS = 250;      // Rolling extended-hours ring buffer
+const MAX_EXT_SNAPSHOTS = 2400;     // Covers full extended-hours window across 00:00–24:00 ET
 
 export interface TickerIntradayData {
   history: IntradayHistoryPoint[];
@@ -170,6 +170,61 @@ function loadStore(): DailyStore {
     tickers: {},
   };
   return inMemoryStore;
+}
+
+/**
+ * Returns chronologically merged RTH + extended-hours intraday snapshots
+ * for a given ticker and ET session date across the full 00:00–24:00 ET day.
+ */
+export function getMergedIntradayHistory(
+  ticker: string,
+  sessionDate?: string
+): IntradayHistoryPoint[] {
+  const sym = ticker.trim().toUpperCase();
+  const targetDate = sessionDate?.trim() || getTodayEt();
+  const today = getTodayEt();
+
+  let store: DailyStore | null = null;
+  if (targetDate === today) {
+    store = loadStore();
+  } else {
+    const filePath = path.join(getCacheDir(), `intraday-${targetDate}.json`);
+    if (fs.existsSync(filePath)) {
+      try {
+        const raw = fs.readFileSync(filePath, "utf-8");
+        const parsed = JSON.parse(raw) as DailyStore;
+        if (parsed && parsed.tickers) {
+          store = parsed;
+        }
+      } catch {
+        store = null;
+      }
+    }
+  }
+
+  const tickerData = store?.tickers?.[sym];
+  if (!tickerData) return [];
+
+  const { rth, ext } = ensurePartitionedHistory(tickerData);
+  const byTs = new Map<number, IntradayHistoryPoint>();
+  for (const pt of [...(tickerData.history ?? []), ...ext, ...rth]) {
+    if (!pt || !Number.isFinite(pt.ts) || !Number.isFinite(pt.spot) || pt.spot <= 0) {
+      continue;
+    }
+    try {
+      const ptDate = new Date(pt.ts * 1000).toLocaleDateString("en-CA", {
+        timeZone: "America/New_York",
+      });
+      if (ptDate !== targetDate) continue;
+    } catch {
+      // Keep if Intl fails
+    }
+    const mins = getEtMinutesFromTs(pt.ts);
+    if (mins < 0 || mins >= 1440) continue;
+    byTs.set(pt.ts, pt);
+  }
+
+  return Array.from(byTs.values()).sort((a, b) => a.ts - b.ts);
 }
 
 function saveStore(store: DailyStore): void {

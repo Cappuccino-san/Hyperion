@@ -209,14 +209,22 @@ export async function GET(req: NextRequest) {
     if (searchParams.get("scan") === "true" || searchParams.get("poll") === "all") {
       const baseUrl = req.nextUrl.origin || "http://localhost:3000";
       const tickers = ["SPY", "QQQ", "IWM"];
-      for (const sym of tickers) {
-        try {
-          await fetch(`${baseUrl}/api/options?ticker=${sym}&force=true`, {
-            cache: "no-store",
-          }).then((r) => r.json());
-        } catch {
-          // Non-fatal
+      const scanController = new AbortController();
+      const scanTimeout = setTimeout(() => scanController.abort(), 12_000);
+      try {
+        for (const sym of tickers) {
+          if (scanController.signal.aborted) break;
+          try {
+            await fetch(`${baseUrl}/api/options?ticker=${sym}&force=true`, {
+              cache: "no-store",
+              signal: scanController.signal,
+            }).then((r) => r.json());
+          } catch {
+            // Non-fatal
+          }
         }
+      } finally {
+        clearTimeout(scanTimeout);
       }
       const activePositions = getActivePositions();
       const closedPositions = getClosedPositions();
@@ -283,9 +291,12 @@ export async function GET(req: NextRequest) {
     // Continuously evaluate all open positions across all tickers against live CBOE quotes
     const getLockToken = acquireBarEvaluationLock();
     if (getLockToken) {
+      const evalController = new AbortController();
+      const evalTimeout = setTimeout(() => evalController.abort(), 12_000);
       try {
-        await evaluateAllActivePositions({ webhookUrl });
+        await evaluateAllActivePositions({ webhookUrl, signal: evalController.signal });
       } finally {
+        clearTimeout(evalTimeout);
         releaseBarEvaluationLock(getLockToken);
       }
     }
@@ -315,6 +326,8 @@ export async function POST(req: NextRequest) {
       if (!lockToken) {
         return NextResponse.json({ success: false, busy: true, dispatchedCount: 0, keys: [] }, { status: 409 });
       }
+      const syncController = new AbortController();
+      const syncTimeout = setTimeout(() => syncController.abort(), 12_000);
       try {
         const res = await syncGaiaSpySignalsToDiscord({
           ticker: body.ticker || "SPY",
@@ -327,9 +340,11 @@ export async function POST(req: NextRequest) {
           sessionDate: body.sessionDate,
           webhookUrl: body.webhookUrl,
           isHistoricalBackfill: Boolean(body.isHistoricalBackfill),
+          signal: syncController.signal,
         });
         return NextResponse.json({ success: true, ...res });
       } finally {
+        clearTimeout(syncTimeout);
         releaseBarEvaluationLock(lockToken);
       }
     }
@@ -377,9 +392,12 @@ export async function POST(req: NextRequest) {
     if (!lockToken) {
       return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
     }
+    const postController = new AbortController();
+    const postTimeout = setTimeout(() => postController.abort(), 12_000);
     try {
       const normalizedBody = {
         ...body,
+        signal: postController.signal,
         ...(body.nowEt
           ? { nowEt: new Date(body.nowEt), isHistoricalBackfill: body.isHistoricalBackfill ?? true }
           : {}),
@@ -387,6 +405,7 @@ export async function POST(req: NextRequest) {
       const result = await evaluateTradeSignals(normalizedBody);
       return NextResponse.json(result);
     } finally {
+      clearTimeout(postTimeout);
       releaseBarEvaluationLock(lockToken);
     }
   } catch (err: unknown) {

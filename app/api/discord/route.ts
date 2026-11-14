@@ -1,8 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const DEFAULT_DISCORD_WEBHOOK_URL =
-  "https://discord.com/api/webhooks/1562857850676449411/Qza12VWuPoBlek12-6o7V6fc2EscYDjIQrKw7KJyfB8Y3i9VAMvU7OJH0m7joqUH5arx";
-
 interface CachedEvent {
   timestamp: number;
 }
@@ -10,6 +7,7 @@ const dispatchedAlertsCache = new Map<string, CachedEvent>();
 
 export interface DiscordAlertRequestBody {
   webhookUrl?: string;
+  dryRun?: boolean;
   action?: "BUY_TO_OPEN" | "SELL_TO_CLOSE";
   eventType?: string; // 'bto' | 'stc' | 'buy_to_open' | 'sell_to_close' | 'call' | 'put' | 'zero' | 'king' | 'test'
   isHistoricalBackfill?: boolean;
@@ -71,7 +69,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 2. Webhook Idempotency & Deduplication Guard
+    // 2. Webhook Idempotency & Deduplication Guard (stamped only after HTTP 2xx)
     if (body.eventId) {
       const nowMs = Date.now();
       const existing = dispatchedAlertsCache.get(body.eventId);
@@ -81,25 +79,27 @@ export async function POST(req: NextRequest) {
           reason: "Duplicate eventId already dispatched.",
         });
       }
-      dispatchedAlertsCache.set(body.eventId, { timestamp: nowMs });
-      if (dispatchedAlertsCache.size > 2000) {
-        const oldestKey = dispatchedAlertsCache.keys().next().value;
-        if (oldestKey) dispatchedAlertsCache.delete(oldestKey);
-      }
     }
     const webhookUrl =
       (body.webhookUrl && body.webhookUrl.trim().length > 0
         ? body.webhookUrl.trim()
-        : process.env.DISCORD_WEBHOOK_URL)?.trim() || DEFAULT_DISCORD_WEBHOOK_URL;
+        : process.env.DISCORD_WEBHOOK_URL?.trim()) || "";
 
-    if (!webhookUrl) {
+    if (!body.dryRun && !webhookUrl) {
       return NextResponse.json(
-        { error: "No Discord Webhook URL configured or provided." },
+        { error: "No Discord Webhook URL configured (DISCORD_WEBHOOK_URL unset)." },
         { status: 400 }
       );
     }
 
-    const ticker = body.ticker || "SPY";
+    if (webhookUrl && !/^https:\/\//i.test(webhookUrl)) {
+      return NextResponse.json(
+        { error: "Invalid Discord Webhook URL protocol; HTTPS required." },
+        { status: 400 }
+      );
+    }
+
+    const ticker = (body.ticker || "SPY").trim().toUpperCase();
     const spot = body.spotPrice ?? 0;
     const eventType = (body.eventType || "").toLowerCase();
     const action = body.action || (eventType === "bto" || eventType === "buy_to_open"
@@ -107,6 +107,13 @@ export async function POST(req: NextRequest) {
       : eventType === "stc" || eventType === "sell_to_close"
         ? "SELL_TO_CLOSE"
         : undefined);
+
+    if ((action === "BUY_TO_OPEN" || action === "SELL_TO_CLOSE") && (!Number.isFinite(spot) || spot <= 0)) {
+      return NextResponse.json(
+        { error: "Invalid trade alert payload: positive spotPrice is required." },
+        { status: 400 }
+      );
+    }
 
     let payload: any;
 
@@ -437,6 +444,16 @@ export async function POST(req: NextRequest) {
       };
     }
 
+    if (body.dryRun) {
+      return NextResponse.json({
+        success: true,
+        dryRun: true,
+        validated: true,
+        action: action || eventType || "TEST",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     const discordRes = await fetch(webhookUrl, {
       method: "POST",
       headers: {
@@ -451,6 +468,14 @@ export async function POST(req: NextRequest) {
         { error: `Discord Webhook error: ${errText || discordRes.statusText}` },
         { status: discordRes.status }
       );
+    }
+
+    if (body.eventId) {
+      dispatchedAlertsCache.set(body.eventId, { timestamp: Date.now() });
+      if (dispatchedAlertsCache.size > 2000) {
+        const oldestKey = dispatchedAlertsCache.keys().next().value;
+        if (oldestKey) dispatchedAlertsCache.delete(oldestKey);
+      }
     }
 
     return NextResponse.json({ success: true, timestamp: new Date().toISOString() });

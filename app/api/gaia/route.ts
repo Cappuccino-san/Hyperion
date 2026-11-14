@@ -4,6 +4,7 @@ import {
   getActiveExpirationSelection,
   parseOccSymbol,
 } from "@/lib/optionsExposure";
+import { getMergedIntradayHistory, getEtMinutesFromTs } from "@/lib/intradayHistory";
 
 export const dynamic = "force-dynamic";
 
@@ -183,7 +184,7 @@ async function fetchYahooSeries(
   interval: string,
   range: string,
   includePrePost: boolean = false,
-  startHour: number = 7
+  startHour: number = 0
 ): Promise<RawYahooBar[]> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
     yahooSymbol
@@ -237,19 +238,26 @@ async function fetchYahooSeries(
         hour12: false,
         hourCycle: "h23",
       });
-      const [hNum, mNum] = etTime24.split(":").map(Number);
-      if (startHour === 9) {
+      const [hNumRaw, mNum] = etTime24.split(":").map(Number);
+      const hNum = hNumRaw % 24;
+      if (startHour === 0) {
+        // 24-hour ET window (00:00 – 23:59 ET): keep all extended-hours + RTH 5m bars
+      } else if (startHour === 9) {
         if (hNum < 9 || (hNum === 9 && mNum < 30) || hNum > 16 || (hNum === 16 && mNum > 0)) {
+          continue;
+        }
+        if (hNum === 16 && mNum === 0) {
+          // Skip 4:00 PM settlement cross bar to preserve true 3:55 PM regular session close
           continue;
         }
       } else {
         if (hNum < startHour || hNum > 16 || (hNum === 16 && mNum > 0)) {
           continue;
         }
-      }
-      if (hNum === 16 && mNum === 0) {
-        // Skip 4:00 PM settlement cross bar to preserve true 3:55 PM regular session close
-        continue;
+        if (hNum === 16 && mNum === 0) {
+          // Skip 4:00 PM settlement cross bar to preserve true 3:55 PM regular session close
+          continue;
+        }
       }
     }
     bars.push({
@@ -831,13 +839,15 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const rawTicker = (searchParams.get("ticker") ?? "SPY").trim().toUpperCase();
   const requestedSession = (searchParams.get("session") ?? "").trim();
-  const rawStart = (searchParams.get("start") ?? searchParams.get("startHour") ?? "7").trim().toLowerCase();
+  const rawStart = (searchParams.get("start") ?? searchParams.get("startHour") ?? "0").trim().toLowerCase();
   const startHour =
     rawStart === "9:30" || rawStart === "9.5" || rawStart === "9"
       ? 9
       : rawStart === "8"
         ? 8
-        : 7;
+        : rawStart === "7"
+          ? 7
+          : 0;
 
   const ticker = /^[A-Z0-9._-]{1,10}$/.test(rawTicker) ? rawTicker : "SPY";
   const yahooSymbol = mapYahooSymbol(ticker);
@@ -887,8 +897,49 @@ export async function GET(request: NextRequest) {
     const activeSessionObj =
       sessions.find((s) => s.isoDate === activeSessionDate) ?? sessions[0];
 
+    // Backfill missing 5m extended-hours buckets (00:00–24:00 ET) from recorded intraday history
+    const extPoints = getMergedIntradayHistory(ticker, activeSessionDate);
+    let bars5mWithExt = bars5mRaw;
+    if (extPoints.length > 0) {
+      const existingBuckets = new Set<number>();
+      for (const b of bars5mRaw) {
+        if (b.etDate === activeSessionDate) {
+          existingBuckets.add(Math.floor(b.ts / 300) * 300);
+        }
+      }
+      const startMin = startHour === 9 ? 570 : startHour >= 7 ? startHour * 60 : 0;
+      const endMin = startHour === 0 ? 1440 : 960;
+      const bucketMap = new Map<number, { open: number; high: number; low: number; close: number }>();
+      for (const pt of extPoints) {
+        const mins = getEtMinutesFromTs(pt.ts);
+        if (mins < startMin || mins >= endMin) continue;
+        const bTs = Math.floor(pt.ts / 300) * 300;
+        if (existingBuckets.has(bTs)) continue;
+        const prev = bucketMap.get(bTs);
+        if (!prev) {
+          bucketMap.set(bTs, { open: pt.spot, high: pt.spot, low: pt.spot, close: pt.spot });
+        } else {
+          prev.high = Math.max(prev.high, pt.spot);
+          prev.low = Math.min(prev.low, pt.spot);
+          prev.close = pt.spot;
+        }
+      }
+      if (bucketMap.size > 0) {
+        const backfilledBars: RawYahooBar[] = Array.from(bucketMap.entries()).map(([bTs, ohlc]) => ({
+          ts: bTs,
+          etDate: activeSessionDate,
+          etTime: formatEtTime(bTs),
+          open: Number(ohlc.open.toFixed(2)),
+          high: Number(ohlc.high.toFixed(2)),
+          low: Number(ohlc.low.toFixed(2)),
+          close: Number(ohlc.close.toFixed(2)),
+        }));
+        bars5mWithExt = [...bars5mRaw, ...backfilledBars].sort((a, b) => a.ts - b.ts);
+      }
+    }
+
     // Enrich 5m bars with Wilder RSI(14) and MACD(12,26,9) across the full continuous series
-    const enriched5m = enrichBarsWithRsiAndMacd(bars5mRaw);
+    const enriched5m = enrichBarsWithRsiAndMacd(bars5mWithExt);
 
     // Locate indices belonging to activeSessionDate
     const sessionGlobalIndices: number[] = [];

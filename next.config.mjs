@@ -9,7 +9,12 @@ const nextConfig = {
     return [
       {
         source: "/charts",
-        destination: "/antaeus",
+        destination: "/gaia",
+        permanent: true,
+      },
+      {
+        source: "/antaeus",
+        destination: "/gaia",
         permanent: true,
       },
     ];

@@ -4,12 +4,11 @@
  * Mathematical Invariants Enforced:
  * 1. Total Capital Outlay Invariant:
  *    Total risk exposure per trade MUST be strictly UNDER $100.00 (maximum 1 or 2 contracts).
- * 2. Contract Sizing Invariant:
- *    - Ask * 100 <= $50.00  -> Size 2 contracts max (Total outlay: $30.00 - $100.00)
- *    - $50.00 < Ask * 100 <= $100.00 -> Size 1 contract (Total outlay: $51.00 - $100.00)
- *    - Ask * 100 > $100.00 -> REJECT execution immediately (Total outlay: $0.00, Never exceeds budget)
+ * 2. Contract Sizing Invariant (1-Contract Sniper Mode):
+ *    - Ask * 100 <= $100.00 -> Size strictly 1 contract (Total outlay: $1.00 - $100.00)
+ *    - Ask * 100 > $100.00  -> REJECT execution immediately (Total outlay: $0.00, Never exceeds budget)
  * 3. Contract Quantity Invariant:
- *    Quantity MUST strictly be in {1, 2}. Sizing 3+ contracts is mathematically impossible.
+ *    Quantity MUST strictly be 1. Sizing 2+ contracts is mathematically impossible.
  */
 
 export interface PositionSizingResult {
@@ -61,7 +60,7 @@ export function calculateSmallAccountSize(contractAsk: number): PositionSizingRe
       contractAsk,
       contractCost,
       contractsQty: 1,
-      totalOutlay: contractCost,
+      totalOutlay: 0,
       rejectionReason: `BUDGET_EXCEEDED: Contract cost $${contractCost.toFixed(
         2
       )} exceeds maximum allowed outlay of $${MAX_SMALL_ACCOUNT_BUDGET.toFixed(2)}`,
@@ -69,21 +68,7 @@ export function calculateSmallAccountSize(contractAsk: number): PositionSizingRe
     };
   }
 
-  // 2. If 2 contracts cost <= $100.00 (20,000 cents / 2 <= 10,000 cents, Ask <= $0.50), size 2 contracts
-  if (2 * singleContractCents <= MAX_OUTLAY_CENTS) {
-    const contractsQty: 1 | 2 = 2;
-    const totalOutlay = (2 * singleContractCents) / 100;
-    return {
-      allowed: true,
-      contractAsk,
-      contractCost,
-      contractsQty,
-      totalOutlay,
-      sizingTier: "TWO_CONTRACTS",
-    };
-  }
-
-  // 3. Otherwise (Ask between $0.51 and $1.00), size exactly 1 contract
+  // 2. Strict 1-Contract Sniper Automaton: size strictly 1 contract when Ask * 100 <= $100.00
   const contractsQty: 1 | 2 = 1;
   const totalOutlay = singleContractCents / 100;
   return {
@@ -140,14 +125,7 @@ export function calculatePositionSize(askPrice: number, bidPrice?: number): Sizi
     }
   }
 
-  if (2 * singleContractCents <= MAX_OUTLAY_CENTS) {
-    return {
-      allowed: true,
-      contractsQty: 2,
-      totalOutlay: (2 * singleContractCents) / 100,
-    };
-  }
-
+  // Strict 1-Contract Sniper Automaton
   return {
     allowed: true,
     contractsQty: 1,
@@ -163,10 +141,10 @@ export function assertSmallAccountInvariant(
   totalOutlay: number,
   contractsQty: number
 ): { valid: boolean; violation?: string } {
-  if (contractsQty !== 1 && contractsQty !== 2) {
+  if (contractsQty !== 1) {
     return {
       valid: false,
-      violation: `CONTRACT_QTY_VIOLATION: Sized ${contractsQty} contracts. Must strictly be 1 or 2 contracts.`,
+      violation: `CONTRACT_QTY_VIOLATION: Sized ${contractsQty} contracts. Must strictly be 1 contract.`,
     };
   }
 

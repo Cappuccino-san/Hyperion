@@ -33,3 +33,6 @@ next-env.d.ts
 .agents/
 argon.bat
 *argon_bridge*
+
+# generated audit reports
+AUDIT_RECOMMENDATIONS.md

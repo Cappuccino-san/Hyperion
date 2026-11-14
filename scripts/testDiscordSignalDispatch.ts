@@ -10,12 +10,11 @@ import fs from "fs";
 import path from "path";
 import assert from "node:assert/strict";
 import {
-  DEFAULT_DISCORD_WEBHOOK_URL,
   sendDiscordTradeAlert,
   TradeLifecycleAlert,
 } from "../lib/tradeSignalEngine";
 
-function resolveWebhookUrl(): { url: string; source: string } {
+function resolveWebhookUrl(isLive: boolean): { url: string; source: string } {
   try {
     const envPath = path.resolve(process.cwd(), ".env.local");
     if (fs.existsSync(envPath)) {
@@ -34,7 +33,13 @@ function resolveWebhookUrl(): { url: string; source: string } {
   if (process.env.DISCORD_WEBHOOK_URL?.trim()) {
     return { url: process.env.DISCORD_WEBHOOK_URL.trim(), source: "process.env" };
   }
-  return { url: DEFAULT_DISCORD_WEBHOOK_URL, source: "DEFAULT_DISCORD_WEBHOOK_URL" };
+  if (!isLive) {
+    return {
+      url: "https://discord.com/api/webhooks/000000000000000000/dry-run-placeholder",
+      source: "dry-run-placeholder",
+    };
+  }
+  return { url: "", source: "unset" };
 }
 
 function buildScenarioAlerts(nowSec: number): Array<{ label: string; expectBlocked?: boolean; alert: TradeLifecycleAlert }> {
@@ -237,14 +242,24 @@ function buildScenarioAlerts(nowSec: number): Array<{ label: string; expectBlock
 
 async function main(): Promise<void> {
   const isLive = process.argv.includes("--live");
-  const { url: webhookUrl, source } = resolveWebhookUrl();
+  const { url: webhookUrl, source } = resolveWebhookUrl(isLive);
   const masked = webhookUrl.replace(/(webhooks\/\d+\/)[^?]+/, "$1***");
 
   console.log("================================================================================");
   console.log(`  HYPERION DISCORD BTO/STC VERIFICATION (${isLive ? "LIVE DISPATCH" : "DRY-RUN"})`);
   console.log("================================================================================");
-  console.log(`Webhook (${source}): ${masked}`);
+  console.log(`Webhook (${source}): ${masked || "(unset)"}`);
   assert.ok(webhookUrl.startsWith("https://discord.com/api/webhooks/"), "Valid Discord webhook URL required");
+
+  // Verify fail-closed behavior when neither customWebhookUrl nor process.env.DISCORD_WEBHOOK_URL is set
+  if (!isLive) {
+    const prevEnvUrl = process.env.DISCORD_WEBHOOK_URL;
+    delete process.env.DISCORD_WEBHOOK_URL;
+    const scenariosCheck = buildScenarioAlerts(Math.floor(Date.now() / 1000));
+    const failClosed = await sendDiscordTradeAlert(scenariosCheck[1].alert, undefined, { bypassFsmFirewall: true });
+    if (prevEnvUrl !== undefined) process.env.DISCORD_WEBHOOK_URL = prevEnvUrl;
+    assert.strictEqual(failClosed, false, "Unset Discord webhook URL must fail closed (return false)");
+  }
 
   const capturedPayloads: Array<{ label: string; url: string; payload: any }> = [];
   const originalFetch = globalThis.fetch;

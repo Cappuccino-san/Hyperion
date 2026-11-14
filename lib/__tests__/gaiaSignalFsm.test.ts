@@ -306,4 +306,64 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
     assert.strictEqual(newlyCommitted[1].toState, "STAND_ASIDE");
     assert.strictEqual(snapshot.committedState, "STAND_ASIDE");
   });
+
+  it("Stage-2 Trailing Stop retains BE+10% floor and commitClosedBar blocks entries at or after 16:00 ET", () => {
+    // 1. Post-16:00 ET firewall: bar with etMins >= 960 must NOT enter a new trade
+    const fsmEod = new GaiaSignalFsm();
+    const preBar: GaiaBarData = {
+      barTimestamp: 1000,
+      open: 760.0,
+      high: 760.5,
+      low: 759.5,
+      close: 760.1,
+      chi: 0.52,
+      bias: 0.04,
+      netFlux: 0.02,
+      peclet: 0.4,
+      etMins: 950,
+      isClosed: true,
+    };
+    const eodSetupBar: GaiaBarData = {
+      barTimestamp: 1600,
+      open: 760.1,
+      high: 763.0,
+      low: 760.0,
+      close: 762.8,
+      chi: 0.90,
+      bias: 0.45,
+      netFlux: 0.38,
+      peclet: 2.7,
+      etMins: 960, // 16:00 ET hard cutoff
+      isClosed: true,
+    };
+    const eodSig = fsmEod.commitClosedBar(eodSetupBar, computeCausalEquilibriumDispersion([preBar, eodSetupBar], 1), {
+      macroRegime: "CALL",
+      callDominancePct: 75,
+    });
+    assert.strictEqual(eodSig, null, "Must never open a new FSM position at/after 16:00 ET (etMins >= 960)");
+
+    // 2. Stage-2 BE+10% floor invariant on active LONG runner
+    const fsmTrail = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [
+      { barTimestamp: 1000, open: 760.0, high: 760.4, low: 759.6, close: 760.0, chi: 0.50, bias: 0.0, netFlux: 0.0, peclet: 0.2, etMins: 565, isClosed: true },
+      // Entry LONG around 762.0 (stop ~ 760.0 -> initialRisk = 2.0, targetWall = 768.0)
+      { barTimestamp: 1300, open: 760.0, high: 762.4, low: 759.9, close: 762.0, chi: 0.88, bias: 0.42, netFlux: 0.35, peclet: 2.5, etMins: 575, isClosed: true },
+      // Runner surges > 75% to wall (766.8) on a wide bar (low 761.0 < BE+10% floor 762.2), promoting Stage-2 trail
+      { barTimestamp: 1600, open: 762.0, high: 767.0, low: 761.0, close: 766.8, chi: 0.90, bias: 0.45, netFlux: 0.36, peclet: 2.6, etMins: 580, isClosed: true },
+      // Next bar pulls back below Stage-2 BE+10% floor (762.20) even though prior bar low was 761.0
+      { barTimestamp: 1900, open: 766.5, high: 766.5, low: 762.10, close: 762.15, chi: 0.65, bias: 0.15, netFlux: 0.10, peclet: 1.0, etMins: 585, isClosed: true },
+    ];
+    const { newlyCommitted } = fsmTrail.commitSeries(bars, {
+      macroRegime: "CALL",
+      callDominancePct: 75,
+      structuralLevels: {
+        putWall: 758.0,
+        callWall: 768.0,
+        zeroGamma: 760.0,
+      },
+    });
+    assert.strictEqual(newlyCommitted[0]?.toState, "LONG", "Expected initial LONG entry");
+    const exitSig = newlyCommitted.find((s) => s.fromState === "LONG" && s.toState === "STAND_ASIDE");
+    assert.ok(exitSig, "Expected Stage-2 BE+10% floor or stop exit when runner retraces below BE+10% floor");
+  });
 });

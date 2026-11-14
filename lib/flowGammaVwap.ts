@@ -573,6 +573,26 @@ export interface StructuralFlowNodes {
  * Aggregates a series of intraday bars and option contracts into bar-by-bar
  * Flow VWAP & Flux Field PDE points, including tick-level ±1σ / ±2σ band wick signals.
  */
+function getEtDateAndMinsFromTimestamp(tsRaw: number): { etDate: string; etMins: number } | null {
+  if (!Number.isFinite(tsRaw) || tsRaw <= 0) return null;
+  const ms = tsRaw > 1e11 ? tsRaw : tsRaw * 1000;
+  try {
+    const dt = new Date(ms);
+    const etDate = dt.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(dt);
+    const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 0) % 24;
+    const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
+    return { etDate, etMins: hour * 60 + minute };
+  } catch {
+    return null;
+  }
+}
+
 export function computeBarFlowGammaVwapSeries(
   candles: Array<{
     timestamp: number;
@@ -581,6 +601,7 @@ export function computeBarFlowGammaVwapSeries(
     low: number;
     close: number;
     volume?: number;
+    etMins?: number;
   }>,
   optionsBook?: Array<{
     strike: number;
@@ -639,63 +660,61 @@ export function computeBarFlowGammaVwapSeries(
     }
   }
 
-  // 2. Establish Causal Opening Anchor for the Base Profile [p_F, p_C]
-  const openSlice = candles.slice(0, Math.min(3, candles.length));
-  const openHigh = Math.max(...openSlice.map((c) => c.high));
-  const openLow = Math.min(...openSlice.map((c) => c.low));
-  const openRange = Math.max(refOpenSpot * 0.004, openHigh - openLow);
+  // Causal opening spectral calibration helper (uses only bars [sessionStartIdx .. i] <= 3 bars, zero lookahead)
+  const buildCausalOpeningSpec = (openSlice: typeof candles) => {
+    const sliceOpenSpot = openSlice[0].open || openSlice[0].close;
+    const openHigh = Math.max(...openSlice.map((c) => c.high));
+    const openLow = Math.min(...openSlice.map((c) => c.low));
+    const openRange = Math.max(sliceOpenSpot * 0.004, openHigh - openLow);
 
-  const baseFloorNode =
-    structuralNodes?.floorNode && structuralNodes.floorNode > 0 && structuralNodes.floorNode < openHigh
-      ? structuralNodes.floorNode
-      : putWallCandidate > 0 && Math.abs(refOpenSpot - putWallCandidate) <= openRange * 2.5
-        ? Math.min(putWallCandidate, openLow - openRange * 0.08)
-        : Number((openLow - openRange * 0.12).toFixed(2));
+    const baseFloorNode =
+      structuralNodes?.floorNode && structuralNodes.floorNode > 0 && structuralNodes.floorNode < openHigh
+        ? structuralNodes.floorNode
+        : putWallCandidate > 0 && Math.abs(sliceOpenSpot - putWallCandidate) <= openRange * 2.5
+          ? Math.min(putWallCandidate, openLow - openRange * 0.08)
+          : Number((openLow - openRange * 0.12).toFixed(2));
 
-  const baseCeilingNode =
-    structuralNodes?.ceilingNode && structuralNodes.ceilingNode > baseFloorNode
-      ? structuralNodes.ceilingNode
-      : callWallCandidate > baseFloorNode && Math.abs(callWallCandidate - refOpenSpot) <= openRange * 2.5
-        ? Math.max(callWallCandidate, openHigh + openRange * 0.08)
-        : Number((openHigh + openRange * 0.12).toFixed(2));
+    const baseCeilingNode =
+      structuralNodes?.ceilingNode && structuralNodes.ceilingNode > baseFloorNode
+        ? structuralNodes.ceilingNode
+        : callWallCandidate > baseFloorNode && Math.abs(callWallCandidate - sliceOpenSpot) <= openRange * 2.5
+          ? Math.max(callWallCandidate, openHigh + openRange * 0.08)
+          : Number((openHigh + openRange * 0.12).toFixed(2));
 
-  const baseW = Math.max(1.0, baseCeilingNode - baseFloorNode);
+    const baseW = Math.max(1.0, baseCeilingNode - baseFloorNode);
+    const openCenterPrice =
+      openSlice.reduce((acc, c) => acc + (c.open + c.close + c.high + c.low) / 4, 0) /
+      openSlice.length;
+    const openCenterRel = Math.max(0.08 * baseW, Math.min(0.92 * baseW, openCenterPrice - baseFloorNode));
+    const openSpread = Math.max(0.08 * baseW, Math.min(0.25 * baseW, (openSlice[0].high - openSlice[0].low) * 1.5 || 0.14 * baseW));
 
-  // 3. Construct Opening Aggressive Premium Profile Pi(x) on x in [0, baseW] (first 1-3 bars at 9:30 open)
-  const openCenterPrice =
-    openSlice.reduce((acc, c) => acc + (c.open + c.close + c.high + c.low) / 4, 0) /
-    openSlice.length;
-  const openCenterRel = Math.max(0.08 * baseW, Math.min(0.92 * baseW, openCenterPrice - baseFloorNode));
-  const openSpread = Math.max(0.08 * baseW, Math.min(0.25 * baseW, (openSlice[0].high - openSlice[0].low) * 1.5 || 0.14 * baseW));
-
-  const openingProfile = (x: number): number => {
-    const distOpen = x - openCenterRel;
-    let val = 100 * Math.exp(-(distOpen * distOpen) / (2 * openSpread * openSpread));
-    if (strikeGammaWeights.length > 0) {
-      const strikePrice = baseFloorNode + x;
-      for (const sw of strikeGammaWeights) {
-        const d = strikePrice - sw.strike;
-        if (Math.abs(d) <= baseW * 0.25) {
-          val += Math.min(80, Math.log1p(sw.weight) * 2.5) * Math.exp(-(d * d) / (2 * openSpread * openSpread));
+    const openingProfile = (x: number): number => {
+      const distOpen = x - openCenterRel;
+      let val = 100 * Math.exp(-(distOpen * distOpen) / (2 * openSpread * openSpread));
+      if (strikeGammaWeights.length > 0) {
+        const strikePrice = baseFloorNode + x;
+        for (const sw of strikeGammaWeights) {
+          const d = strikePrice - sw.strike;
+          if (Math.abs(d) <= baseW * 0.25) {
+            val += Math.min(80, Math.log1p(sw.weight) * 2.5) * Math.exp(-(d * d) / (2 * openSpread * openSpread));
+          }
         }
       }
-    }
-    return val;
+      return val;
+    };
+
+    const gammaDiff = (baseW * baseW) / (Math.PI * Math.PI * 140);
+    const kappa = gammaDiff;
+    const baseModes = computeSpectralModes({
+      openingProfile,
+      W: baseW,
+      sigmaC: 1.0,
+      muDelta: 0,
+      gammaDiff,
+      numModes: 18,
+    });
+    return { gammaDiff, kappa, baseModes };
   };
-
-  // Diffusivity kappa & Gamma calibrated so higher modes relax over a ~180m session
-  const gammaDiff = (baseW * baseW) / (Math.PI * Math.PI * 140);
-  const kappa = gammaDiff;
-
-  // Baseline Fourier Sine Coefficients at 9:30 open
-  const baseModes = computeSpectralModes({
-    openingProfile,
-    W: baseW,
-    sigmaC: 1.0,
-    muDelta: 0,
-    gammaDiff,
-    numModes: 18,
-  });
 
   const totalBookWeight = strikeGammaWeights.reduce((s, w) => s + w.weight, 0);
 
@@ -704,32 +723,58 @@ export function computeBarFlowGammaVwapSeries(
   let runningLow = +Infinity;
   let causalAtr = 0;
   const atrAlpha = 1 / 14;
-  let hasResetForRth = false;
+  let lastRthResetDate = "";
+  let sessionStartIdx = 0;
+  let sessionStartTs = candles[0].timestamp;
+  let open930 = candles[0].open || candles[0].close;
+  let openingSpec = buildCausalOpeningSpec([candles[0]]);
 
   for (let i = 0; i < candles.length; i++) {
     const c = candles[i];
-    const etMins = (c as any).etMins;
-    if (!hasResetForRth && typeof etMins === "number" && etMins >= 570) {
-      hasResetForRth = true;
-      engine.reset(c.open || c.close);
-      runningHigh = c.high;
-      runningLow = c.low;
+    const parsedEt = getEtDateAndMinsFromTimestamp(c.timestamp);
+    const etMins =
+      typeof c.etMins === "number" && Number.isFinite(c.etMins)
+        ? c.etMins
+        : parsedEt?.etMins;
+    const etDate = parsedEt?.etDate ?? "SESSION";
+
+    const barRange = Math.max(0, c.high - c.low);
+    const isFirstBarOfRthSession =
+      typeof etMins === "number" && etMins >= 570 && lastRthResetDate !== etDate;
+    if (isFirstBarOfRthSession) {
+      lastRthResetDate = etDate;
+      open930 = c.open || c.close;
+      if (i > 0) {
+        engine.reset(open930);
+        runningHigh = -Infinity;
+        runningLow = +Infinity;
+        causalAtr = 0;
+        sessionStartIdx = i;
+        sessionStartTs = c.timestamp;
+      }
     }
+
+    // Refine opening spectral calibration strictly from observed bars [sessionStartIdx .. i] (<= 3 bars)
+    const barsIntoSession = i - sessionStartIdx;
+    if (barsIntoSession < 3) {
+      openingSpec = buildCausalOpeningSpec(candles.slice(sessionStartIdx, i + 1));
+    }
+    const { gammaDiff, kappa, baseModes } = openingSpec;
+
     const spot = c.close;
     const barVol = Math.max(1, c.volume || 100);
 
-    // 1. Update causal running extrema using strictly history [0 .. i]
+    // 1. Update causal running extrema using strictly history [sessionStartIdx .. i]
     if (c.high > runningHigh) runningHigh = c.high;
     if (c.low < runningLow) runningLow = c.low;
 
     // 2. Causal Wilder True Range
-    const barRange = Math.max(0, c.high - c.low);
-    const prevClose = i > 0 ? candles[i - 1].close : c.open;
+    const prevClose = barsIntoSession > 0 ? candles[i - 1].close : c.open;
     const trueRange =
-      i === 0
+      barsIntoSession === 0
         ? Math.max(barRange, c.close * 0.0015)
         : Math.max(barRange, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose));
-    causalAtr = i === 0 ? trueRange : atrAlpha * trueRange + (1 - atrAlpha) * causalAtr;
+    causalAtr = barsIntoSession === 0 ? trueRange : atrAlpha * trueRange + (1 - atrAlpha) * causalAtr;
 
     // 3. Causal absorbing domain buffers [p_F(t_i), p_C(t_i)]
     const causalBuffer = Math.max(0.5 * causalAtr, c.close * 0.001);
@@ -761,7 +806,7 @@ export function computeBarFlowGammaVwapSeries(
       for (const sw of strikeGammaWeights) {
         const dist = Math.abs(sw.strike - spot);
         const prox = Math.exp(-(dist * dist) / (2 * 16)); // ~4 pt sigma
-        const w = sw.weight * prox * (barVol / (candles.length * 100));
+        const w = sw.weight * prox * (barVol / 7800);
         barWeight += w;
         netSigned += w * sw.signedBias;
       }
@@ -786,13 +831,12 @@ export function computeBarFlowGammaVwapSeries(
     // Minutes elapsed since session open
     const tauMinutes = Math.max(
       1,
-      c.timestamp > candles[0].timestamp
-        ? (c.timestamp - candles[0].timestamp) / (c.timestamp > 1e11 ? 60000 : 60)
-        : (i + 1) * 5
+      c.timestamp > sessionStartTs
+        ? (c.timestamp - sessionStartTs) / (c.timestamp > 1e11 ? 60000 : 60)
+        : (barsIntoSession + 1) * 5
     );
 
     // Multi-Horizon Structural Advection Velocity (Session Open + VWAP + Momentum)
-    const open930 = candles.find((b) => ((b as any).etMins ?? 0) >= 570)?.open ?? candles[0].open;
     const currentVwap = baseSnap.flowVwap || c.close;
     const atrEst = Math.max(0.40, causalAtr);
 
@@ -801,9 +845,9 @@ export function computeBarFlowGammaVwapSeries(
     // 2. Structural Horizon: Distance from Flow VWAP
     const vwapDrive = (c.close - currentVwap) / (1.2 * atrEst);
     // 3. Windowed 30m (6-bar), 20m (4-bar) & 10m (2-bar) Impulse Horizon
-    const lb6 = Math.max(0, i - 6);
-    const lb4 = Math.max(0, i - 4);
-    const lb2 = Math.max(0, i - 2);
+    const lb6 = Math.max(sessionStartIdx, i - 6);
+    const lb4 = Math.max(sessionStartIdx, i - 4);
+    const lb2 = Math.max(sessionStartIdx, i - 2);
     const impulseDrive = (
       0.20 * ((c.close - candles[lb6].close) / atrEst) +
       0.45 * ((c.close - candles[lb4].close) / atrEst) +
@@ -832,14 +876,14 @@ export function computeBarFlowGammaVwapSeries(
 
     // Couple incremental empirical Flow VWAP with Spectral PDE Flow VWAP (smooth orange trajectory in Image 3)
     const empiricalVwap = baseSnap.flowVwap;
-    const spectralWeight = candles.length > 3 ? 0.28 : 0.0;
+    const spectralWeight = barsIntoSession >= 3 ? 0.28 : 0.0;
     const blendedFlowVwap =
       spectralWeight > 0
         ? empiricalVwap * (1 - spectralWeight) + pdeState.spectralFlowVwap * spectralWeight
         : empiricalVwap;
 
     const effectiveSigma =
-      candles.length > 3
+      barsIntoSession >= 3
         ? Math.max(baseSnap.sigma, pdeState.spectralSigma * 0.65)
         : baseSnap.sigma;
 
@@ -886,10 +930,10 @@ export function computeBarFlowGammaVwapSeries(
       netFluxJ: pdeState.netFluxJ,
       impulsePeclet,
       impulseChi,
-      deltaChi6Bar: i >= 6 && results[i - 6]?.ceilingShareChi !== undefined
+      deltaChi6Bar: barsIntoSession >= 6 && results[i - 6]?.ceilingShareChi !== undefined
         ? Number((pdeState.ceilingShareChi - results[i - 6].ceilingShareChi!).toFixed(4))
         : 0,
-      deltaNetFlux6Bar: i >= 6 && results[i - 6]?.netFluxJ !== undefined
+      deltaNetFlux6Bar: barsIntoSession >= 6 && results[i - 6]?.netFluxJ !== undefined
         ? Number((pdeState.netFluxJ - results[i - 6].netFluxJ!).toFixed(2))
         : 0,
       fluxAlpha: pdeState.fluxAlpha,

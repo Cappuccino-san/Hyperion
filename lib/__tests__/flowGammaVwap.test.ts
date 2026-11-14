@@ -257,6 +257,32 @@ runTest("Windowed 30m Impulse Flux (impulseChi / deltaChi6Bar) recovers on after
   assert.ok((bounceBar.deltaChi6Bar ?? 0) > 0, `Expected positive deltaChi6Bar on reclaim, got ${bounceBar.deltaChi6Bar}`);
 });
 
+runTest("Causal prefix invariance across pre-market and 09:30 ET RTH session reset (zero future lookahead)", () => {
+  // 09:20 ET (560) .. 10:15 ET (615) on 2026-11-13
+  const baseTs = 1794579600; // 2026-11-13 09:20:00 ET (Wait: explicit etMins works + timestamp spacing)
+  const bars = [
+    { timestamp: baseTs, open: 760.0, high: 761.0, low: 759.5, close: 760.8, volume: 12000 },
+    { timestamp: baseTs + 300, open: 760.8, high: 761.4, low: 760.2, close: 760.9, volume: 15000 },
+    { timestamp: baseTs + 600, open: 760.9, high: 761.5, low: 758.5, close: 758.8, volume: 65000 }, // 09:30 ET reset
+    { timestamp: baseTs + 900, open: 758.8, high: 759.2, low: 756.5, close: 756.9, volume: 72000 },
+    { timestamp: baseTs + 1200, open: 756.9, high: 757.4, low: 755.1, close: 755.5, volume: 80000 },
+    { timestamp: baseTs + 1500, open: 755.5, high: 757.8, low: 755.3, close: 757.4, volume: 60000 },
+    { timestamp: baseTs + 1800, open: 757.4, high: 759.6, low: 757.0, close: 759.2, volume: 68000 },
+    { timestamp: baseTs + 2100, open: 759.2, high: 761.0, low: 759.0, close: 760.7, volume: 74000 },
+  ];
+  const fullSeries = computeBarFlowGammaVwapSeries(bars);
+  for (let k = 0; k < bars.length; k++) {
+    const prefixSeries = computeBarFlowGammaVwapSeries(bars.slice(0, k + 1));
+    const a = prefixSeries[k];
+    const b = fullSeries[k];
+    assert.strictEqual(a.flowVwap, b.flowVwap, `flowVwap diverged on prefix k=${k}`);
+    assert.strictEqual(a.ceilingShareChi, b.ceilingShareChi, `chi diverged on prefix k=${k}`);
+    assert.strictEqual(a.pecletNumber, b.pecletNumber, `peclet diverged on prefix k=${k}`);
+    assert.strictEqual(a.impulseChi, b.impulseChi, `impulseChi diverged on prefix k=${k}`);
+    assert.strictEqual(a.deltaChi6Bar, b.deltaChi6Bar, `deltaChi6Bar diverged on prefix k=${k}`);
+  }
+});
+
 console.log(`\n=======================================================`);
 console.log(`Test Results: ${testsPassed} / ${testsRun} Passed`);
 console.log(`=======================================================\n`);

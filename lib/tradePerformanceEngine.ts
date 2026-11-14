@@ -7,7 +7,6 @@ import {
   saveTradeStore,
   getTodayEt,
   getNowEtTime,
-  DEFAULT_DISCORD_WEBHOOK_URL,
 } from "./tradeSignalEngine";
 
 export interface TradePerformanceItem {
@@ -211,8 +210,11 @@ export async function sendDailyPerformanceDiscordRecap(
   customWebhookUrl?: string
 ): Promise<boolean> {
   const webhookUrl =
-    (customWebhookUrl || process.env.DISCORD_WEBHOOK_URL)?.trim() ||
-    DEFAULT_DISCORD_WEBHOOK_URL;
+    (customWebhookUrl || process.env.DISCORD_WEBHOOK_URL)?.trim() || "";
+  if (!webhookUrl) {
+    console.warn("[TradePerformanceEngine] Skipping daily recap Discord dispatch: DISCORD_WEBHOOK_URL is not configured.");
+    return false;
+  }
 
   try {
     const isProfitable = report.totalRealizedDollarPnl > 0;

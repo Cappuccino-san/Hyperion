@@ -95,7 +95,12 @@ export function acquireBarEvaluationLock(): number {
 
 export function releaseBarEvaluationLock(token?: number): void {
   const state = getBotState();
-  if (typeof token === "number" && token > 0 && state.lockToken !== token) {
+  if (
+    typeof token !== "number" ||
+    !Number.isFinite(token) ||
+    token <= 0 ||
+    state.lockToken !== token
+  ) {
     return;
   }
   state.isEvaluatingLiveBar = false;
@@ -106,7 +111,10 @@ export async function runLiveBotTick(): Promise<void> {
   const botState = getBotState();
   if (botState.isPolling) return;
 
-  if (!isWithinRthWindow()) {
+  const rthOpen = isWithinRthWindow();
+  const initialStore = loadTradeStore();
+  const hasStrandedOpen = Object.keys(initialStore.activePositions || {}).length > 0;
+  if (!rthOpen && !hasStrandedOpen) {
     botState.lastStatus = "OUTSIDE_RTH";
     return;
   }
@@ -117,15 +125,23 @@ export async function runLiveBotTick(): Promise<void> {
   botState.isPolling = true;
   botState.lastPollAtMs = Date.now();
   botState.pollCount += 1;
-  botState.lastStatus = "POLLING_RTH";
+  botState.lastStatus = rthOpen ? "POLLING_RTH" : "EOD_STRANDED_CLEANUP";
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12_000);
 
   try {
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("Live bot tick timed out after 15s")), 15_000)
-    );
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      controller.signal.addEventListener(
+        "abort",
+        () => reject(new Error("Live bot tick aborted after 12s timeout")),
+        { once: true }
+      );
+    });
 
     await Promise.race([
       (async () => {
+        if (controller.signal.aborted) return;
         const todayStr = getEtDateString();
         if (botState.sessionDateEt !== todayStr) {
           botState.sessionDateEt = todayStr;
@@ -136,14 +152,23 @@ export async function runLiveBotTick(): Promise<void> {
         const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
         const activeKeys = Object.keys(store.activePositions || {});
 
-        // 1. Always evaluate active positions for STC / 15:55 ET MOC exit first (even in Phase-2)
+        // 1. Always evaluate active positions for STC / 15:55 ET MOC exit first (even after 16:00 ET if stranded)
         if (activeKeys.length > 0) {
           botState.lastStatus = "ACTIVE_EVAL_STC";
-          const activeAlerts = await evaluateAllActivePositions({ webhookUrl });
+          const activeAlerts = await evaluateAllActivePositions({
+            webhookUrl,
+            signal: controller.signal,
+          });
+          if (controller.signal.aborted) return;
           if (activeAlerts && activeAlerts.length > 0) {
             botState.dispatchedCount += activeAlerts.length;
           }
           // Same-Bar Flip Guard: Exit immediately with no same-bar flip re-entries permitted
+          return;
+        }
+
+        if (!isWithinRthWindow()) {
+          botState.lastStatus = "OUTSIDE_RTH";
           return;
         }
 
@@ -153,9 +178,10 @@ export async function runLiveBotTick(): Promise<void> {
           return;
         }
 
-        // Poll watchlist tickers for new BTO setups ONLY when strictly FLAT (0 active, 0 closed)
+        // Poll watchlist tickers for new BTO setups when flat (or Phase-2 Call reclaim eligible)
         botState.lastStatus = "FLAT_EVAL_BTO";
         for (const ticker of WATCH_TICKERS) {
+          if (controller.signal.aborted) break;
           const res = await evaluateTradeSignals({
             ticker,
             spotPrice: 0, // Auto-fetches live spot
@@ -163,29 +189,32 @@ export async function runLiveBotTick(): Promise<void> {
             putWall: 0,
             zeroGamma: 0,
             webhookUrl,
+            signal: controller.signal,
           });
+          if (controller.signal.aborted) break;
 
           if (res.emittedAlerts && res.emittedAlerts.length > 0) {
             botState.dispatchedCount += res.emittedAlerts.length;
           }
 
-          // Single-Slot Guard: Stop polling further tickers if a position was opened
+          // Single-Slot Guard: Stop polling further tickers if a position was opened or daily limit reached
           const refreshedStore = loadTradeStore();
           if (
             Object.keys(refreshedStore.activePositions || {}).length > 0 ||
-            (refreshedStore.closedPositions && refreshedStore.closedPositions.length >= 1)
+            (refreshedStore.closedPositions && refreshedStore.closedPositions.length >= 2)
           ) {
             break;
           }
         }
 
-        botState.lastStatus = "ACTIVE_OK";
+        botState.lastStatus = controller.signal.aborted ? "TIMEOUT_ABORTED" : "ACTIVE_OK";
       })(),
       timeoutPromise,
     ]);
   } catch (err) {
     botState.lastStatus = `ERROR: ${err instanceof Error ? err.message : "unknown"}`;
   } finally {
+    clearTimeout(timeoutId);
     releaseBarEvaluationLock(lockToken);
     botState.isPolling = false;
   }
@@ -218,6 +247,8 @@ export function stopLiveBot(): void {
   }
   botState.isPolling = false;
   botState.isEvaluatingLiveBar = false;
+  botState.lockAcquiredAtMs = 0;
+  botState.lockToken = (botState.lockToken || 0) + 1;
   botState.lastStatus = "STOPPED";
 }
 
