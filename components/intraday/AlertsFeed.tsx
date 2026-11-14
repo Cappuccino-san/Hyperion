@@ -162,7 +162,11 @@ export function AlertsFeed() {
   const serverTradeAlerts = useDashboardStore((state) => state.serverTradeAlerts);
   const fetchServerTrades = useDashboardStore((state) => state.fetchServerTrades);
 
-  const activePosition = (serverActivePositions?.[activeTicker] as OptionTradePositionUI) ?? null;
+  const normalizedPosKey = activeTicker === "SPX" || activeTicker === "SPXW" ? "SPY" : activeTicker;
+  const activePosition =
+    (serverActivePositions?.[activeTicker] as OptionTradePositionUI) ??
+    (serverActivePositions?.[normalizedPosKey] as OptionTradePositionUI) ??
+    null;
   const signalAlerts = (serverTradeAlerts || []) as { id: string; timestamp: string; message: string; ts?: number }[];
   const closedCount = Array.isArray(serverClosedTrades) ? serverClosedTrades.length : 0;
   const [radarSending, setRadarSending] = useState(false);
@@ -170,7 +174,9 @@ export function AlertsFeed() {
   const handleSendRadar = async () => {
     try {
       setRadarSending(true);
-      await fetch("/api/signals?action=send_radar");
+      const customUrl = discordConfig?.webhookUrl?.trim();
+      const qs = customUrl ? `&webhookUrl=${encodeURIComponent(customUrl)}` : "";
+      await fetch(`/api/signals?action=send_radar${qs}`);
       await fetchServerTrades(activeTicker);
     } catch {
       // ignore

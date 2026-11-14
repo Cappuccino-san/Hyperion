@@ -37,6 +37,26 @@ interface ScanSlot {
   rows: ScannerRow[];
 }
 
+interface TradeRadarSetupRow {
+  ticker: string;
+  spotPrice: number;
+  zeroGamma: number;
+  callWall: number;
+  putWall: number;
+  callSetup?: {
+    name: string;
+    triggerLevel: number;
+    contractLabel: string;
+    totalOutlay: number;
+  };
+  putSetup?: {
+    name: string;
+    triggerLevel: number;
+    contractLabel: string;
+    totalOutlay: number;
+  };
+}
+
 interface ScannerData {
   scans?: ScanSlot[];
   slots?: string[];
@@ -95,6 +115,7 @@ export function ScannerView() {
 
   const [scannerMode, setScannerMode] = useState<"PLAYBOOK" | "KING_NODES">("PLAYBOOK");
   const [data, setData] = useState<ScannerData | null>(null);
+  const [radarSetups, setRadarSetups] = useState<TradeRadarSetupRow[]>([]);
   const [curSlot, setCurSlot] = useState<string>("15:50");
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [regimeFilter, setRegimeFilter] = useState<KingFilterType>("ALL");
@@ -128,6 +149,26 @@ export function ScannerView() {
       clearInterval(interval);
     };
   }, [curSlot]);
+
+  useEffect(() => {
+    let active = true;
+    const fetchRadar = async () => {
+      try {
+        const res = await fetch("/api/signals?radar=true", { cache: "no-store" });
+        if (!res.ok) return;
+        const j = await res.json();
+        if (active && Array.isArray(j?.radar?.setups)) {
+          setRadarSetups(j.radar.setups);
+        }
+      } catch {
+        // Ignore transient radar fetch error
+      }
+    };
+    fetchRadar();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const activeScan = (data?.scans || []).find((s) => s.slot === curSlot) ?? data?.scans?.[0];
   const slots = (data?.scans || []).map((s) => s.slot);
@@ -187,9 +228,10 @@ export function ScannerView() {
   }, [rawRows, searchQuery, regimeFilter, sortBy]);
 
   const handleCardClick = (ticker: string) => {
-    setTicker(ticker);
-    setActiveView("Heatmap");
-    router.push("/");
+    const sym = ticker.trim().toUpperCase();
+    setTicker(sym);
+    setActiveView("Gaia");
+    router.push(`/gaia?ticker=${encodeURIComponent(sym)}`);
   };
 
   return (
@@ -241,6 +283,46 @@ export function ScannerView() {
       {scannerMode === "PLAYBOOK" ? (
         <div className="space-y-6">
           <HyperionPlaybook onSelectTicker={handleCardClick} />
+
+          {radarSetups.length > 0 && (
+            <div className="p-4 rounded-xl bg-[#101520] border border-[#1e2638] space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold font-mono uppercase tracking-wider text-cyan-400">
+                  Trade Radar · Live 0DTE Setups (Click to Launch Gaia)
+                </span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                {radarSetups.map((s) => (
+                  <button
+                    key={s.ticker}
+                    type="button"
+                    onClick={() => handleCardClick(s.ticker)}
+                    className="w-full text-left p-3 rounded-lg bg-[#0b0d17] border border-slate-800 hover:border-cyan-400/60 transition-colors cursor-pointer space-y-1 font-mono text-xs"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-extrabold text-white text-sm">
+                        {s.ticker} · ${f2(s.spotPrice)}
+                      </span>
+                      <span className="text-[11px] text-cyan-300">Open in Gaia →</span>
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      ZG ${f2(s.zeroGamma)} · CW ${f2(s.callWall)} · PW ${f2(s.putWall)}
+                    </div>
+                    {s.callSetup && (
+                      <div className="text-[11px] text-emerald-400 truncate">
+                        CALL ≥ ${f2(s.callSetup.triggerLevel)} · {s.callSetup.contractLabel} (${s.callSetup.totalOutlay})
+                      </div>
+                    )}
+                    {s.putSetup && (
+                      <div className="text-[11px] text-rose-400 truncate">
+                        PUT ≤ ${f2(s.putSetup.triggerLevel)} · {s.putSetup.contractLabel} (${s.putSetup.totalOutlay})
+                      </div>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Quick banner link to the Full 50-Ticker King Node Scanner */}
           <div className="p-4 rounded-xl bg-[#101520] border border-[#1e2638] flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
@@ -375,7 +457,7 @@ export function ScannerView() {
 
           {/* Hint */}
           <div className="flex items-center justify-between text-[11px] text-slate-500 font-mono">
-            <span>Tap a ticker to open its heatmap</span>
+            <span>Tap a ticker to launch Gaia Flow &amp; GEX chart</span>
             <span>
               Showing {filteredAndSortedRows.length} of {rawRows.length} tickers
             </span>

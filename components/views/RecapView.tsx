@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { cn } from "@/lib/utils";
 
@@ -50,11 +51,65 @@ interface RecapTicker {
   };
 }
 
+interface PortfolioTradeRow {
+  id: string;
+  date: string;
+  ticker: string;
+  contractType: "CALL" | "PUT";
+  contractLabel: string;
+  setupName: string;
+  openedAt: string;
+  closedAt: string;
+  entryOptionPrice: number;
+  exitOptionPrice: number;
+  contractsQty: number;
+  outlay: number;
+  realizedDollarPnl: number;
+  pnlOptionPct: number;
+  rMultiple: number;
+  exitReason: string;
+}
+
+interface PortfolioSummary {
+  windowDays: number;
+  daysWithTrades: string[];
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  breakevens: number;
+  winRatePct: number;
+  cumulativeDollarPnl: number;
+  totalCapitalOutlay: number;
+  profitFactor: number | null;
+  maxDrawdown: number;
+  expectancyR: number;
+  rDistribution: Array<{ label: string; count: number }>;
+  equityCurve: Array<{
+    index: number;
+    date: string;
+    ticker: string;
+    contractLabel: string;
+    tradePnl: number;
+    equity: number;
+    rMultiple: number;
+  }>;
+  dailyBreakdown: Array<{
+    date: string;
+    trades: number;
+    wins: number;
+    losses: number;
+    netDollarPnl: number;
+    equityAfter: number;
+  }>;
+  trades: PortfolioTradeRow[];
+}
+
 interface RecapPayload {
   days?: string[];
   day?: string;
   today_pending?: boolean;
   session_open?: boolean;
+  portfolio?: PortfolioSummary;
   recap?: {
     day: string;
     built_at: number;
@@ -130,11 +185,47 @@ const arrow = (a: any, b: any, moves?: number | null) => {
 };
 
 export function RecapView() {
+  const router = useRouter();
   const [data, setData] = useState<RecapPayload | null>(null);
   const [selectedDay, setSelectedDay] = useState<string>("");
   const [loading, setLoading] = useState<boolean>(true);
+  const [postingDiscord, setPostingDiscord] = useState<boolean>(false);
+  const [discordStatus, setDiscordStatus] = useState<{ ok: boolean; msg: string } | null>(null);
   const setActiveView = useDashboardStore((state) => state.setActiveView);
   const setTicker = useDashboardStore((state) => state.setTicker);
+  const discordWebhookUrl = useDashboardStore((state) => state.discordConfig.webhookUrl);
+
+  const openTickerInGaia = (symbol: string) => {
+    const clean = symbol.trim().toUpperCase();
+    setTicker(clean);
+    setActiveView("Gaia");
+    router.push(`/gaia?ticker=${encodeURIComponent(clean)}`);
+  };
+
+  const handlePostDiscordRecap = async () => {
+    setPostingDiscord(true);
+    setDiscordStatus(null);
+    try {
+      const res = await fetch("/api/signals", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "send_daily_recap",
+          webhookUrl: discordWebhookUrl,
+        }),
+      });
+      const json = await res.json();
+      if (res.ok && json?.success) {
+        setDiscordStatus({ ok: true, msg: json.message || "EOD Recap posted to Discord." });
+      } else {
+        setDiscordStatus({ ok: false, msg: json?.error || "Failed to post EOD Recap." });
+      }
+    } catch {
+      setDiscordStatus({ ok: false, msg: "Network error posting EOD Recap." });
+    } finally {
+      setPostingDiscord(false);
+    }
+  };
 
   useEffect(() => {
     let active = true;
@@ -225,10 +316,7 @@ export function RecapView() {
         <div className="flex items-baseline justify-between gap-2 flex-wrap">
           <button
             type="button"
-            onClick={() => {
-              setTicker(r.symbol);
-              setActiveView("Heatmap");
-            }}
+            onClick={() => openTickerInGaia(r.symbol)}
             className="text-lg font-extrabold text-white hover:text-cyan-400 transition-colors cursor-pointer"
           >
             {r.label}
@@ -418,10 +506,245 @@ export function RecapView() {
         >
           Share to X
         </button>
+
+        <button
+          type="button"
+          onClick={handlePostDiscordRecap}
+          disabled={postingDiscord}
+          className="bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-400/50 text-indigo-200 font-semibold text-xs px-3.5 py-1 rounded-full transition-colors cursor-pointer disabled:opacity-50"
+        >
+          {postingDiscord ? "Posting EOD Recap…" : "Post EOD Recap to Discord"}
+        </button>
+
+        {discordStatus && (
+          <span
+            className={cn(
+              "text-xs font-mono",
+              discordStatus.ok ? "text-emerald-400" : "text-rose-400"
+            )}
+          >
+            {discordStatus.msg}
+          </span>
+        )}
       </div>
 
+      {/* 7-Day Rolling Portfolio Equity Dashboard */}
+      {!loading && data?.portfolio && (
+        <section className="space-y-4">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <h2 className="text-xs font-bold uppercase tracking-widest text-[#22d3ee] font-mono">
+              7-Day Rolling Portfolio Equity ({data.portfolio.daysWithTrades.length} Sessions)
+            </h2>
+            <span className="text-[11px] font-mono text-slate-400">
+              Retained `.cache/active-trades-*.json` Ledger
+            </span>
+          </div>
+
+          {/* KPI Strip */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 font-mono">
+            <div className="bg-[#111827]/70 border border-slate-800 rounded-xl p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-500">Cumulative P&amp;L</div>
+              <div
+                className={cn(
+                  "text-lg font-extrabold tabular-nums mt-0.5",
+                  data.portfolio.cumulativeDollarPnl >= 0 ? "text-emerald-400" : "text-rose-400"
+                )}
+              >
+                {data.portfolio.cumulativeDollarPnl >= 0 ? "+" : "-"}$
+                {Math.abs(data.portfolio.cumulativeDollarPnl).toFixed(2)}
+              </div>
+            </div>
+            <div className="bg-[#111827]/70 border border-slate-800 rounded-xl p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-500">Win Rate</div>
+              <div className="text-lg font-extrabold text-white tabular-nums mt-0.5">
+                {data.portfolio.winRatePct.toFixed(1)}%
+              </div>
+              <div className="text-[10px] text-slate-400">
+                {data.portfolio.wins}W · {data.portfolio.losses}L · {data.portfolio.breakevens}BE
+              </div>
+            </div>
+            <div className="bg-[#111827]/70 border border-slate-800 rounded-xl p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-500">Profit Factor</div>
+              <div className="text-lg font-extrabold text-cyan-300 tabular-nums mt-0.5">
+                {data.portfolio.profitFactor == null
+                  ? "—"
+                  : data.portfolio.profitFactor >= 999
+                    ? "∞"
+                    : data.portfolio.profitFactor.toFixed(2)}
+              </div>
+            </div>
+            <div className="bg-[#111827]/70 border border-slate-800 rounded-xl p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-500">Expectancy</div>
+              <div
+                className={cn(
+                  "text-lg font-extrabold tabular-nums mt-0.5",
+                  data.portfolio.expectancyR >= 0 ? "text-emerald-400" : "text-rose-400"
+                )}
+              >
+                {data.portfolio.expectancyR >= 0 ? "+" : ""}
+                {data.portfolio.expectancyR.toFixed(2)}R
+              </div>
+            </div>
+            <div className="bg-[#111827]/70 border border-slate-800 rounded-xl p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-500">Max Drawdown</div>
+              <div className="text-lg font-extrabold text-amber-300 tabular-nums mt-0.5">
+                ${data.portfolio.maxDrawdown.toFixed(2)}
+              </div>
+            </div>
+            <div className="bg-[#111827]/70 border border-slate-800 rounded-xl p-3">
+              <div className="text-[10px] uppercase tracking-wider text-slate-500">Trades · Outlay</div>
+              <div className="text-lg font-extrabold text-white tabular-nums mt-0.5">
+                {data.portfolio.totalTrades}
+              </div>
+              <div className="text-[10px] text-slate-400">
+                ${data.portfolio.totalCapitalOutlay.toFixed(0)} risked
+              </div>
+            </div>
+          </div>
+
+          {/* Equity Curve & R-Multiple Distribution */}
+          {data.portfolio.totalTrades > 0 && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+              <div className="bg-[#111827]/65 border border-slate-800 rounded-2xl p-3.5 space-y-2">
+                <div className="text-[11px] font-bold font-mono uppercase tracking-wider text-slate-400">
+                  Cumulative Equity Curve ($)
+                </div>
+                {(() => {
+                  const pts = [{ index: 0, equity: 0 }, ...data.portfolio.equityCurve];
+                  const vals = pts.map((p) => p.equity);
+                  const minY = Math.min(0, ...vals);
+                  const maxY = Math.max(10, ...vals);
+                  const spanY = Math.max(1, maxY - minY);
+                  const w = 480;
+                  const h = 140;
+                  const pad = 12;
+                  const xFor = (i: number) =>
+                    pad + (i / Math.max(1, pts.length - 1)) * (w - pad * 2);
+                  const yFor = (v: number) =>
+                    h - pad - ((v - minY) / spanY) * (h - pad * 2);
+                  const zeroY = yFor(0);
+                  const poly = pts.map((p, idx) => `${xFor(idx).toFixed(1)},${yFor(p.equity).toFixed(1)}`).join(" ");
+                  const lastEq = vals[vals.length - 1] ?? 0;
+                  const stroke = lastEq >= 0 ? "#10b981" : "#f43f5e";
+                  return (
+                    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-36">
+                      <line x1={pad} y1={zeroY} x2={w - pad} y2={zeroY} stroke="#334155" strokeDasharray="4 4" strokeWidth="1" />
+                      <polyline fill="none" stroke={stroke} strokeWidth="2.5" strokeLinejoin="round" points={poly} />
+                      {pts.map((p, idx) => (
+                        <circle key={idx} cx={xFor(idx)} cy={yFor(p.equity)} r="3" fill={stroke} />
+                      ))}
+                    </svg>
+                  );
+                })()}
+              </div>
+
+              <div className="bg-[#111827]/65 border border-slate-800 rounded-2xl p-3.5 space-y-2.5">
+                <div className="text-[11px] font-bold font-mono uppercase tracking-wider text-slate-400">
+                  R-Multiple Distribution
+                </div>
+                <div className="space-y-2 font-mono text-xs">
+                  {(() => {
+                    const maxCount = Math.max(1, ...data.portfolio.rDistribution.map((b) => b.count));
+                    return data.portfolio.rDistribution.map((bucket) => {
+                      const pct = (bucket.count / maxCount) * 100;
+                      const isNeg = bucket.label.startsWith("<=") || bucket.label.startsWith("-1.0");
+                      return (
+                        <div key={bucket.label} className="flex items-center gap-2.5">
+                          <span className="w-24 text-[11px] text-slate-400 shrink-0">{bucket.label}</span>
+                          <div className="flex-1 h-2.5 rounded-full bg-slate-800/90 overflow-hidden">
+                            <div
+                              style={{ width: `${pct}%` }}
+                              className={cn(
+                                "h-full rounded-full transition-all",
+                                isNeg ? "bg-rose-500/80" : "bg-emerald-400/85"
+                              )}
+                            />
+                          </div>
+                          <span className="w-8 text-right text-[11px] text-slate-200 tabular-nums">
+                            {bucket.count}
+                          </span>
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Closed Trades Ledger */}
+          {data.portfolio.trades.length > 0 && (
+            <div className="bg-[#111827]/65 border border-slate-800 rounded-2xl p-3.5 overflow-x-auto">
+              <div className="text-[11px] font-bold font-mono uppercase tracking-wider text-slate-400 mb-2">
+                Closed Trades Ledger (Click Ticker to Inspect in Gaia)
+              </div>
+              <table className="w-full text-xs font-mono tabular-nums">
+                <thead>
+                  <tr className="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-slate-800">
+                    <th className="py-1.5 pr-3">Date</th>
+                    <th className="py-1.5 pr-3">Ticker</th>
+                    <th className="py-1.5 pr-3">Contract</th>
+                    <th className="py-1.5 pr-3">Window</th>
+                    <th className="py-1.5 pr-3 text-right">Entry → Exit</th>
+                    <th className="py-1.5 pr-3 text-right">P&amp;L $</th>
+                    <th className="py-1.5 pr-3 text-right">R-Mult</th>
+                    <th className="py-1.5">Exit Reason</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/50">
+                  {data.portfolio.trades.map((t) => {
+                    const win = t.realizedDollarPnl >= 0;
+                    return (
+                      <tr key={t.id} className="hover:bg-slate-800/30">
+                        <td className="py-1.5 pr-3 text-slate-400 whitespace-nowrap">{t.date}</td>
+                        <td className="py-1.5 pr-3">
+                          <button
+                            type="button"
+                            onClick={() => openTickerInGaia(t.ticker)}
+                            className="font-bold text-cyan-300 hover:text-cyan-200 underline-offset-2 hover:underline cursor-pointer"
+                          >
+                            {t.ticker}
+                          </button>
+                        </td>
+                        <td className="py-1.5 pr-3 text-slate-200 whitespace-nowrap">{t.contractLabel}</td>
+                        <td className="py-1.5 pr-3 text-slate-400 whitespace-nowrap">
+                          {t.openedAt} → {t.closedAt}
+                        </td>
+                        <td className="py-1.5 pr-3 text-right text-slate-300 whitespace-nowrap">
+                          ${t.entryOptionPrice.toFixed(2)} → ${t.exitOptionPrice.toFixed(2)}
+                        </td>
+                        <td
+                          className={cn(
+                            "py-1.5 pr-3 text-right font-bold whitespace-nowrap",
+                            win ? "text-emerald-400" : "text-rose-400"
+                          )}
+                        >
+                          {win ? "+" : "-"}${Math.abs(t.realizedDollarPnl).toFixed(2)}
+                        </td>
+                        <td
+                          className={cn(
+                            "py-1.5 pr-3 text-right font-bold whitespace-nowrap",
+                            t.rMultiple >= 0 ? "text-emerald-400" : "text-rose-400"
+                          )}
+                        >
+                          {t.rMultiple >= 0 ? "+" : ""}
+                          {t.rMultiple.toFixed(2)}R
+                        </td>
+                        <td className="py-1.5 text-slate-400 truncate max-w-[260px]" title={t.exitReason}>
+                          {t.exitReason}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
       {/* Notes */}
-      {recap && (
+      {recap && tickers.length > 0 && (
         <div className="bg-[#111827]/50 border border-slate-800 rounded-xl p-3 text-xs text-slate-400 space-y-1 font-mono leading-relaxed">
           <div>
             Built {et(recap.built_at)} from the closing books. Values are shown the way the heatmap shows them; hover a value for the exact number.
@@ -434,11 +757,11 @@ export function RecapView() {
         <div className="bg-[#111827]/60 border border-slate-800 rounded-xl p-12 text-center text-xs text-slate-500 font-mono">
           Loading completed session recap…
         </div>
-      ) : tickers.length === 0 ? (
+      ) : tickers.length === 0 && !data?.portfolio?.totalTrades ? (
         <div className="bg-[#111827]/60 border border-slate-800 rounded-xl p-12 text-center text-xs text-slate-500 font-mono">
           No completed session recap yet. The first recap is built after a session closes.
         </div>
-      ) : (
+      ) : tickers.length === 0 ? null : (
         <div className="space-y-6">
           {mainTickers.length > 0 && (
             <div className="space-y-3">

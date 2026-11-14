@@ -60,6 +60,7 @@ export interface DrawTradeExecutionMarkersOptions {
   priceToY: (price: number) => number;
   serverTrades?: ServerTradesState | null;
   fsmSignals?: any[];
+  precomputedTrades?: NormalizedChartTrade[];
   padLeft?: number;
   plotRightX?: number;
   padTop?: number;
@@ -370,6 +371,13 @@ export function clampSpotToCandle(spot: number, candle: ChartCandleLike): number
   return Math.max(lo, Math.min(hi, spot));
 }
 
+let lastExtractCache: {
+  ticker: string;
+  serverTrades: ServerTradesState | null | undefined;
+  fsmSignals: any[] | undefined;
+  result: NormalizedChartTrade[];
+} | null = null;
+
 /**
  * Draws the On-Chart Trade Execution Markers (`BTO` triangles + labels, `STC` cover markers,
  * glowing PnL pill badges, and dotted trajectory connectors) onto a 2D canvas context.
@@ -386,6 +394,7 @@ export function drawTradeExecutionMarkers(
     priceToY,
     serverTrades,
     fsmSignals,
+    precomputedTrades,
     padLeft = 18,
     plotRightX = 9999,
     padTop = 18,
@@ -393,7 +402,20 @@ export function drawTradeExecutionMarkers(
   } = options;
 
   if (!candles || candles.length === 0 || safeActiveIdx < 0) return;
-  const trades = extractNormalizedTradesForTicker(ticker, serverTrades, fsmSignals);
+  let trades: NormalizedChartTrade[];
+  if (precomputedTrades) {
+    trades = precomputedTrades;
+  } else if (
+    lastExtractCache &&
+    lastExtractCache.ticker === ticker &&
+    lastExtractCache.serverTrades === serverTrades &&
+    lastExtractCache.fsmSignals === fsmSignals
+  ) {
+    trades = lastExtractCache.result;
+  } else {
+    trades = extractNormalizedTradesForTicker(ticker, serverTrades, fsmSignals);
+    lastExtractCache = { ticker, serverTrades, fsmSignals, result: trades };
+  }
   if (trades.length === 0) return;
 
   for (const trade of trades) {

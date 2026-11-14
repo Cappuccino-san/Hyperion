@@ -133,18 +133,10 @@ export async function runLiveBotTick(): Promise<void> {
         }
 
         const store = loadTradeStore();
-
-        // Linear State Machine Invariant:
-        // FLAT (0 trades) -> ACTIVE (1 contract) -> LOCKED_FOR_DAY (1 trade completed)
-        if (store.closedPositions && store.closedPositions.length >= 1) {
-          botState.lastStatus = "LOCKED_FOR_DAY";
-          return;
-        }
-
         const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
         const activeKeys = Object.keys(store.activePositions || {});
 
-        // If an active position exists, evaluate exits ONLY. No new BTO entries allowed.
+        // 1. Always evaluate active positions for STC / 15:55 ET MOC exit first (even in Phase-2)
         if (activeKeys.length > 0) {
           botState.lastStatus = "ACTIVE_EVAL_STC";
           const activeAlerts = await evaluateAllActivePositions({ webhookUrl });
@@ -152,6 +144,12 @@ export async function runLiveBotTick(): Promise<void> {
             botState.dispatchedCount += activeAlerts.length;
           }
           // Same-Bar Flip Guard: Exit immediately with no same-bar flip re-entries permitted
+          return;
+        }
+
+        // 2. Hard daily ceiling: max 2 closed trades/day (1 primary + 1 gated opposite-regime Phase-2)
+        if (store.closedPositions && store.closedPositions.length >= 2) {
+          botState.lastStatus = "LOCKED_FOR_DAY";
           return;
         }
 

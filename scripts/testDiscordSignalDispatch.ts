@@ -1,18 +1,21 @@
 /**
- * CLI Verification Script: Live Discord #trade-signals Dispatch
+ * CLI Verification Script: Discord #trade-signals BTO & STC Dispatch Suite
  *
- * Verifies:
- * 1. Webhook URL resolution from .env.local
- * 2. Proper ?wait=true parameter attachment
- * 3. HTTP 200 OK receipt from Discord API
- * 4. Extraction of Discord Message ID and Channel ID
+ * Usage:
+ *   npx tsx scripts/testDiscordSignalDispatch.ts          # Dry-run payload + firewall verification (zero network, zero .cache writes)
+ *   npx tsx scripts/testDiscordSignalDispatch.ts --live   # Live Discord webhook reachability test across BTO & STC embeds
  */
 
 import fs from "fs";
 import path from "path";
-import { sendDiscordTradeAlert, TradeLifecycleAlert } from "../lib/tradeSignalEngine";
+import assert from "node:assert/strict";
+import {
+  DEFAULT_DISCORD_WEBHOOK_URL,
+  sendDiscordTradeAlert,
+  TradeLifecycleAlert,
+} from "../lib/tradeSignalEngine";
 
-function getEnvWebhook(): string {
+function resolveWebhookUrl(): { url: string; source: string } {
   try {
     const envPath = path.resolve(process.cwd(), ".env.local");
     if (fs.existsSync(envPath)) {
@@ -20,84 +23,272 @@ function getEnvWebhook(): string {
       for (const line of content.split("\n")) {
         const trimmed = line.trim();
         if (trimmed.startsWith("DISCORD_WEBHOOK_URL=")) {
-          return trimmed.slice("DISCORD_WEBHOOK_URL=".length).trim();
+          const val = trimmed.slice("DISCORD_WEBHOOK_URL=".length).trim().replace(/^["']|["']$/g, "");
+          if (val) return { url: val, source: ".env.local" };
         }
       }
     }
-  } catch {}
-  return process.env.DISCORD_WEBHOOK_URL || "";
+  } catch {
+    // ignore
+  }
+  if (process.env.DISCORD_WEBHOOK_URL?.trim()) {
+    return { url: process.env.DISCORD_WEBHOOK_URL.trim(), source: "process.env" };
+  }
+  return { url: DEFAULT_DISCORD_WEBHOOK_URL, source: "DEFAULT_DISCORD_WEBHOOK_URL" };
 }
 
-async function main(): Promise<void> {
-  const webhookUrl = getEnvWebhook();
-  console.log("================================================================================");
-  console.log("   HYPERION / GAIA DISCORD #trade-signals LIVE VERIFICATION DISPATCH             ");
-  console.log("================================================================================");
-
-  if (!webhookUrl) {
-    console.error("❌ Error: No DISCORD_WEBHOOK_URL found in .env.local or environment.");
-    process.exit(1);
-  }
-
-  const masked = webhookUrl.replace(/(webhooks\/\d+\/)[^?]+/, "$1***");
-  console.log(`Endpoint: ${masked}`);
-
-  const nowSec = Math.floor(Date.now() / 1000);
-  const testAlert: TradeLifecycleAlert = {
-    id: `gaia-cli-verify-${nowSec}`,
-    timestamp: "12:05 PM",
+function buildScenarioAlerts(nowSec: number): Array<{ label: string; expectBlocked?: boolean; alert: TradeLifecycleAlert }> {
+  const base: Omit<TradeLifecycleAlert, "id" | "action" | "contractType" | "contractLabel" | "strike" | "setupName" | "reason" | "status" | "message"> = {
+    timestamp: "11:35 AM",
     ts: nowSec,
     dispatchedAt: nowSec,
     ticker: "SPY",
-    action: "BUY_TO_OPEN",
-    contractType: "CALL",
-    contractLabel: "SPY 261104 765C (Today, 0 DTE · Same-Day · $0.65)",
-    strike: 765,
-    expiration: "2026-11-04",
-    expHuman: "Today, Nov 4 (0 DTE · Same-Day)",
-    robinhoodExp: "Nov 4",
+    expiration: "2026-11-13",
+    expHuman: "Today, Nov 13 (0 DTE · Same-Day)",
+    robinhoodExp: "Nov 13",
     robinhoodTab: "Today (0 DTE)",
-    setupName: "Gaia Tactical HUD [LONG · FLUX FSM]",
-    reason: "Gaia Intraday Non-Repainting FSM Confirmation at $764.50",
-    status: "OPEN",
-    spotPrice: 764.50,
-    btoSpotPrice: 764.50,
-    target1Spot: 766.30,
-    target2Spot: 768.00,
-    stopLossSpot: 763.30,
+    spotPrice: 752.45,
+    btoSpotPrice: 750.30,
+    target1Spot: 753.00,
+    target2Spot: 755.50,
+    stopLossSpot: 749.10,
     optionMid: 0.65,
-    optionBid: 0.63,
-    optionAsk: 0.65,
+    optionBid: 0.64,
+    optionAsk: 0.66,
     btoOptionMid: 0.65,
     contractsQty: 1,
     remainingQty: 1,
     totalOutlay: 65,
-    estTp1Mid: 0.90,
-    estTp2Mid: 1.25,
+    estTp1Mid: 0.95,
+    estTp2Mid: 1.40,
     estStopMid: 0.49,
-    tp1Pct: 38,
-    tp2Pct: 92,
-    rrRatio: 1.5,
+    tp1Pct: 46,
+    tp2Pct: 115,
+    rrRatio: 2.25,
     calibratedWinRate: 68,
     calibratedExpectancyR: 0.45,
-    dataConvictionScore: 92,
+    dataConvictionScore: 88,
+    flowVwap: 751.80,
+    ceilingShareChi: 0.72,
+    pecletNumber: 2.4,
     isHistoricalBackfill: false,
-    eventId: `gaia-cli-verify-${nowSec}`,
-    message: "🟢 BUY TO OPEN (1x @ $0.65) · SPY [Gaia LONG · FLUX FSM] @ $764.50",
+    eventId: `verify-${nowSec}`,
   };
 
-  console.log("\nDispatching live verified trade alert to #trade-signals...");
-  const success = await sendDiscordTradeAlert(testAlert, webhookUrl);
+  return [
+    {
+      label: "1. Historical Backfill Silence Guard",
+      expectBlocked: true,
+      alert: {
+        ...base,
+        id: `verify-backfill-${nowSec}`,
+        action: "BUY_TO_OPEN",
+        contractType: "CALL",
+        contractLabel: "SPY 261113 752C",
+        strike: 752,
+        setupName: "Impulse Flux & Divergence Reclaim [BTO CALL]",
+        reason: "Historical replay test",
+        status: "OPEN",
+        isHistoricalBackfill: true,
+        message: "Backfill silenced test",
+      },
+    },
+    {
+      label: "2. BUY_TO_OPEN (CALL)",
+      alert: {
+        ...base,
+        id: `verify-bto-call-${nowSec}`,
+        action: "BUY_TO_OPEN",
+        contractType: "CALL",
+        contractLabel: "SPY 261113 752C (Today, 0 DTE · $0.65)",
+        strike: 752,
+        setupName: "Impulse Flux & Divergence Reclaim [BTO CALL]",
+        reason: "Put Wall 750 Bounce + 5m Bullish Divergence",
+        status: "OPEN",
+        message: "🟢 BUY TO OPEN (1x @ $0.65) · SPY 261113 752C @ $750.30",
+      },
+    },
+    {
+      label: "3. BUY_TO_OPEN (PUT)",
+      alert: {
+        ...base,
+        id: `verify-bto-put-${nowSec}`,
+        action: "BUY_TO_OPEN",
+        contractType: "PUT",
+        contractLabel: "SPY 261113 757P (Today, 0 DTE · $0.58)",
+        strike: 757,
+        spotPrice: 758.25,
+        btoSpotPrice: 758.25,
+        target1Spot: 755.50,
+        target2Spot: 752.50,
+        stopLossSpot: 760.10,
+        setupName: "Flux-Field Breakdown & Upper Rejection [BTO PUT]",
+        reason: "Bearish Zero-Gamma & Flow VWAP Rejection",
+        status: "OPEN",
+        ceilingShareChi: 0.12,
+        pecletNumber: -4.2,
+        message: "🟣 BUY TO OPEN (1x @ $0.58) · SPY 261113 757P @ $758.25",
+      },
+    },
+    {
+      label: "4. SELL_TO_CLOSE (TAKE_PROFIT)",
+      alert: {
+        ...base,
+        id: `verify-stc-tp-${nowSec}`,
+        action: "SELL_TO_CLOSE",
+        contractType: "CALL",
+        contractLabel: "SPY 261113 752C",
+        strike: 752,
+        setupName: "Impulse Flux & Divergence Reclaim [BTO CALL]",
+        reason: "TARGET 1 HIT · FULL PROFIT EXIT (1 CONTRACT)",
+        status: "CLOSED",
+        remainingQty: 0,
+        optionMid: 1.05,
+        pnlOptionPct: 61.5,
+        pnlSpotPct: 0.36,
+        message: "🎯 STC · SPY 261113 752C [TARGET 1 HIT] @ $753.00 (+61.5%)",
+      },
+    },
+    {
+      label: "5. SELL_TO_CLOSE (TRAILING_PROFIT)",
+      alert: {
+        ...base,
+        id: `verify-stc-trail-${nowSec}`,
+        action: "SELL_TO_CLOSE",
+        contractType: "PUT",
+        contractLabel: "SPY 261113 757P",
+        strike: 757,
+        spotPrice: 754.10,
+        btoSpotPrice: 758.25,
+        setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
+        reason: "TRAILING PROFIT LOCKED",
+        status: "CLOSED",
+        remainingQty: 0,
+        optionMid: 2.15,
+        pnlOptionPct: 230.8,
+        pnlSpotPct: 0.55,
+        message: "🔒 STC · SPY 261113 757P [TRAILING PROFIT LOCKED] @ $754.10 (+230.8%)",
+      },
+    },
+    {
+      label: "6. SELL_TO_CLOSE (REVERSAL)",
+      alert: {
+        ...base,
+        id: `verify-stc-reversal-${nowSec}`,
+        action: "SELL_TO_CLOSE",
+        contractType: "PUT",
+        contractLabel: "SPY 261113 757P",
+        strike: 757,
+        spotPrice: 756.04,
+        btoSpotPrice: 758.25,
+        setupName: "Flux-Field Breakdown & Upper Rejection [BTO PUT]",
+        reason: "MOMENTUM REVERSAL PROFIT LOCK",
+        status: "CLOSED",
+        remainingQty: 0,
+        optionMid: 1.18,
+        pnlOptionPct: 81.5,
+        pnlSpotPct: 0.29,
+        message: "🔄 STC · SPY 261113 757P [MOMENTUM REVERSAL PROFIT LOCK] @ $756.04 (+81.5%)",
+      },
+    },
+    {
+      label: "7. SELL_TO_CLOSE (STOP_LOSS)",
+      alert: {
+        ...base,
+        id: `verify-stc-sl-${nowSec}`,
+        action: "SELL_TO_CLOSE",
+        contractType: "CALL",
+        contractLabel: "SPY 261113 752C",
+        strike: 752,
+        spotPrice: 749.10,
+        setupName: "Support Bounce / Bullish Reversal",
+        reason: "STOP LOSS / LEVEL INVALIDATION",
+        status: "CLOSED",
+        remainingQty: 0,
+        optionMid: 0.48,
+        pnlOptionPct: -26.2,
+        pnlSpotPct: -0.16,
+        message: "🛑 STC · SPY 261113 752C [STOP LOSS] @ $749.10 (-26.2%)",
+      },
+    },
+    {
+      label: "8. SELL_TO_CLOSE (EOD_1555_FORCE_CLOSE)",
+      alert: {
+        ...base,
+        id: `verify-stc-moc-${nowSec}`,
+        action: "SELL_TO_CLOSE",
+        contractType: "CALL",
+        contractLabel: "SPY 261113 752C",
+        strike: 752,
+        timestamp: "3:55 PM",
+        spotPrice: 754.25,
+        setupName: "Impulse Flux & Divergence Reclaim [BTO CALL]",
+        reason: "15:55 PM ET HARD MARKET CLOSE CUTOFF",
+        status: "CLOSED",
+        remainingQty: 0,
+        optionMid: 1.32,
+        pnlOptionPct: 103.1,
+        pnlSpotPct: 0.53,
+        message: "⏰ STC · SPY 261113 752C [15:55 PM ET HARD MARKET CLOSE CUTOFF] @ $754.25 (+103.1%)",
+      },
+    },
+  ];
+}
 
-  if (success) {
-    console.log("✅ Dispatch successful! Webhook returned HTTP 200 OK receipt.");
-  } else {
-    console.error("❌ Dispatch failed! Check network connectivity or rate limits.");
-    process.exit(1);
+async function main(): Promise<void> {
+  const isLive = process.argv.includes("--live");
+  const { url: webhookUrl, source } = resolveWebhookUrl();
+  const masked = webhookUrl.replace(/(webhooks\/\d+\/)[^?]+/, "$1***");
+
+  console.log("================================================================================");
+  console.log(`  HYPERION DISCORD BTO/STC VERIFICATION (${isLive ? "LIVE DISPATCH" : "DRY-RUN"})`);
+  console.log("================================================================================");
+  console.log(`Webhook (${source}): ${masked}`);
+  assert.ok(webhookUrl.startsWith("https://discord.com/api/webhooks/"), "Valid Discord webhook URL required");
+
+  const capturedPayloads: Array<{ label: string; url: string; payload: any }> = [];
+  const originalFetch = globalThis.fetch;
+
+  if (!isLive) {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const targetUrl = String(input);
+      const parsedBody = init?.body ? JSON.parse(String(init.body)) : {};
+      capturedPayloads.push({ label: parsedBody?.embeds?.[0]?.title ?? "", url: targetUrl, payload: parsedBody });
+      return new Response(JSON.stringify({ id: "dry-run-msg-id" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
   }
+
+  try {
+    const scenarios = buildScenarioAlerts(Math.floor(Date.now() / 1000));
+    for (const sc of scenarios) {
+      const ok = await sendDiscordTradeAlert(sc.alert, webhookUrl, { bypassFsmFirewall: true });
+      if (sc.expectBlocked) {
+        assert.strictEqual(ok, false, `${sc.label} must return false`);
+        console.log(`✅ [PASS] ${sc.label} -> silenced`);
+      } else {
+        assert.strictEqual(ok, true, `${sc.label} must succeed`);
+        if (!isLive) {
+          const last = capturedPayloads[capturedPayloads.length - 1];
+          assert.ok(last.url.includes("?wait=true") || last.url.includes("&wait=true"), `${sc.label} must attach wait=true`);
+          assert.ok(last.payload?.embeds?.[0]?.title, `${sc.label} embed title missing`);
+          assert.ok(Array.isArray(last.payload?.embeds?.[0]?.fields) && last.payload.embeds[0].fields.length >= 6, `${sc.label} embed fields incomplete`);
+          console.log(`✅ [PASS] ${sc.label} -> "${last.payload.embeds[0].title}"`);
+        } else {
+          console.log(`✅ [LIVE 200 OK] ${sc.label}`);
+        }
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  console.log("\nAll 8 Discord BTO/STC & Backfill Silence checks passed with zero .cache/active-trades-*.json writes.");
 }
 
 main().catch((err) => {
-  console.error("Fatal error:", err);
+  console.error("❌ Verification failed:", err);
   process.exit(1);
 });

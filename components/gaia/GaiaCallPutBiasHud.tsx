@@ -291,6 +291,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
   // Chart Container & Dynamic Axis Scaling / Pan State
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const cachedInverseCtmRef = useRef<DOMMatrix | null>(null);
   const [xScale, setXScale] = useState<number>(1.0); // 0.5x to 4.0x
   const [xPanOffset, setXPanOffset] = useState<number>(0); // in pixels
   const [yScale, setYScale] = useState<number>(1.0); // 0.5x to 4.0x
@@ -1001,17 +1002,40 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     }).catch(() => {});
   }, [activeSymbol, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, gammaLevels?.zeroGamma]);
 
+  const invalidateSvgCtm = useCallback(() => {
+    cachedInverseCtmRef.current = null;
+  }, []);
+
+  const cacheSvgCtm = useCallback((): DOMMatrix | null => {
+    const svg = svgRef.current;
+    if (!svg) return null;
+    const ctm = svg.getScreenCTM();
+    const inv = ctm ? ctm.inverse() : null;
+    cachedInverseCtmRef.current = inv;
+    return inv;
+  }, []);
+
+  useEffect(() => {
+    cachedInverseCtmRef.current = null;
+    window.addEventListener("resize", invalidateSvgCtm, { passive: true });
+    window.addEventListener("scroll", invalidateSvgCtm, { passive: true });
+    return () => {
+      window.removeEventListener("resize", invalidateSvgCtm);
+      window.removeEventListener("scroll", invalidateSvgCtm);
+    };
+  }, [svgWidth, svgHeight, invalidateSvgCtm]);
+
   // Screen Pixel to SVG ViewBox Coordinate Conversion
   const getSvgCoordinates = useCallback(
     (clientX: number, clientY: number) => {
       if (!svgRef.current) return { x: 0, y: 0 };
       const svg = svgRef.current;
-      const ctm = svg.getScreenCTM();
-      if (ctm) {
+      const invCtm = cachedInverseCtmRef.current ?? cacheSvgCtm();
+      if (invCtm) {
         const pt = svg.createSVGPoint();
         pt.x = clientX;
         pt.y = clientY;
-        const svgPt = pt.matrixTransform(ctm.inverse());
+        const svgPt = pt.matrixTransform(invCtm);
         return { x: svgPt.x, y: svgPt.y };
       }
       const rect = svg.getBoundingClientRect();
@@ -1019,11 +1043,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       const y = ((clientY - rect.top) / Math.max(1, rect.height)) * svgHeight;
       return { x, y };
     },
-    [svgWidth, svgHeight]
+    [svgWidth, svgHeight, cacheSvgCtm]
   );
 
   // Pointer & Interactive Drag Handlers
   const handlePointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    cacheSvgCtm();
     const { x: svgX, y: svgY } = getSvgCoordinates(e.clientX, e.clientY);
 
     dragStartRef.current = {
@@ -1094,6 +1119,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   };
 
   const handlePointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
+    invalidateSvgCtm();
     setDragMode("none");
     try {
       (e.target as Element).releasePointerCapture?.(e.pointerId);
@@ -1293,7 +1319,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
+          onPointerCancel={() => {
+            setDragMode("none");
+            invalidateSvgCtm();
+          }}
           onPointerLeave={() => {
+            invalidateSvgCtm();
             setHoverIndex(null);
             setDragMode("none");
           }}

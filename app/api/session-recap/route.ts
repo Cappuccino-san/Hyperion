@@ -4,8 +4,225 @@ import path from "path";
 
 export const dynamic = "force-dynamic";
 
+export interface PortfolioTradeRow {
+  id: string;
+  date: string;
+  ticker: string;
+  contractType: "CALL" | "PUT";
+  contractLabel: string;
+  setupName: string;
+  openedAt: string;
+  closedAt: string;
+  openedTs: number;
+  closedTs: number;
+  entryOptionPrice: number;
+  exitOptionPrice: number;
+  contractsQty: number;
+  outlay: number;
+  realizedDollarPnl: number;
+  pnlOptionPct: number;
+  rMultiple: number;
+  exitReason: string;
+}
+
+export interface PortfolioDailyRow {
+  date: string;
+  trades: number;
+  wins: number;
+  losses: number;
+  netDollarPnl: number;
+  equityAfter: number;
+}
+
+export interface PortfolioRecapSummary {
+  windowDays: number;
+  daysWithTrades: string[];
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  breakevens: number;
+  winRatePct: number;
+  cumulativeDollarPnl: number;
+  totalCapitalOutlay: number;
+  profitFactor: number | null;
+  maxDrawdown: number;
+  expectancyR: number;
+  rDistribution: Array<{ label: string; count: number }>;
+  equityCurve: Array<{
+    index: number;
+    date: string;
+    ticker: string;
+    contractLabel: string;
+    tradePnl: number;
+    equity: number;
+    rMultiple: number;
+  }>;
+  dailyBreakdown: PortfolioDailyRow[];
+  trades: PortfolioTradeRow[];
+}
+
+function buildRollingPortfolioSummary(): PortfolioRecapSummary {
+  const cacheDir = path.resolve(process.cwd(), ".cache");
+  const trades: PortfolioTradeRow[] = [];
+  const dailyBreakdown: PortfolioDailyRow[] = [];
+
+  if (fs.existsSync(cacheDir)) {
+    const files = fs
+      .readdirSync(cacheDir)
+      .filter((f) => /^active-trades-\d{4}-\d{2}-\d{2}\.json$/.test(f))
+      .sort()
+      .slice(-7);
+
+    let runningEquity = 0;
+    for (const file of files) {
+      const fileDate = file.slice("active-trades-".length, "active-trades-".length + 10);
+      try {
+        const parsed = JSON.parse(fs.readFileSync(path.join(cacheDir, file), "utf-8"));
+        const closed = Array.isArray(parsed?.closedPositions) ? parsed.closedPositions : [];
+        let dayWins = 0;
+        let dayLosses = 0;
+        let dayPnl = 0;
+
+        for (const p of closed) {
+          const qty = Number(p.contractsQty) || 1;
+          const entryPx = Number(
+            p.btoOptionAsk ?? p.optionAsk ?? p.btoPrice ?? p.btoOptionMid ?? p.btoMid ?? 0.5
+          );
+          const exitPx = Number(p.closedOptionBid ?? p.stcPrice ?? p.closedOptionMid ?? 0);
+          const outlay = Number(p.totalOutlay ?? Math.round(entryPx * 100 * qty));
+          const realizedDollarPnl = Number(
+            (p.realizedPnlDollars ?? p.pnlDollars ?? (exitPx - entryPx) * 100 * qty).toFixed(2)
+          );
+          const pnlOptionPct = Number(
+            (
+              p.pnlOptionPct ??
+              p.realizedPnlPct ??
+              (entryPx > 0 ? ((exitPx - entryPx) / entryPx) * 100 : 0)
+            ).toFixed(1)
+          );
+          const riskDollars = Math.max(10, outlay * 0.25);
+          const rMultiple = Number((p.realizedR ?? realizedDollarPnl / riskDollars).toFixed(2));
+
+          if (realizedDollarPnl > 0) dayWins++;
+          else if (realizedDollarPnl < 0) dayLosses++;
+          dayPnl += realizedDollarPnl;
+
+          trades.push({
+            id: String(p.id || `${fileDate}-${p.ticker || "SPY"}-${trades.length}`),
+            date: fileDate,
+            ticker: String(p.ticker || "SPY").toUpperCase(),
+            contractType: p.contractType === "PUT" ? "PUT" : "CALL",
+            contractLabel: String(p.contractLabel || p.optionSymbol || ""),
+            setupName: String(p.setupName || ""),
+            openedAt: String(p.openedAt || "—"),
+            closedAt: String(p.closedAt || "—"),
+            openedTs: Number(p.openedTs || 0),
+            closedTs: Number(p.closedTs || 0),
+            entryOptionPrice: Number(entryPx.toFixed(2)),
+            exitOptionPrice: Number(exitPx.toFixed(2)),
+            contractsQty: qty,
+            outlay: Math.round(outlay),
+            realizedDollarPnl,
+            pnlOptionPct,
+            rMultiple,
+            exitReason: String(p.exitReason || "Closed"),
+          });
+        }
+
+        runningEquity = Number((runningEquity + dayPnl).toFixed(2));
+        dailyBreakdown.push({
+          date: fileDate,
+          trades: closed.length,
+          wins: dayWins,
+          losses: dayLosses,
+          netDollarPnl: Number(dayPnl.toFixed(2)),
+          equityAfter: runningEquity,
+        });
+      } catch {
+        // Skip malformed cache files so healthy sessions remain visible
+      }
+    }
+  }
+
+  trades.sort((a, b) => (a.closedTs || a.openedTs) - (b.closedTs || b.openedTs));
+
+  let cumulativePnl = 0;
+  let peakEquity = 0;
+  let maxDrawdown = 0;
+  let grossGains = 0;
+  let grossLosses = 0;
+  let wins = 0;
+  let losses = 0;
+  let breakevens = 0;
+
+  const equityCurve = trades.map((t, idx) => {
+    cumulativePnl = Number((cumulativePnl + t.realizedDollarPnl).toFixed(2));
+    if (cumulativePnl > peakEquity) peakEquity = cumulativePnl;
+    maxDrawdown = Math.max(maxDrawdown, Number((peakEquity - cumulativePnl).toFixed(2)));
+    if (t.realizedDollarPnl > 0) {
+      wins++;
+      grossGains += t.realizedDollarPnl;
+    } else if (t.realizedDollarPnl < 0) {
+      losses++;
+      grossLosses += Math.abs(t.realizedDollarPnl);
+    } else {
+      breakevens++;
+    }
+    return {
+      index: idx + 1,
+      date: t.date,
+      ticker: t.ticker,
+      contractLabel: t.contractLabel,
+      tradePnl: t.realizedDollarPnl,
+      equity: cumulativePnl,
+      rMultiple: t.rMultiple,
+    };
+  });
+
+  const rDistribution = [
+    { label: "<= -1.0R", count: trades.filter((t) => t.rMultiple <= -1.0).length },
+    { label: "-1.0R..0R", count: trades.filter((t) => t.rMultiple > -1.0 && t.rMultiple < 0).length },
+    { label: "0R..+1.0R", count: trades.filter((t) => t.rMultiple >= 0 && t.rMultiple < 1.0).length },
+    { label: "+1.0R..+2.0R", count: trades.filter((t) => t.rMultiple >= 1.0 && t.rMultiple < 2.0).length },
+    { label: ">= +2.0R", count: trades.filter((t) => t.rMultiple >= 2.0).length },
+  ];
+
+  const totalTrades = trades.length;
+  const winRatePct = totalTrades > 0 ? Number(((wins / totalTrades) * 100).toFixed(1)) : 0;
+  const profitFactor =
+    grossLosses > 0
+      ? Number((grossGains / grossLosses).toFixed(2))
+      : grossGains > 0
+        ? 999
+        : null;
+  const expectancyR =
+    totalTrades > 0
+      ? Number((trades.reduce((s, t) => s + t.rMultiple, 0) / totalTrades).toFixed(2))
+      : 0;
+
+  return {
+    windowDays: 7,
+    daysWithTrades: dailyBreakdown.map((d) => d.date),
+    totalTrades,
+    wins,
+    losses,
+    breakevens,
+    winRatePct,
+    cumulativeDollarPnl: cumulativePnl,
+    totalCapitalOutlay: trades.reduce((s, t) => s + t.outlay, 0),
+    profitFactor,
+    maxDrawdown,
+    expectancyR,
+    rDistribution,
+    equityCurve,
+    dailyBreakdown,
+    trades: [...trades].reverse(),
+  };
+}
+
 export async function GET(req: Request) {
   try {
+    const portfolio = buildRollingPortfolioSummary();
     const possiblePaths = [
       path.resolve(process.cwd(), "scratch/terrashade/api_recap.json"),
       path.resolve(process.cwd(), ".cache/terrashade/api_recap.json"),
@@ -14,27 +231,32 @@ export async function GET(req: Request) {
 
     for (const p of possiblePaths) {
       if (fs.existsSync(p)) {
-        const raw = fs.readFileSync(p, "utf-8");
-        return new NextResponse(raw, {
-          headers: {
-            "Content-Type": "application/json",
-            "Cache-Control": "public, s-maxage=60, stale-while-revalidate=120",
-          },
-        });
+        const parsed = JSON.parse(fs.readFileSync(p, "utf-8"));
+        return NextResponse.json(
+          { ...parsed, portfolio },
+          { headers: { "Cache-Control": "no-store" } }
+        );
       }
     }
 
-    // Fallback minimal structure if file is unreachable
-    return NextResponse.json({
-      days: ["2026-10-16"],
-      day: "2026-10-16",
-      recap: {
-        day: "2026-10-16",
-        built_at: 1792274473,
-        next_date: "2026-10-19",
-        tickers: [],
+    const latestDay =
+      portfolio.daysWithTrades[portfolio.daysWithTrades.length - 1] ||
+      new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+
+    return NextResponse.json(
+      {
+        days: portfolio.daysWithTrades.length > 0 ? portfolio.daysWithTrades : [latestDay],
+        day: latestDay,
+        recap: {
+          day: latestDay,
+          built_at: Math.floor(Date.now() / 1000),
+          next_date: latestDay,
+          tickers: [],
+        },
+        portfolio,
       },
-    });
+      { headers: { "Cache-Control": "no-store" } }
+    );
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Recap error" },

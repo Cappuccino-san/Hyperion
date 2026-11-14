@@ -15,11 +15,11 @@ export default function GaiaPage() {
   return (
     <div className="min-h-screen bg-[#0b0d17] text-slate-100 flex flex-col">
       <TopNavBar />
-      <main className="flex-1 max-w-[1600px] w-full mx-auto px-4 py-4">
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-4">
         <GaiaView />
       </main>
       <footer className="border-t border-white/10 bg-[#111422]/80 py-4 px-4 mt-6">
-        <div className="max-w-[1100px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px] font-mono text-slate-400">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px] font-mono text-slate-400">
           <div className="flex flex-wrap items-center gap-3">
             <a
               href="https://discord.gg/WS7t69W2D"

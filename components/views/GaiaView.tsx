@@ -27,6 +27,8 @@ import type {
 import { cn } from "@/lib/utils";
 import {
   drawTradeExecutionMarkers,
+  extractNormalizedTradesForTicker,
+  type NormalizedChartTrade,
   type ServerTradesState,
 } from "@/components/chart/TradeExecutionMarkersOverlay";
 
@@ -202,6 +204,35 @@ interface DivergencePayload {
   symbol: string;
   rows: DivergenceRow[];
   levels: { King: number; "Call wall": number; "Put wall": number };
+}
+
+function getCandleEtMinutes(c: { timestamp?: number; timeLabel?: string }): number | null {
+  if (typeof c.timestamp === "number" && c.timestamp > 0) {
+    const epochMs = c.timestamp > 1e11 ? c.timestamp : c.timestamp * 1000;
+    try {
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      }).formatToParts(new Date(epochMs));
+      const h = Number(parts.find((p) => p.type === "hour")?.value ?? NaN);
+      const m = Number(parts.find((p) => p.type === "minute")?.value ?? NaN);
+      if (Number.isFinite(h) && Number.isFinite(m)) return h * 60 + m;
+    } catch {}
+  }
+  if (c.timeLabel) {
+    const match = c.timeLabel.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?/i);
+    if (match) {
+      let h = parseInt(match[1], 10);
+      const m = match[2] ? parseInt(match[2], 10) : 0;
+      const ampm = (match[3] || "").toUpperCase();
+      if (ampm === "PM" && h < 12) h += 12;
+      if (ampm === "AM" && h === 12) h = 0;
+      return h * 60 + m;
+    }
+  }
+  return null;
 }
 
 /**
@@ -687,10 +718,25 @@ export function GaiaView() {
   const [activeBarIndex, setActiveBarIndex] = useState<number>(0);
   const [hoverBarIndex, setHoverBarIndex] = useState<number | null>(null);
   const [isReplaying, setIsReplaying] = useState<boolean>(false);
+  const [isReplayFrozen, setIsReplayFrozen] = useState<boolean>(false);
+  const [replaySpeed, setReplaySpeed] = useState<1 | 2 | 4>(1);
   const storeHeatmapKingNode = useDashboardStore((s) => s.kingNode);
   const storeHeatmapTicker = useDashboardStore((s) => s.activeTicker);
   const isReplayingRef = useRef<boolean>(false);
+  const isReplayFrozenRef = useRef<boolean>(false);
+  const prevStoreTickerRef = useRef<string>(storeTicker);
+  const urlSyncDoneRef = useRef<boolean>(false);
   useEffect(() => { isReplayingRef.current = isReplaying; }, [isReplaying]);
+  useEffect(() => { isReplayFrozenRef.current = isReplayFrozen; }, [isReplayFrozen]);
+  const syncTickerUrlParam = useCallback((sym: string) => {
+    if (typeof window === "undefined") return;
+    const upper = sym.trim().toUpperCase();
+    if (!upper) return;
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("ticker")?.toUpperCase() === upper) return;
+    url.searchParams.set("ticker", upper);
+    window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+  }, []);
   const [openDivTf, setOpenDivTf] = useState<string | null>(null);
   const [divPayload, setDivPayload] = useState<DivergencePayload | null>(null);
 
@@ -761,8 +807,7 @@ export function GaiaView() {
         }
         const payload = data as GaiaLivePayload;
         setLivePayload(payload);
-        setSelectedSessionIso(payload.sessionDate);
-        if (!isReplayingRef.current) {
+        if (!isReplayingRef.current && !isReplayFrozenRef.current) {
           setActiveBarIndex(Math.max(0, payload.candles.length - 1));
         }
         setHoverBarIndex(null);
@@ -783,25 +828,73 @@ export function GaiaView() {
     [startHour]
   );
 
+  // Browser back/forward ?ticker= URL sync
+  useEffect(() => {
+    const handlePopState = () => {
+      const urlTicker = new URLSearchParams(window.location.search)
+        .get("ticker")
+        ?.trim()
+        .toUpperCase();
+      if (urlTicker && urlTicker !== loadedTicker) {
+        prevStoreTickerRef.current = urlTicker;
+        setTickerInput(urlTicker);
+        setLoadedTicker(urlTicker);
+        setStoreTicker(urlTicker);
+        fetchOptionsChain(urlTicker, true);
+        isReplayingRef.current = false;
+        setIsReplaying(false);
+        isReplayFrozenRef.current = false;
+        setIsReplayFrozen(false);
+        setSelectedSessionIso("");
+      }
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [loadedTicker, setStoreTicker, fetchOptionsChain]);
+
   // Initial load and sync when global store ticker changes externally
   useEffect(() => {
-    if (storeTicker && storeTicker !== loadedTicker) {
-      setTickerInput(storeTicker);
-      setLoadedTicker(storeTicker);
-      setSelectedSessionIso("");
-      fetchLiveGaia(storeTicker, "", startHour, false);
+    if (storeTicker !== prevStoreTickerRef.current) {
+      prevStoreTickerRef.current = storeTicker;
+      if (storeTicker && storeTicker !== loadedTicker) {
+        setTickerInput(storeTicker);
+        setLoadedTicker(storeTicker);
+        setSelectedSessionIso("");
+        isReplayingRef.current = false;
+        setIsReplaying(false);
+        isReplayFrozenRef.current = false;
+        setIsReplayFrozen(false);
+        syncTickerUrlParam(storeTicker);
+      }
     }
-  }, [storeTicker, loadedTicker, fetchLiveGaia, startHour]);
+  }, [storeTicker, loadedTicker, syncTickerUrlParam]);
 
   useEffect(() => {
+    if (!urlSyncDoneRef.current && typeof window !== "undefined") {
+      urlSyncDoneRef.current = true;
+      const urlTicker = new URLSearchParams(window.location.search)
+        .get("ticker")
+        ?.trim()
+        .toUpperCase();
+      if (urlTicker && urlTicker !== loadedTicker) {
+        prevStoreTickerRef.current = urlTicker;
+        setTickerInput(urlTicker);
+        setLoadedTicker(urlTicker);
+        setStoreTicker(urlTicker);
+        fetchOptionsChain(urlTicker, true);
+        return;
+      }
+      syncTickerUrlParam(loadedTicker);
+    }
     fetchLiveGaia(loadedTicker, selectedSessionIso, startHour, false);
-  }, [loadedTicker, selectedSessionIso, startHour, fetchLiveGaia]);
+  }, [loadedTicker, selectedSessionIso, startHour, fetchLiveGaia, setStoreTicker, fetchOptionsChain, syncTickerUrlParam]);
 
   useEffect(() => {
-    if (!isReplaying && !selectedSessionIso) {
+    if (!isReplaying && !isReplayFrozen && !selectedSessionIso) {
       const liveInterval = setInterval(() => {
         if (
           !isReplayingRef.current &&
+          !isReplayFrozenRef.current &&
           (typeof document === "undefined" || document.visibilityState === "visible")
         ) {
           fetchLiveGaia(loadedTicker, "", startHour, true);
@@ -809,11 +902,11 @@ export function GaiaView() {
       }, 2500);
       return () => clearInterval(liveInterval);
     }
-  }, [loadedTicker, selectedSessionIso, startHour, isReplaying, fetchLiveGaia]);
+  }, [loadedTicker, selectedSessionIso, startHour, isReplaying, isReplayFrozen, fetchLiveGaia]);
 
   // Instant 800ms tick reactivity for GaiaView livePayload spot & candle tip
   useEffect(() => {
-    if (!liveTickPrice || liveTickPrice <= 0 || isReplaying) return;
+    if (!liveTickPrice || liveTickPrice <= 0 || isReplaying || isReplayFrozen) return;
     setLivePayload((prev) => {
       if (!prev) return prev;
       const candles = prev.candles;
@@ -878,20 +971,24 @@ export function GaiaView() {
     [livePayload]
   );
 
-  // Automatic bar-by-bar replay timer
+  // Automatic bar-by-bar replay timer scaled by replaySpeed (1x / 2x / 4x)
   useEffect(() => {
     if (!isReplaying) return;
+    const intervalMs = Math.max(60, Math.round(320 / replaySpeed));
     const timer = setInterval(() => {
       setActiveBarIndex((prev) => {
         if (prev >= maxBarIdx) {
+          isReplayingRef.current = false;
           setIsReplaying(false);
+          isReplayFrozenRef.current = false;
+          setIsReplayFrozen(false);
           return maxBarIdx;
         }
         return prev + 1;
       });
-    }, 320);
+    }, intervalMs);
     return () => clearInterval(timer);
-  }, [isReplaying, maxBarIdx]);
+  }, [isReplaying, replaySpeed, maxBarIdx]);
 
   const dataset = useMemo(() => {
     if (!livePayload) return null;
@@ -907,6 +1004,16 @@ export function GaiaView() {
     }));
     return computeBarFlowGammaVwapSeries(dataset.candles, optionsBook);
   }, [dataset?.candles, livePayload?.optionBuckets]);
+
+  const precomputedChartTrades = useMemo<NormalizedChartTrade[]>(
+    () =>
+      extractNormalizedTradesForTicker(
+        dataset?.ticker || loadedTicker,
+        effectiveServerTrades,
+        przmHudSignals
+      ),
+    [dataset?.ticker, loadedTicker, effectiveServerTrades, przmHudSignals]
+  );
 
   // Dynamic Price Domain Bounds based on Scope Preset, Zoom (yScale) and Pan (yPanOffset)
   const priceBounds = useMemo(() => {
@@ -1010,19 +1117,36 @@ export function GaiaView() {
   const handleLoadTicker = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const cleaned = tickerInput.trim().toUpperCase() || "SPY";
+    prevStoreTickerRef.current = cleaned;
     setTickerInput(cleaned);
-    setLoadedTicker(cleaned);
     setStoreTicker(cleaned);
     fetchOptionsChain(cleaned, true);
+    isReplayingRef.current = false;
     setIsReplaying(false);
+    isReplayFrozenRef.current = false;
+    setIsReplayFrozen(false);
     setSelectedSessionIso("");
-    fetchLiveGaia(cleaned, "");
+    syncTickerUrlParam(cleaned);
+    if (cleaned !== loadedTicker) {
+      setLoadedTicker(cleaned);
+    } else {
+      fetchLiveGaia(cleaned, "", startHour, false);
+    }
   };
 
   const handleSessionChange = (newSessionIso: string) => {
-    setSelectedSessionIso(newSessionIso);
+    const latestSessionIso = sessionOptions[0]?.isoDate;
+    const normalizedIso =
+      latestSessionIso && newSessionIso === latestSessionIso ? "" : newSessionIso;
+    isReplayingRef.current = false;
     setIsReplaying(false);
-    fetchLiveGaia(loadedTicker, newSessionIso);
+    isReplayFrozenRef.current = false;
+    setIsReplayFrozen(false);
+    if (normalizedIso === selectedSessionIso) {
+      fetchLiveGaia(loadedTicker, normalizedIso);
+    } else {
+      setSelectedSessionIso(normalizedIso);
+    }
   };
 
   const handleResetView = () => {
@@ -1030,7 +1154,10 @@ export function GaiaView() {
     setExpFilter("ALL");
     setSelectedDateExp("");
     setPathToKing(true);
+    isReplayingRef.current = false;
     setIsReplaying(false);
+    isReplayFrozenRef.current = false;
+    setIsReplayFrozen(false);
     setActiveBarIndex(maxBarIdx);
     setHoverBarIndex(null);
     setYScale(1.0);
@@ -1047,13 +1174,34 @@ export function GaiaView() {
     if (isReplaying) {
       isReplayingRef.current = false;
       setIsReplaying(false);
+      isReplayFrozenRef.current = true;
+      setIsReplayFrozen(true);
     } else {
+      isReplayFrozenRef.current = false;
+      setIsReplayFrozen(false);
       isReplayingRef.current = true;
       if (activeBarIndex >= maxBarIdx - 1) {
         setActiveBarIndex(0);
       }
       setIsReplaying(true);
     }
+  };
+
+  const handleStepBar = (delta: number) => {
+    isReplayingRef.current = false;
+    setIsReplaying(false);
+    isReplayFrozenRef.current = true;
+    setIsReplayFrozen(true);
+    setActiveBarIndex((prev) => Math.max(0, Math.min(maxBarIdx, prev + delta)));
+  };
+
+  const handleSnapToLive = () => {
+    isReplayingRef.current = false;
+    setIsReplaying(false);
+    isReplayFrozenRef.current = false;
+    setIsReplayFrozen(false);
+    setActiveBarIndex(maxBarIdx);
+    setHoverBarIndex(null);
   };
 
   // Canvas Mouse & Interaction Handlers for Zooming, Resizing and Panning
@@ -1195,16 +1343,26 @@ export function GaiaView() {
       return;
     }
 
+    const axisStartMins = startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
     const totalSessionSlots = Math.max(
-      startHour === 7 ? 108 : startHour === 8 ? 96 : 78,
+      Math.round((1020 - axisStartMins) / 5),
       dataset.candles.length
     );
     const stepX = (sessionWidth / totalSessionSlots) * xScale;
-    const relX = mouseX - padLeft - xPanOffset;
-    // Map coordinate to nearest candlestick center with entry/exit boundaries switching cleanly at the exact bar midpoint
-    const floatIdx = (relX - 0.5 * stepX) / Math.max(0.001, stepX);
-    const rawBarIdx = Math.round(floatIdx);
-    const barIdx = Math.max(0, Math.min(safeActiveIdx, rawBarIdx));
+    let bestBarIdx = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i <= safeActiveIdx; i++) {
+      const c = dataset.candles[i];
+      const etMins = c ? getCandleEtMinutes(c) : null;
+      const slotIdx = etMins !== null && etMins >= axisStartMins ? (etMins - axisStartMins) / 5 : i;
+      const cx = padLeft + xPanOffset + (slotIdx + 0.5) * stepX;
+      const d = Math.abs(cx - mouseX);
+      if (d < bestDist) {
+        bestDist = d;
+        bestBarIdx = i;
+      }
+    }
+    const barIdx = Math.max(0, Math.min(safeActiveIdx, bestBarIdx));
     setHoverBarIndex(barIdx);
   };
 
@@ -1246,23 +1404,23 @@ export function GaiaView() {
 
     if (e.key === "ArrowLeft") {
       e.preventDefault();
-      setIsReplaying(false);
-      setActiveBarIndex((prev) => Math.max(0, prev - 1));
+      handleStepBar(-1);
     } else if (e.key === "ArrowRight") {
       e.preventDefault();
-      setIsReplaying(false);
-      setActiveBarIndex((prev) => Math.min(maxIdx, prev + 1));
+      handleStepBar(1);
     } else if (e.key === "Home") {
       e.preventDefault();
+      isReplayingRef.current = false;
       setIsReplaying(false);
+      isReplayFrozenRef.current = true;
+      setIsReplayFrozen(true);
       setActiveBarIndex(0);
     } else if (e.key === "End") {
       e.preventDefault();
-      setIsReplaying(false);
-      setActiveBarIndex(maxIdx);
+      handleSnapToLive();
     } else if (e.key === " " || e.key === "Spacebar") {
       e.preventDefault();
-      setIsReplaying((prev) => !prev);
+      handleToggleReplay();
     } else if (e.key === "+" || e.key === "=") {
       e.preventDefault();
       setYScale((s) => Math.min(10.0, s * 1.22));
@@ -1396,8 +1554,9 @@ export function GaiaView() {
     // Left Zone (custom width via dividerRatio) & Right Zone (outlook Zone)
     const dividerX = Math.round(padLeft + totalPlotWidth * dividerRatio);
     const sessionWidth = dividerX - padLeft;
+    const axisStartMins = startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
     const totalSessionSlots = Math.max(
-      startHour === 7 ? 108 : startHour === 8 ? 96 : 78,
+      Math.round((1020 - axisStartMins) / 5),
       dataset.candles.length
     );
 
@@ -1407,9 +1566,24 @@ export function GaiaView() {
       return padTop + (1 - ratio) * plotHeight;
     };
 
+    const candleSlotIndices = dataset.candles.map((c, idx) => {
+      const etMins = getCandleEtMinutes(c);
+      if (etMins !== null && etMins >= axisStartMins) {
+        return (etMins - axisStartMins) / 5;
+      }
+      return idx;
+    });
+
     const barToX = (barIdx: number): number => {
       const stepX = (sessionWidth / totalSessionSlots) * xScale;
-      return padLeft + xPanOffset + (barIdx + 0.5) * stepX;
+      const slotIdx = candleSlotIndices[barIdx] ?? barIdx;
+      return padLeft + xPanOffset + (slotIdx + 0.5) * stepX;
+    };
+
+    const minsToX = (etMins: number): number => {
+      const stepX = (sessionWidth / totalSessionSlots) * xScale;
+      const slotIdx = (etMins - axisStartMins) / 5;
+      return padLeft + xPanOffset + (slotIdx + 0.5) * stepX;
     };
 
     // Subtle horizontal grid lines at the price axis ticks
@@ -1988,6 +2162,7 @@ export function GaiaView() {
       priceToY,
       serverTrades: effectiveServerTrades,
       fsmSignals: przmHudSignals,
+      precomputedTrades: precomputedChartTrades,
       padLeft,
       plotRightX: dividerX,
       padTop,
@@ -2261,10 +2436,13 @@ export function GaiaView() {
       });
     }
 
-    // Generate standard milestone schedule across the trading day (7:00 AM to 4:00 PM)
+    // Generate full-day milestone schedule (7:00 AM to 5:00 PM ET: 420..1020 mins)
     const milestoneSchedule: { h: number; m: number; label: string; isMarketOpen?: boolean; isMarketClose?: boolean }[] = [];
-    for (let h = startHour; h <= 16; h++) {
+    for (let h = startHour; h <= 17; h++) {
       if (h === 9) {
+        if (startHour < 9) {
+          milestoneSchedule.push({ h: 9, m: 0, label: "9:00" });
+        }
         milestoneSchedule.push({ h: 9, m: 30, label: "9:30", isMarketOpen: true });
         continue;
       }
@@ -2278,25 +2456,17 @@ export function GaiaView() {
 
     milestoneSchedule.forEach((ms) => {
       const timeKey = `${String(ms.h).padStart(2, "0")}:${String(ms.m).padStart(2, "0")}`;
+      const etMins = ms.h * 60 + ms.m;
       let x = -1;
       if (candleHourIndices.has(timeKey)) {
         x = barToX(candleHourIndices.get(timeKey)!);
-      } else {
-        let totalMinsFromStart = 0;
-        if (startHour === 9) {
-          totalMinsFromStart = (ms.h - 9) * 60 + (ms.m - 30);
-        } else {
-          totalMinsFromStart = (ms.h - startHour) * 60 + ms.m;
-        }
-        const theoreticalSlot = Math.round(totalMinsFromStart / 5);
-        if (theoreticalSlot >= 0 && theoreticalSlot < totalSessionSlots) {
-          x = barToX(theoreticalSlot);
-        }
+      } else if (etMins >= axisStartMins && etMins <= 1020) {
+        x = minsToX(etMins);
       }
 
-      if (x >= padLeft - 4 && x <= dividerX - 8) {
+      if (x >= padLeft - 4 && x <= dividerX + 4) {
         axisTicks.push({
-          x,
+          x: Math.min(dividerX - 2, x),
           label: ms.label,
           isHourMark: true,
           isMarketOpen: Boolean(ms.isMarketOpen),
@@ -2305,56 +2475,87 @@ export function GaiaView() {
       }
     });
 
-    // 4. Render Each Tick Mark, Subtle Vertical Grid Line & High-Contrast Time Label
+    // 4. Render Each Tick Mark, Vertical Grid / RTH Boundary Lines & Time Labels
     ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
     ctx.textBaseline = "middle";
     const labelY = height - padBottom / 2 + 1;
 
     let lastDrawnX = -999;
-    const minSpacing = 36; // minimum pixels between adjacent labels to prevent overlap
+    const minSpacing = 32; // minimum pixels between adjacent labels to prevent overlap
 
     axisTicks.forEach((tick) => {
+      const isRthBoundary = tick.isMarketOpen || tick.isMarketClose;
       if (Math.abs(tick.x - lastDrawnX) < minSpacing) {
-        if (!tick.isMarketOpen) return;
+        if (!isRthBoundary) return;
       }
 
       lastDrawnX = tick.x;
 
-      // Subtle Vertical Grid Line for Hour Marks or Market Open
+      // Vertical Grid Line (or crisp #2dd4bf 1.5px RTH Open/Close boundary)
       ctx.save();
-      if (tick.isMarketOpen) {
-        ctx.strokeStyle = "rgba(56, 189, 248, 0.35)";
-        ctx.setLineDash([4, 4]);
+      if (isRthBoundary) {
+        ctx.strokeStyle = "rgba(45, 212, 191, 0.75)";
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([]);
       } else {
         ctx.strokeStyle = "rgba(148, 163, 184, 0.08)";
+        ctx.lineWidth = 1;
       }
-      ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(tick.x, padTop);
       ctx.lineTo(tick.x, height - padBottom);
       ctx.stroke();
+
+      if (isRthBoundary) {
+        const tagText = tick.isMarketOpen ? "9:30 OPEN" : "4:00 CLOSE";
+        ctx.font = "bold 9px ui-monospace, SFMono-Regular, Menlo, monospace";
+        const tagW = ctx.measureText(tagText).width + 10;
+        const tagX = Math.max(padLeft + 2, Math.min(dividerX - tagW - 2, tick.x - tagW / 2));
+
+        // Top RTH boundary tag
+        ctx.fillStyle = "rgba(8, 12, 20, 0.88)";
+        ctx.strokeStyle = "rgba(45, 212, 191, 0.45)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.roundRect(tagX, padTop + 4, tagW, 15, 4);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "#2dd4bf";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(tagText, tagX + tagW / 2, padTop + 11.5);
+
+        // Bottom RTH boundary tag just above axis baseline
+        const botTagY = height - padBottom - 19;
+        ctx.fillStyle = "rgba(8, 12, 20, 0.88)";
+        ctx.beginPath();
+        ctx.roundRect(tagX, botTagY, tagW, 15, 4);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = "#2dd4bf";
+        ctx.fillText(tagText, tagX + tagW / 2, botTagY + 7.5);
+      }
       ctx.restore();
 
       // Tick Dash extending down from axis baseline
-      ctx.strokeStyle = tick.isMarketOpen
-        ? "rgba(56, 189, 248, 0.85)"
-        : tick.isMarketClose
-          ? "rgba(255, 255, 255, 0.85)"
-          : "rgba(148, 163, 184, 0.5)";
-      ctx.lineWidth = 1;
+      ctx.strokeStyle = isRthBoundary
+        ? "#2dd4bf"
+        : "rgba(148, 163, 184, 0.5)";
+      ctx.lineWidth = isRthBoundary ? 1.5 : 1;
       ctx.beginPath();
       ctx.moveTo(tick.x, height - padBottom);
-      ctx.lineTo(tick.x, height - padBottom + (tick.isMarketOpen ? 5 : 4));
+      ctx.lineTo(tick.x, height - padBottom + (isRthBoundary ? 5 : 4));
       ctx.stroke();
 
-      // Time Text Label (Market Open in cyan, Close in white, Hour marks in bright silver)
-      ctx.fillStyle = tick.isMarketOpen
-        ? "#38bdf8"
-        : tick.isMarketClose
-          ? "#ffffff"
-          : "#e2e8f0";
-      ctx.textAlign = "center";
+      // Time Text Label (RTH Open/Close in bold #2dd4bf, Hour marks in silver)
+      ctx.save();
+      ctx.font = isRthBoundary
+        ? "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace"
+        : "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.fillStyle = isRthBoundary ? "#2dd4bf" : "#e2e8f0";
+      ctx.textAlign = tick.x > dividerX - 18 ? "right" : "center";
       ctx.fillText(tick.label, tick.x, labelY);
+      ctx.restore();
     });
 
     // 4. Outlook Column Label
@@ -2451,6 +2652,7 @@ export function GaiaView() {
     hudTradeSignals,
     effectiveServerTrades,
     przmHudSignals,
+    precomputedChartTrades,
     gammaLevels?.zeroGamma,
     livePayload,
   ]);
@@ -2547,7 +2749,7 @@ export function GaiaView() {
               <span>Session:</span>
               <select
                 aria-label="Select trading session"
-                value={selectedSessionIso}
+                value={selectedSessionIso || livePayload?.sessionDate || ""}
                 onChange={(e) => handleSessionChange(e.target.value)}
                 className="bg-[#101520] border border-[#1e2638] rounded-md px-2 py-0.5 text-[11px] font-mono text-slate-300 focus:outline-none focus:border-[#38bdf8]"
               >
@@ -2687,10 +2889,7 @@ export function GaiaView() {
         <div className="bg-[#151b28] border border-[#232d42] rounded-full p-1 flex items-center gap-1 font-mono text-xs">
           <button
             type="button"
-            onClick={() => {
-              setStartHour(7);
-              fetchLiveGaia(loadedTicker, selectedSessionIso, 7);
-            }}
+            onClick={() => setStartHour(7)}
             title="Start session at 7:00 AM ET (Early pre-market volume & catalyst discovery)"
             className={cn(
               "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
@@ -2703,10 +2902,7 @@ export function GaiaView() {
           </button>
           <button
             type="button"
-            onClick={() => {
-              setStartHour(8);
-              fetchLiveGaia(loadedTicker, selectedSessionIso, 8);
-            }}
+            onClick={() => setStartHour(8)}
             title="Start session at 8:00 AM ET (Regular pre-market session)"
             className={cn(
               "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
@@ -2719,10 +2915,7 @@ export function GaiaView() {
           </button>
           <button
             type="button"
-            onClick={() => {
-              setStartHour(9);
-              fetchLiveGaia(loadedTicker, selectedSessionIso, 9);
-            }}
+            onClick={() => setStartHour(9)}
             title="Start session at 9:30 AM ET (Regular Trading Hours only)"
             className={cn(
               "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
@@ -2757,7 +2950,35 @@ export function GaiaView() {
           {fluxFocusMode ? "⚡ FLUX CORRIDOR: 88%" : "OUTLOOK CONE: EXPANDED"}
         </button>
 
-        {/* 6. Reset View Pill */}
+        {/* 6. RTH Corridor (9:30-4:00) & Reset View Pills */}
+        <button
+          type="button"
+          onClick={() => {
+            const canvasW = canvasRef.current?.clientWidth || 1050;
+            const totalPlotW = Math.max(200, canvasW - CHART_PAD_LEFT - CHART_RIGHT_AXIS_WIDTH);
+            const approxSessionW = totalPlotW * dividerRatio;
+            const axisStartMins = startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
+            const totalSlots = Math.max(
+              Math.round((1020 - axisStartMins) / 5),
+              dataset?.candles.length ?? 0
+            );
+            const rthOpenSlot = Math.max(0, (570 - axisStartMins) / 5);
+            const paddedRthSlots = 82; // 78 RTH bars (9:30-4:00) + 2-slot symmetric margin
+            const nextXScale = totalSlots / paddedRthSlots;
+            const nextStepX = (approxSessionW / totalSlots) * nextXScale;
+            const nextXPan = 2 * nextStepX - (rthOpenSlot + 0.5) * nextStepX;
+            setXScale(nextXScale);
+            setXPanOffset(nextXPan);
+            setYScale(1.0);
+            setYPanOffset(0);
+          }}
+          title="Frame exact 9:30 AM – 4:00 PM ET RTH corridor between boundary lines"
+          className="bg-[#151b28] border border-[#2dd4bf]/45 text-[#2dd4bf] hover:bg-[#2dd4bf]/15 rounded-full px-3.5 py-1.5 text-xs font-mono font-bold transition cursor-pointer"
+        >
+          RTH (9:30-4:00)
+        </button>
+
+        {/* 6b. Reset View Pill */}
         <button
           type="button"
           onClick={handleResetView}
@@ -3066,10 +3287,22 @@ export function GaiaView() {
         serverTrades={effectiveServerTrades}
         onSignalsEvaluated={setPrzmHudSignals}
         onSymbolChange={(sym) => {
-          setTickerInput(sym);
-          setLoadedTicker(sym);
-          setStoreTicker(sym);
-          void fetchLiveGaia(sym, selectedSessionIso, startHour);
+          const cleaned = sym.trim().toUpperCase() || "SPY";
+          prevStoreTickerRef.current = cleaned;
+          setTickerInput(cleaned);
+          setStoreTicker(cleaned);
+          fetchOptionsChain(cleaned, true);
+          isReplayingRef.current = false;
+          setIsReplaying(false);
+          isReplayFrozenRef.current = false;
+          setIsReplayFrozen(false);
+          setSelectedSessionIso("");
+          syncTickerUrlParam(cleaned);
+          if (cleaned !== loadedTicker) {
+            setLoadedTicker(cleaned);
+          } else {
+            void fetchLiveGaia(cleaned, "", startHour);
+          }
         }}
       />
 
@@ -3289,18 +3522,62 @@ export function GaiaView() {
 
         {/* 4A. Interactive Session Replay Bar */}
         {dataset && (
-          <div className="bg-[#101520] border border-[#1e2638] rounded-xl px-4 py-2.5 flex items-center gap-4">
-            <button
-              type="button"
-              onClick={handleToggleReplay}
-              aria-label={isReplaying ? "Pause session replay" : "Start session replay"}
-              className="bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold text-xs px-4 py-1.5 rounded-full hover:opacity-95 transition cursor-pointer shrink-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-white"
-            >
-              {isReplaying ? "Pause" : "Replay"}
-            </button>
+          <div className="bg-[#101520] border border-[#1e2638] rounded-xl px-4 py-2.5 flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={handleToggleReplay}
+                aria-label={isReplaying ? "Pause session replay" : "Start session replay"}
+                className="bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold text-xs px-4 py-1.5 rounded-full hover:opacity-95 transition cursor-pointer shrink-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-white"
+              >
+                {isReplaying ? "Pause" : "Replay"}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleStepBar(-1)}
+                disabled={safeActiveIdx <= 0}
+                aria-label="Step back one candle"
+                title="Previous candle (ArrowLeft)"
+                className="w-7 h-7 flex items-center justify-center rounded-full border border-[#232d42] bg-[#151b28] text-slate-200 hover:text-white hover:border-[#38bdf8] disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer text-[11px]"
+              >
+                ◀
+              </button>
+              <button
+                type="button"
+                onClick={() => handleStepBar(1)}
+                disabled={safeActiveIdx >= maxBarIdx}
+                aria-label="Step forward one candle"
+                title="Next candle (ArrowRight)"
+                className="w-7 h-7 flex items-center justify-center rounded-full border border-[#232d42] bg-[#151b28] text-slate-200 hover:text-white hover:border-[#38bdf8] disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer text-[11px]"
+              >
+                ▶
+              </button>
+              <div
+                className="flex items-center bg-[#151b28] border border-[#232d42] rounded-full p-0.5 font-mono text-[10px]"
+                role="group"
+                aria-label="Replay speed"
+              >
+                {([1, 2, 4] as const).map((spd) => (
+                  <button
+                    key={spd}
+                    type="button"
+                    onClick={() => setReplaySpeed(spd)}
+                    aria-pressed={replaySpeed === spd}
+                    className={cn(
+                      "px-2 py-0.5 rounded-full font-bold transition cursor-pointer",
+                      replaySpeed === spd
+                        ? "bg-[#38bdf8] text-[#090d16]"
+                        : "text-slate-400 hover:text-white"
+                    )}
+                  >
+                    {spd}x
+                  </button>
+                ))}
+              </div>
+            </div>
 
             {/* Custom Glowing Cyan Range Scrubber */}
-            <div className="relative flex-1 flex items-center h-5">
+            <div className="relative flex-1 min-w-[160px] flex items-center h-5">
               <div className="w-full h-1.5 rounded-full bg-[#1e2638] overflow-hidden">
                 <div
                   className="h-full bg-[#22d3ee] shadow-[0_0_8px_#22d3ee]"
@@ -3322,7 +3599,10 @@ export function GaiaView() {
                 aria-valuenow={safeActiveIdx}
                 aria-valuetext={`Time ${dataset.candles[safeActiveIdx]?.timeLabel ?? ""}, Price $${activeCandle?.close.toFixed(2) ?? ""}`}
                 onChange={(e) => {
+                  isReplayingRef.current = false;
                   setIsReplaying(false);
+                  isReplayFrozenRef.current = true;
+                  setIsReplayFrozen(true);
                   setActiveBarIndex(Number(e.target.value));
                 }}
                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer focus:outline-none focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-[#38bdf8]"
@@ -3332,6 +3612,21 @@ export function GaiaView() {
             <span className="font-mono text-xs text-slate-300 tabular-nums shrink-0">
               {dataset.candles[safeActiveIdx]?.timeLabel ?? "3:55 PM"}
             </span>
+
+            <button
+              type="button"
+              onClick={handleSnapToLive}
+              aria-label="Snap to live candle"
+              title="Jump to latest live bar and resume polling (End)"
+              className={cn(
+                "px-2.5 py-1 rounded-full font-mono text-[11px] font-bold border transition cursor-pointer shrink-0",
+                !isReplaying && !isReplayFrozen && safeActiveIdx >= maxBarIdx
+                  ? "bg-emerald-500/15 border-emerald-400/60 text-emerald-300"
+                  : "bg-[#151b28] border-[#232d42] text-slate-300 hover:text-white hover:border-emerald-400/60"
+              )}
+            >
+              Live
+            </button>
           </div>
         )}
       </div>

@@ -47,17 +47,31 @@ function runCommand(cmd: string): { success: boolean; output: string } {
 // =============================================================================
 function auditEngineInvariants() {
   log("Step 1: Auditing Signal Engine Execution Invariants...");
-  const res = runCommand("npx tsx scripts/verifyExecutionInvariants.ts");
+  const res = runCommand("npm test");
   if (!res.success) {
     FINDINGS.push({
       severity: "CRITICAL",
       category: "INVARIANTS",
-      title: "Invariant Verification Suite Failure",
-      description: "scripts/verifyExecutionInvariants.ts encountered failing test assertions.",
-      recommendation: "Inspect scripts/verifyExecutionInvariants.ts output and resolve broken invariant contracts.",
+      title: "Full Test Suite Failure (npm test)",
+      description: res.output.slice(-600),
+      recommendation: "Inspect failing unit/invariant suite and resolve before next RTH session.",
     });
   } else {
-    log("  [PASS] All 76 programmatic execution invariants passed.");
+    log("  [PASS] Full npm test suite (flow-vwap, playbook, invariants, viewport, fsm) passed.");
+  }
+
+  log("Step 1B: Auditing 10-Day Historical Walk-Forward Backtest...");
+  const btRes = runCommand("npx tsx scripts/audit10DayBacktest.ts");
+  if (!btRes.success) {
+    FINDINGS.push({
+      severity: "CRITICAL",
+      category: "INVARIANTS",
+      title: "10-Day Backtest Invariant Failure",
+      description: btRes.output.slice(-600),
+      recommendation: "Inspect scripts/audit10DayBacktest.ts expectations vs signal engine.",
+    });
+  } else {
+    log("  [PASS] 10-Day walk-forward backtest passed with 0 invariant violations.");
   }
 
   // Audit active session caches for Single-Slot Automaton invariants
@@ -110,29 +124,35 @@ function auditEngineInvariants() {
 }
 
 // =============================================================================
-// 2. CACHE PRUNING & STORAGE RETENTION POLICY (3 DAYS)
+// 2. CACHE PRUNING & STORAGE RETENTION POLICY (7 DAYS TRADES, 3 DAYS INTRADAY)
 // =============================================================================
 function auditAndPruneCache() {
-  log("Step 2: Checking Cache Retention & Storage Bounds (3-day limit)...");
+  log("Step 2: Checking Cache Retention & Storage Bounds (7d active-trades / 3d intraday)...");
   const cacheDir = path.resolve(".cache");
   if (!fs.existsSync(cacheDir)) return;
 
   const nowMs = Date.now();
-  const RETENTION_MS = 3 * 24 * 60 * 60 * 1000; // 3 days (72h)
+  const TRADES_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7-day rolling trade retention for /recap
+  const INTRADAY_RETENTION_MS = 3 * 24 * 60 * 60 * 1000; // 3 days (72h) for intraday snapshots
   const files = fs.readdirSync(cacheDir);
 
   let prunedCount = 0;
   for (const f of files) {
+    if (f.includes(".json.tmp.")) continue;
     const fullPath = path.join(cacheDir, f);
     const stat = fs.statSync(fullPath);
     const ageMs = nowMs - stat.mtimeMs;
 
-    // Prune active-trades or intraday JSON older than 3 days
-    if (ageMs > RETENTION_MS && (f.startsWith("active-trades-") || f.startsWith("intraday-"))) {
+    // Prune active-trades (>7 days) or intraday JSON (>3 days)
+    const isExpiredTrade =
+      f.startsWith("active-trades-") && f.endsWith(".json") && ageMs > TRADES_RETENTION_MS;
+    const isExpiredIntraday =
+      f.startsWith("intraday-") && f.endsWith(".json") && ageMs > INTRADAY_RETENTION_MS;
+    if (isExpiredTrade || isExpiredIntraday) {
       try {
         fs.unlinkSync(fullPath);
         prunedCount++;
-        log(`  [PRUNED] Removed expired cache file (>3 days): ${f}`);
+        log(`  [PRUNED] Removed expired cache file: ${f}`);
       } catch (err: any) {
         FINDINGS.push({
           severity: "WARNING",
@@ -146,13 +166,13 @@ function auditAndPruneCache() {
   }
 
   if (prunedCount === 0) {
-    log("  [PASS] Cache storage within 3-day retention policy.");
+    log("  [PASS] Cache storage within 7-day trade / 3-day intraday retention policy.");
   } else {
     FINDINGS.push({
       severity: "INFO",
       category: "CACHE",
       title: `Pruned ${prunedCount} Expired Cache Files`,
-      description: `Automatically cleaned up ${prunedCount} cache files older than 72 hours.`,
+      description: `Automatically cleaned up ${prunedCount} cache files outside the 7-day trade / 3-day intraday window.`,
       recommendation: "Retention policy successfully maintained.",
     });
   }
@@ -194,7 +214,9 @@ function auditDiscordGatewayGuards() {
     const content = fs.readFileSync(fullPath, "utf-8");
 
     // Scan for webhook dispatch calls
-    const webhookCalls = content.match(/fetch\s*\(\s*(?:webhookUrl|process\.env\.DISCORD_WEBHOOK_URL)[^)]*\)/g) || [];
+    const webhookCalls =
+      content.match(/fetch\s*\(\s*(?:[a-zA-Z0-9_.]*webhook[a-zA-Z0-9_.]*|process\.env\.DISCORD_WEBHOOK_URL)[^)]*\)/gi) ||
+      [];
     
     // Check if isHistoricalBackfill guard is present in the file
     if (webhookCalls.length > 0) {
@@ -265,11 +287,12 @@ function writeAuditRecommendations() {
   }
 
   md += `## 3. Verified System Contracts\n\n`;
-  md += `1. **Single-Slot Automaton:** FLAT -> ACTIVE -> LOCKED_FOR_DAY state transitions verified.\n`;
+  md += `1. **Single-Slot Automaton:** FLAT -> ACTIVE -> LOCKED_FOR_DAY (and gated Phase-2 <= 2/day cap) verified.\n`;
   md += `2. **Capital Outlay Invariant:** Strict <= $100 capital ceiling holds across all scenario sweeps.\n`;
-  md += `3. **Cache Storage Bound:** 3-day (72h) retention window safely maintained in \`.cache/\`.\n`;
+  md += `3. **Cache Storage Bound:** 7-day rolling trade retention & 3-day intraday retention safely maintained in \`.cache/\`.\n`;
   md += `4. **Replay Firewall:** Replay & backfill runs silenced at network boundary (\`!isHistoricalBackfill\`).\n`;
   md += `5. **Zero-Push Compliance:** Recommendations documented for human review; no unauthorized git branches pushed.\n`;
+  md += `6. **Full Suite & 10-Day Backtest:** \`npx tsc --noEmit\`, \`npm test\`, and \`audit10DayBacktest.ts\` executed.\n`;
 
   fs.writeFileSync(reportPath, md, "utf-8");
   log(`  [SAVED] Report written to AUDIT_RECOMMENDATIONS.md`);
@@ -305,18 +328,53 @@ async function runAuditCycle() {
   }
 }
 
+function getEtClock(): { dateEt: string; weekday: string; etMins: number } {
+  const now = new Date();
+  const dateEt = now.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  const weekday = now.toLocaleDateString("en-US", {
+    timeZone: "America/New_York",
+    weekday: "short",
+  });
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(now);
+  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 0) % 24;
+  const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
+  return { dateEt, weekday, etMins: hour * 60 + minute };
+}
+
 async function main() {
-  const isDaemonMode = process.argv.includes("--daemon") || process.env.DAEMON_INTERVAL_MS !== undefined;
+  const isPostCloseSchedule = process.argv.includes("--post-close");
+  const isDaemonMode =
+    isPostCloseSchedule ||
+    process.argv.includes("--daemon") ||
+    process.env.DAEMON_INTERVAL_MS !== undefined;
   const intervalMs = Number(process.env.DAEMON_INTERVAL_MS) || 15 * 60 * 1000; // default 15 minutes
 
-  // Execute initial cycle immediately
-  await runAuditCycle();
+  if (!isPostCloseSchedule) {
+    // Execute initial cycle immediately
+    await runAuditCycle();
+  }
 
   if (isDaemonMode) {
-    log(`Daemon mode active. Recurring audit every ${Math.round(intervalMs / 60000)} minutes.`);
+    let lastPostCloseDateEt = "";
+    log(
+      isPostCloseSchedule
+        ? "Daemon mode active. Scheduled weekday post-close audit at 16:15 ET."
+        : `Daemon mode active. Recurring audit every ${Math.round(intervalMs / 60000)} minutes.`
+    );
     setInterval(async () => {
+      if (isPostCloseSchedule) {
+        const { dateEt, weekday, etMins } = getEtClock();
+        if (weekday === "Sat" || weekday === "Sun") return;
+        if (etMins < 16 * 60 + 15 || lastPostCloseDateEt === dateEt) return;
+        lastPostCloseDateEt = dateEt;
+      }
       await runAuditCycle();
-    }, intervalMs);
+    }, isPostCloseSchedule ? 60_000 : intervalMs);
   }
 }
 

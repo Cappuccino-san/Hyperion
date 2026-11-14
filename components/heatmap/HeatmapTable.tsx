@@ -235,12 +235,7 @@ export function HeatmapTable() {
   // 4-Horizon Expected Move bounds (Daily D, Weekly W, Monthly M, Annual A)
   const emHorizons = useMemo(() => {
     const approx = (days: number) =>
-      0.85 *
-      spotPrice *
-      impliedVolatility *
-      Math.sqrt(days / 252) *
-      Math.sqrt(2 / Math.PI) *
-      2;
+      spotPrice * (impliedVolatility / Math.sqrt(252)) * Math.sqrt(days);
 
     const dLow = expectedMoves?.daily?.low ?? spotPrice - approx(1);
     const dHigh = expectedMoves?.daily?.high ?? spotPrice + approx(1);
@@ -255,7 +250,7 @@ export function HeatmapTable() {
       low: number;
       high: number;
     }[] = [
-      { code: "D", color: "#ffffff", low: dLow, high: dHigh },
+      { code: "D", color: "#cbd5e1", low: dLow, high: dHigh },
       { code: "W", color: "#facc15", low: wLow, high: wHigh },
       { code: "M", color: "#fb923c", low: mLow, high: mHigh },
     ];
@@ -264,16 +259,7 @@ export function HeatmapTable() {
       activeTicker.toUpperCase()
     );
 
-    const annual = isAnnualSupported
-      ? (expectedMoves?.annual ??
-        (activeTicker === "SPY"
-          ? { low: 567.74, high: 796.1 }
-          : activeTicker === "SPXW" || activeTicker === "SPX"
-            ? { low: 5677.4, high: 7961.0 }
-            : activeTicker === "QQQ"
-              ? { low: 487.45, high: 704.35 }
-              : null))
-      : null;
+    const annual = isAnnualSupported ? (expectedMoves?.annual ?? null) : null;
 
     if (annual) {
       list.push({
@@ -301,8 +287,19 @@ export function HeatmapTable() {
     });
 
     const assignEmMarkers = (strikesList: { strike: number }[]) => {
-      const findNearestIdx = (target: number) => {
-        let bestIdx = 0;
+      const multiMap = new Map<number, EmMarkerTag[]>();
+      if (strikesList.length === 0) return multiMap;
+
+      let strikeStep = Infinity;
+      for (let i = 1; i < strikesList.length; i++) {
+        const diff = Math.abs(strikesList[i].strike - strikesList[i - 1].strike);
+        if (diff > 0 && diff < strikeStep) strikeStep = diff;
+      }
+      if (!Number.isFinite(strikeStep)) strikeStep = 1;
+
+      const findNearestIdx = (target: number): number | null => {
+        if (!Number.isFinite(target) || target <= 0) return null;
+        let bestIdx = -1;
         let bestDiff = Infinity;
         strikesList.forEach((r, idx) => {
           const d = Math.abs(r.strike - target);
@@ -311,10 +308,12 @@ export function HeatmapTable() {
             bestIdx = idx;
           }
         });
+        if (bestIdx < 0 || bestDiff > Math.max(strikeStep * 2, 1)) {
+          return null;
+        }
         return bestIdx;
       };
 
-      const multiMap = new Map<number, EmMarkerTag[]>();
       const pushTag = (idx: number, item: EmMarkerTag) => {
         const arr = multiMap.get(idx) ?? [];
         arr.push(item);
@@ -322,16 +321,22 @@ export function HeatmapTable() {
       };
 
       for (const h of emHorizons) {
-        pushTag(findNearestIdx(h.high), {
-          tag: `${h.code}↑`,
-          color: h.color,
-          side: "high",
-        });
-        pushTag(findNearestIdx(h.low), {
-          tag: `${h.code}↓`,
-          color: h.color,
-          side: "low",
-        });
+        const highIdx = findNearestIdx(h.high);
+        if (highIdx !== null) {
+          pushTag(highIdx, {
+            tag: `${h.code}↑`,
+            color: h.color,
+            side: "high",
+          });
+        }
+        const lowIdx = findNearestIdx(h.low);
+        if (lowIdx !== null) {
+          pushTag(lowIdx, {
+            tag: `${h.code}↓`,
+            color: h.color,
+            side: "low",
+          });
+        }
       }
       return multiMap;
     };
@@ -629,7 +634,6 @@ export function HeatmapTable() {
               `${row.original.strike}_${expCol.id}`
             );
             const showTopRightBadge =
-              metric === "GEX" &&
               cellMode === "Value" &&
               !isZeroCell &&
               (isTopFive || isNearSpot) &&
@@ -697,7 +701,7 @@ export function HeatmapTable() {
                 {showTopRightBadge && (
                   <i
                     className={cn(
-                      "absolute top-[1px] right-[2px] z-10 not-italic text-[8px] font-bold leading-none px-[2px] py-[0.5px] rounded-[2px] bg-black/82 pointer-events-none",
+                      "absolute top-[3px] right-[2px] z-10 not-italic text-[8px] font-bold leading-none px-[2px] py-[0.5px] rounded-[2px] bg-black/82 pointer-events-none",
                       pctSinceOpen >= 0 ? "text-[#4ade80]" : "text-[#f87171]"
                     )}
                   >
@@ -1187,7 +1191,7 @@ export function HeatmapTable() {
         </div>
         <div className="flex flex-wrap items-center gap-2 text-slate-400">
           <span>EM Lines:</span>
-          <span className="text-white font-bold">D↑/D↓</span>
+          <span className="text-slate-300 font-bold">D↑/D↓</span>
           <span className="text-[#facc15] font-bold">W↑/W↓</span>
           <span className="text-[#fb923c] font-bold">M↑/M↓</span>
           <span className="text-[#f87171] font-bold">A↑/A↓</span>

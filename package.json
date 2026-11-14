@@ -14,6 +14,7 @@
     "test:viewport": "npx tsx --test lib/__tests__/viewportAndDurationInvariants.test.ts",
     "test:fsm": "npx tsx --test lib/__tests__/gaiaSignalFsm.test.ts",
     "test:fsm-optimize": "npx tsx scripts/validateFsmAdaptiveParams.ts",
+    "test:routes": "npx tsx scripts/verifyLiveRoutes.ts",
     "daemon:audit": "npx tsx scripts/autoImprovementDaemon.ts"
   },
   "dependencies": {

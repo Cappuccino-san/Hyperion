@@ -802,6 +802,8 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         flowGammaVwapData: null,
       };
     });
+    get().fetchOptionsChain(preset.ticker, true).catch(() => {});
+    get().fetchServerTrades(preset.ticker).catch(() => {});
     get().fetchFlowGammaVwap(preset.ticker).catch(() => {});
   },
 

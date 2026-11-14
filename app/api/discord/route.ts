@@ -256,6 +256,16 @@ export async function POST(req: NextRequest) {
         resultWord = "TAKE PROFIT HIT";
         resultEmoji = "💰";
         embedColor = 0x10b981;
+      } else if (
+        reasonUpper.includes("REVERSAL") ||
+        reasonUpper.includes("FLIP") ||
+        reasonUpper.includes("DIVERGENCE") ||
+        reasonUpper.includes("SCRATCH")
+      ) {
+        exitBadge = isWin ? "🔒 REVERSAL PROFIT LOCK" : "🔄 REGIME FLIP EXIT";
+        resultWord = isWin ? "REVERSAL PROFIT LOCK" : "REGIME PROTECT EXIT";
+        resultEmoji = isWin ? "🔒" : "🔄";
+        embedColor = isWin ? 0x10b981 : 0x3b82f6;
       } else if (reasonUpper.includes("TRAIL") || reasonUpper.includes("PROFIT LOCK") || reasonUpper.includes("RATCHET") || reasonUpper.includes("LOCK PROFIT")) {
         exitBadge = "🛡️ TRAILING PROFIT LOCKED";
         resultWord = "TRAILING PROFIT LOCKED";
@@ -273,11 +283,6 @@ export async function POST(req: NextRequest) {
         resultWord = isWin ? "3:55 PM EOD PROFIT EXIT" : "3:55 PM EOD CUTOFF";
         resultEmoji = isWin ? "💰" : "⏰";
         embedColor = isWin ? 0x10b981 : 0xf59e0b;
-      } else if (reasonUpper.includes("REVERSAL") || reasonUpper.includes("FLIP")) {
-        exitBadge = "🔄 REGIME FLIP EXIT";
-        resultWord = isWin ? "REGIME PROFIT EXIT" : "REGIME PROTECT EXIT";
-        resultEmoji = isWin ? "💰" : "🔄";
-        embedColor = isWin ? 0x10b981 : 0x3b82f6;
       } else if (reasonUpper.includes("BREAKEVEN")) {
         exitBadge = "⚪ BREAKEVEN STOP";
         resultWord = "BREAKEVEN STOP";

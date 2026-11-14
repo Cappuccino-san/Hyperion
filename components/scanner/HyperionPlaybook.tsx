@@ -44,12 +44,13 @@ export function HyperionPlaybook({
   const payload = storePayload || localPayload;
 
   const handleTickerSelect = (ticker: string) => {
+    const sym = ticker.trim().toUpperCase();
     if (onSelectTicker) {
-      onSelectTicker(ticker);
+      onSelectTicker(sym);
     } else {
-      setDashboardTicker(ticker);
-      setActiveView("Heatmap");
-      router.push("/");
+      setDashboardTicker(sym);
+      setActiveView("Gaia");
+      router.push(`/gaia?ticker=${encodeURIComponent(sym)}`);
     }
   };
 

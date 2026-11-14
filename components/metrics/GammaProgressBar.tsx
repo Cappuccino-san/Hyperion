@@ -10,6 +10,9 @@ interface GammaProgressBarProps {
 
 export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
   const spotPrice = useDashboardStore((state) => state.spotPrice);
+  const liveTickPrice = useDashboardStore((state) => state.liveTickPrice);
+  const effectiveSpot =
+    liveTickPrice && liveTickPrice > 0 ? liveTickPrice : spotPrice;
   const {
     putWall,
     putWallGex,
@@ -23,29 +26,32 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
 
   const lowBound = Math.min(putWall, callWall);
   const highBound = Math.max(putWall, callWall);
-  const span = Math.max(0.01, highBound - lowBound);
+  const hasValidWalls = lowBound > 0 && highBound > lowBound;
+  const span = hasValidWalls ? Math.max(0.01, highBound - lowBound) : 1;
 
-  const rawPct = ((spotPrice - lowBound) / span) * 100;
+  const rawPct = hasValidWalls ? ((effectiveSpot - lowBound) / span) * 100 : 50;
   const percentage = Math.min(100, Math.max(0, rawPct));
-  const zeroGammaPct = Math.min(
-    100,
-    Math.max(0, ((zeroGamma - lowBound) / span) * 100)
-  );
+  const zeroGammaPct = hasValidWalls
+    ? Math.min(100, Math.max(0, ((zeroGamma - lowBound) / span) * 100))
+    : 50;
   const showZgTick =
-    hasZeroGammaFlip && zeroGamma >= lowBound && zeroGamma <= highBound;
+    hasValidWalls &&
+    hasZeroGammaFlip &&
+    zeroGamma >= lowBound &&
+    zeroGamma <= highBound;
   const activeKingStrike = kingNode.filteredKing ?? kingNode.allExpKing;
-  const kingPct = Math.min(
-    100,
-    Math.max(0, ((activeKingStrike - lowBound) / span) * 100)
-  );
+  const kingPct = hasValidWalls
+    ? Math.min(100, Math.max(0, ((activeKingStrike - lowBound) / span) * 100))
+    : 50;
   const showKingMarker =
-    activeKingStrike >= lowBound && activeKingStrike <= highBound;
+    hasValidWalls && activeKingStrike >= lowBound && activeKingStrike <= highBound;
 
-  const positionMessage =
-    spotPrice > highBound
-      ? `spot $${(spotPrice - highBound).toFixed(2)} above the upper wall`
-      : spotPrice < lowBound
-        ? `spot $${(lowBound - spotPrice).toFixed(2)} below the lower wall`
+  const positionMessage = !hasValidWalls
+    ? "awaiting structural walls"
+    : effectiveSpot > highBound
+      ? `spot $${(effectiveSpot - highBound).toFixed(2)} above the upper wall`
+      : effectiveSpot < lowBound
+        ? `spot $${(lowBound - effectiveSpot).toFixed(2)} below the lower wall`
         : `${Math.round(percentage)}% of the way from put wall to call wall`;
 
   const isContested = kingNode.isContested || allExpKingNode?.isContested;
@@ -65,7 +71,7 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
             CALL WALL
           </div>
           <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#22d3ee] tabular-nums">
-            {callWall.toFixed(callWall % 1 !== 0 ? 2 : 0)}
+            {callWall > 0 ? callWall.toFixed(callWall % 1 !== 0 ? 2 : 0) : "—"}
           </div>
           <div className="text-[11px] font-mono text-slate-400">
             {callWallGex !== undefined && callWallGex !== 0
@@ -80,7 +86,7 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
             PUT WALL
           </div>
           <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#e879f9] tabular-nums">
-            {putWall.toFixed(putWall % 1 !== 0 ? 2 : 0)}
+            {putWall > 0 ? putWall.toFixed(putWall % 1 !== 0 ? 2 : 0) : "—"}
           </div>
           <div className="text-[11px] font-mono text-slate-400">
             {putWallGex !== undefined && putWallGex !== 0
@@ -99,7 +105,7 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
           </div>
           <div className="text-[11px] font-mono text-slate-400">
             {hasZeroGammaFlip
-              ? spotPrice >= zeroGamma
+              ? effectiveSpot >= zeroGamma
                 ? "spot above"
                 : "spot below"
               : "no flip"}
@@ -127,7 +133,7 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
             style={{ left: `${percentage}%` }}
           >
             <div className="rounded-md bg-[#1c223a] border border-[#5e72e4] px-2 py-0.5 text-[10px] font-mono font-bold text-white shadow-[0_0_12px_rgba(94,114,228,0.8)] whitespace-nowrap">
-              ${spotPrice.toFixed(2)}
+              ${effectiveSpot.toFixed(2)}
             </div>
           </div>
 

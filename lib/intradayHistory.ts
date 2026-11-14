@@ -26,8 +26,15 @@ export interface IntradayAlert {
   type: "call" | "put" | "zero" | "king";
 }
 
+const RTH_START_MINS = 9 * 60 + 30; // 09:30 ET
+const RTH_END_MINS = 16 * 60;       // 16:00 ET (exclusive)
+const MAX_RTH_SNAPSHOTS = 1600;     // Covers full 6.5h RTH session at 15s cadence
+const MAX_EXT_SNAPSHOTS = 250;      // Rolling extended-hours ring buffer
+
 export interface TickerIntradayData {
   history: IntradayHistoryPoint[];
+  rthHistory?: IntradayHistoryPoint[];
+  extHistory?: IntradayHistoryPoint[];
   alerts: IntradayAlert[];
   lastBackfillAttempt?: number;
   officialLevels?: {
@@ -80,6 +87,49 @@ export function formatTimeEt(dateOrTs: Date | number): string {
   } catch {
     return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   }
+}
+
+export function getEtMinutesFromTs(tsSec: number): number {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date(tsSec * 1000));
+    const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 0) % 24;
+    const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
+    return hour * 60 + minute;
+  } catch {
+    const d = new Date(tsSec * 1000);
+    return d.getHours() * 60 + d.getMinutes();
+  }
+}
+
+export function isRthTimestampEt(tsSec: number): boolean {
+  const etMins = getEtMinutesFromTs(tsSec);
+  return etMins >= RTH_START_MINS && etMins < RTH_END_MINS;
+}
+
+function ensurePartitionedHistory(tickerData: TickerIntradayData): {
+  rth: IntradayHistoryPoint[];
+  ext: IntradayHistoryPoint[];
+} {
+  if (Array.isArray(tickerData.rthHistory) && Array.isArray(tickerData.extHistory)) {
+    return { rth: tickerData.rthHistory, ext: tickerData.extHistory };
+  }
+  const rth: IntradayHistoryPoint[] = [];
+  const ext: IntradayHistoryPoint[] = [];
+  for (const pt of tickerData.history ?? []) {
+    if (isRthTimestampEt(pt.ts)) rth.push(pt);
+    else ext.push(pt);
+  }
+  tickerData.rthHistory = rth.slice(-MAX_RTH_SNAPSHOTS);
+  tickerData.extHistory = ext.slice(-MAX_EXT_SNAPSHOTS);
+  tickerData.history = [...tickerData.rthHistory, ...tickerData.extHistory].sort(
+    (a, b) => a.ts - b.ts
+  );
+  return { rth: tickerData.rthHistory, ext: tickerData.extHistory };
 }
 
 function loadStore(): DailyStore {
@@ -194,15 +244,24 @@ async function backfillFromTerraShade(
         }
       );
 
-      // Merge avoiding duplicate timestamps
-      const existingTs = new Set(tickerData.history.map((item) => item.ts));
+      // Merge avoiding duplicate timestamps into partitioned RTH vs Extended-Hours arrays
+      const { rth, ext } = ensurePartitionedHistory(tickerData);
+      const existingTs = new Set([...rth, ...ext].map((item) => item.ts));
       for (const item of backfilledHistory) {
         if (!existingTs.has(item.ts)) {
-          tickerData.history.push(item);
+          if (isRthTimestampEt(item.ts)) rth.push(item);
+          else ext.push(item);
           existingTs.add(item.ts);
         }
       }
-      tickerData.history.sort((a, b) => a.ts - b.ts);
+      rth.sort((a, b) => a.ts - b.ts);
+      ext.sort((a, b) => a.ts - b.ts);
+      tickerData.rthHistory = rth.slice(-MAX_RTH_SNAPSHOTS);
+      tickerData.extHistory = ext.slice(-MAX_EXT_SNAPSHOTS);
+      tickerData.history = [
+        ...tickerData.rthHistory,
+        ...tickerData.extHistory,
+      ].sort((a, b) => a.ts - b.ts);
     }
 
     if (Array.isArray(data.alerts) && data.alerts.length > 0) {
@@ -266,8 +325,11 @@ export async function recordIntradaySnapshot(params: {
   putWall: number;
   zeroGamma: number;
   allExpKing?: number;
+  nowMs?: number;
 }): Promise<{
   history: IntradayHistoryPoint[];
+  rthHistory?: IntradayHistoryPoint[];
+  extHistory?: IntradayHistoryPoint[];
   alerts: IntradayAlert[];
   officialLevels?: {
     callWall: number;
@@ -292,17 +354,23 @@ export async function recordIntradaySnapshot(params: {
 
   const tickerData = store.tickers[sym] ?? {
     history: [],
+    rthHistory: [],
+    extHistory: [],
     alerts: [],
     lastBackfillAttempt: 0,
   };
+  const { rth, ext } = ensurePartitionedHistory(tickerData);
 
-  const now = Date.now();
+  const now = params.nowMs ?? Date.now();
   const nowSec = Math.floor(now / 1000);
+  const isRthTick = isRthTimestampEt(nowSec);
+  const targetBucket = isRthTick ? rth : ext;
   const timeStr = formatTimeEt(nowSec);
   const tStr =
     new Date(now).toISOString().replace("T", " ").slice(0, 16) + " UTC";
 
   const prev = tickerData.history[tickerData.history.length - 1];
+  const bucketPrev = targetBucket[targetBucket.length - 1];
 
   // 1. Detect transition alerts
   if (prev) {
@@ -391,14 +459,14 @@ export async function recordIntradaySnapshot(params: {
     }
   }
 
-  // 2. Append snapshot if 15s passed or values changed
+  // 2. Append snapshot if 15s passed in target session partition or values changed
   const shouldAppend =
-    !prev ||
-    nowSec - prev.ts >= 15 ||
-    Math.abs(prev.spot - spotPrice) >= 0.05 ||
-    prev.cw !== callWall ||
-    prev.pw !== putWall ||
-    (allExpKing !== undefined && prev.king !== allExpKing);
+    !bucketPrev ||
+    nowSec - bucketPrev.ts >= 15 ||
+    Math.abs(bucketPrev.spot - spotPrice) >= 0.05 ||
+    bucketPrev.cw !== callWall ||
+    bucketPrev.pw !== putWall ||
+    (allExpKing !== undefined && bucketPrev.king !== allExpKing);
 
   if (shouldAppend) {
     const newPoint: IntradayHistoryPoint = {
@@ -414,11 +482,17 @@ export async function recordIntradaySnapshot(params: {
       zeroGamma: Number(zeroGamma.toFixed(2)),
       king: allExpKing,
     };
-    tickerData.history.push(newPoint);
+    targetBucket.push(newPoint);
 
-    if (tickerData.history.length > 500) {
-      tickerData.history = tickerData.history.slice(-500);
+    if (isRthTick && rth.length > MAX_RTH_SNAPSHOTS) {
+      tickerData.rthHistory = rth.slice(-MAX_RTH_SNAPSHOTS);
+    } else if (!isRthTick && ext.length > MAX_EXT_SNAPSHOTS) {
+      tickerData.extHistory = ext.slice(-MAX_EXT_SNAPSHOTS);
     }
+    tickerData.history = [
+      ...(tickerData.rthHistory ?? rth),
+      ...(tickerData.extHistory ?? ext),
+    ].sort((a, b) => a.ts - b.ts);
   }
 
   store.tickers[sym] = tickerData;
@@ -426,6 +500,8 @@ export async function recordIntradaySnapshot(params: {
 
   return {
     history: tickerData.history,
+    rthHistory: tickerData.rthHistory,
+    extHistory: tickerData.extHistory,
     alerts: tickerData.alerts,
     officialLevels: tickerData.officialLevels,
   };

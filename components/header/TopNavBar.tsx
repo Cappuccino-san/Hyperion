@@ -8,6 +8,7 @@ import { GuideModal } from "@/components/modals/GuideModal";
 import { CheatCodesModal } from "@/components/modals/CheatCodesModal";
 import { SetupModal } from "@/components/modals/SetupModal";
 import { CommandPalette } from "@/components/CommandPalette";
+import { ExpectedMovesBadges } from "@/components/header/ExpectedMovesBadges";
 import { cn } from "@/lib/utils";
 
 const VIEW_TABS: ActiveView[] = ["Heatmap", "Quad", "Gaia", "Scanner", "Recap"];
@@ -303,7 +304,7 @@ export function TopNavBar() {
   return (
     <>
       <header className="w-full bg-[#0b0d17]/95 backdrop-blur-md">
-        <div className="max-w-[1080px] mx-auto px-4 pt-3 pb-2 space-y-2.5">
+        <div className="max-w-7xl mx-auto px-4 pt-3 pb-2 space-y-2.5">
           {/* Brand & Top Action Links Row */}
           <div className="flex flex-wrap items-center justify-between gap-3">
             {/* Left: Hyperion solar/orbital icon + Brand */}
@@ -507,6 +508,12 @@ export function TopNavBar() {
               </span>
             </div>
           </div>
+
+          {activeView !== "Heatmap" && (
+            <div className="pt-1 border-t border-white/5">
+              <ExpectedMovesBadges />
+            </div>
+          )}
         </div>
       </header>
 

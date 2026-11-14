@@ -78,7 +78,7 @@ export function PlaybookCard({ pick, rank, liveSpot, onSelectTicker }: PlaybookC
               type="button"
               onClick={() => onSelectTicker?.(pick.ticker)}
               className="group/t inline-flex items-center gap-1.5 text-lg font-black text-white hover:text-cyan-400 transition-colors"
-              title={`View ${pick.ticker} Heatmap`}
+              title={`Open ${pick.ticker} in Gaia`}
             >
               <span>{pick.ticker}</span>
               <ExternalLink className="w-3.5 h-3.5 opacity-0 group-hover/t:opacity-100 transition-opacity text-cyan-400" />
@@ -365,7 +365,7 @@ export function PlaybookCard({ pick, rank, liveSpot, onSelectTicker }: PlaybookC
             onClick={() => onSelectTicker(pick.ticker)}
             className="inline-flex items-center gap-1 text-[11px] font-semibold text-cyan-400 hover:text-cyan-300 transition-colors cursor-pointer"
           >
-            <span>Open {pick.ticker} Heatmap</span>
+            <span>Open {pick.ticker} Gaia</span>
             <ExternalLink className="w-3 h-3" />
           </button>
         )}

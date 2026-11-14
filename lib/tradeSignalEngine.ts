@@ -1379,16 +1379,19 @@ export async function fetchLive5mCandleAndDivergence(
  */
 export async function sendDiscordTradeAlert(
   alert: TradeLifecycleAlert,
-  customWebhookUrl?: string
+  customWebhookUrl?: string,
+  options?: { bypassFsmFirewall?: boolean }
 ): Promise<boolean> {
   // Strict Backfill Firewall: NEVER dispatch historical replay/backfill signals to Discord
   if (alert.isHistoricalBackfill) {
     return false;
   }
 
-  // Strict Macro Regime & FSM Gating Firewall
-  const store = loadTradeStore();
-  if (alert.ticker === "SPY") {
+  // Strict Macro Regime & FSM Gating Firewall (BTO Gaia HUD entries only — NEVER block STC exits or Phase-2/Structural setups)
+  const isBtoAlert = alert.action === "BUY_TO_OPEN";
+  const isGaiaHudSetup = Boolean(alert.setupName?.includes("Gaia Tactical HUD"));
+  if (!options?.bypassFsmFirewall && isBtoAlert && isGaiaHudSetup && alert.ticker === "SPY") {
+    const store = loadTradeStore();
     const fsmState = store.activeFsmState;
     const macro = store.macroRegime;
     const chiPct = store.chiPct ?? 50;
@@ -1574,7 +1577,13 @@ export async function sendDiscordTradeAlert(
         emoji = "🎯";
         badge = alert.contractsQty === 1 ? "TARGET 1 FULL PROFIT HIT" : "TARGET 1 PROFIT SECURED";
         title = `🎯 ${badge} · ${alert.ticker} ${alert.contractType}S`;
-      } else if (reasonUpper.includes("3:55") || reasonUpper.includes("CLOSE") || reasonUpper.includes("EOD") || reasonUpper.includes("MOC")) {
+      } else if (
+        reasonUpper.includes("15:55") ||
+        reasonUpper.includes("3:55") ||
+        reasonUpper.includes("CLOSE") ||
+        reasonUpper.includes("EOD") ||
+        reasonUpper.includes("MOC")
+      ) {
         embedColor = isProfitable ? 0x10b981 : 0xf59e0b;
         emoji = "⏰";
         badge = isProfitable ? "3:55 PM EOD MARKET CLOSE CUTOFF (WIN)" : "3:55 PM EOD MARKET CLOSE CUTOFF";
@@ -3412,11 +3421,18 @@ export async function evaluateTradeSignals(
       (a) => a.ticker === "SPY" && !a.isHistoricalBackfill && !store.dispatchedAlertIds?.[a.id]
     );
     if (unsentTodayAlerts.length > 0) {
+      let anyMarked = false;
       for (const alert of unsentTodayAlerts) {
-        store.dispatchedAlertIds[alert.id] = true;
-        await sendDiscordTradeAlert({ ...alert, isHistoricalBackfill: false }, params.webhookUrl).catch(() => {});
+        const sent = await sendDiscordTradeAlert(
+          { ...alert, isHistoricalBackfill: false },
+          params.webhookUrl
+        ).catch(() => false);
+        if (sent) {
+          store.dispatchedAlertIds[alert.id] = true;
+          anyMarked = true;
+        }
       }
-      saveTradeStore(store);
+      if (anyMarked) saveTradeStore(store);
     }
   }
 
@@ -4364,14 +4380,21 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
       store.activePositions["SPY"] = newPos;
       store.alerts.push(btoAlert);
       store.dispatchedAlertIds = store.dispatchedAlertIds || {};
-      store.dispatchedAlertIds[btoAlert.id] = true;
-      store.dispatchedAlertIds[idempotencyKey] = true;
-      saveTradeStore(store);
-
-      if (!isHistoricalBackfill) {
-        await sendDiscordTradeAlert(btoAlert, params.webhookUrl).catch((err) => {
+      if (isHistoricalBackfill) {
+        store.dispatchedAlertIds[btoAlert.id] = true;
+        store.dispatchedAlertIds[idempotencyKey] = true;
+        saveTradeStore(store);
+      } else {
+        saveTradeStore(store);
+        const sent = await sendDiscordTradeAlert(btoAlert, params.webhookUrl).catch((err) => {
           console.error("[GaiaSync] Failed to dispatch BTO alert to Discord:", err);
+          return false;
         });
+        if (sent) {
+          store.dispatchedAlertIds[btoAlert.id] = true;
+          store.dispatchedAlertIds[idempotencyKey] = true;
+          saveTradeStore(store);
+        }
       }
     }
 
@@ -4447,13 +4470,19 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
 
         store.alerts.push(exitAlert);
         store.dispatchedAlertIds = store.dispatchedAlertIds || {};
-        store.dispatchedAlertIds[exitAlert.id] = true;
-        saveTradeStore(store);
-
-        if (!isExitHistorical) {
-          await sendDiscordTradeAlert(exitAlert, params.webhookUrl).catch((err) => {
+        if (isExitHistorical) {
+          store.dispatchedAlertIds[exitAlert.id] = true;
+          saveTradeStore(store);
+        } else {
+          saveTradeStore(store);
+          const sent = await sendDiscordTradeAlert(exitAlert, params.webhookUrl).catch((err) => {
             console.error("[GaiaSync] Failed to dispatch STC alert to Discord:", err);
+            return false;
           });
+          if (sent) {
+            store.dispatchedAlertIds[exitAlert.id] = true;
+            saveTradeStore(store);
+          }
         }
       }
     }

@@ -117,7 +117,7 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
                   Hyperion Alerts · Discord Webhook Setup
                 </Dialog.Title>
                 <Dialog.Description className="text-xs font-mono text-slate-400">
-                  Deliver real-time Hyperion Alerts for gamma wall &amp; King node shifts straight to your Discord channel
+                  Deliver real-time BTO &amp; STC options trade signals (09:35–15:55 ET) straight to your Discord channel
                 </Dialog.Description>
               </div>
             </div>
@@ -176,56 +176,27 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
               </div>
 
               <div className="space-y-2.5 pt-1">
-                <label className="flex items-center gap-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={notifyWalls}
-                    onChange={(e) => setNotifyWalls(e.target.checked)}
-                    className="h-4 w-4 rounded border-white/20 bg-[#111422] text-[#5e72e4] focus:ring-0"
-                  />
-                  <div>
-                    <div className="font-mono font-bold text-slate-200">
-                      Call & Put Wall Shifts
-                    </div>
-                    <div className="text-[11px] font-mono text-slate-400">
-                      Notify when dealer call or put resistance levels migrate.
-                    </div>
+                <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2">
+                  <div className="font-mono font-bold text-emerald-300">
+                    🟢 BUY TO OPEN (CALL &amp; PUT) · 09:35–14:30 ET
                   </div>
-                </label>
+                  <div className="text-[11px] font-mono text-slate-400">
+                    Live RTH small-account sniper entries (1 contract, Flux-Field + Wall confluence). Historical backfills are silenced.
+                  </div>
+                </div>
 
-                <label className="flex items-center gap-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={notifyZeroGamma}
-                    onChange={(e) => setNotifyZeroGamma(e.target.checked)}
-                    className="h-4 w-4 rounded border-white/20 bg-[#111422] text-[#5e72e4] focus:ring-0"
-                  />
-                  <div>
-                    <div className="font-mono font-bold text-slate-200">
-                      Zero γ (Gamma Flip) Crossings
-                    </div>
-                    <div className="text-[11px] font-mono text-slate-400">
-                      Notify when spot flips between positive chop and negative volatility regimes.
-                    </div>
+                <div className="rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2">
+                  <div className="font-mono font-bold text-amber-300">
+                    🎯 SELL TO CLOSE (TP / Trail / Reversal / SL / 15:55 MOC)
                   </div>
-                </label>
+                  <div className="text-[11px] font-mono text-slate-400">
+                    Real-time profit locks, trailing ratchets, stop losses, and mandatory 15:55 ET Market-On-Close exits.
+                  </div>
+                </div>
 
-                <label className="flex items-center gap-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={notifyKing}
-                    onChange={(e) => setNotifyKing(e.target.checked)}
-                    className="h-4 w-4 rounded border-white/20 bg-[#111422] text-[#5e72e4] focus:ring-0"
-                  />
-                  <div>
-                    <div className="font-mono font-bold text-slate-200">
-                      King Node Migration
-                    </div>
-                    <div className="text-[11px] font-mono text-slate-400">
-                      Notify when the all-expirations magnetic King strike shifts.
-                    </div>
-                  </div>
-                </label>
+                <div className="text-[10.5px] font-mono text-slate-500 pt-0.5">
+                  Legacy structural wall / Zero-γ / King alerts are silenced in Discord so #trade-signals stays 100% actionable.
+                </div>
               </div>
             </div>
 

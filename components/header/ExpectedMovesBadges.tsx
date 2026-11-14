@@ -63,21 +63,14 @@ export function ExpectedMovesBadges() {
   );
 
   const annualObj = isAnnualSupported
-    ? (expectedMoves?.annual ??
-      (activeTicker === "SPY"
-        ? { exp: "2026", em: 114.18, pct: 16.75, low: 567.74, high: 796.1, fixed: true }
-        : activeTicker === "SPXW" || activeTicker === "SPX"
-          ? { exp: "2026", em: 1141.8, pct: 16.75, low: 5677.4, high: 7961.0, fixed: true }
-          : activeTicker === "QQQ"
-            ? { exp: "2026", em: 108.45, pct: 18.2, low: 487.45, high: 704.35, fixed: true }
-            : null))
+    ? (expectedMoves?.annual ?? null)
     : null;
 
   return (
-    <div className="flex flex-wrap items-center gap-2 pt-2">
-      {/* Daily (D) - White */}
-      <div className="inline-flex items-center gap-1.5 rounded-full border border-[#ffffff] bg-[#111520] text-slate-200 px-3 py-1 text-[11px] font-mono tabular-nums">
-        <b className="font-bold text-white">Daily</b>
+    <div className="flex flex-wrap items-center gap-2">
+      {/* Daily (D) - Silver */}
+      <div className="inline-flex items-center gap-1.5 rounded-full border border-slate-300/75 bg-[#111520] text-slate-200 px-3 py-1 text-[11px] font-mono tabular-nums">
+        <b className="font-bold text-slate-200">Daily</b>
         <span className="font-semibold">±${dailyEm.toFixed(2)}</span>
         <span className="opacity-90">
           ({dailyLow.toFixed(2)}–{dailyHigh.toFixed(2)})
@@ -109,7 +102,7 @@ export function ExpectedMovesBadges() {
       {annualObj && (
         <div
           className={cn(
-            "inline-flex items-center gap-1.5 rounded-full border border-[#f87171] bg-[#111520] text-slate-200 px-3 py-1 text-[11px] font-mono tabular-nums"
+            "inline-flex items-center gap-1.5 rounded-full border border-[#ef4444] bg-[#111520] text-slate-200 px-3 py-1 text-[11px] font-mono tabular-nums"
           )}
         >
           <b className="font-bold text-[#f87171]">Annual {annualObj.exp}</b>
