@@ -648,56 +648,6 @@ export function GaiaView() {
     setPrzmHudSignals([]);
   }, [loadedTicker]);
 
-  // Dynamic Trade Signals Engine Hook for Gaia HUD & Canvas Execution Markers
-  useEffect(() => {
-    let isMounted = true;
-    async function fetchSignals() {
-      try {
-        const res = await fetch(`/api/signals?ticker=${encodeURIComponent(loadedTicker)}`, {
-          cache: "no-store",
-        });
-        if (!res.ok) return;
-        const data = await res.json();
-        if (isMounted && data) {
-          const payload: ServerTradesState = {
-            activePositions: data.activePositions || {},
-            closedPositions: data.closedPositions || [],
-            alerts: data.alerts || [],
-          };
-          setServerTrades(payload);
-          setStoreServerTrades(payload);
-
-          if (Array.isArray(data.alerts)) {
-            const mapped: GaiaHudTradeSignal[] = data.alerts
-              .filter(
-                (a: any) =>
-                  a.action === "BUY_TO_OPEN" &&
-                  !a.setupName?.includes("Gaia Tactical HUD") &&
-                  !a.id?.startsWith("gaia-spy-")
-              )
-              .map((a: any) => ({
-                timestamp: (a.ts || 0) * 1000,
-                action: a.action,
-                contractType: a.contractType,
-                spotPrice: a.btoSpotPrice || a.spotPrice,
-                setupName: a.setupName,
-                isWin: a.status === "TARGET_HIT" || (a.pnlOptionPct && a.pnlOptionPct > 0),
-              }));
-            setHudTradeSignals(mapped);
-          }
-        }
-      } catch {
-        // Silent fallback
-      }
-    }
-    fetchSignals();
-    const interval = setInterval(fetchSignals, 5000);
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
-    };
-  }, [loadedTicker, setStoreServerTrades]);
-
   const [livePayload, setLivePayload] = useState<GaiaLivePayload | null>(
     null
   );
@@ -995,6 +945,78 @@ export function GaiaView() {
     return buildLiveGaiaDataset(livePayload, exposureMode, expFilter);
   }, [livePayload, exposureMode, expFilter]);
 
+  const chartSessionDate = useMemo<string | undefined>(() => {
+    const candles = dataset?.candles;
+    if (candles && candles.length > 0) {
+      const lastTs = candles[candles.length - 1]?.timestamp;
+      if (typeof lastTs === "number" && Number.isFinite(lastTs) && lastTs > 0) {
+        const tsMs = lastTs > 1e11 ? lastTs : lastTs * 1000;
+        return new Intl.DateTimeFormat("en-CA", {
+          timeZone: "America/New_York",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+        }).format(new Date(tsMs));
+      }
+    }
+    const fallback = selectedSessionIso || livePayload?.sessionDate || dataset?.sessionDate;
+    return fallback && /^\d{4}-\d{2}-\d{2}$/.test(fallback) ? fallback : undefined;
+  }, [dataset?.candles, dataset?.sessionDate, selectedSessionIso, livePayload?.sessionDate]);
+
+  // Dynamic Trade Signals Engine Hook for Gaia HUD & Canvas Execution Markers
+  useEffect(() => {
+    let isMounted = true;
+    async function fetchSignals() {
+      try {
+        const dateParam = chartSessionDate ? `&date=${encodeURIComponent(chartSessionDate)}` : "";
+        const res = await fetch(
+          `/api/signals?ticker=${encodeURIComponent(loadedTicker)}${dateParam}`,
+          {
+            cache: "no-store",
+          }
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        if (isMounted && data) {
+          const payload: ServerTradesState = {
+            activePositions: data.activePositions || {},
+            closedPositions: data.closedPositions || [],
+            alerts: data.alerts || [],
+          };
+          setServerTrades(payload);
+          setStoreServerTrades(payload);
+
+          if (Array.isArray(data.alerts)) {
+            const mapped: GaiaHudTradeSignal[] = data.alerts
+              .filter(
+                (a: any) =>
+                  a.action === "BUY_TO_OPEN" &&
+                  !a.setupName?.includes("Gaia Tactical HUD") &&
+                  !a.id?.startsWith("gaia-spy-")
+              )
+              .map((a: any) => ({
+                timestamp: (a.ts || 0) * 1000,
+                action: a.action,
+                contractType: a.contractType,
+                spotPrice: a.btoSpotPrice || a.spotPrice,
+                setupName: a.setupName,
+                isWin: a.status === "TARGET_HIT" || (a.pnlOptionPct && a.pnlOptionPct > 0),
+              }));
+            setHudTradeSignals(mapped);
+          }
+        }
+      } catch {
+        // Silent fallback
+      }
+    }
+    fetchSignals();
+    const interval = setInterval(fetchSignals, 5000);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [loadedTicker, chartSessionDate, setStoreServerTrades]);
+
   const flowVwapPoints = useMemo<FlowGammaVwapSnapshot[]>(() => {
     if (!dataset?.candles || dataset.candles.length === 0) return [];
     const optionsBook = (livePayload?.optionBuckets || []).map((b) => ({
@@ -1009,9 +1031,10 @@ export function GaiaView() {
     () =>
       extractNormalizedTradesForTicker(
         dataset?.ticker || loadedTicker,
-        effectiveServerTrades
+        effectiveServerTrades,
+        przmHudSignals
       ),
-    [dataset?.ticker, loadedTicker, effectiveServerTrades]
+    [dataset?.ticker, loadedTicker, effectiveServerTrades, przmHudSignals]
   );
 
   // Dynamic Price Domain Bounds based on Scope Preset, Zoom (yScale) and Pan (yPanOffset)
@@ -2167,7 +2190,7 @@ export function GaiaView() {
       barToX,
       priceToY,
       serverTrades: effectiveServerTrades,
-      fsmSignals: undefined,
+      fsmSignals: przmHudSignals,
       precomputedTrades: precomputedChartTrades,
       padLeft,
       plotRightX: dividerX,
@@ -3338,6 +3361,7 @@ export function GaiaView() {
         liveSpot={activeCandle ? activeCandle.close : null}
         tradeSignals={hudTradeSignals}
         serverTrades={effectiveServerTrades}
+        sessionDate={chartSessionDate}
         dividerRatio={dividerRatio}
         isReplayMode={isReplaying || isReplayFrozen}
         replayBarTsSec={replayBarTsSec > 0 ? replayBarTsSec : undefined}

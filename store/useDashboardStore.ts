@@ -559,7 +559,7 @@ export interface DashboardState {
     closedPositions?: any[];
     alerts?: any[];
   }) => void;
-  fetchServerTrades: (ticker?: string) => Promise<void>;
+  fetchServerTrades: (ticker?: string, sessionDate?: string) => Promise<void>;
   playbookPayload: PlaybookPayload | null;
   setPlaybookPayload: (payload: PlaybookPayload) => void;
   fetchPlaybook: () => Promise<void>;
@@ -641,11 +641,15 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       serverClosedTrades: payload.closedPositions ?? [],
       serverTradeAlerts: payload.alerts ?? [],
     }),
-  fetchServerTrades: async (ticker) => {
+  fetchServerTrades: async (ticker, sessionDate) => {
     const targetTicker = (ticker || get().activeTicker || "SPY").toUpperCase();
+    const dateParam =
+      sessionDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionDate)
+        ? `&date=${encodeURIComponent(sessionDate)}`
+        : "";
     try {
       const res = await fetch(
-        `/api/signals?ticker=${encodeURIComponent(targetTicker)}`,
+        `/api/signals?ticker=${encodeURIComponent(targetTicker)}${dateParam}`,
         { cache: "no-store" }
       );
       if (res.ok) {

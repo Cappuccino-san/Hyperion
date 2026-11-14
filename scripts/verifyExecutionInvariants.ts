@@ -42,6 +42,8 @@ import {
   stopLiveBot,
 } from "../lib/liveBotDaemon";
 import { NormalizedOptionContract } from "../lib/optionsExposure";
+import { NextRequest } from "next/server";
+import { GET as getSignalsRoute } from "../app/api/signals/route";
 
 let totalTests = 0;
 let passedTests = 0;
@@ -1257,6 +1259,24 @@ async function runTestSuite() {
   assert(
     typeof lastBounceSnap?.deltaImpulseChi6Bar === "number" && lastBounceSnap.deltaImpulseChi6Bar > 0,
     "deltaImpulseChi6Bar must turn strictly positive on afternoon V-reclaim"
+  );
+
+  // Verify GET /api/signals?ticker=SPY&date=2026-11-13 returns historical session trades read-only on weekends/off-hours
+  const histSignalsReq = new NextRequest("http://localhost:3000/api/signals?ticker=SPY&date=2026-11-13");
+  const histSignalsRes = await getSignalsRoute(histSignalsReq);
+  const histSignalsBody = await histSignalsRes.json();
+  assert(
+    histSignalsRes.status === 200,
+    `GET /api/signals?ticker=SPY&date=2026-11-13 returns HTTP 200 (got ${histSignalsRes.status})`
+  );
+  assert(
+    histSignalsBody.sessionDate === "2026-11-13",
+    `GET /api/signals?date=2026-11-13 returns sessionDate === "2026-11-13" (got ${histSignalsBody.sessionDate})`
+  );
+  assert(
+    Array.isArray(histSignalsBody.closedPositions) &&
+      histSignalsBody.closedPositions.some((p: { id?: string }) => p.id === "SPY-PUT-1794581245"),
+    "GET /api/signals?ticker=SPY&date=2026-11-13 returns 2026-11-13 closed trade SPY-PUT-1794581245"
   );
 
   // ===========================================================================

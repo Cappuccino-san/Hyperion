@@ -511,9 +511,34 @@ export function getNowEtTime(date?: Date): { hours: number; minutes: number; tot
   }
 }
 
-export function loadTradeStore(): DailyTradeStore {
+export function loadTradeStore(requestedDate?: string): DailyTradeStore {
   const today = getTodayEt();
   const cacheDir = getCacheDir();
+
+  if (requestedDate && /^\d{4}-\d{2}-\d{2}$/.test(requestedDate) && requestedDate !== today) {
+    const histPath = path.join(cacheDir, `active-trades-${requestedDate}.json`);
+    if (fs.existsSync(histPath)) {
+      try {
+        const raw = fs.readFileSync(histPath, "utf-8");
+        const parsed = JSON.parse(raw) as DailyTradeStore;
+        if (parsed && parsed.activePositions) {
+          return parsed;
+        }
+      } catch {
+        // ignore malformed historical file
+      }
+    }
+    return {
+      date: requestedDate,
+      version: 1,
+      updatedAtMs: Date.now(),
+      activePositions: {},
+      closedPositions: [],
+      alerts: [],
+      prevSpotPrices: {},
+    };
+  }
+
   const filePath = path.join(cacheDir, `active-trades-${today}.json`);
 
   if (inMemoryTradeStore && inMemoryTradeStore.date === today) {
@@ -631,14 +656,14 @@ export function saveTradeStore(store: DailyTradeStore): void {
   }
 }
 
-export function getActivePositions(): Record<string, OptionTradePosition> {
-  const store = loadTradeStore();
+export function getActivePositions(date?: string): Record<string, OptionTradePosition> {
+  const store = loadTradeStore(date);
   return store.activePositions;
 }
 
 
-export function getClosedPositions(ticker?: string): OptionTradePosition[] {
-  const store = loadTradeStore();
+export function getClosedPositions(ticker?: string, date?: string): OptionTradePosition[] {
+  const store = loadTradeStore(date);
   if (!ticker) return store.closedPositions;
   const sym = ticker.trim().toUpperCase();
   const normalizedSym = sym === "SPX" ? "SPXW" : sym;
@@ -647,8 +672,8 @@ export function getClosedPositions(ticker?: string): OptionTradePosition[] {
   );
 }
 
-export function getDailyTradeAlerts(ticker?: string): TradeLifecycleAlert[] {
-  const store = loadTradeStore();
+export function getDailyTradeAlerts(ticker?: string, date?: string): TradeLifecycleAlert[] {
+  const store = loadTradeStore(date);
   if (!ticker) return store.alerts;
   const sym = ticker.trim().toUpperCase();
   const normalizedSym = sym === "SPX" ? "SPXW" : sym;

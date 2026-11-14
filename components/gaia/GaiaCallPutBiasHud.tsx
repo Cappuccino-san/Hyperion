@@ -57,6 +57,7 @@ export interface GaiaCallPutBiasHudProps {
   spot?: number | null;
   tradeSignals?: GaiaHudTradeSignal[];
   serverTrades?: ServerTradeData;
+  sessionDate?: string;
   onSymbolChange?: (symbol: string) => void;
   onSignalsEvaluated?: (signals: PrzmSignalPoint[]) => void;
   dividerRatio?: number;
@@ -244,6 +245,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   spot,
   tradeSignals = [],
   serverTrades: serverTradesProp,
+  sessionDate,
   onSymbolChange,
   onSignalsEvaluated,
   dividerRatio = 1,
@@ -268,10 +270,6 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const [internalServerTrades, setInternalServerTrades] = useState<ServerTradeData>(
     serverTradesProp || {}
   );
-  const [hasLoadedServerTrades, setHasLoadedServerTrades] = useState<boolean>(
-    serverTradesProp !== undefined
-  );
-  const hasAuthoritativeServerTrades = serverTradesProp !== undefined || hasLoadedServerTrades;
 
   useEffect(() => {
     if (serverTradesProp) {
@@ -285,9 +283,16 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     let isMounted = true;
     async function syncServerTrades() {
       try {
-        const res = await fetch(`/api/signals?ticker=${encodeURIComponent(activeSymbol)}`, {
-          cache: "no-store",
-        });
+        const dateParam =
+          sessionDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionDate)
+            ? `&date=${encodeURIComponent(sessionDate)}`
+            : "";
+        const res = await fetch(
+          `/api/signals?ticker=${encodeURIComponent(activeSymbol)}${dateParam}`,
+          {
+            cache: "no-store",
+          }
+        );
         if (!res.ok) return;
         const data = await res.json();
         if (isMounted) {
@@ -296,7 +301,6 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             closedPositions: data?.closedPositions || [],
             alerts: data?.alerts || [],
           });
-          setHasLoadedServerTrades(true);
         }
       } catch {
         // Silent fallback
@@ -308,7 +312,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       isMounted = false;
       clearInterval(interval);
     };
-  }, [activeSymbol, serverTradesProp]);
+  }, [activeSymbol, sessionDate, serverTradesProp]);
 
   // Chart Container & Dynamic Axis Scaling / Pan State
   const svgWrapperRef = useRef<HTMLDivElement | null>(null);
@@ -977,7 +981,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     const trades = extractNormalizedTradesForTicker(
       activeSymbol,
       internalServerTrades,
-      hasAuthoritativeServerTrades ? undefined : przmSignals
+      przmSignals
     ).filter((t) => !String(t.id).startsWith("test-"));
     if (trades.length === 0 || enrichedPoints.length === 0) return [];
     return trades
@@ -1026,7 +1030,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         };
       })
       .filter((item): item is NonNullable<typeof item> => item !== null);
-  }, [activeSymbol, internalServerTrades, hasAuthoritativeServerTrades, przmSignals, enrichedPoints, xForIdx, yForPrice]);
+  }, [activeSymbol, internalServerTrades, przmSignals, enrichedPoints, xForIdx, yForPrice]);
 
   // Structural Metrics (Open 9:30 & Straddle Expected Move) - Strictly Viewport-Invariant
   const structuralMetrics = useMemo(() => {
@@ -1268,7 +1272,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         open930={structuralMetrics.open930}
         straddleEm={structuralMetrics.expectedMove}
         activeFsmState={fsmCommittedState}
-        serverTrades={hasAuthoritativeServerTrades ? internalServerTrades : undefined}
+        serverTrades={internalServerTrades}
         isReplayMode={isReplayMode}
         replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined}
       />
@@ -1585,7 +1589,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           />
 
           {/* Pinned Intraday Trade Markers */}
-          {(hasAuthoritativeServerTrades || svgServerTradeMarkers.length > 0 ? [] : markers).map((m) => {
+          {(svgServerTradeMarkers.length > 0 ? [] : markers).map((m) => {
             if (m.x < padLeft - 20 || m.x > svgWidth - padRight + 20) return null;
             const isCall = m.isCall;
             const isPending = (m as any).isPending ?? false;
@@ -2070,7 +2074,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         series={przmSeries}
         liveSpot={activeSpotPrice}
         activeFsmState={fsmCommittedState}
-        serverTrades={hasAuthoritativeServerTrades ? internalServerTrades : undefined}
+        serverTrades={internalServerTrades}
         ticker={activeSymbol}
         replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined}
       />

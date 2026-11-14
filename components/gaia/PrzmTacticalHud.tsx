@@ -442,11 +442,8 @@ export function evaluatePrzmCallLedger(
 
   // When authoritative server trades exist, lock the ledger to the Single-Slot Sniper Automaton
   // so unexecuted FSM transitions do not dilute the 1-Trade-Max scoreboard.
-  const hasAuthoritativeServerTrades = serverTrades !== undefined;
   const mergedEntries: EvaluatedCallEntry[] =
-    hasAuthoritativeServerTrades || serverEntries.length > 0
-      ? [...serverEntries]
-      : [...chronologicalEntries];
+    serverEntries.length > 0 ? [...serverEntries] : [...chronologicalEntries];
 
   let rightCount = mergedEntries.filter((e) => e.status === "RIGHT").length;
   const wrongCount = mergedEntries.filter((e) => e.status === "WRONG").length;

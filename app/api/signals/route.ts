@@ -6,6 +6,7 @@ import {
   getClosedPositions,
   getDailyTradeAlerts,
   clearDailyTrades,
+  getTodayEt,
   selectOptimalContract,
   sendDiscordTradeAlert,
   generateDailyPerformanceReport,
@@ -29,6 +30,11 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const rawTicker = searchParams.get("ticker") || searchParams.get("symbol") || "";
     const ticker = rawTicker ? rawTicker.trim().toUpperCase() : undefined;
+    const rawDate = searchParams.get("date")?.trim();
+    if (rawDate && !/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+      return NextResponse.json({ error: "Invalid date format. Expected YYYY-MM-DD." }, { status: 400 });
+    }
+    const requestedDate = rawDate || undefined;
     const testAction = searchParams.get("test");
     const webhookUrl = searchParams.get("webhookUrl") || undefined;
 
@@ -289,6 +295,17 @@ export async function GET(req: NextRequest) {
     }
 
     // Continuously evaluate all open positions across all tickers against live CBOE quotes
+    const todayEt = getTodayEt();
+    if (requestedDate && requestedDate !== todayEt) {
+      return NextResponse.json({
+        activePositions: getActivePositions(requestedDate),
+        closedPositions: getClosedPositions(ticker, requestedDate),
+        alerts: getDailyTradeAlerts(ticker, requestedDate),
+        sessionDate: requestedDate,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     const getLockToken = acquireBarEvaluationLock();
     if (getLockToken) {
       const evalController = new AbortController();
@@ -309,6 +326,7 @@ export async function GET(req: NextRequest) {
       activePositions,
       closedPositions,
       alerts,
+      sessionDate: todayEt,
       timestamp: new Date().toISOString(),
     });
   } catch (err: unknown) {
