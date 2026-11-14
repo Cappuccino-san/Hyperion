@@ -268,6 +268,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const [internalServerTrades, setInternalServerTrades] = useState<ServerTradeData>(
     serverTradesProp || {}
   );
+  const [hasLoadedServerTrades, setHasLoadedServerTrades] = useState<boolean>(
+    serverTradesProp !== undefined
+  );
+  const hasAuthoritativeServerTrades = serverTradesProp !== undefined || hasLoadedServerTrades;
 
   useEffect(() => {
     if (serverTradesProp) {
@@ -292,6 +296,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             closedPositions: data?.closedPositions || [],
             alerts: data?.alerts || [],
           });
+          setHasLoadedServerTrades(true);
         }
       } catch {
         // Silent fallback
@@ -972,7 +977,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     const trades = extractNormalizedTradesForTicker(
       activeSymbol,
       internalServerTrades,
-      przmSignals
+      hasAuthoritativeServerTrades ? undefined : przmSignals
     ).filter((t) => !String(t.id).startsWith("test-"));
     if (trades.length === 0 || enrichedPoints.length === 0) return [];
     return trades
@@ -1021,7 +1026,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         };
       })
       .filter((item): item is NonNullable<typeof item> => item !== null);
-  }, [activeSymbol, internalServerTrades, przmSignals, enrichedPoints, xForIdx, yForPrice]);
+  }, [activeSymbol, internalServerTrades, hasAuthoritativeServerTrades, przmSignals, enrichedPoints, xForIdx, yForPrice]);
 
   // Structural Metrics (Open 9:30 & Straddle Expected Move) - Strictly Viewport-Invariant
   const structuralMetrics = useMemo(() => {
@@ -1263,7 +1268,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         open930={structuralMetrics.open930}
         straddleEm={structuralMetrics.expectedMove}
         activeFsmState={fsmCommittedState}
-        serverTrades={internalServerTrades}
+        serverTrades={hasAuthoritativeServerTrades ? internalServerTrades : undefined}
         isReplayMode={isReplayMode}
         replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined}
       />
@@ -1580,7 +1585,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           />
 
           {/* Pinned Intraday Trade Markers */}
-          {(svgServerTradeMarkers.length > 0 ? [] : markers).map((m) => {
+          {(hasAuthoritativeServerTrades || svgServerTradeMarkers.length > 0 ? [] : markers).map((m) => {
             if (m.x < padLeft - 20 || m.x > svgWidth - padRight + 20) return null;
             const isCall = m.isCall;
             const isPending = (m as any).isPending ?? false;
@@ -2065,7 +2070,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         series={przmSeries}
         liveSpot={activeSpotPrice}
         activeFsmState={fsmCommittedState}
-        serverTrades={internalServerTrades}
+        serverTrades={hasAuthoritativeServerTrades ? internalServerTrades : undefined}
         ticker={activeSymbol}
         replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined}
       />

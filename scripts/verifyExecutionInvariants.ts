@@ -1013,6 +1013,99 @@ async function runTestSuite() {
     "500-Transition Monte Carlo 10C: EXACTLY ZERO same-direction re-entries or >2 closed trades/day violations"
   );
 
+  // --- PART 10D: Full 78-Bar RTH Session Noisy Oscillation & Anti-Churn Invariant ---
+  console.log("  10D: Simulating 78-Bar RTH Session with Noisy Oscillations (Max 2 Trades/Day & Zero <10% Micro-Scalps)...");
+  const storeBackup10D = loadTradeStore();
+  try {
+    const sessionDate10D = getTodayEt();
+    const rthStartEpoch = Math.floor(new Date(`${sessionDate10D}T09:30:00-05:00`).getTime() / 1000);
+    saveTradeStore({
+      date: sessionDate10D,
+      activePositions: {},
+      closedPositions: [],
+      alerts: [],
+      prevSpotPrices: { QQQ: 500.0 },
+    });
+
+    const mockChain10D: NormalizedOptionContract[] = [
+      { symbol: "QQQ20991231C00502000", strike: 502, expiration: "2099-12-31", optionType: "C", bid: 0.62, ask: 0.65, last: 0.64, volume: 1200, openInterest: 3000, iv: 0.20, delta: 0.35, gamma: 0.05, vega: 0.03, percentChange: 0 },
+      { symbol: "QQQ20991231P00498000", strike: 498, expiration: "2099-12-31", optionType: "P", bid: 0.62, ask: 0.65, last: 0.64, volume: 1200, openInterest: 3000, iv: 0.20, delta: -0.35, gamma: 0.05, vega: 0.03, percentChange: 0 },
+    ];
+
+    for (let barIdx = 0; barIdx < 78; barIdx++) {
+      const barEpoch = rthStartEpoch + barIdx * 300;
+      const barDate = new Date(barEpoch * 1000);
+      const isAfternoon = barIdx >= 36; // 12:30 PM ET onward flips regime
+      const noise = (barIdx % 2 === 0 ? 1 : -1) * 0.40;
+      const spot = (isAfternoon ? 498.5 : 501.5) + noise;
+      const chi = isAfternoon ? (barIdx % 3 === 0 ? 0.38 : 0.22) : (barIdx % 3 === 0 ? 0.62 : 0.86);
+      const flux = isAfternoon ? (barIdx % 3 === 0 ? 0.05 : -0.30) : (barIdx % 3 === 0 ? -0.05 : 0.30);
+      const priorClose = 500.0;
+      const zeroGamma = 500.0;
+      const flowVwap = isAfternoon ? 499.5 : 500.5;
+
+      await evaluateTradeSignals({
+        ticker: "QQQ",
+        spotPrice: spot,
+        prevSpotPrice: spot - noise,
+        callWall: 506.0,
+        putWall: 494.0,
+        zeroGamma,
+        priorClose,
+        premarketFlowVwap: flowVwap,
+        contracts: mockChain10D,
+        nowEt: barDate,
+        latest5mCandle: {
+          open: spot - 0.15,
+          high: spot + 0.45,
+          low: spot - 0.45,
+          close: spot,
+          sma34: flowVwap,
+          flowSnapshot: {
+            timestamp: barEpoch,
+            spot,
+            flowVwap,
+            ceilingShareChi: chi,
+            pecletNumber: isAfternoon ? -2.1 : 2.1,
+            netFluxJ: flux,
+            upper1s: flowVwap + 1.0,
+            lower1s: flowVwap - 1.0,
+            upper2s: flowVwap + 2.0,
+            lower2s: flowVwap - 2.0,
+            upper1Sigma: flowVwap + 1.0,
+            lower1Sigma: flowVwap - 1.0,
+            upper2Sigma: flowVwap + 2.0,
+            lower2Sigma: flowVwap - 2.0,
+            sigma: 1.0,
+            variance: 1.0,
+            cumGammaWeight: 100,
+            totalWeight: 100,
+            signedGammaAcceleration: 0,
+            count: 10,
+            bandSignal: isAfternoon ? "UPPER_2S_REJECT" : "LOWER_2S_BOUNCE",
+          },
+        },
+      });
+    }
+
+    const finalStore10D = loadTradeStore();
+    const allQqqTrades = [
+      ...finalStore10D.closedPositions.filter((p) => p.ticker === "QQQ"),
+      ...(finalStore10D.activePositions["QQQ"] ? [finalStore10D.activePositions["QQQ"]] : []),
+    ];
+    const callCount10D = allQqqTrades.filter((p) => p.contractType === "CALL").length;
+    const putCount10D = allQqqTrades.filter((p) => p.contractType === "PUT").length;
+    const microReversalScalps10D = finalStore10D.closedPositions.filter(
+      (p) => p.ticker === "QQQ" && (p.exitReason || "").includes("REVERSAL") && (p.pnlOptionPct ?? 0) < 10
+    );
+
+    assert(allQqqTrades.length <= 2, `78-bar RTH session total trades <= 2 (got ${allQqqTrades.length})`);
+    assert(callCount10D <= 1 && putCount10D <= 1, `78-bar RTH session <= 1 same-direction trade (CALL=${callCount10D}, PUT=${putCount10D})`);
+    assert(microReversalScalps10D.length === 0, `78-bar RTH session zero <10% reversal micro-scalps (got ${microReversalScalps10D.length})`);
+  } finally {
+    saveTradeStore(storeBackup10D);
+  }
+
   // ===========================================================================
   // 11. GEMINI 4 CARBON AUDIT HARDENING & EDGE-CASE INVARIANTS
   // ===========================================================================

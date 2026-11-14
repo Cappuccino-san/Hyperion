@@ -1009,10 +1009,9 @@ export function GaiaView() {
     () =>
       extractNormalizedTradesForTicker(
         dataset?.ticker || loadedTicker,
-        effectiveServerTrades,
-        przmHudSignals
+        effectiveServerTrades
       ),
-    [dataset?.ticker, loadedTicker, effectiveServerTrades, przmHudSignals]
+    [dataset?.ticker, loadedTicker, effectiveServerTrades]
   );
 
   // Dynamic Price Domain Bounds based on Scope Preset, Zoom (yScale) and Pan (yPanOffset)
@@ -2168,7 +2167,7 @@ export function GaiaView() {
       barToX,
       priceToY,
       serverTrades: effectiveServerTrades,
-      fsmSignals: przmHudSignals,
+      fsmSignals: undefined,
       precomputedTrades: precomputedChartTrades,
       padLeft,
       plotRightX: dividerX,

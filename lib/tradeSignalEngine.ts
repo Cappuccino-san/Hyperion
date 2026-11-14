@@ -2216,13 +2216,22 @@ export async function evaluateTradeSignals(
   );
 
   // Gated Single-Slot / Phase-2 Opposite-Regime State Machine:
-  // Max 2 closed trades/day; Phase-2 Call reclaim allowed only after 10:45 AM ET following a closed PUT.
-  const canTryPhase2CallReclaim =
+  // Phase 1: Max 1 trade (09:35-14:30 ET). Lock if winner (>12%) or >= 2 closed trades.
+  // Phase 2: At most 1 opposite-direction trade (10:45-14:30 ET, >=30m cooldown).
+  const phase1Closed = closedForTickerEarly[0];
+  const phase1WinnerLocked =
+    closedForTickerEarly.length === 1 && (phase1Closed?.pnlOptionPct ?? 0) > 12;
+  const phase1CooldownOk =
     closedForTickerEarly.length === 1 &&
-    closedForTickerEarly[0]?.contractType === "PUT" &&
+    typeof phase1Closed?.closedTs === "number" &&
+    nowTs - phase1Closed.closedTs >= 1800;
+  const canTryPhase2Reclaim =
+    closedForTickerEarly.length === 1 &&
+    !phase1WinnerLocked &&
+    phase1CooldownOk &&
     etTime.totalMinutes >= 645 &&
     etTime.totalMinutes <= 870;
-  if ((closedForTickerEarly.length >= 2 || (closedForTickerEarly.length >= 1 && !canTryPhase2CallReclaim)) && !activePos) {
+  if ((closedForTickerEarly.length >= 2 || (closedForTickerEarly.length >= 1 && !canTryPhase2Reclaim)) && !activePos) {
     return {
       ticker: normalizedTicker,
       activePosition: null,
@@ -2291,7 +2300,9 @@ export async function evaluateTradeSignals(
     }
 
     // Realistic execution: exits execute at live BID, not mid, clamped to physical Greek bounds
-    const heldMin = Math.max(1, (nowTs - (activePos.openedTs || nowTs)) / 60);
+    const rawHeldMin = Math.max(0, (nowTs - (activePos.openedTs || nowTs)) / 60);
+    const heldMin = Math.max(1, rawHeldMin);
+    const adverseSpotMove = isCall ? activePos.btoSpotPrice - posSpotPrice : posSpotPrice - activePos.btoSpotPrice;
     const rawExitPrice = liveBid && liveBid > 0 ? liveBid : currentOptionMid;
     const entryFillPrice = activePos.optionAsk || activePos.btoOptionMid;
     const exitFillPrice = clampOptionPriceToGreekEnvelope(
@@ -2454,38 +2465,38 @@ export async function evaluateTradeSignals(
     // 2. STC: 10:45 AM MORNING CHOP TIME STOP (Protect profits before midday theta crush)
     else if (
       activePos.status === "OPEN" &&
+      rawHeldMin >= 10 &&
       (activePos.openedAt.includes("9:") || activePos.openedAt.includes("10:0") || activePos.openedAt.includes("10:1")) &&
       ((etTime.hours === 10 && etTime.minutes >= 45) || etTime.hours === 11) &&
-      pnlOptionPct < 25 &&
+      pnlOptionPct >= 10 && pnlOptionPct < 25 &&
       ((isCall && posCandle && posCandle.close < posCandle.sma34) ||
         (!isCall && posCandle && posCandle.close > posCandle.sma34))
     ) {
       closePosition("10:45 AM MOMENTUM CUTOFF (PROTECT PROFITS / AVOID MIDDAY CHOP)", "Chop Time Stop");
     }
     // 3. STC (MOMENTUM REVERSAL / DIVERGENCE COVER — DYNAMIC TREND EXIT)
-    // Enforce minimum holding noise buffer (heldMin >= 1 bar) and substantial move confirmation
+    // Enforce minimum hold (rawHeldMin >= 10m / 2 bars) + confirmed >= $0.75 adverse move or >= 10% profit lock
     else if (
       activePos.status === "OPEN" &&
       !(isRunnerSetup && solidFluxAligned) &&
-      heldMin >= 1 &&
+      rawHeldMin >= 10 &&
+      (adverseSpotMove >= 0.75 || pnlOptionPct >= 10) &&
       ((!isCall &&
         ((posPutWall > 0 &&
           posSpotPrice <= posPutWall * 1.0012 &&
-          activePos.btoSpotPrice - posSpotPrice >= 1.25) ||
-         (divergence5m === "BULL" && activePos.btoSpotPrice - posSpotPrice >= 0.75) ||
+          adverseSpotMove >= 0.75) ||
+         divergence5m === "BULL" ||
          Boolean(
            posCandle &&
              typeof posCandle.sma34 === "number" &&
-             posCandle.close > posCandle.sma34 &&
-             (activePos.btoSpotPrice - posSpotPrice >= 0.75 || pnlOptionPct >= 10)
+             posCandle.close > posCandle.sma34
          ))) ||
        (isCall &&
-        ((divergence5m === "BEAR" && posSpotPrice - activePos.btoSpotPrice >= 0.75) ||
+        (divergence5m === "BEAR" ||
          Boolean(
            posCandle &&
              typeof posCandle.sma34 === "number" &&
-             posCandle.close < posCandle.sma34 &&
-             (posSpotPrice - activePos.btoSpotPrice >= 0.75 || pnlOptionPct >= 10)
+             posCandle.close < posCandle.sma34
          ))))
     ) {
       const exitReason =
@@ -2558,14 +2569,22 @@ export async function evaluateTradeSignals(
   const sameTickerClosed = store.closedPositions.filter(
     (p) => p.ticker === positionTickerForCheck || p.ticker === normalizedTicker
   );
-  const isPhase2CallReclaimWindow =
+  const lastClosed = sameTickerClosed[0];
+  const isPhase1WinnerLocked =
+    sameTickerClosed.length === 1 && (lastClosed?.pnlOptionPct ?? 0) > 12;
+  const isPhase2CooldownMet =
     sameTickerClosed.length === 1 &&
-    sameTickerClosed[0]?.contractType === "PUT" &&
+    typeof lastClosed?.closedTs === "number" &&
+    nowTs - lastClosed.closedTs >= 1800;
+  const isPhase2ReclaimWindow =
+    sameTickerClosed.length === 1 &&
+    !isPhase1WinnerLocked &&
+    isPhase2CooldownMet &&
     etTime.totalMinutes >= 645 &&
     etTime.totalMinutes <= 870;
   const hasCompletedTradeToday =
     sameTickerClosed.length >= 2 ||
-    (sameTickerClosed.length >= 1 && !isPhase2CallReclaimWindow);
+    (sameTickerClosed.length >= 1 && !isPhase2ReclaimWindow);
   const hasActiveTrade = Boolean(
     activePos ||
     hadActivePositionAtStart ||
@@ -3377,11 +3396,13 @@ export async function evaluateTradeSignals(
       }
     }
 
-    // Phase-2 Gate: Second trade today must be an opposite-regime CALL reclaim with impulseChi >= 0.60 && (deltaChi6Bar >= 0.03 || deltaImpulseChi6Bar >= 0.06)
+    // Phase-2 Gate: Second trade today must be an opposite-regime reclaim (CALL reclaim requires impulseChi confirmation)
     if (
       candidateBto &&
-      isPhase2CallReclaimWindow &&
-      !(candidateBto.contractType === "CALL" && impChi >= 0.60 && (deltaChi6 >= 0.03 || deltaImpulseChi6 >= 0.06))
+      isPhase2ReclaimWindow &&
+      (candidateBto.contractType === lastClosed?.contractType ||
+        (candidateBto.contractType === "CALL" &&
+          !(impChi >= 0.60 && (deltaChi6 >= 0.03 || deltaImpulseChi6 >= 0.06))))
     ) {
       candidateBto = null;
     }
@@ -4275,7 +4296,14 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
   // Consistency Guard: Transition active Gaia HUD position to CLOSED if FSM is STAND_ASIDE or in opposite regime
   const spyPos = store.activePositions["SPY"];
   const isSpyStructural = Boolean(spyPos && !spyPos.setupName.includes("Gaia Tactical HUD"));
-  if (params.activeFsmState === "STAND_ASIDE" && !isSpyStructural && spyPos) {
+  const guardNowTs = Math.floor(Date.now() / 1000);
+  const guardHeldSec = spyPos ? guardNowTs - (spyPos.openedTs || guardNowTs) : 0;
+  const guardCloseSpot = Number(params.spotPrice) > 0 ? Number(params.spotPrice) : spyPos?.btoSpotPrice ?? 0;
+  const guardAdverseMove = spyPos
+    ? (spyPos.contractType === "CALL" ? spyPos.btoSpotPrice - guardCloseSpot : guardCloseSpot - spyPos.btoSpotPrice)
+    : 0;
+  const guardCanExit = Boolean(spyPos && !isSpyStructural && guardHeldSec >= 600 && guardAdverseMove >= 0.75);
+  if (params.activeFsmState === "STAND_ASIDE" && guardCanExit && spyPos) {
     const nowTs = Math.floor(Date.now() / 1000);
     const closeSpot = Number(params.spotPrice) > 0 ? Number(params.spotPrice) : spyPos.btoSpotPrice;
     spyPos.status = "CLOSED";
@@ -4292,7 +4320,7 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
   } else if (
     (params.activeFsmState === "LONG" || (store.macroRegime === "CALL" && (store.chiPct ?? 50) > 52)) &&
     spyPos?.contractType === "PUT" &&
-    !isSpyStructural
+    guardCanExit
   ) {
     console.warn("[GaiaSync] Closed contradicting SPY PUT position on rotation to Bull Regime.");
     const nowTs = Math.floor(Date.now() / 1000);
@@ -4310,7 +4338,7 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
   } else if (
     (params.activeFsmState === "SHORT" || (store.macroRegime === "PUT" && (store.chiPct ?? 50) < 48)) &&
     spyPos?.contractType === "CALL" &&
-    !isSpyStructural
+    guardCanExit
   ) {
     console.warn("[GaiaSync] Closed contradicting SPY CALL position on rotation to Bear Regime.");
     const nowTs = Math.floor(Date.now() / 1000);
@@ -4428,15 +4456,22 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
 
     if (!dispatchedSet.has(entryKey) && !store.dispatchedAlertIds?.[idempotencyKey]) {
       // Gated Single-Slot / Phase-2 Opposite-Regime State Machine:
-      // FLAT (0 trades) -> ACTIVE (1 contract) -> optional Phase-2 CALL reclaim >= 10:45 AM ET -> LOCKED_FOR_DAY
+      // FLAT (0 trades) -> ACTIVE (1 contract) -> optional Phase-2 opposite reclaim (>=10:45 ET, >=30m cooldown, Phase1 <=12%) -> LOCKED_FOR_DAY
       const closedCount = store.closedPositions?.length ?? 0;
-      const canPhase2CallReclaim =
+      const prevClosed = store.closedPositions?.[closedCount - 1];
+      const prevWinnerLocked = closedCount === 1 && (prevClosed?.pnlOptionPct ?? 0) > 12;
+      const prevCooldownMet =
         closedCount === 1 &&
-        store.closedPositions[0]?.contractType === "PUT" &&
+        typeof prevClosed?.closedTs === "number" &&
+        eventTs - prevClosed.closedTs >= 1800;
+      const canPhase2OppositeReclaim =
+        closedCount === 1 &&
+        !prevWinnerLocked &&
+        prevCooldownMet &&
         sigEt.totalMinutes >= 645 &&
-        isImpulseCallReclaim &&
-        direction === "CALL";
-      if (closedCount >= 2 || (closedCount >= 1 && !canPhase2CallReclaim)) {
+        sigEt.totalMinutes <= 870 &&
+        prevClosed?.contractType !== direction;
+      if (closedCount >= 2 || (closedCount >= 1 && !canPhase2OppositeReclaim)) {
         console.warn(`[GaiaSync FIREWALL] Blocked trade dispatch: Day is LOCKED_FOR_DAY (${closedCount} closed trades).`);
         continue;
       }
@@ -4616,6 +4651,14 @@ export async function syncGaiaSpySignalsToDiscord(params: SyncGaiaSpyParams): Pr
       if (params.signal?.aborted) break;
       const openSpyPos = store.activePositions["SPY"];
       if (!openSpyPos || openSpyPos.contractType !== direction) {
+        continue;
+      }
+      const nextSigTsRaw = nextSig.timestamp || nextSig.barTimestamp || Math.floor(Date.now() / 1000);
+      const nextSigTsSec = nextSigTsRaw > 1e11 ? Math.floor(nextSigTsRaw / 1000) : nextSigTsRaw;
+      const heldSeconds = nextSigTsSec - (openSpyPos.openedTs || nextSigTsSec);
+      const adverseSpot = isCall ? openSpyPos.btoSpotPrice - nextSig.price : nextSig.price - openSpyPos.btoSpotPrice;
+      const estOptMovePct = (((isCall ? nextSig.price - openSpyPos.btoSpotPrice : openSpyPos.btoSpotPrice - nextSig.price) * 0.45) / Math.max(0.01, openSpyPos.btoOptionMid || 0.5)) * 100;
+      if (heldSeconds < 600 || (adverseSpot < 0.75 && estOptMovePct < 10)) {
         continue;
       }
 

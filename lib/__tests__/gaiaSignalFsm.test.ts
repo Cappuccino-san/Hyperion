@@ -366,4 +366,73 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
     const exitSig = newlyCommitted.find((s) => s.fromState === "LONG" && s.toState === "STAND_ASIDE");
     assert.ok(exitSig, "Expected Stage-2 BE+10% floor or stop exit when runner retraces below BE+10% floor");
   });
+
+  it("Full 78-bar RTH session with noisy oscillations produces <= 2 trades (<= 1 same-direction), >= 30m cooldown, and zero <10% reversal micro-scalps", () => {
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [];
+    const baseEpoch = 1794580200; // 09:30 ET
+
+    for (let i = 0; i < 78; i++) {
+      const etMins = 570 + i * 5;
+      const isAfternoon = i >= 36; // 12:30 ET regime flip
+      const noise = (i % 2 === 0 ? 1 : -1) * 0.40;
+      const close = (isAfternoon ? 757.0 : 763.0) + noise;
+      bars.push({
+        barTimestamp: baseEpoch + i * 300,
+        open: close - noise * 0.5,
+        high: close + 0.45,
+        low: close - 0.45,
+        close,
+        chi: isAfternoon ? (i % 3 === 0 ? 0.35 : 0.15) : (i % 3 === 0 ? 0.65 : 0.88),
+        bias: isAfternoon ? -0.35 : 0.35,
+        netFlux: isAfternoon ? (i % 3 === 0 ? 0.08 : -0.32) : (i % 3 === 0 ? -0.08 : 0.32),
+        peclet: 2.2,
+        flowVwap: isAfternoon ? 758.5 : 761.5,
+        vwapSlope: isAfternoon ? -0.25 : 0.25,
+        etMins,
+        isClosed: true,
+      });
+    }
+
+    const allSignals: ReturnType<GaiaSignalFsm["commitSeries"]>["newlyCommitted"] = [];
+    for (let i = 0; i < bars.length; i++) {
+      const isAfternoon = i >= 36;
+      const disp = computeCausalEquilibriumDispersion(bars, i);
+      const sig = fsm.commitClosedBar(bars[i], disp, {
+        macroRegime: isAfternoon ? "PUT" : "CALL",
+        callDominancePct: isAfternoon ? 25 : 75,
+        structuralLevels: { putWall: 754, callWall: 766, zeroGamma: 760 },
+      });
+      if (sig) allSignals.push(sig);
+    }
+
+    const entries = allSignals.filter((s) => s.toState === "LONG" || s.toState === "SHORT");
+    const longEntries = entries.filter((s) => s.toState === "LONG");
+    const shortEntries = entries.filter((s) => s.toState === "SHORT");
+
+    assert.ok(entries.length <= 2, `Expected <= 2 entries over 78-bar RTH session, got ${entries.length}`);
+    assert.ok(longEntries.length <= 1, `Expected <= 1 LONG entry, got ${longEntries.length}`);
+    assert.ok(shortEntries.length <= 1, `Expected <= 1 SHORT entry, got ${shortEntries.length}`);
+
+    if (entries.length === 2) {
+      const firstExit = allSignals.find(
+        (s) => s.fromState === entries[0].toState && s.toState === "STAND_ASIDE"
+      );
+      assert.ok(firstExit, "First trade must exit before second opposite-direction entry");
+      assert.ok(
+        entries[1].barTimestamp - firstExit!.barTimestamp >= 1800,
+        "Phase 2 opposite-direction entry must enforce >= 30-min (1800s) cooldown"
+      );
+    }
+
+    const microReversalExits = allSignals.filter((s) => {
+      if (s.toState !== "STAND_ASIDE" || !s.reason.includes("REVERSAL")) return false;
+      const entry = [...entries].reverse().find((e) => e.sequence < s.sequence);
+      if (!entry) return false;
+      const heldBars = (s.barTimestamp - entry.barTimestamp) / 300;
+      const adverseMove = entry.toState === "LONG" ? entry.price - s.price : s.price - entry.price;
+      return heldBars < 2 || adverseMove < 0.75;
+    });
+    assert.strictEqual(microReversalExits.length, 0, "Zero <2-bar or <$0.75 reversal micro-scalps permitted");
+  });
 });
