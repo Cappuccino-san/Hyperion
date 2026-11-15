@@ -12,7 +12,7 @@ import {
   generateDailyPerformanceReport,
   checkAndSendMarketCloseRecap,
   TradeLifecycleAlert,
-  syncGaiaSpySignalsToDiscord,
+  syncGaiaTickerSignalsToDiscord,
 } from "@/lib/tradeSignalEngine";
 import {
   getPreTradeRadarData,
@@ -23,6 +23,8 @@ import {
   releaseBarEvaluationLock,
   ensureLiveBotRunning,
   ensureMocCutoffForRemainingPositions,
+  getActiveTrackedTickers,
+  registerActiveTrackedTicker,
   getEtClockNow,
 } from "@/lib/liveBotDaemon";
 
@@ -275,7 +277,7 @@ export async function GET(req: NextRequest) {
 
     if (searchParams.get("scan") === "true" || searchParams.get("poll") === "all") {
       const baseUrl = req.nextUrl.origin || "http://localhost:3000";
-      const tickers = ["SPY", "QQQ", "IWM"];
+      const tickers = Array.from(new Set([...getActiveTrackedTickers(), "SPY", "QQQ", "IWM"]));
       const scanController = new AbortController();
       const scanTimeout = setTimeout(() => scanController.abort(), 12_000);
       try {
@@ -392,6 +394,7 @@ export async function GET(req: NextRequest) {
     }
 
     ensureLiveBotRunning();
+    if (ticker) registerActiveTrackedTicker(ticker);
     const getLockToken = acquireBarEvaluationLock();
     if (getLockToken) {
       const evalController = new AbortController();
@@ -429,7 +432,12 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
 
-    if (body.action === "SYNC_GAIA_SPY_SIGNALS") {
+    if (body.action === "REGISTER_TRACKED_TICKER") {
+      const trackedTickers = registerActiveTrackedTicker(body.ticker);
+      return NextResponse.json({ success: true, trackedTickers });
+    }
+
+    if (body.action === "SYNC_GAIA_TICKER_SIGNALS" || body.action === "SYNC_GAIA_SPY_SIGNALS") {
       const sessionDate = parseIsoDateParam(body.sessionDate);
       const backfill = isHistoricalBackfillRequest({
         explicitFlag: body.isHistoricalBackfill,
@@ -446,6 +454,9 @@ export async function POST(req: NextRequest) {
           keys: [],
         });
       }
+      if (!backfill && typeof body.ticker === "string" && body.ticker.trim()) {
+        registerActiveTrackedTicker(body.ticker);
+      }
       const lockToken = acquireBarEvaluationLock();
       if (!lockToken) {
         return NextResponse.json({ success: false, busy: true, dispatchedCount: 0, keys: [] }, { status: 409 });
@@ -453,13 +464,14 @@ export async function POST(req: NextRequest) {
       const syncController = new AbortController();
       const syncTimeout = setTimeout(() => syncController.abort(), 12_000);
       try {
-        const res = await syncGaiaSpySignalsToDiscord({
+        const res = await syncGaiaTickerSignalsToDiscord({
           ticker: body.ticker || "SPY",
           signals: Array.isArray(body.signals) ? body.signals : [],
           spotPrice: Number(body.spotPrice) || 0,
           activeFsmState: body.activeFsmState,
           macroRegime: body.macroRegime,
           chiPct: body.chiPct,
+          impulseChi: typeof body.impulseChi === "number" ? body.impulseChi : undefined,
           zeroGamma: typeof body.zeroGamma === "number" ? body.zeroGamma : undefined,
           sessionDate,
           webhookUrl: backfill ? undefined : body.webhookUrl,
@@ -554,6 +566,9 @@ export async function POST(req: NextRequest) {
         nowEt: body.nowEt,
         candleTimestamp: body.latest5mCandle?.timestamp,
       });
+      if (!backfill && typeof body.ticker === "string" && body.ticker.trim()) {
+        registerActiveTrackedTicker(body.ticker);
+      }
       const normalizedBody = {
         ...body,
         webhookUrl: backfill ? undefined : body.webhookUrl,

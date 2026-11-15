@@ -531,9 +531,10 @@ export const PrzmTopDeck: React.FC<{
   isReplayMode?: boolean;
   replayBarTsSec?: number;
 }> = ({ ticker, liveSpot, series, signals, open930, straddleEm, activeFsmState, serverTrades, isReplayMode = false, replayBarTsSec }) => {
+  const displayTicker = (ticker || "SPY").trim().toUpperCase() || "SPY";
   const ledger = useMemo(
-    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, ticker, replayBarTsSec),
-    [signals, series, liveSpot, activeFsmState, serverTrades, ticker, replayBarTsSec]
+    () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, displayTicker, replayBarTsSec),
+    [signals, series, liveSpot, activeFsmState, serverTrades, displayTicker, replayBarTsSec]
   );
 
   // Live 1-second clock for "TO THE BELL" radial dial
@@ -744,7 +745,7 @@ export const PrzmTopDeck: React.FC<{
         {/* Bottom 3-Metric Strip */}
         <div className="pt-2.5 border-t border-slate-800/70 flex items-center justify-between font-mono text-[11px] tracking-[0.08em]">
           <div>
-            <span className="text-slate-500 mr-1.5">{ticker}</span>
+            <span className="text-slate-500 mr-1.5">{displayTicker}</span>
             <span className="text-slate-100 font-bold tabular-nums">{liveSpot.toFixed(2)}</span>
           </div>
           <div>

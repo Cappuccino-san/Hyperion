@@ -266,7 +266,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   onResetViewport,
 }) => {
   const uid = useId().replace(/:/g, "");
-  const activeSymbol = (symbol || ticker || "SPY").trim().toUpperCase() === "QQQ" ? "QQQ" : "SPY";
+  const activeSymbol = (symbol || ticker || "SPY").trim().toUpperCase() || "SPY";
   const liveTickPrice = useDashboardStore((s) => s.liveTickPrice);
   const liveTickCount = useDashboardStore((s) => s.liveTickCount);
   const gammaLevels = useDashboardStore((s) => s.gammaLevels);
@@ -1107,13 +1107,15 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     }));
   }, [enrichedPoints, effectiveCandles]);
 
-  // Auto-sync active Gaia SPY signals directly to Discord trade-signals engine
+  // Auto-sync active Gaia signals directly to Discord trade-signals engine
   const lastSyncedGaiaSigFingerprint = useRef<string>("");
   useEffect(() => {
-    if (isReplayMode || activeSymbol !== "SPY" || effectiveCandles.length === 0 || !przmSignals || przmSignals.length === 0 || !activeSpotPrice || activeSpotPrice <= 0) return;
-    const fingerprint = przmSignals
-      .map((s) => `${s.id}:${s.type}:${s.time}:${s.price.toFixed(2)}`)
-      .join("|");
+    if (isReplayMode || !activeSymbol || effectiveCandles.length === 0 || !przmSignals || przmSignals.length === 0 || !activeSpotPrice || activeSpotPrice <= 0) return;
+    const fingerprint =
+      `${activeSymbol}::` +
+      przmSignals
+        .map((s) => `${s.id}:${s.type}:${s.time}:${s.price.toFixed(2)}`)
+        .join("|");
     if (fingerprint === lastSyncedGaiaSigFingerprint.current) return;
     lastSyncedGaiaSigFingerprint.current = fingerprint;
 
@@ -1121,8 +1123,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        action: "SYNC_GAIA_SPY_SIGNALS",
-        ticker: "SPY",
+        action: "SYNC_GAIA_TICKER_SIGNALS",
+        ticker: activeSymbol,
         signals: przmSignals,
         spotPrice: activeSpotPrice,
         activeFsmState: fsmCommittedState,
@@ -1132,7 +1134,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         zeroGamma: typeof gammaLevels?.zeroGamma === "number" && gammaLevels.zeroGamma > 0 ? gammaLevels.zeroGamma : undefined,
       }),
     }).catch(() => {});
-  }, [isReplayMode, activeSymbol, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, latestPt?.impulseChi, gammaLevels?.zeroGamma]);
+  }, [isReplayMode, activeSymbol, effectiveCandles.length, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, latestPt?.impulseChi, gammaLevels?.zeroGamma]);
 
   const invalidateSvgCtm = useCallback(() => {
     cachedInverseCtmRef.current = null;
@@ -1354,9 +1356,14 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             <span className="text-cyan-400 mr-2 text-base font-bold">+</span>
             <span className="text-slate-400 mr-1.5">[</span>
             <button
-              onClick={() => onSymbolChange?.(activeSymbol === "SPY" ? "QQQ" : "SPY")}
+              onClick={() => {
+                const cycle = ["SPY", "QQQ", "IWM", "NVDA"];
+                const idx = cycle.indexOf(activeSymbol);
+                const nextSym = idx >= 0 ? cycle[(idx + 1) % cycle.length] : "SPY";
+                onSymbolChange?.(nextSym);
+              }}
               className="text-cyan-400 font-bold hover:text-cyan-300 transition-colors uppercase tracking-wider underline decoration-cyan-500/40 decoration-dashed underline-offset-4"
-              title="Click to toggle between SPY and QQQ"
+              title={`Active ticker: ${activeSymbol} (click to cycle SPY/QQQ/IWM/NVDA)`}
             >
               {activeSymbol}
             </button>

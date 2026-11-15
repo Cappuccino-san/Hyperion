@@ -39,18 +39,36 @@ export const GAIA_ENTRY_CUTOFF_MINS = ENTRY_CUTOFF_MINS;
 export const GAIA_EOD_FORCE_FLAT_MINS = EOD_FORCE_FLAT_MINS;
 export const GAIA_RTH_CLOSE_MINS = RTH_CLOSE_MINS;
 
-/** Wall proximity: never buy into a wall closer than this (underlying $). */
-const WALL_BLOCK_DOLLARS = 1.25;
 /** Structural take-profit fires when price trades within this distance of the target wall. */
 const TARGET_TOUCH_DOLLARS = 0.25;
 /** Minimum hold before non-stop reversal exits (2 closed 5m bars = 10 min). */
 const MIN_HOLD_BARS = 2;
-/** Minimum underlying adverse move ($) for momentum reversal exit. */
-const MIN_REVERSAL_ADVERSE_DOLLARS = 0.75;
 /** Cooldown between Phase 1 exit and Phase 2 opposite-regime entry (30 min = 1800s). */
 const PHASE2_COOLDOWN_SEC = 1800;
 /** Minimum reward:risk to the structural target. */
 const MIN_REWARD_RISK = 1.5;
+
+export interface AdaptiveQuantMetrics {
+  minWallRoom: number;
+  wallProximityBuffer: number;
+  minReversalInvalidation: number;
+  maxSignalBarBody: number;
+  unitRisk: number;
+  stopWickBuffer: number;
+}
+
+export function computeAdaptiveQuantMetrics(spot: number, atr5m: number): AdaptiveQuantMetrics {
+  const safeSpot = Math.max(1, Number.isFinite(spot) && spot > 0 ? spot : 100);
+  const safeAtr = Math.max(0, Number.isFinite(atr5m) ? atr5m : safeSpot * 0.0015);
+  return {
+    minWallRoom: Math.max(safeSpot * 0.0020, 0.75 * safeAtr),
+    wallProximityBuffer: Math.max(safeSpot * 0.0016, 0.50 * safeAtr),
+    minReversalInvalidation: Math.max(safeSpot * 0.0010, 0.50 * safeAtr),
+    maxSignalBarBody: Math.max(safeSpot * 0.0030, 1.75 * safeAtr),
+    unitRisk: Math.max(safeSpot * 0.0012, 1.15 * safeAtr),
+    stopWickBuffer: Math.max(0.03, safeSpot * 0.0002),
+  };
+}
 
 export interface GaiaBarData {
   barTimestamp: number; // Bar open in epoch seconds
@@ -180,9 +198,10 @@ export function computeCausalEquilibriumDispersion(
 
   let sumSqChiDev = 0;
   let sumSqFluxDev = 0;
-  let sumTr = 0;
   const atrPeriod = Math.min(14, slice.length);
   const atrStart = slice.length - atrPeriod;
+  const atrAlpha = 2 / (atrPeriod + 1);
+  let emaAtr = 0;
 
   for (let j = 0; j < slice.length; j++) {
     const b = slice[j];
@@ -198,15 +217,15 @@ export function computeCausalEquilibriumDispersion(
         Math.abs(b.high - prevClose),
         Math.abs(b.low - prevClose)
       );
-      sumTr += tr;
+      emaAtr = j === atrStart ? tr : atrAlpha * tr + (1 - atrAlpha) * emaAtr;
     }
   }
 
   // Rolling RMS around structural equilibrium (chi=0.5, flux=0.0)
   const rmsChi = Math.sqrt(sumSqChiDev / slice.length);
   const rmsFlux = Math.sqrt(sumSqFluxDev / slice.length);
-  const rawAtr = atrPeriod > 0 ? sumTr / atrPeriod : 0.5;
   const latestClose = slice[slice.length - 1]?.close || 100;
+  const rawAtr = atrPeriod > 0 ? emaAtr : latestClose * 0.0008;
   const atr = Math.max(rawAtr, latestClose * 0.0008);
 
   return {
@@ -334,13 +353,19 @@ export class GaiaSignalFsm {
     );
     const nearestOverheadWall =
       overheadCandidates.length > 0 ? Math.min(...overheadCandidates) : undefined;
+    const qm = computeAdaptiveQuantMetrics(bar.close, dispersion.atr);
+    const barBody = bar.close - bar.open;
+    const smallWickBuf = Math.max(0.02, bar.close * 0.00013);
+    const trailBuf = Math.max(0.02, bar.close * 0.00007);
+    const fallbackTargetDist = Math.max(qm.minWallRoom, bar.close * 0.0033);
+
     const callBlockedByWall =
-      nearestOverheadWall !== undefined && nearestOverheadWall - bar.close < WALL_BLOCK_DOLLARS;
+      nearestOverheadWall !== undefined && nearestOverheadWall - bar.close < qm.wallProximityBuffer;
 
     const putBlockedByWall =
-      putWall !== undefined && putWall < bar.close && bar.close - putWall < WALL_BLOCK_DOLLARS;
+      putWall !== undefined && putWall < bar.close && bar.close - putWall < qm.wallProximityBuffer;
 
-    const unitRisk = Math.max(0.90, 1.15 * dispersion.atr);
+    const unitRisk = qm.unitRisk;
 
     if (currentState === "STAND_ASIDE") {
       if (!isWithinEntryWindow) {
@@ -393,15 +418,15 @@ export class GaiaSignalFsm {
             bar.close < (bookCenter ?? pdh!) &&
             (bar.flowVwap === undefined || bar.close <= bar.flowVwap));
         const leg2CallTarget =
-          callWall && callWall > bar.close + 1.50
+          callWall && callWall > bar.close + qm.minWallRoom
             ? callWall
-            : zg && zg > bar.close + 1.50
+            : zg && zg > bar.close + qm.minWallRoom
               ? zg
               : undefined;
         const leg2PutTarget =
-          putWall && bar.close - putWall >= 1.50
+          putWall && bar.close - putWall >= qm.minWallRoom
             ? putWall
-            : zg && bar.close - zg >= 1.50
+            : zg && bar.close - zg >= qm.minWallRoom
               ? zg
               : undefined;
         const leg2CallRoom = Math.max(
@@ -419,13 +444,14 @@ export class GaiaSignalFsm {
           leg2BullReclaim &&
           impulseChi >= 0.60 &&
           (deltaNetFlux6Bar > 0 || bullSmaOrVwap) &&
-          leg2CallRoom >= 1.50
+          barBody <= qm.maxSignalBarBody &&
+          leg2CallRoom >= qm.minWallRoom
         ) {
           return {
             nextState: "LONG",
             reason: "LEG2_PUT_WALL_BULL_RECLAIM_CALL",
-            targetWall: leg2CallTarget ?? Number((bar.close + Math.max(2.0, 2.0 * dispersion.atr)).toFixed(2)),
-            stopPrice: Number((leg2TestLow - 0.15).toFixed(2)),
+            targetWall: leg2CallTarget ?? Number((bar.close + Math.max(bar.close * 0.0027, 2.0 * dispersion.atr)).toFixed(2)),
+            stopPrice: Number((leg2TestLow - qm.stopWickBuffer).toFixed(2)),
           };
         }
 
@@ -435,13 +461,14 @@ export class GaiaSignalFsm {
           leg2BearReject &&
           impulseChi <= 0.40 &&
           (deltaNetFlux6Bar < 0 || bearSmaOrVwap) &&
-          leg2PutRoom >= 1.50
+          -barBody <= qm.maxSignalBarBody &&
+          leg2PutRoom >= qm.minWallRoom
         ) {
           return {
             nextState: "SHORT",
             reason: "LEG2_CALL_WALL_BEAR_REJECTION_PUT",
-            targetWall: leg2PutTarget ?? Number((bar.close - Math.max(2.0, 2.0 * dispersion.atr)).toFixed(2)),
-            stopPrice: Number((leg2TestHigh + 0.15).toFixed(2)),
+            targetWall: leg2PutTarget ?? Number((bar.close - Math.max(bar.close * 0.0027, 2.0 * dispersion.atr)).toFixed(2)),
+            stopPrice: Number((leg2TestHigh + qm.stopWickBuffer).toFixed(2)),
           };
         }
 
@@ -466,8 +493,8 @@ export class GaiaSignalFsm {
         const rejectedMean =
           (bar.flowVwap === undefined || bar.close <= bar.flowVwap) ||
           (bar.sma34 === undefined || bar.close < bar.sma34);
-        const pgCallTarget = bookCenter && bookCenter > bar.close + 1.25 ? bookCenter : (callWall ?? zg ?? bar.close + 2.5);
-        const pgPutTarget = bookCenter && bar.close - bookCenter >= 1.25 ? bookCenter : (putWall ?? zg ?? bar.close - 2.5);
+        const pgCallTarget = bookCenter && bookCenter > bar.close + qm.wallProximityBuffer ? bookCenter : (callWall ?? zg ?? bar.close + fallbackTargetDist);
+        const pgPutTarget = bookCenter && bar.close - bookCenter >= qm.wallProximityBuffer ? bookCenter : (putWall ?? zg ?? bar.close - fallbackTargetDist);
         const pgCallDest = callWall && callWall > pgCallTarget ? callWall : pgCallTarget;
         const pgPutDest = putWall && putWall < pgPutTarget ? putWall : pgPutTarget;
 
@@ -483,7 +510,7 @@ export class GaiaSignalFsm {
             nextState: "LONG",
             reason: "POSITIVE_GAMMA_PUT_WALL_BOUNCE_CALL",
             targetWall: pgCallDest,
-            stopPrice: Number((pgTestLow - 0.10).toFixed(2)),
+            stopPrice: Number((pgTestLow - smallWickBuf).toFixed(2)),
           };
         }
 
@@ -499,7 +526,7 @@ export class GaiaSignalFsm {
             nextState: "SHORT",
             reason: "POSITIVE_GAMMA_CALL_WALL_REJECTION_PUT",
             targetWall: pgPutDest,
-            stopPrice: Number((pgTestHigh + 0.10).toFixed(2)),
+            stopPrice: Number((pgTestHigh + smallWickBuf).toFixed(2)),
           };
         }
       }
@@ -521,7 +548,7 @@ export class GaiaSignalFsm {
           bar.netFlux < 0 ||
           bar.chi < 0.45 ||
           Boolean(bar.bearDiv5m);
-        const downsideTarget = putWall ?? bookCenter ?? bar.close - 2.50;
+        const downsideTarget = putWall ?? bookCenter ?? bar.close - fallbackTargetDist;
         const downsideRoom = (bar.close - downsideTarget) >= MIN_REWARD_RISK * unitRisk;
 
         if (nearUpper && belowFlowAndSma && negativeFluxConfirm && downsideRoom) {
@@ -529,7 +556,7 @@ export class GaiaSignalFsm {
             nextState: "SHORT",
             reason: "STRUCTURAL_PUT_UPPER_WALL_REJECTION",
             targetWall: putWall ?? downsideTarget,
-            stopPrice: testHigh + 0.10,
+            stopPrice: testHigh + smallWickBuf,
           };
         }
 
@@ -539,7 +566,7 @@ export class GaiaSignalFsm {
           (callWall !== undefined && bar.close < callWall);
         const bearishLean = (bar.flowVwap !== undefined && bar.close < bar.flowVwap) &&
           bar.netFlux < 0 && bar.chi <= 0.45 && isBearMacro;
-        const downsideRoom = (bar.close - (putWall ?? bar.close - 2.50)) >= MIN_REWARD_RISK * unitRisk;
+        const downsideRoom = (bar.close - (putWall ?? bar.close - fallbackTargetDist)) >= MIN_REWARD_RISK * unitRisk;
         if (rejectedOverhead && bearishLean && downsideRoom) {
           return { nextState: "SHORT", reason: "PREMARKET_FLUX_REJECTION_PUT", targetWall: putWall };
         }
@@ -548,14 +575,14 @@ export class GaiaSignalFsm {
       // Setup P-B (Zero-Gamma / Book Center Breakdown Flush)
         if (zg !== undefined && bar.close < zg && bookCenter !== undefined) {
           const brokeCenter = bar.close < bookCenter && (bar.sma34 === undefined || bar.close < bar.sma34);
-          const downsideRoomFlush = (bar.close - (putWall ?? bar.close - 2.50)) >= MIN_REWARD_RISK * unitRisk;
+          const downsideRoomFlush = (bar.close - (putWall ?? bar.close - fallbackTargetDist)) >= MIN_REWARD_RISK * unitRisk;
           const expandingBearFlux = bar.netFlux < 0 && (bar.prevNetFlux === undefined || bar.netFlux <= bar.prevNetFlux || bar.chi < 0.48);
           if (brokeCenter && expandingBearFlux && downsideRoomFlush) {
             return {
               nextState: "SHORT",
               reason: "STRUCTURAL_PUT_BREAKDOWN_FLUSH",
               targetWall: putWall,
-              stopPrice: bookCenter + 0.20,
+              stopPrice: bookCenter + Math.max(0.03, bar.close * 0.00027),
             };
           }
         }
@@ -568,22 +595,23 @@ export class GaiaSignalFsm {
         // Primary Flux-Field Call Entry (Lower -1.5sigma Flux Exhaustion + Cyan Boundary Flux Flip & Flow VWAP Reclaim)
       if (!callBlockedByWall && !bar.bearDiv5m) {
         const vwapRef = bar.flowVwap ?? bookCenter ?? bar.sma34;
-        const fluxDistSigma = vwapRef !== undefined && dispersion.atr > 0 ? (bar.close - vwapRef) / Math.max(0.75, dispersion.atr) : 0;
+        const fluxScale = Math.max(qm.minReversalInvalidation, dispersion.atr);
+        const fluxDistSigma = vwapRef !== undefined && dispersion.atr > 0 ? (bar.close - vwapRef) / fluxScale : 0;
         const testLow = bar.recentLow4 ?? bar.low;
         const touchedLowerFluxOrWall =
           (bar.lowerBand2 !== undefined && testLow <= bar.lowerBand2 * 1.0008) ||
           (bar.lowerBand1 !== undefined && testLow <= bar.lowerBand1 && bar.close > bar.lowerBand1) ||
-          (vwapRef !== undefined && (testLow - vwapRef) / Math.max(0.75, dispersion.atr) <= -1.25) ||
+          (vwapRef !== undefined && (testLow - vwapRef) / fluxScale <= -1.25) ||
           [putWall, pdl].some((lvl) => typeof lvl === "number" && Math.abs(testLow - lvl) / lvl <= 0.0030);
         const cyanFluxFlip = bar.netFlux > 0 && (bar.peclet >= 0.40 || bar.chi >= 0.48 || (bar.prevChi !== undefined && bar.chi - bar.prevChi >= 0.06));
         const reclaimedEquilibrium = (vwapRef !== undefined && bar.close >= vwapRef) || (bar.sma34 !== undefined && bar.close > bar.sma34);
-        const upsideRoom = ((callWall ?? zg ?? (vwapRef ? vwapRef + 2.0 * Math.max(0.85, dispersion.atr) : bar.close + 2.50)) - bar.close) >= MIN_REWARD_RISK * unitRisk;
+        const upsideRoom = ((callWall ?? zg ?? (vwapRef ? vwapRef + 2.0 * fluxScale : bar.close + fallbackTargetDist)) - bar.close) >= MIN_REWARD_RISK * unitRisk;
         if (touchedLowerFluxOrWall && cyanFluxFlip && reclaimedEquilibrium && fluxDistSigma < 1.25 && upsideRoom) {
-          const upperFluxTarget = vwapRef ? Number((vwapRef + 2.0 * Math.max(0.85, dispersion.atr)).toFixed(2)) : undefined;
+          const upperFluxTarget = vwapRef ? Number((vwapRef + 2.0 * fluxScale).toFixed(2)) : undefined;
           return {
             nextState: "LONG",
             reason: "FLUX_FIELD_EXTREMITY_RECLAIM_CALL",
-            targetWall: callWall && callWall > bar.close + 1.0 ? callWall : upperFluxTarget,
+            targetWall: callWall && callWall > bar.close + Math.max(0.15, bar.close * 0.0013) ? callWall : upperFluxTarget,
           };
         }
       }
@@ -600,7 +628,7 @@ export class GaiaSignalFsm {
           (bar.prevChi !== undefined && bar.chi > bar.prevChi) ||
           bar.netFlux > 0 ||
           bar.close > bar.open;
-        const upsideTarget = callWall ?? zg ?? bar.close + 2.50;
+        const upsideTarget = callWall ?? zg ?? bar.close + fallbackTargetDist;
         const upsideRoom = (upsideTarget - bar.close) >= MIN_REWARD_RISK * unitRisk;
 
         if (nearLower && reclaimed && improvingFlux && upsideRoom) {
@@ -608,20 +636,20 @@ export class GaiaSignalFsm {
             nextState: "LONG",
             reason: "STRUCTURAL_CALL_WALL_BOUNCE_RECLAIM",
             targetWall: upsideTarget,
-            stopPrice: testLow - 0.10,
+            stopPrice: testLow - smallWickBuf,
           };
         }
 
         // Setup C-B (Zero-Gamma / Positive-Gamma Breakout)
         if (zg !== undefined && bar.close > zg) {
           const aboveVwap = bar.flowVwap === undefined || bar.close > bar.flowVwap;
-          const upsideRoomBreakout = ((callWall ?? bar.close + 3.0) - bar.close) >= MIN_REWARD_RISK * unitRisk;
+          const upsideRoomBreakout = ((callWall ?? bar.close + Math.max(qm.minWallRoom, bar.close * 0.0040)) - bar.close) >= MIN_REWARD_RISK * unitRisk;
           if (aboveVwap && bar.netFlux > 0 && bar.chi >= 0.50 && upsideRoomBreakout) {
             return {
               nextState: "LONG",
               reason: "STRUCTURAL_CALL_WALL_BREAKOUT",
               targetWall: callWall,
-              stopPrice: zg - 0.20,
+              stopPrice: zg - Math.max(0.03, bar.close * 0.00027),
             };
           }
         }
@@ -642,7 +670,7 @@ export class GaiaSignalFsm {
           return {
             nextState: "LONG",
             reason: "ZERO_GAMMA_FLUX_RECLAIM_CALL",
-            targetWall: callWall && callWall > bar.close + 1.0 ? callWall : Number((vwapLevel + 2.0 * Math.max(0.75, 1.25 * dispersion.atr)).toFixed(2))
+            targetWall: callWall && callWall > bar.close + Math.max(0.15, bar.close * 0.0013) ? callWall : Number((vwapLevel + 2.0 * Math.max(qm.minReversalInvalidation, 1.25 * dispersion.atr)).toFixed(2))
           };
         }
 
@@ -693,8 +721,8 @@ export class GaiaSignalFsm {
       const clampFill = (p: number) => Number(Math.max(bar.low, Math.min(bar.high, p)).toFixed(2));
       const solidBullFlux = bar.netFlux > 0 && bar.chi > 0.85;
       const fluxDecelerating = bar.prevNetFlux !== undefined && bar.netFlux <= bar.prevNetFlux;
-      const upperFluxBand = bar.upperBand2 ?? (bar.flowVwap !== undefined ? bar.flowVwap + 1.95 * Math.max(0.85, dispersion.atr) : undefined);
-      if (minHoldMet && ((upperFluxBand !== undefined && bar.high >= upperFluxBand && (fluxDecelerating || !solidBullFlux)) || (adverseMove >= MIN_REVERSAL_ADVERSE_DOLLARS && bar.netFlux < 0 && bar.peclet <= -0.75 && bar.flowVwap !== undefined && bar.close < bar.flowVwap))) {
+      const upperFluxBand = bar.upperBand2 ?? (bar.flowVwap !== undefined ? bar.flowVwap + 1.95 * Math.max(qm.minReversalInvalidation, dispersion.atr) : undefined);
+      if (minHoldMet && ((upperFluxBand !== undefined && bar.high >= upperFluxBand && (fluxDecelerating || !solidBullFlux)) || (adverseMove >= qm.minReversalInvalidation && bar.netFlux < 0 && bar.peclet <= -0.75 && bar.flowVwap !== undefined && bar.close < bar.flowVwap))) {
         return { nextState: "STAND_ASIDE", reason: "UPPER_FLUX_FIELD_TARGET_OR_FLUX_FLIP", fillPrice: bar.close };
       }
       const targetW = targetWallRef || this.activeTargetWall;
@@ -718,7 +746,7 @@ export class GaiaSignalFsm {
         // Stage 2 Ratchet (75% progress): Trail under prior 5m low with Stage-1 BE+10% floor
         if (progress >= 0.75) {
           const refLow = this.prevBarLow > 0 ? this.prevBarLow : bar.open;
-          const trailStop = Number(Math.max(be10Stop, refLow - 0.05).toFixed(2));
+          const trailStop = Number(Math.max(be10Stop, refLow - trailBuf).toFixed(2));
           if (bar.close < trailStop) {
             return {
               nextState: "STAND_ASIDE",
@@ -750,7 +778,7 @@ export class GaiaSignalFsm {
           this.activeSetupReason.startsWith("LEG2_") ||
           this.activeSetupReason.startsWith("POSITIVE_GAMMA_") ||
           this.activeSetupReason.includes("FLUX");
-        if (minHoldMet && adverseMove >= MIN_REVERSAL_ADVERSE_DOLLARS && !isStructuralLong && !solidBullFlux && isBearMacro && !isBullMacro) {
+        if (minHoldMet && adverseMove >= qm.minReversalInvalidation && !isStructuralLong && !solidBullFlux && isBearMacro && !isBullMacro) {
           return { nextState: "STAND_ASIDE", reason: "MACRO_REGIME_BEAR_FLIP" };
         }
 
@@ -773,8 +801,8 @@ export class GaiaSignalFsm {
       const clampFill = (p: number) => Number(Math.max(bar.low, Math.min(bar.high, p)).toFixed(2));
       const solidBearFlux = bar.netFlux < 0 && bar.chi < 0.15;
       const fluxDecelerating = bar.prevNetFlux !== undefined && bar.netFlux >= bar.prevNetFlux;
-      const lowerFluxBand = bar.lowerBand2 ?? (bar.flowVwap !== undefined ? bar.flowVwap - 1.95 * Math.max(0.85, dispersion.atr) : undefined);
-      if (minHoldMet && ((lowerFluxBand !== undefined && bar.low <= lowerFluxBand && (fluxDecelerating || !solidBearFlux)) || (adverseMove >= MIN_REVERSAL_ADVERSE_DOLLARS && bar.netFlux > 0 && bar.peclet >= 0.75 && bar.flowVwap !== undefined && bar.close > bar.flowVwap))) {
+      const lowerFluxBand = bar.lowerBand2 ?? (bar.flowVwap !== undefined ? bar.flowVwap - 1.95 * Math.max(qm.minReversalInvalidation, dispersion.atr) : undefined);
+      if (minHoldMet && ((lowerFluxBand !== undefined && bar.low <= lowerFluxBand && (fluxDecelerating || !solidBearFlux)) || (adverseMove >= qm.minReversalInvalidation && bar.netFlux > 0 && bar.peclet >= 0.75 && bar.flowVwap !== undefined && bar.close > bar.flowVwap))) {
         return { nextState: "STAND_ASIDE", reason: "LOWER_FLUX_FIELD_TARGET_OR_FLUX_FLIP", fillPrice: bar.close };
       }
       const targetW = targetWallRef || this.activeTargetWall;
@@ -798,7 +826,7 @@ export class GaiaSignalFsm {
         // Stage 2 Ratchet (75% progress): Trail above prior 5m high with Stage-1 BE+10% floor
         if (progress >= 0.75) {
           const refHigh = this.prevBarHigh > 0 ? this.prevBarHigh : bar.open;
-          const trailStop = Number(Math.min(be10Stop, refHigh + 0.05).toFixed(2));
+          const trailStop = Number(Math.min(be10Stop, refHigh + trailBuf).toFixed(2));
           if (bar.close > trailStop) {
             return {
               nextState: "STAND_ASIDE",
@@ -830,7 +858,7 @@ export class GaiaSignalFsm {
           this.activeSetupReason.startsWith("LEG2_") ||
           this.activeSetupReason.startsWith("POSITIVE_GAMMA_") ||
           this.activeSetupReason.includes("FLUX");
-        if (minHoldMet && adverseMove >= MIN_REVERSAL_ADVERSE_DOLLARS && !isStructuralShort && !solidBearFlux && isBullMacro && !isBearMacro) {
+        if (minHoldMet && adverseMove >= qm.minReversalInvalidation && !isStructuralShort && !solidBearFlux && isBullMacro && !isBearMacro) {
           return { nextState: "STAND_ASIDE", reason: "MACRO_REGIME_BULL_FLIP" };
         }
 

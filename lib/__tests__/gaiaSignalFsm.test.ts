@@ -605,4 +605,68 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
     const leg2 = newlyCommitted.find((s) => s.barTimestamp === 7000);
     assert.ok(leg2 && leg2.toState === "LONG", "Saturated impulseChi >= 0.60 with flowVwap reclaim must unlock Leg-2 LONG despite deltaNetFlux6Bar === 0");
   });
+
+  it("Multi-Ticker IWM ($220): dynamic ATR/% gates trigger Leg-1 & Leg-2 with <$1.25/$1.50 SPY dollar room", () => {
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [
+      // 09:35 ET: close 219.90 vs putWall 218.90 ($1.00 < $1.25 old SPY WALL_BLOCK_DOLLARS; >= $0.35 wallProximityBuffer & >= 1.5*unitRisk)
+      { barTimestamp: 1000, open: 220.15, high: 220.25, low: 219.80, close: 219.90, chi: 0.25, bias: -0.45, netFlux: -0.35, peclet: -2.2, flowVwap: 220.05, sma34: 220.10, etMins: 575, isClosed: true },
+      { barTimestamp: 1300, open: 219.90, high: 219.92, low: 219.35, close: 219.40, chi: 0.22, bias: -0.48, netFlux: -0.38, peclet: -2.4, flowVwap: 219.80, sma34: 219.95, etMins: 580, isClosed: true },
+      // 09:45 ET: touches Put Wall 218.90 + 0.25 -> STRUCTURAL_TARGET_HIT
+      { barTimestamp: 1600, open: 219.40, high: 219.45, low: 219.10, close: 219.25, chi: 0.28, bias: -0.35, netFlux: -0.25, peclet: -1.8, flowVwap: 219.65, sma34: 219.80, etMins: 585, isClosed: true },
+      // 11:30 ET (+2100s >= 1800s cooldown): Call Wall 220.45 gives $1.13 room (< $1.50 old SPY constant, >= $0.44 minWallRoom)
+      { barTimestamp: 3700, open: 219.05, high: 219.40, low: 218.92, close: 219.32, recentLow4: 218.92, chi: 0.56, impulseChi: 0.68, deltaNetFlux6Bar: 0.14, bias: 0.28, netFlux: 0.18, peclet: 0.8, impulsePeclet: 1.5, flowVwap: 219.20, sma34: 219.22, sigmaMinus1: 219.00, sigmaPlus1: 220.25, bullDiv5m: true, etMins: 690, isClosed: true },
+    ];
+    const { newlyCommitted } = fsm.commitSeries(bars, {
+      macroRegime: "PUT",
+      callDominancePct: 35,
+      structuralLevels: { putWall: 218.90, callWall: 220.45, zeroGamma: 220.00, bookCenter: 219.70 },
+    });
+    const entries = newlyCommitted.filter((s) => s.toState === "LONG" || s.toState === "SHORT");
+    assert.strictEqual(entries.length, 2, `Expected 2 IWM entries (Leg-1 SHORT + Leg-2 LONG), got ${entries.length}`);
+    assert.strictEqual(entries[0].toState, "SHORT");
+    assert.strictEqual(entries[1].toState, "LONG");
+    assert.strictEqual(entries[1].reason, "LEG2_PUT_WALL_BULL_RECLAIM_CALL");
+  });
+
+  it("Multi-Ticker NVDA ($140): triggers <$1.25/$1.50 room, fires proportional <$0.75 reversal exit, and blocks <wallProximityBuffer jams", () => {
+    const fsm = new GaiaSignalFsm();
+    const bars: GaiaBarData[] = [
+      // 09:35 ET: close 139.75 vs putWall 138.90 ($0.85 < $1.25 old SPY constant)
+      { barTimestamp: 1000, open: 139.98, high: 140.02, low: 139.70, close: 139.75, chi: 0.24, bias: -0.42, netFlux: -0.32, peclet: -2.0, flowVwap: 139.90, sma34: 139.95, etMins: 575, isClosed: true },
+      { barTimestamp: 1300, open: 139.75, high: 139.82, low: 139.50, close: 139.55, chi: 0.32, bias: -0.25, netFlux: -0.18, peclet: -1.4, flowVwap: 139.75, sma34: 139.85, etMins: 580, isClosed: true },
+      // 09:45 ET (barsHeld=2): +$0.37 adverse bounce (<$0.75 old SPY constant, >=$0.21 minReversalInvalidation) triggers flux-flip exit
+      { barTimestamp: 1600, open: 139.55, high: 140.16, low: 139.52, close: 140.12, chi: 0.58, bias: 0.22, netFlux: 0.16, peclet: 0.90, flowVwap: 139.90, sma34: 139.88, etMins: 585, isClosed: true },
+      // 11:30 ET (+2100s >= 1800s): Leg-2 LONG at 139.18 vs callWall 140.25 ($1.07 < $1.50 old SPY constant, >= $0.30 minWallRoom)
+      { barTimestamp: 3700, open: 139.00, high: 139.25, low: 138.92, close: 139.18, recentLow4: 138.92, chi: 0.58, impulseChi: 0.69, deltaNetFlux6Bar: 0.16, bias: 0.30, netFlux: 0.20, peclet: 0.85, impulsePeclet: 1.6, flowVwap: 139.10, sma34: 139.12, sigmaMinus1: 139.00, sigmaPlus1: 140.20, bullDiv5m: true, etMins: 690, isClosed: true },
+    ];
+    const { newlyCommitted } = fsm.commitSeries(bars, {
+      macroRegime: "PUT",
+      callDominancePct: 35,
+      structuralLevels: { putWall: 138.90, callWall: 140.25, zeroGamma: 140.10, bookCenter: 140.00 },
+    });
+    const entries = newlyCommitted.filter((s) => s.toState === "LONG" || s.toState === "SHORT");
+    const exits = newlyCommitted.filter((s) => s.fromState === "SHORT" && s.toState === "STAND_ASIDE");
+    assert.strictEqual(entries.length, 2, `Expected 2 NVDA entries, got ${entries.length}`);
+    assert.strictEqual(exits[0]?.reason, "LOWER_FLUX_FIELD_TARGET_OR_FLUX_FLIP", "Proportional <$0.75 reversal exit must fire on NVDA");
+    assert.strictEqual(entries[1]?.reason, "LEG2_PUT_WALL_BULL_RECLAIM_CALL");
+
+    // Negative control: $0.15 room to Put Wall (< $0.224 wallProximityBuffer) strictly blocks SHORT
+    const fsmJam = new GaiaSignalFsm();
+    const jamOut = fsmJam.commitSeries(
+      [{ barTimestamp: 1000, open: 140.00, high: 140.05, low: 139.85, close: 139.90, chi: 0.24, bias: -0.42, netFlux: -0.32, peclet: -2.0, flowVwap: 140.05, sma34: 140.05, etMins: 575, isClosed: true }],
+      { macroRegime: "PUT", callDominancePct: 35, structuralLevels: { putWall: 139.75, callWall: 141.00, zeroGamma: 140.10, bookCenter: 140.00 } }
+    );
+    assert.strictEqual(jamOut.newlyCommitted.length, 0, "Wall proximity <$0.224 must still block NVDA SHORT");
+  });
+
+  it("Multi-Ticker QQQ ($510): dynamic ATR/% gates trigger valid setup with $1.10 wall room", () => {
+    const fsm = new GaiaSignalFsm();
+    const { newlyCommitted } = fsm.commitSeries(
+      [{ barTimestamp: 1000, open: 510.25, high: 510.35, low: 509.80, close: 509.95, chi: 0.25, bias: -0.45, netFlux: -0.35, peclet: -2.2, flowVwap: 510.15, sma34: 510.20, etMins: 575, isClosed: true }],
+      { macroRegime: "PUT", callDominancePct: 35, structuralLevels: { putWall: 508.85, callWall: 511.20, zeroGamma: 510.10, bookCenter: 510.10 } }
+    );
+    assert.strictEqual(newlyCommitted.length, 1);
+    assert.strictEqual(newlyCommitted[0].toState, "SHORT");
+  });
 });

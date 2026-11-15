@@ -87,6 +87,7 @@ export interface FlowGammaVwapSnapshot {
   candleLow?: number;
   candleOpen?: number;
   candleClose?: number;
+  atr5m?: number;
 }
 
 /**
@@ -232,7 +233,7 @@ export function evaluateSpectralFlowAndFluxAtTau(params: {
     alphaScale = 1.0,
   } = params;
 
-  const W = Math.max(0.5, ceilingNode - floorNode);
+  const W = Math.max(Math.max(0.05, floorNode * 0.001), ceilingNode - floorNode);
   const midpoint = floorNode + W / 2;
   const tau = Math.max(0.05, tauMinutes);
 
@@ -278,7 +279,8 @@ export function evaluateSpectralFlowAndFluxAtTau(params: {
   if (totalMassIntegral > 1e-9) {
     const eP2 = (W * W * W * numSecondMoment) / totalMassIntegral;
     const varP = eP2 - relativeVwap * relativeVwap;
-    if (Number.isFinite(varP) && varP > 0.04) {
+    const minSpectralVar = Math.max(1e-4, (W * 0.01) * (W * 0.01));
+    if (Number.isFinite(varP) && varP > minSpectralVar) {
       spectralSigma = Math.min(W * 0.28, Math.max(W * 0.08, Math.sqrt(varP)));
     }
   }
@@ -701,7 +703,7 @@ export function computeBarFlowGammaVwapSeries(
           ? Math.max(callWallCandidate, openHigh + openRange * 0.08)
           : Number((openHigh + openRange * 0.12).toFixed(2));
 
-    const baseW = Math.max(1.0, baseCeilingNode - baseFloorNode);
+    const baseW = Math.max(Math.max(0.10, sliceOpenSpot * 0.002), baseCeilingNode - baseFloorNode);
     const openCenterPrice =
       openSlice.reduce((acc, c) => acc + (c.open + c.close + c.high + c.low) / 4, 0) /
       openSlice.length;
@@ -821,7 +823,7 @@ export function computeBarFlowGammaVwapSeries(
           ? Math.max(callWallCandidate, causalCeiling)
           : Number(causalCeiling.toFixed(2));
 
-    const W = Math.max(1.0, ceilingNode - floorNode);
+    const W = Math.max(Math.max(0.10, spot * 0.002), ceilingNode - floorNode);
     const midpointNode = Number((floorNode + W / 2).toFixed(2));
 
     let barWeight = 0;
@@ -829,9 +831,10 @@ export function computeBarFlowGammaVwapSeries(
 
     if (strikeGammaWeights.length > 0 && totalBookWeight > 0) {
       let netSigned = 0;
+      const strikeProxSigma = Math.max(0.5, spot * 0.0053);
       for (const sw of strikeGammaWeights) {
         const dist = Math.abs(sw.strike - spot);
-        const prox = Math.exp(-(dist * dist) / (2 * 16)); // ~4 pt sigma
+        const prox = Math.exp(-(dist * dist) / (2 * strikeProxSigma * strikeProxSigma));
         const w = sw.weight * prox * (barVol / 7800);
         barWeight += w;
         netSigned += w * sw.signedBias;
@@ -843,7 +846,7 @@ export function computeBarFlowGammaVwapSeries(
         }
       }
     } else {
-      const range = Math.max(0.2, c.high - c.low);
+      const range = Math.max(c.close * 0.0003, c.high - c.low);
       barWeight = barVol * range * 10;
     }
 
@@ -866,7 +869,7 @@ export function computeBarFlowGammaVwapSeries(
 
     // Multi-Horizon Structural Advection Velocity (Session Open + VWAP + Momentum)
     const currentVwap = baseSnap.flowVwap || c.close;
-    const atrEst = Math.max(0.40, causalAtr);
+    const atrEst = Math.max(c.close * 0.0005, causalAtr);
 
     // 1. Session Macro Horizon: Distance from 9:30 AM Open
     const macroDrive = (c.close - open930) / (2.2 * atrEst);
@@ -1022,6 +1025,7 @@ export function computeBarFlowGammaVwapSeries(
       candleLow: c.low,
       candleOpen: c.open,
       candleClose: c.close,
+      atr5m: Number(causalAtr.toFixed(4)),
     });
   }
 

@@ -35,6 +35,7 @@ import {
   OptionTradePosition,
   getTodayEt,
   estimateDynamicAtmIv,
+  syncGaiaTickerSignalsToDiscord,
 } from "../lib/tradeSignalEngine";
 import {
   acquireBarEvaluationLock,
@@ -44,7 +45,7 @@ import {
 } from "../lib/liveBotDaemon";
 import { NormalizedOptionContract } from "../lib/optionsExposure";
 import { NextRequest } from "next/server";
-import { GET as getSignalsRoute } from "../app/api/signals/route";
+import { GET as getSignalsRoute, POST as postSignalsRoute } from "../app/api/signals/route";
 
 let totalTests = 0;
 let passedTests = 0;
@@ -1846,6 +1847,318 @@ async function runTestSuite() {
       histSignalsBody.closedPositions.some((p: { id?: string }) => p.id === "SPY-PUT-1794581245"),
     "GET /api/signals?ticker=SPY&date=2026-11-13 returns 2026-11-13 closed trade SPY-PUT-1794581245"
   );
+
+  // ===========================================================================
+  // TEST SECTION 12: MULTI-TICKER IV & CONTRACT SELECTION (SPY/QQQ/IWM/NVDA 48% IV)
+  // ===========================================================================
+  console.log("\n12. Verifying Multi-Ticker IV & Contract Selection (SPY $750, QQQ $510, IWM $220, NVDA $140 @ 48% IV)...");
+
+  const makeVolBars = (startPrice: number, stepPct: number, count = 22) => {
+    const out: Array<{ close: number }> = [];
+    let p = startPrice;
+    for (let i = 0; i < count; i++) {
+      if (i > 0) p = Number((p * (1 + (i % 2 === 0 ? stepPct : -stepPct))).toFixed(4));
+      out.push({ close: p });
+    }
+    return out;
+  };
+
+  // 12A: estimateDynamicAtmIv across low-IV ETFs & high-IV NVDA (48% IV)
+  const spyDynIv = estimateDynamicAtmIv(makeVolBars(750, 0.0011), 21, 0.085, 0.16);
+  const qqqDynIv = estimateDynamicAtmIv(makeVolBars(510, 0.0014), 21, 0.085, 0.20);
+  const iwmDynIv = estimateDynamicAtmIv(makeVolBars(220, 0.0017), 21, 0.085, 0.24);
+  const nvdaDynIv = estimateDynamicAtmIv(makeVolBars(140, 0.0034), 21, 0.085, 0.48);
+  const nvdaShockIv = estimateDynamicAtmIv(makeVolBars(140, 0.0080), 21, 0.085, 1.20);
+  const nvdaOpenRefIv = estimateDynamicAtmIv([{ close: 140 }], 0, 0.085, 0.48);
+
+  assert(spyDynIv >= 0.12 && spyDynIv <= 0.22, `12A.1: SPY 16% ETF IV calibrated (got ${(spyDynIv * 100).toFixed(1)}%)`);
+  assert(qqqDynIv >= 0.15 && qqqDynIv <= 0.26, `12A.2: QQQ 20% ETF IV calibrated (got ${(qqqDynIv * 100).toFixed(1)}%)`);
+  assert(iwmDynIv >= 0.18 && iwmDynIv <= 0.30, `12A.3: IWM 24% ETF IV calibrated (got ${(iwmDynIv * 100).toFixed(1)}%)`);
+  assert(nvdaDynIv >= 0.38 && nvdaDynIv <= 0.60, `12A.4: NVDA 48% high-IV equity unblocked above 20% cap (got ${(nvdaDynIv * 100).toFixed(1)}%)`);
+  assert(nvdaShockIv >= 0.085 && nvdaShockIv <= 0.85, `12A.5: Extreme IV bounded <= 85% ceiling (got ${(nvdaShockIv * 100).toFixed(1)}%)`);
+  assert(nvdaOpenRefIv >= 0.40 && nvdaOpenRefIv <= 0.56, `12A.6: NVDA opening bar honors referenceChainIv=48% (got ${(nvdaOpenRefIv * 100).toFixed(1)}%)`);
+
+  // 12B: selectSmallAccountContract across SPY ($750), QQQ ($510), IWM ($220), NVDA ($140 @ 48% IV)
+  const mtMorningEt = new Date("2026-11-13T10:15:00-05:00");
+  const mtExp = "2026-11-13";
+  const mtContracts: Array<{
+    ticker: string;
+    type: "CALL" | "PUT";
+    spot: number;
+    t1: number;
+    t2: number;
+    sl: number;
+    cw: number;
+    pw: number;
+    expectedStrike: number;
+    rejectedOnlyChain: NormalizedOptionContract[];
+    fullChain: NormalizedOptionContract[];
+  }> = [
+    {
+      ticker: "SPY", type: "CALL", spot: 750, t1: 753, t2: 756, sl: 748.5, cw: 756, pw: 746, expectedStrike: 753,
+      rejectedOnlyChain: [
+        { symbol: "SPY261113C00754000", strike: 754, expiration: mtExp, optionType: "C", bid: 0.49, ask: 0.52, last: 0.50, volume: 9000, openInterest: 8000, iv: 0.16, delta: 0.27, gamma: 0.03, vega: 0.06, percentChange: 0 },
+        { symbol: "SPY261113C00752000", strike: 752, expiration: mtExp, optionType: "C", bid: 0.77, ask: 0.80, last: 0.79, volume: 9000, openInterest: 8000, iv: 0.16, delta: 0.24, gamma: 0.04, vega: 0.07, percentChange: 0 },
+      ],
+      fullChain: [
+        { symbol: "SPY261113C00750000", strike: 750, expiration: mtExp, optionType: "C", bid: 1.80, ask: 1.85, last: 1.82, volume: 12000, openInterest: 10000, iv: 0.16, delta: 0.52, gamma: 0.05, vega: 0.08, percentChange: 0 },
+        { symbol: "SPY261113C00753000", strike: 753, expiration: mtExp, optionType: "C", bid: 0.75, ask: 0.78, last: 0.77, volume: 15000, openInterest: 11000, iv: 0.16, delta: 0.32, gamma: 0.04, vega: 0.07, percentChange: 0 },
+      ],
+    },
+    {
+      ticker: "QQQ", type: "CALL", spot: 510, t1: 512, t2: 514, sl: 508.8, cw: 514, pw: 507, expectedStrike: 512,
+      rejectedOnlyChain: [
+        { symbol: "QQQ261113C00513000", strike: 513, expiration: mtExp, optionType: "C", bid: 0.51, ask: 0.54, last: 0.52, volume: 8000, openInterest: 7000, iv: 0.20, delta: 0.28, gamma: 0.04, vega: 0.05, percentChange: 0 },
+      ],
+      fullChain: [
+        { symbol: "QQQ261113C00510000", strike: 510, expiration: mtExp, optionType: "C", bid: 1.38, ask: 1.42, last: 1.40, volume: 11000, openInterest: 9000, iv: 0.20, delta: 0.51, gamma: 0.06, vega: 0.06, percentChange: 0 },
+        { symbol: "QQQ261113C00512000", strike: 512, expiration: mtExp, optionType: "C", bid: 0.73, ask: 0.76, last: 0.75, volume: 14000, openInterest: 10000, iv: 0.20, delta: 0.34, gamma: 0.05, vega: 0.05, percentChange: 0 },
+      ],
+    },
+    {
+      ticker: "IWM", type: "CALL", spot: 220, t1: 221, t2: 222, sl: 219.4, cw: 222, pw: 218.8, expectedStrike: 220.5,
+      rejectedOnlyChain: [
+        { symbol: "IWM261113C00221000", strike: 221, expiration: mtExp, optionType: "C", bid: 0.45, ask: 0.48, last: 0.47, volume: 7000, openInterest: 6000, iv: 0.24, delta: 0.30, gamma: 0.08, vega: 0.03, percentChange: 0 },
+      ],
+      fullChain: [
+        { symbol: "IWM261113C00220000", strike: 220, expiration: mtExp, optionType: "C", bid: 1.11, ask: 1.15, last: 1.13, volume: 10000, openInterest: 8500, iv: 0.24, delta: 0.51, gamma: 0.11, vega: 0.04, percentChange: 0 },
+        { symbol: "IWM261113C00220500", strike: 220.5, expiration: mtExp, optionType: "C", bid: 0.65, ask: 0.68, last: 0.67, volume: 13000, openInterest: 9500, iv: 0.24, delta: 0.38, gamma: 0.10, vega: 0.04, percentChange: 0 },
+      ],
+    },
+    {
+      ticker: "NVDA", type: "CALL", spot: 140, t1: 141.1, t2: 142, sl: 139.4, cw: 142, pw: 138, expectedStrike: 140.5,
+      rejectedOnlyChain: [
+        { symbol: "NVDA261113C00141000", strike: 141, expiration: mtExp, optionType: "C", bid: 0.55, ask: 0.58, last: 0.57, volume: 18000, openInterest: 14000, iv: 0.48, delta: 0.34, gamma: 0.12, vega: 0.03, percentChange: 0 },
+        { symbol: "NVDA261113C00140500", strike: 140.5, expiration: mtExp, optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 18000, openInterest: 14000, iv: 0.48, delta: 0.24, gamma: 0.12, vega: 0.03, percentChange: 0 },
+      ],
+      fullChain: [
+        { symbol: "NVDA261113C00140000", strike: 140, expiration: mtExp, optionType: "C", bid: 1.24, ask: 1.28, last: 1.26, volume: 22000, openInterest: 16000, iv: 0.48, delta: 0.52, gamma: 0.15, vega: 0.04, percentChange: 0 },
+        { symbol: "NVDA261113C00140500", strike: 140.5, expiration: mtExp, optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 18500, openInterest: 14200, iv: 0.48, delta: 0.41, gamma: 0.14, vega: 0.04, percentChange: 0 },
+      ],
+    },
+    {
+      ticker: "NVDA", type: "PUT", spot: 140, t1: 138.9, t2: 138, sl: 140.6, cw: 142, pw: 138, expectedStrike: 139.5,
+      rejectedOnlyChain: [
+        { symbol: "NVDA261113P00139000", strike: 139, expiration: mtExp, optionType: "P", bid: 0.53, ask: 0.56, last: 0.55, volume: 16000, openInterest: 12000, iv: 0.48, delta: -0.33, gamma: 0.12, vega: 0.03, percentChange: 0 },
+      ],
+      fullChain: [
+        { symbol: "NVDA261113P00140000", strike: 140, expiration: mtExp, optionType: "P", bid: 1.21, ask: 1.25, last: 1.23, volume: 20000, openInterest: 15000, iv: 0.48, delta: -0.49, gamma: 0.15, vega: 0.04, percentChange: 0 },
+        { symbol: "NVDA261113P00139500", strike: 139.5, expiration: mtExp, optionType: "P", bid: 0.71, ask: 0.74, last: 0.73, volume: 17500, openInterest: 13500, iv: 0.48, delta: -0.40, gamma: 0.14, vega: 0.04, percentChange: 0 },
+      ],
+    },
+  ];
+
+  for (const row of mtContracts) {
+    const rej = await selectSmallAccountContract({
+      ticker: row.ticker, contractType: row.type, spotPrice: row.spot,
+      target1Spot: row.t1, target2Spot: row.t2, stopLossSpot: row.sl,
+      contracts: row.rejectedOnlyChain, nowEt: mtMorningEt, zeroDteCallWall: row.cw, zeroDtePutWall: row.pw,
+    });
+    assert(rej === null, `12B.${row.ticker}.${row.type}: Rejects >0.45% OTM / <0.25 delta contracts`);
+
+    const picked = await selectSmallAccountContract({
+      ticker: row.ticker, contractType: row.type, spotPrice: row.spot,
+      target1Spot: row.t1, target2Spot: row.t2, stopLossSpot: row.sl,
+      contracts: [...row.rejectedOnlyChain, ...row.fullChain], nowEt: mtMorningEt, zeroDteCallWall: row.cw, zeroDtePutWall: row.pw,
+    });
+    assert(picked?.strike === row.expectedStrike, `12B.${row.ticker}.${row.type}: Selected near-ATM ${row.expectedStrike} (got ${picked?.strike})`);
+    assert(picked?.contractsQty === 1 && (picked?.totalOutlay ?? 999) <= 100, `12B.${row.ticker}.${row.type}: Strict 1-contract <=$100 outlay`);
+    assert((picked?.delta ?? 0) >= 0.25 && Math.abs((picked?.strike ?? 0) - row.spot) / row.spot <= 0.0045, `12B.${row.ticker}.${row.type}: |delta| >= 0.25 & <= 0.45% OTM`);
+    if (row.ticker === "NVDA" && row.type === "CALL") {
+      assert((picked?.entryIv ?? 0) >= 0.40 && (picked?.entryIv ?? 0) <= 0.60, `12B.NVDA: entryIv honors 48% IV (got ${picked?.entryIv})`);
+    }
+  }
+
+  // Afternoon NVDA 48% IV fallback: 3-DTE over $1.00 rejected -> selects qualifying sub-$1.00 0-DTE 140.5C
+  const nvdaAfternoonPick = await selectSmallAccountContract({
+    ticker: "NVDA", contractType: "CALL", spotPrice: 140, target1Spot: 141.1, target2Spot: 142, stopLossSpot: 139.4,
+    contracts: [
+      { symbol: "NVDA261116C00140500", strike: 140.5, expiration: "2026-11-16", optionType: "C", bid: 2.30, ask: 2.35, last: 2.32, volume: 12000, openInterest: 9000, iv: 0.48, delta: 0.46, gamma: 0.08, vega: 0.09, percentChange: 0 },
+      { symbol: "NVDA261113C00140500", strike: 140.5, expiration: "2026-11-13", optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 18500, openInterest: 14200, iv: 0.48, delta: 0.41, gamma: 0.14, vega: 0.04, percentChange: 0 },
+    ],
+    nowEt: new Date("2026-11-13T11:35:00-05:00"), zeroDteCallWall: 142, zeroDtePutWall: 138,
+  });
+  assert(nvdaAfternoonPick?.strike === 140.5 && (nvdaAfternoonPick?.totalOutlay ?? 999) <= 100, "12B.NVDA.PM: Rejects >$1 3-DTE and selects sub-$1.00 140.5C");
+
+  // ===========================================================================
+  // TEST SECTION 13: MULTI-TICKER DYNAMIC ATR/% GATES IN evaluateTradeSignals
+  // ===========================================================================
+  console.log("\n13. Verifying Dynamic ATR/% Gates Trigger Valid IWM ($220) & NVDA ($140 @ 48% IV) Setups...");
+  const storeBackupMT = loadTradeStore();
+  try {
+    const mtDate = getTodayEt();
+    const makeEtDateMt = (hh: number, mm: number): Date => {
+      const utcGuess = Date.UTC(Number(mtDate.slice(0, 4)), Number(mtDate.slice(5, 7)) - 1, Number(mtDate.slice(8, 10)), hh + 5, mm, 0);
+      const etHh = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", hourCycle: "h23" }).format(new Date(utcGuess)));
+      return new Date(utcGuess - (etHh - hh) * 3600_000);
+    };
+    const mtEvalTime = makeEtDateMt(11, 30);
+    const mtEvalTs = Math.floor(mtEvalTime.getTime() / 1000);
+    const makeMtFlow = (spot: number, vwap: number, sigma: number, chi: number, impChi: number, pe: number, flux: number, dFlux6: number) => ({
+      timestamp: mtEvalTs, spot, flowVwap: vwap, ceilingShareChi: chi, impulseChi: impChi, pecletNumber: pe, impulsePeclet: pe,
+      netFluxJ: flux, deltaChi6Bar: dFlux6, deltaImpulseChi6Bar: dFlux6, deltaNetFlux6Bar: dFlux6,
+      upper1s: vwap + sigma, lower1s: vwap - sigma, upper2s: vwap + 2 * sigma, lower2s: vwap - 2 * sigma,
+      upper1Sigma: vwap + sigma, lower1Sigma: vwap - sigma, upper2Sigma: vwap + 2 * sigma, lower2Sigma: vwap - 2 * sigma,
+      sigma, variance: sigma * sigma, cumGammaWeight: 100, totalWeight: 100, signedGammaAcceleration: 0, count: 10, bandSignal: null,
+    });
+    const mtExpLive = `${mtDate.slice(0, 4)}-${mtDate.slice(5, 7)}-${mtDate.slice(8, 10)}`;
+
+    // 13A: IWM ($220) with $1.15 room to Call Wall (< $1.25/$1.50 SPY constants) triggers BTO CALL
+    saveTradeStore({ date: mtDate, activePositions: {}, closedPositions: [], alerts: [], prevSpotPrices: { IWM: 219.5 } });
+    const iwmTriggerRes = await evaluateTradeSignals({
+      ticker: "IWM", spotPrice: 220.0, prevSpotPrice: 219.6, callWall: 221.15, putWall: 219.10, zeroGamma: 220.60,
+      priorClose: 219.5, premarketFlowVwap: 219.75, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
+      contracts: [{ symbol: "IWM_220_5C", strike: 220.5, expiration: mtExpLive, optionType: "C", bid: 0.65, ask: 0.68, last: 0.67, volume: 12000, openInterest: 9000, iv: 0.24, delta: 0.38, gamma: 0.10, vega: 0.04, percentChange: 0 }],
+      latest5mCandle: { open: 219.65, high: 220.08, low: 219.12, prevLow: 219.12, close: 220.0, sma34: 219.80, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(220.0, 219.75, 0.55, 0.62, 0.68, 1.3, 0.16, 0.16) },
+    });
+    assert(iwmTriggerRes.activePosition?.ticker === "IWM" && iwmTriggerRes.activePosition?.strike === 220.5, `13A: IWM ($220) triggers valid BTO CALL with $1.15 wall room (got ${iwmTriggerRes.activePosition?.strike ?? "none"})`);
+
+    // 13B.1: NVDA ($140, 48% IV) with $0.95 room to Call Wall & $0.35 candle body triggers BTO CALL
+    const nvdaChainLive: NormalizedOptionContract[] = [
+      { symbol: "NVDA_140_5C", strike: 140.5, expiration: mtExpLive, optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 18500, openInterest: 14200, iv: 0.48, delta: 0.41, gamma: 0.14, vega: 0.04, percentChange: 0 },
+    ];
+    saveTradeStore({ date: mtDate, activePositions: {}, closedPositions: [], alerts: [], prevSpotPrices: { NVDA: 139.6 } });
+    const nvdaTriggerRes = await evaluateTradeSignals({
+      ticker: "NVDA", spotPrice: 140.0, prevSpotPrice: 139.6, callWall: 140.95, putWall: 139.20, zeroGamma: 140.50,
+      priorClose: 139.6, premarketFlowVwap: 139.80, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
+      contracts: nvdaChainLive,
+      latest5mCandle: { open: 139.65, high: 140.05, low: 139.18, prevLow: 139.18, close: 140.0, sma34: 139.80, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(140.0, 139.80, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18) },
+    });
+    assert(nvdaTriggerRes.activePosition?.ticker === "NVDA" && nvdaTriggerRes.activePosition?.strike === 140.5, `13B.1: NVDA ($140 @ 48% IV) triggers valid BTO CALL with $0.95 wall room (got ${nvdaTriggerRes.activePosition?.strike ?? "none"})`);
+
+    // 13B.2: Overextended NVDA $1.15 body (> maxSignalBarBody ~$0.79, < $2.25 old SPY constant) blocked on impulse chase
+    saveTradeStore({ date: mtDate, activePositions: {}, closedPositions: [], alerts: [], prevSpotPrices: { NVDA: 138.85 } });
+    const nvdaChaseBlocked = await evaluateTradeSignals({
+      ticker: "NVDA", spotPrice: 140.0, prevSpotPrice: 138.85, callWall: 142.0, putWall: 137.0, zeroGamma: 140.50,
+      priorClose: 139.2, premarketFlowVwap: 139.40, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
+      contracts: nvdaChainLive,
+      latest5mCandle: { open: 138.85, high: 140.05, low: 138.80, close: 140.0, sma34: 139.50, timestamp: mtEvalTs, flowSnapshot: { ...makeMtFlow(140.0, 139.40, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18), bandSignal: "LOWER_1S_BOUNCE" } },
+    });
+    assert(nvdaChaseBlocked.activePosition === null, "13B.2: Dynamic maxSignalBarBody (~$0.79) blocks $1.15 NVDA chase candle that old $2.25 SPY constant allowed");
+
+    // 13B.3: Proportional minReversalInvalidation ($0.40 adverse move < $0.75 SPY constant) closes held NVDA position
+    const nvdaExitTime = makeEtDateMt(11, 45);
+    const nvdaExitTs = Math.floor(nvdaExitTime.getTime() / 1000);
+    saveTradeStore({
+      date: mtDate,
+      activePositions: {
+        NVDA: {
+          id: "NVDA-CALL-TEST", ticker: "NVDA", contractType: "CALL", contractLabel: "NVDA 140.5C", strike: 140.5, expiration: mtExpLive,
+          setupName: "Impulse Flux & Divergence Reclaim [BTO CALL]", status: "OPEN", btoSpotPrice: 140.0, btoOptionMid: 0.75, optionBid: 0.72, optionAsk: 0.75,
+          contractsQty: 1, remainingQty: 1, totalOutlay: 75, target1Spot: 140.9, target2Spot: 141.5, stopLossSpot: 139.1,
+          openedAt: "11:30 AM", openedTs: nvdaExitTs - 900, initialRisk: 0.9,
+        },
+      },
+      closedPositions: [], alerts: [], prevSpotPrices: { NVDA: 140.0 },
+    });
+    const nvdaRevExit = await evaluateTradeSignals({
+      ticker: "NVDA", spotPrice: 139.60, prevSpotPrice: 139.90, callWall: 141.5, putWall: 138.5, zeroGamma: 140.5,
+      divergence5m: "BEAR", nowEt: nvdaExitTime, isHistoricalBackfill: true,
+      contracts: [{ symbol: "NVDA_140_5C", strike: 140.5, expiration: mtExpLive, optionType: "C", bid: 0.62, ask: 0.65, last: 0.63, volume: 18500, openInterest: 14200, iv: 0.48, delta: 0.33, gamma: 0.13, vega: 0.04, percentChange: 0 }],
+      latest5mCandle: { open: 139.90, high: 139.95, low: 139.55, close: 139.60, sma34: 139.85, timestamp: nvdaExitTs, flowSnapshot: makeMtFlow(139.60, 139.85, 0.45, 0.35, 0.32, -1.2, -0.15, -0.15) },
+    });
+    assert(nvdaRevExit.activePosition === null && loadTradeStore().closedPositions.length === 1, "13B.3: Proportional minReversalInvalidation closes NVDA on -$0.40 (<$0.75 SPY constant) reversal");
+
+    // =========================================================================
+    // TEST SECTION 14: GLOBAL SINGLE-SLOT LOCK ACROSS TICKERS (SPY ACTIVE -> NVDA BLOCKED)
+    // =========================================================================
+    console.log("\n14. Verifying Global Single-Slot Lock Across Tickers (SPY Active -> NVDA Strictly Blocked)...");
+    const spyOpenPos: OptionTradePosition = {
+      id: "SPY-PUT-LOCK-TEST", ticker: "SPY", contractType: "PUT", contractLabel: "SPY 750P", strike: 750, expiration: mtExpLive,
+      setupName: "Bearish Zero-Gamma Flush [BTO PUT]", status: "OPEN", btoSpotPrice: 752.0, btoOptionMid: 0.72, optionBid: 0.70, optionAsk: 0.72,
+      contractsQty: 1, remainingQty: 1, totalOutlay: 72, target1Spot: 750.2, target2Spot: 748.5, stopLossSpot: 753.4,
+      openedAt: "10:15 AM", openedTs: mtEvalTs - 4500, initialRisk: 1.4,
+    };
+    saveTradeStore({ date: mtDate, activePositions: { SPY: { ...spyOpenPos } }, closedPositions: [], alerts: [], prevSpotPrices: { SPY: 751.5, NVDA: 139.6 } });
+
+    // 14A: evaluateTradeSignals blocks NVDA while SPY is active
+    const nvdaLockedEval = await evaluateTradeSignals({
+      ticker: "NVDA", spotPrice: 140.0, prevSpotPrice: 139.6, callWall: 140.95, putWall: 139.20, zeroGamma: 140.50,
+      priorClose: 139.6, premarketFlowVwap: 139.80, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
+      contracts: nvdaChainLive,
+      latest5mCandle: { open: 139.65, high: 140.05, low: 139.18, prevLow: 139.18, close: 140.0, sma34: 139.80, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(140.0, 139.80, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18) },
+    });
+    const storeAfter14A = loadTradeStore();
+    assert(nvdaLockedEval.activePosition === null && nvdaLockedEval.emittedAlerts.length === 0, "14A.1: evaluateTradeSignals strictly blocks NVDA while SPY has an active position");
+    assert(Object.keys(storeAfter14A.activePositions).length === 1 && storeAfter14A.activePositions["SPY"]?.id === spyOpenPos.id && !storeAfter14A.activePositions["NVDA"], "14A.2: Global activePositions remains strictly { SPY }");
+
+    // 14B: syncGaiaTickerSignalsToDiscord & POST /api/signals block NVDA while SPY is active (and do not touch SPY)
+    const syncLockedRes = await syncGaiaTickerSignalsToDiscord({
+      ticker: "NVDA", spotPrice: 140.0, sessionDate: mtDate, activeFsmState: "LONG", macroRegime: "CALL", chiPct: 74, zeroGamma: 139.0, isHistoricalBackfill: true,
+      signals: [{ id: "nvda-lock-sig-1", type: "LONG", price: 140.0, timestamp: mtEvalTs, label: "LONG · OPEN" }],
+    });
+    const postLockedReq = new NextRequest("http://localhost:3000/api/signals", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "SYNC_GAIA_TICKER_SIGNALS", ticker: "NVDA", spotPrice: 140.0, sessionDate: mtDate,
+        activeFsmState: "STAND_ASIDE", isHistoricalBackfill: true,
+        signals: [{ id: "nvda-lock-sig-2", type: "LONG", price: 140.0, timestamp: mtEvalTs, label: "LONG · OPEN" }],
+      }),
+    });
+    const postLockedRes = await postSignalsRoute(postLockedReq);
+    const storeAfter14B = loadTradeStore();
+    assert(syncLockedRes.dispatchedCount === 0 && postLockedRes.status === 200, "14B.1: syncGaiaTickerSignalsToDiscord & POST /api/signals block NVDA dispatch while SPY is active");
+    assert(Object.keys(storeAfter14B.activePositions).length === 1 && storeAfter14B.activePositions["SPY"]?.id === spyOpenPos.id, "14B.2: NVDA sync (even STAND_ASIDE) never mutates or purges active SPY slot");
+
+    // 14C: Closing SPY unlocks NVDA; active NVDA then blocks IWM & SPY
+    saveTradeStore({
+      date: mtDate, activePositions: {},
+      closedPositions: [{ ...spyOpenPos, status: "CLOSED", remainingQty: 0, closedAt: "10:45 AM", closedTs: mtEvalTs - 2700, closedSpotPrice: 750.2, exitReason: "TARGET 1 HIT" }],
+      alerts: [], prevSpotPrices: { SPY: 750.2, NVDA: 139.6 },
+    });
+    const nvdaAfterSpyClose = await evaluateTradeSignals({
+      ticker: "NVDA", spotPrice: 140.0, prevSpotPrice: 139.6, callWall: 140.95, putWall: 139.20, zeroGamma: 140.50,
+      priorClose: 139.6, premarketFlowVwap: 139.80, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
+      contracts: nvdaChainLive,
+      latest5mCandle: { open: 139.65, high: 140.05, low: 139.18, prevLow: 139.18, close: 140.0, sma34: 139.80, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(140.0, 139.80, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18) },
+    });
+    const iwmBlockedByNvda = await evaluateTradeSignals({
+      ticker: "IWM", spotPrice: 220.0, prevSpotPrice: 219.6, callWall: 221.15, putWall: 219.10, zeroGamma: 220.60,
+      priorClose: 219.5, premarketFlowVwap: 219.75, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
+      contracts: [{ symbol: "IWM_220_5C", strike: 220.5, expiration: mtExpLive, optionType: "C", bid: 0.65, ask: 0.68, last: 0.67, volume: 12000, openInterest: 9000, iv: 0.24, delta: 0.38, gamma: 0.10, vega: 0.04, percentChange: 0 }],
+      latest5mCandle: { open: 219.65, high: 220.08, low: 219.12, prevLow: 219.12, close: 220.0, sma34: 219.80, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(220.0, 219.75, 0.55, 0.62, 0.68, 1.3, 0.16, 0.16) },
+    });
+    assert(nvdaAfterSpyClose.activePosition?.ticker === "NVDA" && iwmBlockedByNvda.activePosition === null && Object.keys(loadTradeStore().activePositions).length === 1, "14C: Closing SPY unlocks NVDA; active NVDA blocks IWM");
+
+    // 14D: 200-step Multi-Ticker Monte Carlo (SPY/QQQ/IWM/NVDA global single-slot + <= $100 outlay)
+    const rng14D = createPrng(2026111401);
+    const mtUniverse = [
+      { ticker: "SPY", spot: 750, cw: 754, pw: 746, zg: 752, strike: 753, ask: 0.78, iv: 0.16, sigma: 1.5 },
+      { ticker: "QQQ", spot: 510, cw: 513, pw: 507, zg: 511.5, strike: 512, ask: 0.76, iv: 0.20, sigma: 1.1 },
+      { ticker: "IWM", spot: 220, cw: 221.15, pw: 219.1, zg: 220.6, strike: 220.5, ask: 0.68, iv: 0.24, sigma: 0.55 },
+      { ticker: "NVDA", spot: 140, cw: 140.95, pw: 139.2, zg: 140.5, strike: 140.5, ask: 0.75, iv: 0.48, sigma: 0.45 },
+    ];
+    let mtSlotViolations = 0;
+    let mtOutlayViolations = 0;
+    saveTradeStore({ date: mtDate, activePositions: {}, closedPositions: [], alerts: [], prevSpotPrices: {} });
+    for (let step = 0; step < 200; step++) {
+      const cfg = mtUniverse[Math.floor(rng14D() * mtUniverse.length)];
+      await evaluateTradeSignals({
+        ticker: cfg.ticker, spotPrice: cfg.spot, prevSpotPrice: cfg.spot - cfg.sigma * 0.5,
+        callWall: cfg.cw, putWall: cfg.pw, zeroGamma: cfg.zg, priorClose: cfg.spot - cfg.sigma * 0.5,
+        premarketFlowVwap: cfg.spot - cfg.sigma * 0.3, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
+        contracts: [{ symbol: `${cfg.ticker}_${cfg.strike}C`, strike: cfg.strike, expiration: mtExpLive, optionType: "C", bid: Number((cfg.ask - 0.03).toFixed(2)), ask: cfg.ask, last: cfg.ask, volume: 12000, openInterest: 9000, iv: cfg.iv, delta: 0.38, gamma: 0.10, vega: 0.04, percentChange: 0 }],
+        latest5mCandle: { open: cfg.spot - cfg.sigma * 0.4, high: cfg.spot + cfg.sigma * 0.1, low: cfg.pw, prevLow: cfg.pw, close: cfg.spot, sma34: cfg.spot - cfg.sigma * 0.2, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(cfg.spot, cfg.spot - cfg.sigma * 0.3, cfg.sigma, 0.64, 0.70, 1.4, 0.18, 0.18) },
+      });
+      const st = loadTradeStore();
+      const actKeys = Object.keys(st.activePositions || {});
+      if (actKeys.length > 1) mtSlotViolations++;
+      for (const p of Object.values(st.activePositions || {})) {
+        if (p.contractsQty !== 1 || p.totalOutlay > 100) mtOutlayViolations++;
+      }
+      if (rng14D() < 0.35 && actKeys.length === 1) {
+        const k = actKeys[0];
+        st.closedPositions.push({ ...st.activePositions[k], status: "CLOSED", remainingQty: 0, closedTs: mtEvalTs });
+        delete st.activePositions[k];
+        saveTradeStore(st);
+      }
+    }
+    assert(mtSlotViolations === 0, "14D.1: 200-step Multi-Ticker Monte Carlo ZERO global single-slot violations");
+    assert(mtOutlayViolations === 0, "14D.2: 200-step Multi-Ticker Monte Carlo ZERO qty!=1 or >$100 outlay violations");
+  } finally {
+    saveTradeStore(storeBackupMT);
+  }
 
   // ===========================================================================
   // FINAL REPORT

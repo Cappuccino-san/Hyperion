@@ -1,13 +1,23 @@
 import { isMarketOpen } from "@/lib/marketDataService";
+import { getTickerPreset } from "@/lib/tickerPresets";
 import {
   evaluateTradeSignals,
   evaluateAllActivePositions,
+  fetchLiveCboeOptions,
+  fetchLive5mCandleAndDivergence,
+  getCachedSpotPrice,
   loadTradeStore,
 } from "@/lib/tradeSignalEngine";
-import type { NormalizedOptionContract } from "@/lib/optionsExposure";
+import {
+  computeOptionsAnalytics,
+  deriveTacticalStructuralLevels,
+  type NormalizedOptionContract,
+} from "@/lib/optionsExposure";
 
 const POLL_INTERVAL_MS = 20_000; // 20 seconds during RTH
-const WATCH_TICKERS = ["SPY"];
+const DEFAULT_WATCH_TICKERS = ["SPY"] as const;
+const MAX_TRACKED_TICKERS = 8;
+const TRACKED_TICKER_TTL_MS = 4 * 60 * 60_000;
 
 interface LiveBotGlobalState {
   intervalId: ReturnType<typeof setInterval> | null;
@@ -24,6 +34,7 @@ interface LiveBotGlobalState {
   pollCount: number;
   sessionDateEt: string;
   dispatchedCount: number;
+  activeTrackedTickers: Map<string, number>;
 }
 
 declare global {
@@ -75,6 +86,7 @@ function isWithinRthWindow(nowMs: number = Date.now()): boolean {
 }
 
 function getBotState(): LiveBotGlobalState {
+  const now = Date.now();
   if (!globalThis.__hyperionLiveBotState) {
     globalThis.__hyperionLiveBotState = {
       intervalId: null,
@@ -85,15 +97,97 @@ function getBotState(): LiveBotGlobalState {
       isEvaluatingLiveBar: false,
       lockAcquiredAtMs: 0,
       lockToken: 0,
-      startedAtMs: Date.now(),
+      startedAtMs: now,
       lastPollAtMs: 0,
       lastStatus: "IDLE",
       pollCount: 0,
       sessionDateEt: getEtDateString(),
       dispatchedCount: 0,
+      activeTrackedTickers: new Map<string, number>([["SPY", now]]),
     };
+  } else if (!globalThis.__hyperionLiveBotState.activeTrackedTickers) {
+    globalThis.__hyperionLiveBotState.activeTrackedTickers = new Map<string, number>([["SPY", now]]);
   }
   return globalThis.__hyperionLiveBotState;
+}
+
+export function normalizeTrackedTicker(raw?: string): string {
+  const cleaned = (raw || "").trim().toUpperCase().replace(/^\$/, "");
+  if (!cleaned || !/^[A-Z0-9._-]{1,10}$/.test(cleaned)) return "";
+  return cleaned === "SPX" ? "SPXW" : cleaned;
+}
+
+export function registerActiveTrackedTicker(rawTicker?: string): string[] {
+  const sym = normalizeTrackedTicker(rawTicker);
+  const botState = getBotState();
+  const now = Date.now();
+  if (!botState.activeTrackedTickers) {
+    botState.activeTrackedTickers = new Map([["SPY", now]]);
+  }
+  if (sym) {
+    botState.activeTrackedTickers.set(sym, now);
+  }
+  const openTickers = new Set(Object.keys(loadTradeStore().activePositions || {}));
+  for (const [k, ts] of Array.from(botState.activeTrackedTickers.entries())) {
+    if (k !== "SPY" && !openTickers.has(k) && now - ts > TRACKED_TICKER_TTL_MS) {
+      botState.activeTrackedTickers.delete(k);
+    }
+  }
+  const nonPinned = Array.from(botState.activeTrackedTickers.entries())
+    .filter(([k]) => k !== "SPY" && !openTickers.has(k))
+    .sort((a, b) => b[1] - a[1]);
+  for (const [k] of nonPinned.slice(Math.max(0, MAX_TRACKED_TICKERS - DEFAULT_WATCH_TICKERS.length))) {
+    botState.activeTrackedTickers.delete(k);
+  }
+  return getActiveTrackedTickers();
+}
+
+export function getActiveTrackedTickers(): string[] {
+  const botState = getBotState();
+  const now = Date.now();
+  const store = loadTradeStore();
+  if (!botState.activeTrackedTickers) {
+    botState.activeTrackedTickers = new Map([["SPY", now]]);
+  }
+  const ordered = new Set<string>(DEFAULT_WATCH_TICKERS);
+  for (const k of Object.keys(store.activePositions || {})) {
+    const norm = normalizeTrackedTicker(k);
+    if (norm) ordered.add(norm);
+  }
+  const recent = Array.from(botState.activeTrackedTickers.entries())
+    .filter(([k, ts]) => k === "SPY" || now - ts <= TRACKED_TICKER_TTL_MS)
+    .sort((a, b) => b[1] - a[1]);
+  for (const [k] of recent) ordered.add(k);
+  return Array.from(ordered);
+}
+
+function computeLiveLevelsForTicker(
+  ticker: string,
+  resolvedSpot: number,
+  contracts: NormalizedOptionContract[],
+  previousClose: number
+) {
+  const refSpot = ticker === "SPXW" || ticker === "SPX" ? resolvedSpot / 10 : resolvedSpot;
+  const atmContracts = contracts.filter(
+    (c) => c.iv > 0.01 && c.iv < 3 && Math.abs(c.strike - refSpot) <= refSpot * 0.03
+  );
+  const atmIv =
+    atmContracts.length > 0
+      ? atmContracts.reduce((s, c) => s + c.iv, 0) / atmContracts.length
+      : getTickerPreset(ticker, resolvedSpot).impliedVolatility;
+  const analytics = computeOptionsAnalytics({
+    ticker,
+    dataSource: "CBOE_MARKET_DATA",
+    spotPrice: resolvedSpot,
+    previousClose: previousClose > 0 ? previousClose : resolvedSpot,
+    impliedVolatility: atmIv,
+    contracts,
+  });
+  const levels = deriveTacticalStructuralLevels(analytics);
+  return {
+    ...levels,
+    kingNode: analytics.kingNode,
+  };
 }
 
 export function isEvaluatingLiveBar(): boolean {
@@ -156,7 +250,11 @@ export async function ensureMocCutoffForRemainingPositions(
   for (const [ticker, pos] of openEntries) {
     if (!pos) continue;
     const cachedSpot = Number(
-      store.prevSpotPrices?.[ticker] || store.prevSpotPrices?.[pos.ticker] || pos.btoSpotPrice || 0
+      getCachedSpotPrice(ticker) ||
+        store.prevSpotPrices?.[ticker] ||
+        store.prevSpotPrices?.[pos.ticker] ||
+        pos.btoSpotPrice ||
+        0
     );
     if (cachedSpot <= 0) continue;
     const syntheticContract: NormalizedOptionContract = {
@@ -276,23 +374,107 @@ export async function runLiveBotTick(): Promise<void> {
         return;
       }
 
-      // 2. Hard daily ceiling: max 2 closed trades/day (1 primary + 1 gated opposite-direction Leg-2)
-      const closedLen = store.closedPositions?.length ?? 0;
-      if (closedLen >= 2) {
-        botState.lastStatus = "LOCKED_FOR_DAY";
-        return;
-      }
-
-      // Poll watchlist tickers for new BTO setups when flat (or Phase-2 Call reclaim eligible)
+      // Poll tracked tickers for new BTO setups when flat (or Phase-2 opposite reclaim eligible)
       botState.lastStatus = "FLAT_EVAL_BTO";
-      for (const ticker of WATCH_TICKERS) {
+      const nowClock = getEtClockNow();
+      const nowTs = Math.floor(Date.now() / 1000);
+      const trackedTickers = getActiveTrackedTickers();
+      let evaluatedAny = false;
+      for (const ticker of trackedTickers) {
         if (controller.signal.aborted || botState.isStopped) break;
+        const currentStore = loadTradeStore();
+        if (Object.keys(currentStore.activePositions || {}).length > 0) break;
+        const posKey = ticker === "SPXW" || ticker === "SPX" ? "SPY" : ticker;
+        const sameTickerClosed = (currentStore.closedPositions || []).filter(
+          (p) => p.ticker === ticker || p.ticker === posKey
+        );
+        if (sameTickerClosed.length >= 2) continue;
+        if (sameTickerClosed.length === 1) {
+          const lastClosed = sameTickerClosed.reduce((a, b) => ((b.closedTs ?? 0) >= (a.closedTs ?? 0) ? b : a));
+          if (!lastClosed?.closedTs || nowTs - lastClosed.closedTs < 1800 || nowClock.etMins < 630) {
+            continue;
+          }
+        }
+        evaluatedAny = true;
+
+        const contracts = await fetchLiveCboeOptions(ticker, controller.signal);
+        if (controller.signal.aborted || botState.isStopped) break;
+
+        const cachedLiveSpot =
+          getCachedSpotPrice(ticker) ??
+          currentStore.prevSpotPrices?.[ticker] ??
+          currentStore.prevSpotPrices?.[posKey] ??
+          0;
+        const initialLevels =
+          cachedLiveSpot > 0 && contracts.length > 0
+            ? computeLiveLevelsForTicker(
+                ticker,
+                cachedLiveSpot,
+                contracts,
+                currentStore.prevSpotPrices?.[ticker] || cachedLiveSpot
+              )
+            : null;
+
+        const candleResult = await fetchLive5mCandleAndDivergence(
+          ticker,
+          controller.signal,
+          contracts.length > 0 || initialLevels
+            ? {
+                contracts,
+                structuralNodes: initialLevels
+                  ? {
+                      floorNode: initialLevels.putWall,
+                      ceilingNode: initialLevels.callWall,
+                      zeroGamma: initialLevels.zeroGamma,
+                      netGex: initialLevels.netGexMillions,
+                    }
+                  : undefined,
+              }
+            : undefined
+        );
+        let enrichedCandle = candleResult.candle;
+        const divergence5m = candleResult.divergence5m;
+        const divergence30m = candleResult.divergence30m;
+        const resolvedSpot = cachedLiveSpot > 0 ? cachedLiveSpot : enrichedCandle?.close ?? 0;
+
+        let resolvedLevels = initialLevels;
+        if (!resolvedLevels && resolvedSpot > 0 && contracts.length > 0) {
+          resolvedLevels = computeLiveLevelsForTicker(
+            ticker,
+            resolvedSpot,
+            contracts,
+            currentStore.prevSpotPrices?.[ticker] || resolvedSpot
+          );
+          const reanchored = await fetchLive5mCandleAndDivergence(ticker, controller.signal, {
+            contracts,
+            structuralNodes: {
+              floorNode: resolvedLevels.putWall,
+              ceilingNode: resolvedLevels.callWall,
+              zeroGamma: resolvedLevels.zeroGamma,
+              netGex: resolvedLevels.netGexMillions,
+            },
+          });
+          if (reanchored.candle) enrichedCandle = reanchored.candle;
+        }
+
         const res = await evaluateTradeSignals({
           ticker,
-          spotPrice: 0, // Auto-fetches live spot
-          callWall: 0,
-          putWall: 0,
-          zeroGamma: 0,
+          spotPrice: resolvedSpot,
+          callWall: resolvedLevels?.callWall ?? 0,
+          putWall: resolvedLevels?.putWall ?? 0,
+          zeroGamma: resolvedLevels?.zeroGamma ?? 0,
+          zeroDteCallWall: resolvedLevels?.callWall ?? 0,
+          zeroDtePutWall: resolvedLevels?.putWall ?? 0,
+          zeroDteZeroGamma: resolvedLevels?.zeroGamma ?? 0,
+          dailyExpectedMove: resolvedLevels?.dailyExpectedMove ?? null,
+          kingNode: resolvedLevels?.kingNode,
+          filteredKing: resolvedLevels?.tacticalKing,
+          bookCenter: resolvedLevels?.zeroGamma ?? 0,
+          netGex: resolvedLevels?.netGexMillions,
+          contracts,
+          latest5mCandle: enrichedCandle,
+          divergence5m,
+          divergence30m,
           webhookUrl,
           signal: controller.signal,
         });
@@ -303,17 +485,18 @@ export async function runLiveBotTick(): Promise<void> {
           ).length;
         }
 
-        // Single-Slot Guard: Stop polling further tickers if a position was opened or daily limit reached
+        // Single-Slot Guard: Stop polling further tickers if a position was opened
         const refreshedStore = loadTradeStore();
-        if (
-          Object.keys(refreshedStore.activePositions || {}).length > 0 ||
-          (refreshedStore.closedPositions && refreshedStore.closedPositions.length >= 2)
-        ) {
+        if (Object.keys(refreshedStore.activePositions || {}).length > 0) {
           break;
         }
       }
 
-      botState.lastStatus = controller.signal.aborted ? "TIMEOUT_ABORTED" : "ACTIVE_OK";
+      botState.lastStatus = controller.signal.aborted
+        ? "TIMEOUT_ABORTED"
+        : !evaluatedAny
+          ? "LOCKED_FOR_DAY"
+          : "ACTIVE_OK";
     } catch (err) {
       botState.lastStatus = `ERROR: ${err instanceof Error ? err.message : "unknown"}`;
     } finally {
@@ -401,5 +584,6 @@ export function getLiveBotStatus() {
     pollCount: botState.pollCount,
     sessionDateEt: botState.sessionDateEt,
     dispatchedCount: botState.dispatchedCount,
+    trackedTickers: getActiveTrackedTickers(),
   };
 }

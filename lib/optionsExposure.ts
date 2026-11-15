@@ -1363,3 +1363,98 @@ export function computeOptionsAnalytics(params: {
   };
 }
 
+export interface TacticalStructuralLevels {
+  callWall: number;
+  putWall: number;
+  zeroGamma: number;
+  tacticalKing: number;
+  dailyExpectedMove: { low: number; high: number } | null;
+  netGexMillions: number;
+  netVexMillions: number;
+}
+
+/**
+ * Shared tactical dealer-wall extractor used by both UI analytics and the live daemon
+ * so multi-ticker execution evaluates against exact live GEX/VEX walls and Expected Move.
+ */
+export function deriveTacticalStructuralLevels(
+  payload: OptionsAnalyticsPayload
+): TacticalStructuralLevels {
+  const { gammaLevels, gammaLevelsByFilter } = payload;
+  const tacticalKing =
+    payload.kingNode?.zeroDteKing ??
+    payload.kingByFilter?.["0DTE"]?.strike ??
+    payload.kingNode?.weeklyKing ??
+    payload.kingByFilter?.ALL?.strike ??
+    payload.spotPrice;
+
+  const zeroDteLevels = gammaLevelsByFilter?.["0DTE"] ?? gammaLevelsByFilter?.["THIS_WEEK"];
+  const baseCallWall =
+    zeroDteLevels?.callWall && zeroDteLevels.callWall > 0
+      ? zeroDteLevels.callWall
+      : gammaLevels.callWall > 0 &&
+          Math.abs(gammaLevels.callWall - payload.spotPrice) / Math.max(1, payload.spotPrice) < 0.025
+        ? gammaLevels.callWall
+        : Number((payload.spotPrice * 1.008).toFixed(2));
+  const callWall =
+    tacticalKing > baseCallWall &&
+    (tacticalKing - payload.spotPrice) / Math.max(1, payload.spotPrice) <= 0.015
+      ? tacticalKing
+      : baseCallWall;
+
+  const rawPutWall =
+    zeroDteLevels?.putWall && zeroDteLevels.putWall > 0
+      ? zeroDteLevels.putWall
+      : gammaLevels.putWall > 0 &&
+          Math.abs(payload.spotPrice - gammaLevels.putWall) / Math.max(1, payload.spotPrice) < 0.025
+        ? gammaLevels.putWall
+        : Number((payload.spotPrice * 0.992).toFixed(2));
+
+  let putWall = rawPutWall;
+  const minStepOffset = Math.min(0.5, Math.max(0.05, payload.spotPrice * 0.001));
+  if (
+    rawPutWall > 0 &&
+    (payload.spotPrice - rawPutWall) / Math.max(1, payload.spotPrice) > 0.0095 &&
+    Array.isArray(payload.strikes) &&
+    payload.expirations.length > 0
+  ) {
+    const nearExpId = payload.expirations[0].id;
+    let bestNearPutStrike = 0;
+    let minNearPutGex = 0;
+    for (const row of payload.strikes) {
+      if (
+        row.strike < payload.spotPrice - minStepOffset &&
+        (payload.spotPrice - row.strike) / payload.spotPrice <= 0.0095
+      ) {
+        const g = row.gex[nearExpId] ?? 0;
+        if (g < minNearPutGex) {
+          minNearPutGex = g;
+          bestNearPutStrike = row.strike;
+        }
+      }
+    }
+    if (bestNearPutStrike > 0) {
+      putWall = bestNearPutStrike;
+    } else if (payload.expectedMoves?.daily?.low && payload.expectedMoves.daily.low > rawPutWall) {
+      putWall = Number(payload.expectedMoves.daily.low.toFixed(2));
+    }
+  }
+
+  const zeroGamma =
+    zeroDteLevels?.zeroGamma && zeroDteLevels.zeroGamma > 0
+      ? zeroDteLevels.zeroGamma
+      : gammaLevels.zeroGamma;
+
+  return {
+    callWall,
+    putWall,
+    zeroGamma,
+    tacticalKing,
+    dailyExpectedMove: payload.expectedMoves?.daily
+      ? { low: payload.expectedMoves.daily.low, high: payload.expectedMoves.daily.high }
+      : null,
+    netGexMillions: Number(((payload.netMetrics?.netGex ?? 0) * 1000).toFixed(2)),
+    netVexMillions: Number((payload.netMetrics?.netVex ?? 0).toFixed(2)),
+  };
+}
+

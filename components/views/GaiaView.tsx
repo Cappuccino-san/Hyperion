@@ -1008,7 +1008,7 @@ export function GaiaView() {
                 (a: any) =>
                   a.action === "BUY_TO_OPEN" &&
                   !a.setupName?.includes("Gaia Tactical HUD") &&
-                  !a.id?.startsWith("gaia-spy-")
+                  !a.id?.startsWith("gaia-")
               )
               .map((a: any) => ({
                 timestamp: (a.ts || 0) * 1000,

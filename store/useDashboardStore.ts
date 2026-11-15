@@ -650,7 +650,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     try {
       const res = await fetch(
         `/api/signals?ticker=${encodeURIComponent(targetTicker)}${dateParam}`,
-        { cache: "no-store" }
+        { cache: "no-store", keepalive: true }
       );
       if (res.ok) {
         const data = await res.json();
