@@ -2981,7 +2981,7 @@ export async function evaluateTradeSignals(
     Object.keys(store.activePositions || {}).length > 0
   );
 
-  const isWithinRthEntryWindow = etTime.totalMinutes >= ENTRY_START_MINS && etTime.totalMinutes <= ENTRY_CUTOFF_MINS;
+  const isWithinRthEntryWindow = etTime.totalMinutes >= ENTRY_START_MINS && etTime.totalMinutes <= Math.min(ENTRY_CUTOFF_MINS, 825);
   if (!hasActiveTrade && !hasCompletedTradeToday && !isEodCutoff && isWithinRthEntryWindow) {
     const {
       callWall,
@@ -3256,11 +3256,14 @@ export async function evaluateTradeSignals(
       : (activeKingNode > spotPrice + entryMetrics.minWallRoom ? activeKingNode : Number((spotPrice + Math.max(Math.max(entryMetrics.minWallRoom, spotPrice * 0.0033), fluxSigma * 2.2)).toFixed(2)));
     const callRoomToWall = callMagnetTarget - spotPrice;
 
+    const hasCallChiOrSustainedFlux =
+      currentChi >= 0.35 || (currentNetFlux > 0 && currentPe >= 0.40);
     if (
       !candidateBto &&
       isMiddayReclaimWindow &&
       testedPutWallOrKingOrFlux &&
       reclaimedKingOrSma &&
+      hasCallChiOrSustainedFlux &&
       hasAdequateCallRoomToWall &&
       callRoomToWall >= entryMetrics.minWallRoom &&
       Math.abs(barBody) <= maxSignalBarBody
@@ -3293,7 +3296,9 @@ export async function evaluateTradeSignals(
         spotPrice > effectiveFlowVwap &&
         spotPrice > effectiveSma34;
       const hasPositiveFluxImpulse =
-        currentChi >= 0.48 || currentNetFlux > 0 || currentPe >= 0.40 || store.macroRegime === "CALL";
+        currentChi >= 0.48 ||
+        store.macroRegime === "CALL" ||
+        (currentChi >= 0.35 && (currentNetFlux > 0 || currentPe >= 0.40));
       if (
         !candidateBto &&
         isMiddayReclaimWindow &&
@@ -3505,6 +3510,7 @@ export async function evaluateTradeSignals(
           : Number((spotPrice * 0.992).toFixed(2));
 
     const isTestingPutBounce =
+      etTime.totalMinutes >= 585 &&
       putBounceRef > 0 &&
       spotPrice >= putBounceRef * 0.998 &&
       spotPrice <= putBounceRef * 1.0025 &&
@@ -3992,6 +3998,7 @@ export async function evaluateTradeSignals(
     if (
       !candidateBto &&
       hasBullImpulseReclaim &&
+      !(currentChi < 0.35 && store.macroRegime === "PUT") &&
       hasAdequateCallRoomToWall &&
       (tacticalPw > 0 ? spotPrice >= tacticalPw * 0.9965 : true)
     ) {
@@ -4859,8 +4866,8 @@ export function evaluateUnifiedSniperSetup(
   const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
   const etMins = hour * 60 + minute;
 
-  // Mandatory RTH Entry Window: 09:35 ET (575) through 14:30 ET (870)
-  if (etMins < ENTRY_START_MINS || etMins > ENTRY_CUTOFF_MINS) return null;
+  // Mandatory RTH Entry Window: 09:35 ET (575) through 13:45 ET (825)
+  if (etMins < ENTRY_START_MINS || etMins > Math.min(ENTRY_CUTOFF_MINS, 825)) return null;
 
   const features = computeUnifiedSniperFeatures(bars, idx, explicitKingStrike, referenceChainIv);
   const spot = bar.close;
@@ -4923,16 +4930,22 @@ export function evaluateUnifiedSniperSetup(
     spot < vwap &&
     spot < sma34 &&
     features.gammaRegime < 0 &&
-    (bar.close < bar.open || bar.close < prevBar.close)
+    features.trendVwap < 0 &&
+    vwapSlope < -minVwapSlope &&
+    isLowerLows &&
+    bar.close < bar.open &&
+    bar.close < prevBar.low
   ) {
     direction = "SHORT";
     setupName = "Bearish Zero-Gamma Flush [BTO PUT]";
   }
-  // 3. Support Bounce (Blocked if locked in Bearish Regime)
+  // 3. Support Bounce (Blocked if locked in Bearish Regime or before 09:45 ET)
   else if (
+    etMins >= 585 &&
     !isBearishRegimeLocked &&
+    spot >= vwap &&
     ((bar.low <= openingLow && bar.close > bar.open && bar.close >= sma34 && prevBar.close <= sma34) ||
-      (distSupport >= -Math.max(0.05, spot * 0.0005) && distSupport <= Math.max(0.15, spot * 0.0011) && bar.close > bar.open && features.trendVwap >= -0.25))
+      (distSupport >= -Math.max(0.05, spot * 0.0005) && distSupport <= Math.max(0.15, spot * 0.0011) && bar.close > bar.open && features.trendVwap >= 0))
   ) {
     direction = "LONG";
     setupName = "Support Bounce";
@@ -4951,11 +4964,15 @@ export function evaluateUnifiedSniperSetup(
     direction = "SHORT";
     setupName = "King Magnet Breakdown";
   }
-  // 5. Resistance Rejection (Strictly Blocked when Bullish Regime Locked!)
+  // 5. Resistance Rejection (Strictly Blocked when Bullish Regime Locked or before 09:45 ET!)
   else if (
+    etMins >= 585 &&
     !isBullishRegimeLocked &&
+    spot <= vwap &&
+    vwapSlope < -minVwapSlope &&
+    isLowerLows &&
     ((bar.high >= openingHigh && bar.close < bar.open && bar.close <= sma34 && prevBar.close >= sma34) ||
-      (distResist >= -Math.max(0.05, spot * 0.0005) && distResist <= Math.max(0.15, spot * 0.0011) && bar.close < bar.open && features.trendVwap <= 0.25))
+      (distResist >= -Math.max(0.05, spot * 0.0005) && distResist <= Math.max(0.15, spot * 0.0011) && bar.close < bar.open && features.trendVwap <= 0))
   ) {
     direction = "SHORT";
     setupName = "Resistance Rejection";

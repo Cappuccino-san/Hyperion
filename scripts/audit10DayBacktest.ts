@@ -803,11 +803,13 @@ async function run10DaySniperAudit() {
             canPhase2CallReclaim &&
             testedPutWallOrMinus1S &&
             impChi >= 0.60 &&
-            (dChi6 >= 0.03 || dImpChi6 >= 0.06 || dFlux6 > 0 || bar.close >= fvwap || bar.close >= bar.sma34) &&
+            dFlux6 > 0 &&
+            (dChi6 >= 0.03 || dImpChi6 >= 0.06) &&
             barBody <= 2.25 &&
             bullRoom >= 1.50 &&
-            ((bullDiv5m && (bar.close >= fvwap || bar.close >= bar.sma34)) ||
-              (bar.close > bar.open && bar.close >= fvwap && bar.close >= bar.sma34))
+            bar.close > bar.open &&
+            bar.close >= fvwap &&
+            bar.close >= bar.sma34
           ) {
             leg2Signal = {
               dir: "CALL",
@@ -818,11 +820,13 @@ async function run10DaySniperAudit() {
             canPhase2PutReject &&
             testedCallWallOrPlus1S &&
             impChi <= 0.40 &&
-            (dChi6 <= -0.03 || dImpChi6 <= -0.06 || dFlux6 < 0 || bar.close <= fvwap || bar.close <= bar.sma34) &&
+            dFlux6 < 0 &&
+            (dChi6 <= -0.03 || dImpChi6 <= -0.06) &&
             -barBody <= 2.25 &&
             bearRoom >= 1.50 &&
-            ((bearDiv5m && (bar.close <= fvwap || bar.close <= bar.sma34)) ||
-              (bar.close < bar.open && bar.close <= fvwap && bar.close <= bar.sma34))
+            bar.close < bar.open &&
+            bar.close <= fvwap &&
+            bar.close <= bar.sma34
           ) {
             leg2Signal = {
               dir: "PUT",
