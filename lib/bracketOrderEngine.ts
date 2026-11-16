@@ -19,6 +19,76 @@
 import { NbboQuote } from "@/lib/marketDataService";
 import { etSecondsOfDay, EOD_FORCE_FLAT_MINS } from "@/lib/gaiaSessionGuards";
 
+export const DEFAULT_HARD_OPTION_STOP_LOSS_PCT = 45;
+export const STALL_STOP_MINUTES = 20;
+export const STALL_MIN_PROFIT_PCT = 20;
+export const STALL_TIGHTENED_LOSS_PCT = 25;
+
+export interface OptionRiskStopEvaluation {
+  triggered: boolean;
+  stallTightened: boolean;
+  activeStopLossPct: number;
+  activeStopPrice: number;
+  reason: "OPTION_HARD_STOP_45" | "OPTION_STALL_STOP_25" | null;
+}
+
+/**
+ * Pure deterministic option-level risk evaluator:
+ * - Hard option-premium stop-loss at -45% of entry price (entry * 0.55)
+ * - 4-bar (20-minute) theta-stall rule: if peak option profit has not reached +20%
+ *   within 20 minutes of entry, tightens stop to -25% of entry price (entry * 0.75)
+ */
+export function evaluateOptionRiskStop(params: {
+  entryPrice: number;
+  currentPrice: number;
+  heldMinutes: number;
+  peakPnlPct: number;
+  hardStopLossPct?: number;
+  stallMinutes?: number;
+  stallMinProfitPct?: number;
+  stallTightenedLossPct?: number;
+}): OptionRiskStopEvaluation {
+  const {
+    entryPrice,
+    currentPrice,
+    heldMinutes,
+    peakPnlPct,
+    hardStopLossPct = DEFAULT_HARD_OPTION_STOP_LOSS_PCT,
+    stallMinutes = STALL_STOP_MINUTES,
+    stallMinProfitPct = STALL_MIN_PROFIT_PCT,
+    stallTightenedLossPct = STALL_TIGHTENED_LOSS_PCT,
+  } = params;
+
+  const safeEntry = Math.max(0.01, entryPrice);
+  const pnlPct = ((currentPrice - safeEntry) / safeEntry) * 100;
+  const stallTightened =
+    heldMinutes >= stallMinutes &&
+    peakPnlPct < stallMinProfitPct &&
+    stallTightenedLossPct < hardStopLossPct;
+
+  const activeStopLossPct = stallTightened ? stallTightenedLossPct : hardStopLossPct;
+  const rawStop = Math.max(0.05, safeEntry * (1 - activeStopLossPct / 100));
+  const activeStopPrice = Number((Math.round((rawStop + Number.EPSILON) * 100) / 100).toFixed(2));
+
+  if (currentPrice <= activeStopPrice || pnlPct <= -activeStopLossPct) {
+    return {
+      triggered: true,
+      stallTightened,
+      activeStopLossPct,
+      activeStopPrice,
+      reason: stallTightened ? "OPTION_STALL_STOP_25" : "OPTION_HARD_STOP_45",
+    };
+  }
+
+  return {
+    triggered: false,
+    stallTightened,
+    activeStopLossPct,
+    activeStopPrice,
+    reason: null,
+  };
+}
+
 export interface OcoBracketConfig {
   entryPrice: number; // Executed Ask
   contractsQty: 1 | 2;
@@ -27,7 +97,10 @@ export interface OcoBracketConfig {
   openedTs: number;
   tp1TargetPct: number; // e.g. 30 (+30%)
   tp2TargetPct?: number; // e.g. 60 (+60%)
-  stopLossMaxLossPct: number; // 25 (-25%)
+  stopLossMaxLossPct: number; // 45 (-45% hard loss cap) or explicit override
+  stallMinutes?: number; // Default 20 (4 bars)
+  stallMinProfitPct?: number; // Default +20%
+  stallTightenedLossPct?: number; // Default 25 (-25%)
   target1Spot: number;
   target2Spot: number;
   stopLossSpot: number;
@@ -36,10 +109,12 @@ export interface OcoBracketConfig {
 export interface OcoBracketState {
   tp1LimitPrice: number; // Limit order at Bid
   tp2LimitPrice: number; // Limit order at Bid (for runner)
-  hardStopPrice: number; // Stop order at Bid (-25%)
+  hardStopPrice: number; // Stop order at Bid (-45% or tightened -25% on stall)
   breakevenStopPrice: number;
   isTrailingBreakevenArmed: boolean;
   stagedMomentumTimeStopActive: boolean;
+  peakPnlPct?: number;
+  stallTightened?: boolean;
   marketOnCloseCutoffTimeEt: string;
   remainingContracts: 0 | 1 | 2;
   status: "ARMED" | "PARTIAL_TP1_FILLED" | "CLOSED";
@@ -50,7 +125,7 @@ export type OcoTriggerAction =
   | "TRIM_TP1" // 2-contract position: sell 1 of 2, move runner to BE
   | "EXIT_TP1_FULL" // 1-contract position: sell 1 of 1 (100% exit)
   | "EXIT_TP2" // 2-contract position: sell final runner
-  | "EXIT_STOP_LOSS" // Stop loss triggered (-25% or spot invalidation)
+  | "EXIT_STOP_LOSS" // Stop loss triggered (-45% / -25% stall / spot invalidation)
   | "EXIT_BREAKEVEN" // Runner breakeven stop triggered
   | "EXIT_TIME_STOP" // 10:45 AM momentum stall exit
   | "EXIT_MOC"; // 15:55:00 ET Market-On-Close liquidation
@@ -77,8 +152,11 @@ export function initializeOcoBrackets(config: OcoBracketConfig): OcoBracketState
   // TP2 Limit Order for runner (+50% to +80%)
   const tp2LimitPrice = Number((entryPrice * (1 + tp2TargetPct / 100)).toFixed(2));
 
-  // Hard Stop Loss at Bid (-25% max loss, floor at $0.05)
-  const rawStop = Math.max(0.05, entryPrice * (1 - stopLossMaxLossPct / 100));
+  // Hard Stop Loss at Bid (floor at $0.05)
+  const effectiveStopPct = Number.isFinite(stopLossMaxLossPct)
+    ? stopLossMaxLossPct
+    : DEFAULT_HARD_OPTION_STOP_LOSS_PCT;
+  const rawStop = Math.max(0.05, entryPrice * (1 - effectiveStopPct / 100));
   const hardStopPrice = Number((Math.round((rawStop + Number.EPSILON) * 100) / 100).toFixed(2));
 
   // Staged momentum time stop is active if position was opened before 10:15 AM ET
@@ -98,6 +176,8 @@ export function initializeOcoBrackets(config: OcoBracketConfig): OcoBracketState
     breakevenStopPrice: entryPrice,
     isTrailingBreakevenArmed: false,
     stagedMomentumTimeStopActive: openedBefore1015,
+    peakPnlPct: 0,
+    stallTightened: false,
     marketOnCloseCutoffTimeEt: "15:55:00",
     remainingContracts: contractsQty,
     status: "ARMED",
@@ -168,6 +248,27 @@ export function evaluateOcoBrackets(params: {
 
   const isCall = config.contractType === "CALL";
   const updatedBracket = { ...bracket };
+  const peakPnlPct = Math.max(updatedBracket.peakPnlPct ?? 0, pnlPct);
+  updatedBracket.peakPnlPct = peakPnlPct;
+
+  const heldMinutes =
+    Number.isFinite(config.openedTs) && config.openedTs > 0
+      ? Math.max(0, (Math.floor(now.getTime() / 1000) - config.openedTs) / 60)
+      : 0;
+  const stallEval = evaluateOptionRiskStop({
+    entryPrice: config.entryPrice,
+    currentPrice: liveBid,
+    heldMinutes,
+    peakPnlPct,
+    hardStopLossPct: config.stopLossMaxLossPct,
+    stallMinutes: config.stallMinutes ?? STALL_STOP_MINUTES,
+    stallMinProfitPct: config.stallMinProfitPct ?? STALL_MIN_PROFIT_PCT,
+    stallTightenedLossPct: config.stallTightenedLossPct ?? STALL_TIGHTENED_LOSS_PCT,
+  });
+  if (stallEval.stallTightened && !updatedBracket.stallTightened) {
+    updatedBracket.stallTightened = true;
+    updatedBracket.hardStopPrice = Math.max(updatedBracket.hardStopPrice, stallEval.activeStopPrice);
+  }
 
   // 1. Arm Trailing Breakeven Stop if position gains >= 18%
   if (!updatedBracket.isTrailingBreakevenArmed && pnlPct >= 18) {
@@ -327,7 +428,8 @@ export function evaluateOcoBrackets(params: {
   // --------------------------------------------------------------------------
   const isStopHit =
     liveBid <= updatedBracket.hardStopPrice ||
-    pnlPct <= -config.stopLossMaxLossPct ||
+    stallEval.triggered ||
+    pnlPct <= -stallEval.activeStopLossPct ||
     (isCall && underlyingSpot <= config.stopLossSpot) ||
     (!isCall && underlyingSpot >= config.stopLossSpot);
 
@@ -342,7 +444,9 @@ export function evaluateOcoBrackets(params: {
       triggered: true,
       reason: isBreakeven
         ? `BREAKEVEN STOP HIT · SELL @ $${liveBid.toFixed(2)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%)`
-        : `HARD STOP LOSS HIT (-25% MAX LOSS) · SELL @ $${liveBid.toFixed(2)} (${pnlPct}%)`,
+        : stallEval.reason === "OPTION_STALL_STOP_25"
+          ? `STALL STOP LOSS HIT (-${stallEval.activeStopLossPct}% 20M THETA CAP) · SELL @ $${liveBid.toFixed(2)} (${pnlPct}%)`
+          : `HARD STOP LOSS HIT (-${stallEval.activeStopLossPct}% MAX LOSS) · SELL @ $${liveBid.toFixed(2)} (${pnlPct}%)`,
       exitPrice: liveBid,
       pnlPct,
       contractsToClose: closingQty,

@@ -21,20 +21,25 @@ export interface RegimeAlphaStats {
   lastUpdatedDate?: string;
 }
 
+export type AlphaFeatureWeights = {
+  fluxAlignment: number;
+  flowVwapBand: number;
+  wallRoom: number;
+  kingMagnet: number;
+  mtfDivergence: number;
+  regimeFit: number;
+};
+
+export type FeatureIcMap = AlphaFeatureWeights;
+
 export interface AlphaPriorsState {
   version: number;
   updatedAt: string;
   priorStrengthM: number;
   baselineWinRate: number; // e.g. 0.58
   baselineExpectancyR: number; // e.g. 0.35
-  featureWeights: {
-    fluxAlignment: number;
-    flowVwapBand: number;
-    wallRoom: number;
-    kingMagnet: number;
-    mtfDivergence: number;
-    regimeFit: number;
-  };
+  featureWeights: AlphaFeatureWeights;
+  rollingFeatureIc?: FeatureIcMap;
   regimeStats: Record<MarketRegimeId, RegimeAlphaStats>;
   setupStats: Record<string, RegimeAlphaStats>;
   lastAttributionDate?: string;
@@ -88,6 +93,7 @@ export interface PostMarketAttributionReport {
   skippedCounterfactualAvgR: number;
   missedAlphaCount: number;
   savedChopCount: number;
+  featureIc?: FeatureIcMap;
   updatedPriorsSummary: string;
   records: CounterfactualEvalRecord[];
 }

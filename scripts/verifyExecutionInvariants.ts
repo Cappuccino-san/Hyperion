@@ -12,11 +12,12 @@
  * 4. Microstructure Broker Fill Slips & Reconciliation
  */
 
-import { calculateSmallAccountSize, calculatePositionSize, assertSmallAccountInvariant, MAX_SMALL_ACCOUNT_BUDGET } from "../lib/positionSizer";
+import { calculateSmallAccountSize, calculatePositionSize, assertSmallAccountInvariant, MAX_SMALL_ACCOUNT_BUDGET, resolveMinOptionDelta } from "../lib/positionSizer";
 import { executeNbboOrder, NbboQuote } from "../lib/marketDataService";
 import {
   initializeOcoBrackets,
   evaluateOcoBrackets,
+  evaluateOptionRiskStop,
   parseEtTimeSeconds,
   OcoBracketConfig,
 } from "../lib/bracketOrderEngine";
@@ -454,7 +455,7 @@ async function runTestSuite() {
       last: 0.87,
       openInterest: 3831,
       volume: 23361,
-      delta: -0.34,
+      delta: -0.37,
       gamma: 0.04,
       vega: 0.15,
       iv: 0.17,
@@ -499,13 +500,13 @@ async function runTestSuite() {
   // ===========================================================================
   // TEST SECTION 5B: DEEP-OTM STRIKE & LOW-DELTA FIREWALL (selectSmallAccountContract)
   // ===========================================================================
-  console.log("\n5B. Verifying Deep-OTM (> min($3.50, 0.45%)) & absDelta < 0.25 Rejection...");
+  console.log("\n5B. Verifying Deep-OTM (> min($3.50, 0.45%)) & absDelta < 0.35 Rejection...");
   const friAfternoonEt = new Date("2026-11-13T11:35:00-05:00");
   const deepOtmCallChain: NormalizedOptionContract[] = [
     { symbol: "SPY261113C00769000", strike: 769, expiration: "2026-11-13", optionType: "C", bid: 0.43, ask: 0.45, last: 0.44, volume: 12000, openInterest: 9000, iv: 0.16, delta: 0.08, gamma: 0.01, vega: 0.03, percentChange: 0 },
-    { symbol: "SPY261116C00756000", strike: 756, expiration: "2026-11-16", optionType: "C", bid: 0.70, ask: 0.72, last: 0.71, volume: 8000, openInterest: 6000, iv: 0.16, delta: 0.28, gamma: 0.03, vega: 0.07, percentChange: 0 }, // +$3.69 (0.49%) > 0.45% ($3.385)
-    { symbol: "SPY261116C00755000", strike: 755, expiration: "2026-11-16", optionType: "C", bid: 0.78, ask: 0.80, last: 0.79, volume: 9000, openInterest: 7000, iv: 0.16, delta: 0.24, gamma: 0.04, vega: 0.08, percentChange: 0 }, // absDelta 0.24 < 0.25
-    { symbol: "SPY261116C00754000", strike: 754, expiration: "2026-11-16", optionType: "C", bid: 0.82, ask: 0.84, last: 0.83, volume: 9000, openInterest: 7000, iv: 0.16, delta: 0, gamma: 0.04, vega: 0.08, percentChange: 0 }, // missing/0 delta must not spoof 0.30
+    { symbol: "SPY261116C00756000", strike: 756, expiration: "2026-11-16", optionType: "C", bid: 0.70, ask: 0.72, last: 0.71, volume: 8000, openInterest: 6000, iv: 0.16, delta: 0.38, gamma: 0.03, vega: 0.07, percentChange: 0 }, // +$3.69 (0.49%) > 0.45% ($3.385)
+    { symbol: "SPY261116C00755000", strike: 755, expiration: "2026-11-16", optionType: "C", bid: 0.78, ask: 0.80, last: 0.79, volume: 9000, openInterest: 7000, iv: 0.16, delta: 0.33, gamma: 0.04, vega: 0.08, percentChange: 0 }, // absDelta 0.33 < 0.35
+    { symbol: "SPY261116C00754000", strike: 754, expiration: "2026-11-16", optionType: "C", bid: 0.82, ask: 0.84, last: 0.83, volume: 9000, openInterest: 7000, iv: 0.16, delta: 0, gamma: 0.04, vega: 0.08, percentChange: 0 }, // missing/0 delta must not spoof
   ];
   const rejectedAllCalls = await selectSmallAccountContract({
     ticker: "SPY",
@@ -519,7 +520,7 @@ async function runTestSuite() {
   });
   assert(
     rejectedAllCalls === null,
-    `5B.1: Deep-OTM (769C/756C) and <0.25 delta (755C/0-delta) sub-$0.99 calls must return null (got ${rejectedAllCalls?.strike})`
+    `5B.1: Deep-OTM (769C/756C) and <0.35 delta (755C/0-delta) sub-$0.99 calls must return null (got ${rejectedAllCalls?.strike})`
   );
 
   const friAfternoonMixedCalls: NormalizedOptionContract[] = [
@@ -581,7 +582,7 @@ async function runTestSuite() {
     stopLossSpot: 754.0,
     contracts: [
       { symbol: "SPY261116P00748000", strike: 748, expiration: "2026-11-16", optionType: "P", bid: 0.63, ask: 0.65, last: 0.64, volume: 8000, openInterest: 6000, iv: 0.16, delta: -0.30, gamma: 0.03, vega: 0.07, percentChange: 0 },
-      { symbol: "SPY261116P00751000", strike: 751, expiration: "2026-11-16", optionType: "P", bid: 0.80, ask: 0.82, last: 0.81, volume: 11000, openInterest: 9500, iv: 0.16, delta: -0.34, gamma: 0.05, vega: 0.09, percentChange: 0 },
+      { symbol: "SPY261116P00751000", strike: 751, expiration: "2026-11-16", optionType: "P", bid: 0.80, ask: 0.82, last: 0.81, volume: 11000, openInterest: 9500, iv: 0.16, delta: -0.37, gamma: 0.05, vega: 0.09, percentChange: 0 },
     ],
     nowEt: friAfternoonEt,
   });
@@ -1360,8 +1361,8 @@ async function runTestSuite() {
           flowVwap: 495.5,
           ceilingShareChi: 0.58,
           impulseChi: 0.68,
-          pecletNumber: 0.8,
-          impulsePeclet: 1.4,
+          pecletNumber: 2.1,
+          impulsePeclet: 2.1,
           netFluxJ: 0.22,
           deltaChi6Bar: 0.12,
           deltaImpulseChi6Bar: 0.18,
@@ -1495,7 +1496,7 @@ async function runTestSuite() {
       divergence5m: "BEAR",
       contracts: leg2SymChain,
       nowEt: new Date((leg1CallExitTs + 1200) * 1000),
-      latest5mCandle: { open: 506.0, high: 506.4, low: 505.0, close: 505.2, sma34: 505.7, flowSnapshot: makeFlow(leg1CallExitTs + 1200, 505.2, 505.5, 0.38, 0.30, -1.6, -0.22, -0.18) },
+      latest5mCandle: { open: 506.0, high: 506.4, low: 505.0, close: 505.2, sma34: 505.7, flowSnapshot: makeFlow(leg1CallExitTs + 1200, 505.2, 505.5, 0.38, 0.30, -2.1, -0.22, -0.18) },
     });
     assert(earlyRejectRes.activePosition === null, "10E.1: Leg-2 PUT Call Wall rejection blocked < 30m cooldown");
 
@@ -1531,7 +1532,7 @@ async function runTestSuite() {
       divergence5m: "BEAR",
       contracts: leg2SymChain,
       nowEt: leg2Time,
-      latest5mCandle: { open: 506.0, high: 506.4, low: 505.0, close: 505.2, sma34: 505.7, flowSnapshot: makeFlow(leg2Ts, 505.2, 505.5, 0.38, 0.30, -1.6, -0.22, -0.18) },
+      latest5mCandle: { open: 506.0, high: 506.4, low: 505.0, close: 505.2, sma34: 505.7, flowSnapshot: makeFlow(leg2Ts, 505.2, 505.5, 0.38, 0.30, -2.1, -0.22, -0.18) },
     });
     assert(leg2PutOpenRes.activePosition?.contractType === "PUT", `10E.3: 11:30 AM Call Wall rejection opens opposite Leg-2 PUT (got ${leg2PutOpenRes.activePosition?.contractType ?? "none"})`);
 
@@ -1668,7 +1669,7 @@ async function runTestSuite() {
         { symbol: "QQQ20991231C00496000", strike: 496, expiration: "2099-12-31", optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 1200, openInterest: 3000, iv: 0.20, delta: 0.38, gamma: 0.05, vega: 0.03, percentChange: 0 },
       ],
       nowEt: makeEtDateOn(sessionDate10E, 10, 25), // cooldown 35m >= 30m, but etMins 625 < 630
-      latest5mCandle: { open: 495.2, high: 496.0, low: 494.9, close: 495.8, sma34: 495.4, flowSnapshot: makeFlow(exit950Ts + 2100, 495.8, 495.5, 0.58, 0.68, 1.4, 0.22, 0.15) },
+      latest5mCandle: { open: 495.2, high: 496.0, low: 494.9, close: 495.8, sma34: 495.4, flowSnapshot: makeFlow(exit950Ts + 2100, 495.8, 495.5, 0.58, 0.68, 2.1, 0.22, 0.15) },
     });
     assert(leg2At1025.activePosition === null, "10F.1: Leg-2 blocked at 10:25 AM ET (etMins 625 < 630) even with >=30m cooldown");
 
@@ -1686,7 +1687,7 @@ async function runTestSuite() {
         { symbol: "QQQ20991231C00496000", strike: 496, expiration: "2099-12-31", optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 1200, openInterest: 3000, iv: 0.20, delta: 0.38, gamma: 0.05, vega: 0.03, percentChange: 0 },
       ],
       nowEt: makeEtDateOn(sessionDate10E, 10, 30), // exact 10:30 AM ET (etMins 630)
-      latest5mCandle: { open: 495.2, high: 496.0, low: 494.9, close: 495.8, sma34: 495.4, flowSnapshot: makeFlow(exit950Ts + 2400, 495.8, 495.5, 0.58, 0.68, 1.4, 0.22, 0.15) },
+      latest5mCandle: { open: 495.2, high: 496.0, low: 494.9, close: 495.8, sma34: 495.4, flowSnapshot: makeFlow(exit950Ts + 2400, 495.8, 495.5, 0.58, 0.68, 2.1, 0.22, 0.15) },
     });
     assert(
       leg2At1030.activePosition?.contractType === "CALL",
@@ -1975,11 +1976,11 @@ async function runTestSuite() {
       ticker: "SPY", type: "CALL", spot: 750, t1: 753, t2: 756, sl: 748.5, cw: 756, pw: 746, expectedStrike: 753,
       rejectedOnlyChain: [
         { symbol: "SPY261113C00754000", strike: 754, expiration: mtExp, optionType: "C", bid: 0.49, ask: 0.52, last: 0.50, volume: 9000, openInterest: 8000, iv: 0.16, delta: 0.27, gamma: 0.03, vega: 0.06, percentChange: 0 },
-        { symbol: "SPY261113C00752000", strike: 752, expiration: mtExp, optionType: "C", bid: 0.77, ask: 0.80, last: 0.79, volume: 9000, openInterest: 8000, iv: 0.16, delta: 0.24, gamma: 0.04, vega: 0.07, percentChange: 0 },
+        { symbol: "SPY261113C00752000", strike: 752, expiration: mtExp, optionType: "C", bid: 0.77, ask: 0.80, last: 0.79, volume: 9000, openInterest: 8000, iv: 0.16, delta: 0.22, gamma: 0.04, vega: 0.07, percentChange: 0 },
       ],
       fullChain: [
         { symbol: "SPY261113C00750000", strike: 750, expiration: mtExp, optionType: "C", bid: 1.80, ask: 1.85, last: 1.82, volume: 12000, openInterest: 10000, iv: 0.16, delta: 0.52, gamma: 0.05, vega: 0.08, percentChange: 0 },
-        { symbol: "SPY261113C00753000", strike: 753, expiration: mtExp, optionType: "C", bid: 0.75, ask: 0.78, last: 0.77, volume: 15000, openInterest: 11000, iv: 0.16, delta: 0.32, gamma: 0.04, vega: 0.07, percentChange: 0 },
+        { symbol: "SPY261113C00753000", strike: 753, expiration: mtExp, optionType: "C", bid: 0.75, ask: 0.78, last: 0.77, volume: 15000, openInterest: 11000, iv: 0.16, delta: 0.37, gamma: 0.04, vega: 0.07, percentChange: 0 },
       ],
     },
     {
@@ -1989,7 +1990,7 @@ async function runTestSuite() {
       ],
       fullChain: [
         { symbol: "QQQ261113C00510000", strike: 510, expiration: mtExp, optionType: "C", bid: 1.38, ask: 1.42, last: 1.40, volume: 11000, openInterest: 9000, iv: 0.20, delta: 0.51, gamma: 0.06, vega: 0.06, percentChange: 0 },
-        { symbol: "QQQ261113C00512000", strike: 512, expiration: mtExp, optionType: "C", bid: 0.73, ask: 0.76, last: 0.75, volume: 14000, openInterest: 10000, iv: 0.20, delta: 0.34, gamma: 0.05, vega: 0.05, percentChange: 0 },
+        { symbol: "QQQ261113C00512000", strike: 512, expiration: mtExp, optionType: "C", bid: 0.73, ask: 0.76, last: 0.75, volume: 14000, openInterest: 10000, iv: 0.20, delta: 0.38, gamma: 0.05, vega: 0.05, percentChange: 0 },
       ],
     },
     {
@@ -2006,7 +2007,7 @@ async function runTestSuite() {
       ticker: "NVDA", type: "CALL", spot: 140, t1: 141.1, t2: 142, sl: 139.4, cw: 142, pw: 138, expectedStrike: 140.5,
       rejectedOnlyChain: [
         { symbol: "NVDA261113C00141000", strike: 141, expiration: mtExp, optionType: "C", bid: 0.55, ask: 0.58, last: 0.57, volume: 18000, openInterest: 14000, iv: 0.48, delta: 0.34, gamma: 0.12, vega: 0.03, percentChange: 0 },
-        { symbol: "NVDA261113C00140500", strike: 140.5, expiration: mtExp, optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 18000, openInterest: 14000, iv: 0.48, delta: 0.24, gamma: 0.12, vega: 0.03, percentChange: 0 },
+        { symbol: "NVDA261113C00140500", strike: 140.5, expiration: mtExp, optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 18000, openInterest: 14000, iv: 0.48, delta: 0.22, gamma: 0.12, vega: 0.03, percentChange: 0 },
       ],
       fullChain: [
         { symbol: "NVDA261113C00140000", strike: 140, expiration: mtExp, optionType: "C", bid: 1.24, ask: 1.28, last: 1.26, volume: 22000, openInterest: 16000, iv: 0.48, delta: 0.52, gamma: 0.15, vega: 0.04, percentChange: 0 },
@@ -2031,7 +2032,7 @@ async function runTestSuite() {
       target1Spot: row.t1, target2Spot: row.t2, stopLossSpot: row.sl,
       contracts: row.rejectedOnlyChain, nowEt: mtMorningEt, zeroDteCallWall: row.cw, zeroDtePutWall: row.pw,
     });
-    assert(rej === null, `12B.${row.ticker}.${row.type}: Rejects >0.45% OTM / <0.25 delta contracts`);
+    assert(rej === null, `12B.${row.ticker}.${row.type}: Rejects >0.45% OTM / <0.24 morning delta contracts`);
 
     const picked = await selectSmallAccountContract({
       ticker: row.ticker, contractType: row.type, spotPrice: row.spot,
@@ -2040,7 +2041,7 @@ async function runTestSuite() {
     });
     assert(picked?.strike === row.expectedStrike, `12B.${row.ticker}.${row.type}: Selected near-ATM ${row.expectedStrike} (got ${picked?.strike})`);
     assert(picked?.contractsQty === 1 && (picked?.totalOutlay ?? 999) <= 100, `12B.${row.ticker}.${row.type}: Strict 1-contract <=$100 outlay`);
-    assert((picked?.delta ?? 0) >= 0.25 && Math.abs((picked?.strike ?? 0) - row.spot) / row.spot <= 0.0045, `12B.${row.ticker}.${row.type}: |delta| >= 0.25 & <= 0.45% OTM`);
+    assert((picked?.delta ?? 0) >= resolveMinOptionDelta(615) && Math.abs((picked?.strike ?? 0) - row.spot) / row.spot <= 0.0045, `12B.${row.ticker}.${row.type}: |delta| >= 0.24 & <= 0.45% OTM`);
     if (row.ticker === "NVDA" && row.type === "CALL") {
       assert((picked?.entryIv ?? 0) >= 0.40 && (picked?.entryIv ?? 0) <= 0.60, `12B.NVDA: entryIv honors 48% IV (got ${picked?.entryIv})`);
     }
@@ -2235,6 +2236,140 @@ async function runTestSuite() {
     assert(mtOutlayViolations === 0, "14D.2: 200-step Multi-Ticker Monte Carlo ZERO qty!=1 or >$100 outlay violations");
   } finally {
     saveTradeStore(storeBackupMT);
+  }
+
+  // ===========================================================================
+  // TEST SECTION 15: JANE STREET QUANT UPGRADES (DELTA FLOOR, -45%/20M STOPS, ANTI-WHIPSAW)
+  // ===========================================================================
+  console.log("\n15. Verifying Adaptive Delta Floor (0.24 pre-10:30, 0.35 post-10:30), -45% / 20m -25% Stops & Post-Loss Leg-2 Anti-Whipsaw...");
+  const morning24Admitted = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "CALL",
+    spotPrice: 755.0,
+    target1Spot: 758.0,
+    target2Spot: 760.0,
+    stopLossSpot: 753.5,
+    contracts: [
+      { symbol: "SPY261113C00757000", strike: 757, expiration: "2026-11-13", optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 12000, openInterest: 9000, iv: 0.16, delta: 0.24, gamma: 0.04, vega: 0.06, percentChange: 0 },
+    ],
+    nowEt: new Date("2026-11-13T10:05:00-05:00"),
+  });
+  assert(morning24Admitted?.delta === 0.24, "15.0: Morning window (10:05 ET < 10:30) admits >= 0.24 delta contract");
+
+  const sub35Rejected = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "CALL",
+    spotPrice: 755.0,
+    target1Spot: 758.0,
+    target2Spot: 760.0,
+    stopLossSpot: 753.5,
+    contracts: [
+      { symbol: "SPY261113C00757000", strike: 757, expiration: "2026-11-13", optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 12000, openInterest: 9000, iv: 0.16, delta: 0.33, gamma: 0.04, vega: 0.06, percentChange: 0 },
+    ],
+    nowEt: new Date("2026-11-13T11:30:00-05:00"),
+  });
+  assert(sub35Rejected === null, "15.1: Sub-0.35 delta (0.33) strictly rejected at >= 10:30 ET");
+
+  const hardStopEval = evaluateOptionRiskStop({ entryPrice: 0.80, currentPrice: 0.44, peakPnlPct: 4, heldMinutes: 6 });
+  assert(hardStopEval.triggered && hardStopEval.reason === "OPTION_HARD_STOP_45", "15.2: -45% hard option stop triggers at entry * 0.55");
+
+  const stallStopEval = evaluateOptionRiskStop({ entryPrice: 0.80, currentPrice: 0.60, peakPnlPct: 12, heldMinutes: 20 });
+  assert(stallStopEval.triggered && stallStopEval.reason === "OPTION_STALL_STOP_25", "15.3: 20-minute -25% theta-stall tightener triggers when peak < +20%");
+
+  const storeBackup15 = loadTradeStore();
+  try {
+    const date15 = getTodayEt();
+    const makeEtDate15 = (hh: number, mm: number): Date => {
+      const utcGuess = Date.UTC(Number(date15.slice(0, 4)), Number(date15.slice(5, 7)) - 1, Number(date15.slice(8, 10)), hh + 5, mm, 0);
+      const etHh = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", hourCycle: "h23" }).format(new Date(utcGuess)));
+      return new Date(utcGuess - (etHh - hh) * 3600_000);
+    };
+    const exitTs15 = Math.floor(makeEtDate15(10, 0).getTime() / 1000);
+    saveTradeStore({
+      date: date15,
+      activePositions: {},
+      closedPositions: [{
+        id: "qqq-leg1-loss-15",
+        ticker: "QQQ",
+        contractType: "PUT",
+        contractLabel: "QQQ 20991231 498P",
+        strike: 498,
+        expiration: "2099-12-31",
+        setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
+        status: "CLOSED",
+        btoSpotPrice: 499.0,
+        btoOptionMid: 0.80,
+        contractsQty: 1,
+        remainingQty: 0,
+        totalOutlay: 80,
+        target1Spot: 497.0,
+        target2Spot: 495.0,
+        stopLossSpot: 500.0,
+        openedAt: "09:40 AM",
+        openedTs: exitTs15 - 1200,
+        closedAt: "10:00 AM",
+        closedTs: exitTs15,
+        pnlOptionPct: -45.0,
+        exitReason: "HARD -45% OPTION STOP",
+      }],
+      alerts: [],
+      prevSpotPrices: { QQQ: 495.2 },
+    });
+
+    // Spot still below Zero Gamma 500.0 -> post-loss opposite Leg-2 CALL flip must be vetoed
+    const antiWhipsawRes = await evaluateTradeSignals({
+      ticker: "QQQ",
+      spotPrice: 495.8,
+      prevSpotPrice: 495.2,
+      callWall: 506.0,
+      putWall: 495.0,
+      zeroGamma: 500.0,
+      priorClose: 499.0,
+      premarketFlowVwap: 495.5,
+      divergence5m: "BULL",
+      contracts: [
+        { symbol: "QQQ20991231C00496000", strike: 496, expiration: "2099-12-31", optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 1200, openInterest: 3000, iv: 0.20, delta: 0.38, gamma: 0.05, vega: 0.03, percentChange: 0 },
+      ],
+      nowEt: makeEtDate15(10, 45),
+      latest5mCandle: {
+        open: 495.2,
+        high: 496.0,
+        low: 494.9,
+        close: 495.8,
+        sma34: 495.4,
+        flowSnapshot: {
+          timestamp: exitTs15 + 2700,
+          spot: 495.8,
+          flowVwap: 495.5,
+          ceilingShareChi: 0.62,
+          impulseChi: 0.68,
+          pecletNumber: 2.1,
+          impulsePeclet: 2.1,
+          netFluxJ: 0.22,
+          deltaChi6Bar: 0.12,
+          deltaImpulseChi6Bar: 0.18,
+          deltaNetFlux6Bar: 0.15,
+          upper1s: 496.8,
+          lower1s: 494.2,
+          upper2s: 498.0,
+          lower2s: 493.0,
+          upper1Sigma: 496.8,
+          lower1Sigma: 494.2,
+          upper2Sigma: 498.0,
+          lower2Sigma: 493.0,
+          sigma: 1.0,
+          variance: 1.0,
+          cumGammaWeight: 100,
+          totalWeight: 100,
+          signedGammaAcceleration: 0,
+          count: 10,
+          bandSignal: null,
+        },
+      },
+    });
+    assert(antiWhipsawRes.activePosition === null, "15.4: Post-loss Leg-2 opposite flip vetoed without Zero-Gamma cross+hold & |Pe|>=2.2");
+  } finally {
+    saveTradeStore(storeBackup15);
   }
 
   // ===========================================================================

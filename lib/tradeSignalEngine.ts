@@ -27,10 +27,19 @@ import {
 } from "@/lib/persistenceStore";
 import {
   classifyMarketRegime,
+  evaluateLeg2StructuralGate,
+  evaluateOpeningHorizonAlignment,
+  LEG1_MIN_EXPECTANCY_R,
+  LEG2_MIN_EXPECTANCY_R,
   scoreSetupExpectancy,
   selectOptimalSmallAccountContract,
   type ContractCandidateInput,
 } from "@/lib/alphaScorer";
+import {
+  DEFAULT_HARD_OPTION_STOP_LOSS_PCT,
+  evaluateOptionRiskStop,
+} from "@/lib/bracketOrderEngine";
+import { MAX_OPTION_DELTA, resolveMinOptionDelta } from "@/lib/positionSizer";
 
 export { getTodayEt };
 
@@ -132,6 +141,7 @@ export interface OptionTradePosition {
   flowVwap?: number;
   ceilingShareChi?: number;
   pecletNumber?: number;
+  peakOptionPnlPct?: number;
 }
 
 export interface TradeLifecycleAlert {
@@ -207,6 +217,8 @@ export interface DailyTradeStore {
       zeroGamma?: number;
     }
   >;
+  bookCenterHistoryByTicker?: Record<string, number[]>;
+  bookCenterLastTsByTicker?: Record<string, number>;
 }
 
 export interface SelectedOptionContract {
@@ -967,6 +979,7 @@ export async function selectSmallAccountContract(params: {
       (item) => typeof item.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(item.expiration) && item.expiration > todayEt
     );
 
+    const minOptionDelta = resolveMinOptionDelta(etTime.totalMinutes);
     for (const c of contracts) {
       if (c.optionType !== typeLetter) continue;
       if (typeof c.expiration !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(c.expiration)) continue;
@@ -978,9 +991,9 @@ export async function selectSmallAccountContract(params: {
       // Strict Sub-$1.00 Ask Cap: retail buys at ASK ($0.15 <= ask <= $0.99)
       if (askPrice < 0.15 || askPrice > 0.99) continue;
 
-      // Reject low-delta lotto contracts (< 0.25 delta); never spoof missing/0 delta as 0.30
+      // Time-of-Day Adaptive Delta Floor: 0.24 in [09:35-10:29 ET], 0.35 in [>=10:30 ET], cap 0.50
       const absDelta = typeof c.delta === "number" && Number.isFinite(c.delta) ? Math.abs(c.delta) : 0;
-      if (absDelta < 0.25) continue;
+      if (absDelta < minOptionDelta || absDelta > MAX_OPTION_DELTA) continue;
 
       // Reject crossed/invalid quotes & wide-spread contracts (> 24% spread); never skip spread check when bid is missing
       const effectiveBid = rawBid ?? (askPrice > 0 ? 0 : -1);
@@ -1048,6 +1061,7 @@ export async function selectSmallAccountContract(params: {
       zeroDtePutWall,
       isAfternoon,
       preferredDte,
+      etMins: etTime.totalMinutes,
       nowMs: (nowEt ?? new Date()).getTime(),
     });
     const chosen = selection?.chosen;
@@ -1101,8 +1115,9 @@ export async function selectSmallAccountContract(params: {
       // Guard against non-monotonic or negative moves
       const estTp1Mid = Number(Math.max(entryAsk + 0.05, bsTp1Mid).toFixed(2));
       const estTp2Mid = Number(Math.max(estTp1Mid + 0.05, bsTp2Mid).toFixed(2));
-      // Max -25% loss stop floor: stop price cannot fall below entryAsk * 0.75
-      const estStopMid = Number(Math.max(entryAsk * 0.75, Math.min(entryAsk - 0.01, bsStopMid)).toFixed(2));
+      // Max -45% option hard stop floor: stop price cannot fall below entryAsk * 0.55
+      const hardStopMult = 1 - DEFAULT_HARD_OPTION_STOP_LOSS_PCT / 100;
+      const estStopMid = Number(Math.max(entryAsk * hardStopMult, Math.min(entryAsk - 0.01, bsStopMid)).toFixed(2));
 
       const tp1Pct = Number((((estTp1Mid - entryAsk) / entryAsk) * 100).toFixed(0));
       const tp2Pct = Number((((estTp2Mid - entryAsk) / entryAsk) * 100).toFixed(0));
@@ -2412,6 +2427,13 @@ export async function evaluateTradeSignals(
     const pnlOptionPct = Number(
       (((exitFillPrice - entryFillPrice) / Math.max(0.01, entryFillPrice)) * 100).toFixed(2)
     );
+    activePos.peakOptionPnlPct = Math.max(activePos.peakOptionPnlPct ?? 0, pnlOptionPct);
+    const optStopEval = evaluateOptionRiskStop({
+      entryPrice: entryFillPrice,
+      currentPrice: exitFillPrice,
+      heldMinutes: rawHeldMin,
+      peakPnlPct: activePos.peakOptionPnlPct,
+    });
 
     // Helper to close position (clamps spotPrice to [candle.low, candle.high] for ALL tickers including SPXW->SPY)
     const closePosition = (reason: string) => {
@@ -2677,12 +2699,11 @@ export async function evaluateTradeSignals(
       // Strict 1-Contract Sniper Automaton: 1 BTO -> 1 STC (No multi-contract partial scaling)
       closePosition("TARGET 1 HIT · FULL PROFIT EXIT (1 CONTRACT)");
     }
-    // 5. STC (STOP LOSS / LEVEL INVALIDATION / OPTION HARD STOP HIT)
+    // 5. STC (STOP LOSS / LEVEL INVALIDATION / OPTION -45% HARD STOP OR 20M -25% STALL STOP)
     else if (
       (isCall && posSpotPrice <= activePos.stopLossSpot) ||
       (!isCall && posSpotPrice >= activePos.stopLossSpot) ||
-      (activePos.status === "OPEN" && activePos.estStopMid != null && currentOptionMid <= activePos.estStopMid && pnlOptionPct <= -20) ||
-      (pnlOptionPct <= -25)
+      optStopEval.triggered
     ) {
       const isBreakeven =
         activePos.status === "PARTIAL_TP1" ||
@@ -2692,13 +2713,15 @@ export async function evaluateTradeSignals(
         pnlOptionPct > 0 &&
         ((isCall && activePos.stopLossSpot > activePos.btoSpotPrice + 0.01 && posSpotPrice > activePos.btoSpotPrice) ||
          (!isCall && activePos.stopLossSpot < activePos.btoSpotPrice - 0.01 && posSpotPrice < activePos.btoSpotPrice));
-      const isOptionHardStop = !isBreakeven && !isTrailingProfit && pnlOptionPct <= -22;
+      const isOptionHardStop = !isBreakeven && !isTrailingProfit && optStopEval.triggered;
       const reason = isTrailingProfit
         ? "TRAILING PROFIT LOCKED"
         : isBreakeven
           ? "BREAKEVEN STOP HIT"
           : isOptionHardStop
-            ? "OPTION HARD STOP HIT (-25% MAX LOSS)"
+            ? optStopEval.reason === "OPTION_STALL_STOP_25"
+              ? "OPTION STALL STOP HIT (-25% 20M THETA CAP)"
+              : "OPTION HARD STOP HIT (-45% MAX LOSS)"
             : "STOP LOSS / LEVEL INVALIDATION";
       closePosition(reason);
     }
@@ -2998,6 +3021,25 @@ export async function evaluateTradeSignals(
       : (tacticalPw > 0 && tacticalCw > tacticalPw)
         ? Number(((tacticalCw + tacticalPw) / 2).toFixed(2))
         : effectiveSma34;
+    const observedBookCenter =
+      typeof bookCenter === "number" && Number.isFinite(bookCenter) && bookCenter > 0
+        ? bookCenter
+        : tacticalBookCenter;
+    if (observedBookCenter > 0) {
+      const histMap = { ...(store.bookCenterHistoryByTicker || {}) };
+      const tsMap = { ...(store.bookCenterLastTsByTicker || {}) };
+      const prevHist = [...(histMap[normalizedTicker] || [])];
+      const barTsVal = latest5mCandle?.timestamp ?? 0;
+      if (barTsVal > 0 && tsMap[normalizedTicker] === barTsVal && prevHist.length > 0) {
+        prevHist[prevHist.length - 1] = observedBookCenter;
+      } else {
+        prevHist.push(observedBookCenter);
+        if (barTsVal > 0) tsMap[normalizedTicker] = barTsVal;
+      }
+      histMap[normalizedTicker] = prevHist.slice(-6);
+      store.bookCenterHistoryByTicker = histMap;
+      store.bookCenterLastTsByTicker = tsMap;
+    }
     const recent5mLow = latest5mCandle ? Math.min(latest5mCandle.low, latest5mCandle.prevLow ?? latest5mCandle.low, spotPrice) : spotPrice;
     const recent5mHigh = latest5mCandle ? Math.max(latest5mCandle.high, latest5mCandle.prevHigh ?? latest5mCandle.high, spotPrice) : spotPrice;
     const testedPutWallOrKingOrFlux =
@@ -3809,24 +3851,68 @@ export async function evaluateTradeSignals(
       }
     }
 
-    // Phase-2 Gate: Second trade today must be an opposite-direction structural rotation (>= 10:30 ET, >= 30m cooldown)
-    if (candidateBto && isPhase2ReclaimWindow) {
-      const isOppositeDir = candidateBto.contractType !== lastClosed?.contractType;
-      const isLeg2CallValid =
-        candidateBto.contractType === "CALL" &&
-        testedPutWallOrMinus1Sigma &&
-        (divergence5m === "BULL" || divergence30m === "BULL" || reclaimedSmaAndVwapOrCenter) &&
-        impChi >= 0.60 &&
-        (deltaFlux6 > 0 || spotPrice >= effectiveSma34 || spotPrice >= effectiveFlowVwap) &&
-        leg2CallRoom >= entryMetrics.minWallRoom;
-      const isLeg2PutValid =
-        candidateBto.contractType === "PUT" &&
-        testedCallWallOrPlus1Sigma &&
-        (divergence5m === "BEAR" || divergence30m === "BEAR" || lostSmaAndVwapOrCenter) &&
-        impChi <= 0.40 &&
-        (deltaFlux6 < 0 || spotPrice <= effectiveSma34 || spotPrice <= effectiveFlowVwap) &&
-        leg2PutRoom >= entryMetrics.minWallRoom;
-      if (!isOppositeDir || !(isLeg2CallValid || isLeg2PutValid)) {
+    // Opening Horizon Alignment (09:35-10:00 ET): require 0DTE King pull & Book Center 3-bar slope agreement
+    if (candidateBto && etTime.totalMinutes < 600) {
+      const pre1000Check = evaluateOpeningHorizonAlignment({
+        etMins: etTime.totalMinutes,
+        direction: candidateBto.contractType,
+        spotPrice,
+        zeroDteKing:
+          filteredKing && filteredKing > 0
+            ? filteredKing
+            : (kingNode as { zeroDteKing?: number } | undefined)?.zeroDteKing,
+        allExpKing:
+          kingNode?.allExpKing && kingNode.allExpKing > 0
+            ? kingNode.allExpKing
+            : kingNode?.strike,
+        bookCenterHistory: store.bookCenterHistoryByTicker?.[normalizedTicker] ?? [],
+      });
+      if (!pre1000Check.allowed) {
+        candidateBto = null;
+      }
+    }
+
+    // Asymmetric Leg-2 Structural Gating & Anti-Whipsaw Firewall (10:30-14:30 ET, >= 30m cooldown, opposite dir)
+    if (candidateBto && isPhase2ReclaimWindow && lastClosed) {
+      const effectiveDeltaChi6 =
+        deltaChi6 !== 0
+          ? deltaChi6
+          : deltaImpulseChi6 !== 0
+            ? deltaImpulseChi6
+            : deltaFlux6 > 0
+              ? 0.04
+              : deltaFlux6 < 0
+                ? -0.04
+                : 0;
+      const leg2Gate = evaluateLeg2StructuralGate({
+        direction: candidateBto.contractType,
+        etMins: etTime.totalMinutes,
+        nowTsSec: nowTs,
+        spotPrice,
+        prevSpotPrice,
+        zeroGamma: effectiveZeroGamma,
+        flowVwap: effectiveFlowVwap,
+        sma34: effectiveSma34,
+        leg1Trade: {
+          contractType: lastClosed.contractType,
+          closedTs: lastClosed.closedTs,
+          btoSpotPrice: lastClosed.btoSpotPrice,
+          closedSpotPrice: lastClosed.closedSpotPrice,
+          pnlOptionPct: lastClosed.pnlOptionPct,
+        },
+        testedPutWallOrMinus1Sigma,
+        testedCallWallOrPlus1Sigma,
+        has5mBullDiv: divergence5m === "BULL",
+        has5mBearDiv: divergence5m === "BEAR",
+        impulseChi: impChi,
+        deltaChi6Bar: effectiveDeltaChi6,
+        impulsePeclet: impPe,
+      });
+      const minLeg2RoomOk =
+        candidateBto.contractType === "CALL"
+          ? leg2CallRoom >= entryMetrics.minWallRoom
+          : leg2PutRoom >= entryMetrics.minWallRoom;
+      if (!leg2Gate.allowed || !minLeg2RoomOk) {
         candidateBto = null;
       }
     }
@@ -3874,6 +3960,7 @@ export async function evaluateTradeSignals(
           flowSnapshot: flowSnap,
           regimeClassification,
           priors: readAlphaPriorsSync(),
+          minExpectancyR: isPhase2ReclaimWindow ? LEG2_MIN_EXPECTANCY_R : LEG1_MIN_EXPECTANCY_R,
         });
 
         // Data-Driven Walk-Forward Gate (Empirical Bayes Shrinkage on 10-day prior sessions + Regime Expectancy)
@@ -3884,6 +3971,11 @@ export async function evaluateTradeSignals(
         const passesExpectancy = calibration.passesGate && alphaScore.passesGate;
         if (params.signal?.aborted || !passesExpectancy) {
           const freshAbortStore = loadTradeStore();
+          if (store.bookCenterHistoryByTicker) {
+            freshAbortStore.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
+            freshAbortStore.bookCenterLastTsByTicker = store.bookCenterLastTsByTicker;
+            saveTradeStore(freshAbortStore);
+          }
           return {
             ticker: normalizedTicker,
             activePosition:
@@ -4068,6 +4160,10 @@ export async function evaluateTradeSignals(
 
         const latestStoreBeforeCommit = loadTradeStore();
         latestStoreBeforeCommit.prevSpotPrices[normalizedTicker] = spotPrice;
+        if (store.bookCenterHistoryByTicker) {
+          latestStoreBeforeCommit.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
+          latestStoreBeforeCommit.bookCenterLastTsByTicker = store.bookCenterLastTsByTicker;
+        }
         if (Object.keys(latestStoreBeforeCommit.activePositions || {}).length > 0) {
           console.warn(
             `[evaluateTradeSignals] Aborted ${positionTicker} BTO commit: global slot already occupied (${Object.keys(latestStoreBeforeCommit.activePositions).join(", ")}).`
@@ -4086,11 +4182,18 @@ export async function evaluateTradeSignals(
     }
   }
 
-  // Persist prevSpotPrices onto latest store when no commit/STEP-A write occurred after any await
+  // Persist prevSpotPrices & pre-10:00 Book Center history onto latest store when no commit/STEP-A write occurred
   if (emittedAlerts.length === 0 && !hadActivePositionAtStart) {
     const latestIdleStore = loadTradeStore();
-    if (latestIdleStore.prevSpotPrices[normalizedTicker] !== spotPrice) {
+    if (
+      latestIdleStore.prevSpotPrices[normalizedTicker] !== spotPrice ||
+      Boolean(store.bookCenterHistoryByTicker?.[normalizedTicker]?.length)
+    ) {
       latestIdleStore.prevSpotPrices[normalizedTicker] = spotPrice;
+      if (store.bookCenterHistoryByTicker) {
+        latestIdleStore.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
+        latestIdleStore.bookCenterLastTsByTicker = store.bookCenterLastTsByTicker;
+      }
       saveTradeStore(latestIdleStore);
     }
     store = latestIdleStore;
@@ -5253,8 +5356,8 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
       }
       const estTp1 = optimal.estTp1Mid;
       const estTp2 = optimal.estTp2Mid;
-      // Hard stop loss floor: strictly clamp to max -25% loss (entryAsk * 0.75)
-      const maxStopLossFloor = Number((entryAsk * 0.75).toFixed(2));
+      // Hard stop loss floor: strictly clamp to max -45% loss (entryAsk * 0.55)
+      const maxStopLossFloor = Number((entryAsk * (1 - DEFAULT_HARD_OPTION_STOP_LOSS_PCT / 100)).toFixed(2));
       const estStop = Math.max(maxStopLossFloor, optimal.estStopMid);
       const tp1Pct = Math.round(((estTp1 - entryAsk) / Math.max(0.01, entryAsk)) * 100);
       const tp2Pct = Math.round(((estTp2 - entryAsk) / Math.max(0.01, entryAsk)) * 100);

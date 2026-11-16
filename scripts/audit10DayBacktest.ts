@@ -27,11 +27,17 @@ import {
 import { computeBarFlowGammaVwapSeries } from "../lib/flowGammaVwap";
 import {
   classifyMarketRegime,
+  evaluateLeg2StructuralGate,
+  evaluateOpeningHorizonAlignment,
+  LEG1_MIN_EXPECTANCY_R,
+  LEG2_MIN_EXPECTANCY_R,
   scoreSetupExpectancy,
   selectOptimalSmallAccountContract,
   ContractCandidateInput,
   EmpiricalSampleRecord,
 } from "../lib/alphaScorer";
+import { evaluateOptionRiskStop } from "../lib/bracketOrderEngine";
+import { MAX_OPTION_DELTA, resolveMinOptionDelta } from "../lib/positionSizer";
 import {
   evaluateSessionPlaybook,
   shouldRefreshSupervisorCheckpoint,
@@ -90,6 +96,7 @@ function selectRegimeAdaptiveBacktestContract(params: {
   spot: number;
   direction: "LONG" | "SHORT";
   barTsSec: number;
+  etMins: number;
   sessionDate: string;
   atmIv: number;
   target1Spot: number;
@@ -103,6 +110,7 @@ function selectRegimeAdaptiveBacktestContract(params: {
     spot,
     direction,
     barTsSec,
+    etMins,
     sessionDate,
     atmIv,
     target1Spot,
@@ -116,6 +124,7 @@ function selectRegimeAdaptiveBacktestContract(params: {
 
   const isCall = direction === "LONG";
   const maxOtmDist = Math.min(3.5, spot * 0.0045);
+  const minOptionDelta = resolveMinOptionDelta(etMins);
   const dtePool = preferredDte === "1-2DTE" || isAfternoon ? [1, 2, 0] : [0, 1, 2];
 
   const candidates: ContractCandidateInput[] = [];
@@ -142,7 +151,8 @@ function selectRegimeAdaptiveBacktestContract(params: {
       if (
         quote.ask >= 0.15 &&
         quote.ask <= 0.99 &&
-        absDelta >= 0.25 &&
+        absDelta >= minOptionDelta &&
+        absDelta <= MAX_OPTION_DELTA &&
         quote.bid > 0 &&
         quote.bid <= quote.ask &&
         spreadPct <= 0.24
@@ -192,6 +202,7 @@ function selectRegimeAdaptiveBacktestContract(params: {
     zeroDtePutWall: putWall,
     isAfternoon,
     preferredDte,
+    etMins,
     nowMs: barTsSec * 1000,
   });
 
@@ -281,7 +292,7 @@ async function run10DaySniperAudit() {
               last: 0.64,
               openInterest: 15000,
               volume: 24000,
-              delta: -0.32,
+              delta: -0.38,
               gamma: 0.04,
               vega: 0.12,
               iv: 0.18,
@@ -601,8 +612,10 @@ async function run10DaySniperAudit() {
         tYears: number;
         iv: number;
         dteDays: number;
+        peakOptionPnlPct: number;
         seenSmaSide?: boolean;
         ratchetedBe?: boolean;
+        optBeArmed?: boolean;
         openedTimeEt: string;
         openedTs: number;
       } | null = null;
@@ -610,12 +623,14 @@ async function run10DaySniperAudit() {
       let tradeCountToday = 0;
       let firstTradeType: "CALL" | "PUT" | null = null;
       let lastExitTs: number | null = null;
-      const overlappingToday = 0;
+      let lastClosedTrade: OptionTradePosition | null = null;
       let sessionPolicy: SessionPlaybookPolicy | null = null;
       let prevCausalZg = 0;
       let chopBlocksToday = 0;
       const dayClosedPositions: OptionTradePosition[] = [];
       const skippedSetupsToday: AttributionCandidateSetup[] = [];
+      const bookCenterHistory: number[] = [Number(sessionBars[0].close.toFixed(2))];
+      const overlappingToday = 0;
 
       const openingSlice = sessionBars.slice(0, Math.min(3, sessionBars.length));
       const openingLow = Math.min(...openingSlice.map((b) => b.low));
@@ -641,6 +656,13 @@ async function run10DaySniperAudit() {
         const causalZeroGamma =
           flowSnap?.flowVwap && flowSnap.flowVwap > 0 ? flowSnap.flowVwap : bar.sma34;
         const causalBookCenter = Number(((causalCallWall + causalPutWall) / 2).toFixed(2));
+        const rollingLow = Math.min(...priorBars.map((b) => b.low));
+        const rollingHigh = Math.max(...priorBars.map((b) => b.high));
+        const causalBookEquilibrium = Number(
+          (((rollingHigh + rollingLow) / 2 + (flowSnap?.flowVwap ?? bar.close)) / 2).toFixed(2)
+        );
+        bookCenterHistory.push(causalBookEquilibrium);
+        if (bookCenterHistory.length > 6) bookCenterHistory.shift();
         const causalNetGex =
           bar.close >= causalZeroGamma
             ? Math.abs(bar.close - causalZeroGamma) * 12
@@ -697,11 +719,37 @@ async function run10DaySniperAudit() {
             remainingYears: curRemYears,
             atmIv: activePosition.iv,
           });
+          const favBarQuote = priceOptionWithSkew({
+            spot: isCall ? bar.high : bar.low,
+            strike: activePosition.strike,
+            direction: isCall ? "LONG" : "SHORT",
+            remainingYears: curRemYears,
+            atmIv: activePosition.iv,
+          });
+          const curOptPnlPct =
+            ((Math.max(0.05, curCloseQuote.bid) - activePosition.entryAsk) /
+              Math.max(0.01, activePosition.entryAsk)) *
+            100;
+          const favOptPnlPct =
+            ((Math.max(0.05, favBarQuote.bid) - activePosition.entryAsk) /
+              Math.max(0.01, activePosition.entryAsk)) *
+            100;
+          activePosition.peakOptionPnlPct = Math.max(activePosition.peakOptionPnlPct, favOptPnlPct);
+          if (!activePosition.optBeArmed && (curOptPnlPct >= 25 || activePosition.peakOptionPnlPct >= 30)) {
+            activePosition.optBeArmed = true;
+          }
+          const optStopEval = evaluateOptionRiskStop({
+            entryPrice: activePosition.entryAsk,
+            currentPrice: curCloseQuote.bid,
+            heldMinutes,
+            peakPnlPct: activePosition.peakOptionPnlPct,
+          });
 
           const initialRisk = Math.max(0.1, Math.abs(activePosition.entrySpot - activePosition.initialStopSpot));
           let exitTriggered = false;
           let exitReason = "";
           let exitSpot = bar.close;
+          let limitFillOptionPrice: number | null = null;
           let outcomeR = 0;
 
           // 1. EOD Market-On-Close Cutoff (3:55 PM ET)
@@ -720,6 +768,49 @@ async function run10DaySniperAudit() {
             exitTriggered = true;
             exitSpot = activePosition.stopLossSpot;
             exitReason = activePosition.ratchetedBe ? "BREAKEVEN PROFIT LOCK STOP" : "STOP LOSS HIT";
+            const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
+            outcomeR = Number((dirMove / initialRisk).toFixed(2));
+          }
+          // 2B. Option-Level Hard -45% Stop or 4-Bar (20m) -25% Theta-Stall Tightener
+          else if (optStopEval.triggered) {
+            exitTriggered = true;
+            exitSpot = bar.close;
+            exitReason =
+              optStopEval.reason === "OPTION_STALL_STOP_25"
+                ? "OPTION STALL STOP HIT (-25% 20M THETA CAP)"
+                : "OPTION HARD STOP HIT (-45% MAX LOSS)";
+            const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
+            outcomeR = Number((dirMove / initialRisk).toFixed(2));
+          }
+          // 2C. OCO Runner Breakeven Protect & Option-Level Limit Targets (+35% TP1 / +80% Flux Runner TP2)
+          else if (activePosition.optBeArmed && curOptPnlPct <= 0 && heldMinutes >= 10) {
+            exitTriggered = true;
+            exitSpot = bar.close;
+            limitFillOptionPrice = Number((activePosition.entryAsk * 1.02).toFixed(2));
+            exitReason = "OCO BREAKEVEN PROTECT";
+            const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
+            outcomeR = Number((dirMove / initialRisk).toFixed(2));
+          }
+          else if (
+            favOptPnlPct >= 35 &&
+            !(isCall
+              ? (exitFlow?.netFluxJ ?? 0) > 0 && (exitFlow?.impulseChi ?? 0.5) >= 0.68
+              : (exitFlow?.netFluxJ ?? 0) < 0 && (exitFlow?.impulseChi ?? 0.5) <= 0.32)
+          ) {
+            exitTriggered = true;
+            exitSpot = isCall
+              ? Math.min(bar.high, activePosition.entrySpot + initialRisk * 1.1)
+              : Math.max(bar.low, activePosition.entrySpot - initialRisk * 1.1);
+            limitFillOptionPrice = Number(Math.min(favBarQuote.bid, activePosition.entryAsk * 1.35).toFixed(2));
+            exitReason = "OCO TP1 LIMIT (+35%)";
+            const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
+            outcomeR = Number((dirMove / initialRisk).toFixed(2));
+          }
+          else if (favOptPnlPct >= 80) {
+            exitTriggered = true;
+            exitSpot = isCall ? bar.high : bar.low;
+            limitFillOptionPrice = Number(Math.min(favBarQuote.bid, activePosition.entryAsk * 1.8).toFixed(2));
+            exitReason = "OCO TP2 RUNNER (+80%)";
             const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
             outcomeR = Number((dirMove / initialRisk).toFixed(2));
           }
@@ -782,10 +873,16 @@ async function run10DaySniperAudit() {
             const reward = Math.abs(exitSpot - activePosition.entrySpot);
             outcomeR = Number((reward / initialRisk).toFixed(2));
           } else {
-            // Causal progressive breakeven ratchet (fires ONLY at bar close for subsequent bars when option bid confirms profit)
+            // Causal progressive breakeven + prior-5m-bar trailing ratchet for Zero-Gamma/Flux runners
+            const favMove = isCall ? bar.close - activePosition.entrySpot : activePosition.entrySpot - bar.close;
+            const curR = favMove / initialRisk;
             const favProgress = isCall
-              ? (bar.close - activePosition.entrySpot) / Math.max(0.1, activePosition.target1Spot - activePosition.entrySpot)
-              : (activePosition.entrySpot - bar.close) / Math.max(0.1, activePosition.entrySpot - activePosition.target1Spot);
+              ? favMove / Math.max(0.1, activePosition.target1Spot - activePosition.entrySpot)
+              : favMove / Math.max(0.1, activePosition.entrySpot - activePosition.target1Spot);
+            const isRunner =
+              isZeroGammaFlush ||
+              activePosition.setupName.includes("Flux") ||
+              activePosition.setupName.includes("Impulse");
             if (
               !activePosition.ratchetedBe &&
               heldMinutes >= 10 &&
@@ -801,6 +898,19 @@ async function run10DaySniperAudit() {
                 : Math.min(activePosition.stopLossSpot, beStop);
               activePosition.ratchetedBe = true;
             }
+            if (isRunner && (curR >= 1.5 || favProgress >= 0.75) && heldMinutes >= 10) {
+              const wickBuf = Math.max(0.02, bar.close * 0.00007);
+              const trailStop = isCall
+                ? Number((prevBar.low - wickBuf).toFixed(2))
+                : Number((prevBar.high + wickBuf).toFixed(2));
+              if (
+                (isCall && trailStop > activePosition.entrySpot && trailStop > activePosition.stopLossSpot) ||
+                (!isCall && trailStop < activePosition.entrySpot && trailStop < activePosition.stopLossSpot)
+              ) {
+                activePosition.stopLossSpot = trailStop;
+                activePosition.ratchetedBe = true;
+              }
+            }
           }
 
           if (exitTriggered) {
@@ -813,9 +923,18 @@ async function run10DaySniperAudit() {
               atmIv: activePosition.iv,
             });
 
-            const stopFloor = Number((activePosition.entryAsk * 0.75).toFixed(2));
-            let exitOptionPrice = Number(Math.max(0.05, exitQuote.bid).toFixed(2));
-            if (exitReason === "STOP LOSS HIT" && exitOptionPrice < stopFloor) {
+            const activeFloorMult = optStopEval.stallTightened ? 0.75 : 0.55;
+            const stopFloor = Number((activePosition.entryAsk * activeFloorMult).toFixed(2));
+            let exitOptionPrice =
+              limitFillOptionPrice !== null
+                ? Number(Math.max(0.05, limitFillOptionPrice).toFixed(2))
+                : Number(Math.max(0.05, exitQuote.bid).toFixed(2));
+            if (
+              (exitReason === "STOP LOSS HIT" ||
+                exitReason.includes("OPTION HARD STOP") ||
+                exitReason.includes("OPTION STALL STOP")) &&
+              exitOptionPrice < stopFloor
+            ) {
               exitOptionPrice = stopFloor;
             }
 
@@ -860,7 +979,7 @@ async function run10DaySniperAudit() {
               tradeCountToday,
             });
 
-            dayClosedPositions.push({
+            const closedRecord: OptionTradePosition = {
               id: `bt-${date}-${tradeCountToday}`,
               ticker: "SPY",
               contractType: activePosition.type,
@@ -893,7 +1012,9 @@ async function run10DaySniperAudit() {
                   Math.max(0.1, initialRisk)
                 ).toFixed(2)
               ),
-            });
+            };
+            dayClosedPositions.push(closedRecord);
+            lastClosedTrade = closedRecord;
 
             causalPriorSamples.push({
               regime: activePosition.regime as AlphaSetupRegime,
@@ -970,29 +1091,41 @@ async function run10DaySniperAudit() {
             }
           }
 
+          const zVwap = (bar.close - fvwap) / Math.max(0.05, sigma);
+          const impPe = flowSnap?.impulsePeclet ?? 0;
+
           if (tradeCountToday === 0) {
             const candidate = evaluateUnifiedSniperSetup(unifiedBars, idx, explicitKing);
             if (candidate) {
               const isCall = candidate.direction === "LONG";
-              candDir = isCall ? "CALL" : "PUT";
-              candSetupName = candidate.setupName;
-              candAtmIv = candidate.features.atmIv;
-              const rawStopSpot = isCall
-                ? Math.min(bar.low, openingLow) * 0.9985
-                : Math.max(bar.high, openingHigh) * 1.0015;
-              candStopLoss = Number(rawStopSpot.toFixed(2));
-              const risk = Math.max(0.65, Math.abs(bar.close - candStopLoss));
-              candTarget1 = isCall
-                ? Number((bar.close + risk * 1.5).toFixed(2))
-                : Number((bar.close - risk * 1.5).toFixed(2));
-              candTarget2 = isCall
-                ? Number((bar.close + risk * 2.5).toFixed(2))
-                : Number((bar.close - risk * 2.5).toFixed(2));
-            } else if (flowSnap?.bandSignal === "LOWER_2S_BOUNCE") {
+              const fluxAlignedWithSetup = isCall
+                ? !candidate.setupName.includes("Bounce") ||
+                  (bar.close > fvwap && impChi >= 0.55 && impPe >= 1.2 && !bearDiv5m && (flowSnap?.netFluxJ ?? 0) >= 0)
+                : !candidate.setupName.includes("Rejection") ||
+                  (bar.close < fvwap && impChi <= 0.35 && impPe <= -1.8 && (flowSnap?.netFluxJ ?? 0) < 0 && !bullDiv5m);
+              if (fluxAlignedWithSetup) {
+                candDir = isCall ? "CALL" : "PUT";
+                candSetupName = candidate.setupName;
+                candAtmIv = candidate.features.atmIv;
+                const rawStopSpot = isCall
+                  ? Math.min(bar.low, openingLow) * 0.9985
+                  : Math.max(bar.high, openingHigh) * 1.0015;
+                candStopLoss = Number(rawStopSpot.toFixed(2));
+                const risk = Math.max(0.65, Math.abs(bar.close - candStopLoss));
+                candTarget1 = isCall
+                  ? Number((bar.close + risk * 1.5).toFixed(2))
+                  : Number((bar.close - risk * 1.5).toFixed(2));
+                candTarget2 = isCall
+                  ? Number((bar.close + risk * 2.5).toFixed(2))
+                  : Number((bar.close - risk * 2.5).toFixed(2));
+              }
+            }
+            if (!candDir && flowSnap?.bandSignal === "LOWER_2S_BOUNCE") {
               if (
-                impChi >= 0.6 &&
-                (dFlux6 > 0 || dChi6 > 0 || bar.close > bar.open) &&
-                causalCallWall - bar.close >= 1.5
+                impChi >= 0.62 &&
+                (dFlux6 > 0 || dChi6 > 0) &&
+                bar.close > bar.open &&
+                causalCallWall - bar.close >= 1.25
               ) {
                 candDir = "CALL";
                 candSetupName = "Flow VWAP -2σ Bounce";
@@ -1002,11 +1135,12 @@ async function run10DaySniperAudit() {
                 candTarget1 = Number((bar.close + risk * 1.55).toFixed(2));
                 candTarget2 = Number((bar.close + risk * 2.5).toFixed(2));
               }
-            } else if (flowSnap?.bandSignal === "UPPER_2S_REJECT") {
+            } else if (!candDir && flowSnap?.bandSignal === "UPPER_2S_REJECT") {
               if (
-                impChi <= 0.4 &&
-                (dFlux6 < 0 || dChi6 < 0 || bar.close < bar.open) &&
-                bar.close - causalPutWall >= 1.5
+                impChi <= 0.38 &&
+                (dFlux6 < 0 || dChi6 < 0) &&
+                bar.close < bar.open &&
+                bar.close - causalPutWall >= 1.25
               ) {
                 candDir = "PUT";
                 candSetupName = "Flow VWAP +2σ Reject";
@@ -1016,6 +1150,47 @@ async function run10DaySniperAudit() {
                 candTarget1 = Number((bar.close - risk * 1.55).toFixed(2));
                 candTarget2 = Number((bar.close - risk * 2.5).toFixed(2));
               }
+            }
+            if (
+              !candDir &&
+              bar.totalMinutes >= 600 &&
+              bar.totalMinutes <= 810 &&
+              bar.close > fvwap &&
+              bar.close > bar.sma34 &&
+              bar.close > bar.open &&
+              impChi >= 0.65 &&
+              impPe >= 2.0 &&
+              (flowSnap?.netFluxJ ?? 0) > 0 &&
+              zVwap <= 1.85 &&
+              causalCallWall - bar.close >= 1.25
+            ) {
+              candDir = "CALL";
+              candSetupName = "Boundary Flux Bullish Advection";
+              const minNoiseStop = Math.max(1.2, bar.close * 0.0016);
+              candStopLoss = Number(Math.min(recentLow4 - 0.15, bar.close - minNoiseStop).toFixed(2));
+              const risk = Math.max(0.8, Math.abs(bar.close - candStopLoss));
+              candTarget1 = Number((bar.close + risk * 1.5).toFixed(2));
+              candTarget2 = Number((bar.close + risk * 2.5).toFixed(2));
+            } else if (
+              !candDir &&
+              bar.totalMinutes >= 600 &&
+              bar.totalMinutes <= 810 &&
+              bar.close < fvwap &&
+              bar.close < bar.sma34 &&
+              bar.close < bar.open &&
+              impChi <= 0.35 &&
+              impPe <= -2.0 &&
+              (flowSnap?.netFluxJ ?? 0) < 0 &&
+              zVwap >= -1.85 &&
+              bar.close - causalPutWall >= 1.25
+            ) {
+              candDir = "PUT";
+              candSetupName = "Boundary Flux Bearish Advection";
+              const minNoiseStop = Math.max(1.2, bar.close * 0.0016);
+              candStopLoss = Number(Math.max(recentHigh4 + 0.15, bar.close + minNoiseStop).toFixed(2));
+              const risk = Math.max(0.8, Math.abs(candStopLoss - bar.close));
+              candTarget1 = Number((bar.close - risk * 1.5).toFixed(2));
+              candTarget2 = Number((bar.close - risk * 2.5).toFixed(2));
             }
           } else {
             const intradayPw = Math.floor(Math.min(...priorBars.map((b) => b.low)));
@@ -1033,12 +1208,13 @@ async function run10DaySniperAudit() {
             if (
               canPhase2CallReclaim &&
               testedPutWallOrMinus1S &&
-              impChi >= 0.6 &&
-              (dChi6 >= 0.03 || dImpChi6 >= 0.06 || dFlux6 > 0 || bar.close >= fvwap || bar.close >= bar.sma34) &&
+              impChi >= 0.65 &&
+              (dChi6 >= 0.04 || dImpChi6 >= 0.06 || dFlux6 > 0) &&
               barBody <= 2.25 &&
-              bullRoom >= 1.5 &&
-              ((bullDiv5m && (bar.close >= fvwap || bar.close >= bar.sma34)) ||
-                (bar.close > bar.open && bar.close >= fvwap && bar.close >= bar.sma34))
+              bullRoom >= 1.25 &&
+              bar.close > bar.open &&
+              bar.close >= fvwap &&
+              (bullDiv5m || bar.close >= bar.sma34)
             ) {
               candDir = "CALL";
               candSetupName = "Leg-2 Put Wall / -1σ Bullish Reclaim";
@@ -1049,12 +1225,13 @@ async function run10DaySniperAudit() {
             } else if (
               canPhase2PutReject &&
               testedCallWallOrPlus1S &&
-              impChi <= 0.4 &&
-              (dChi6 <= -0.03 || dImpChi6 <= -0.06 || dFlux6 < 0 || bar.close <= fvwap || bar.close <= bar.sma34) &&
+              impChi <= 0.35 &&
+              (dChi6 <= -0.04 || dImpChi6 <= -0.06 || dFlux6 < 0) &&
               -barBody <= 2.25 &&
-              bearRoom >= 1.5 &&
-              ((bearDiv5m && (bar.close <= fvwap || bar.close <= bar.sma34)) ||
-                (bar.close < bar.open && bar.close <= fvwap && bar.close <= bar.sma34))
+              bearRoom >= 1.25 &&
+              bar.close < bar.open &&
+              bar.close <= fvwap &&
+              (bearDiv5m || bar.close <= bar.sma34)
             ) {
               candDir = "PUT";
               candSetupName = "Leg-2 Call Wall / +1σ Bearish Rejection";
@@ -1062,6 +1239,81 @@ async function run10DaySniperAudit() {
               const risk = Math.max(0.6, Math.abs(bar.close - candStopLoss));
               candTarget1 = Number((bar.close - Math.max(1.25, risk * 1.5)).toFixed(2));
               candTarget2 = Number((candTarget1 - risk).toFixed(2));
+            }
+          }
+
+          // Opening Horizon Alignment (09:35-10:00 ET)
+          if (candDir && bar.totalMinutes < 600) {
+            const openHorizon = evaluateOpeningHorizonAlignment({
+              etMins: bar.totalMinutes,
+              direction: candDir,
+              spotPrice: bar.close,
+              zeroDteKing: explicitKing,
+              allExpKing: explicitKing ? causalBookCenter : undefined,
+              bookCenterHistory,
+            });
+            if (!openHorizon.allowed) {
+              candDir = null;
+            }
+          }
+
+          // Asymmetric Leg-2 Structural Gating & Post-Loss Anti-Whipsaw Firewall (10:30-14:30 ET)
+          if (candDir && tradeCountToday === 1 && lastClosedTrade) {
+            const intradayPw = Math.floor(Math.min(...priorBars.map((b) => b.low)));
+            const intradayCw = Math.ceil(Math.max(...priorBars.map((b) => b.high)));
+            const testedPutWallOrMinus1S =
+              (intradayPw > 0 && Math.abs(recentLow4 - intradayPw) / intradayPw <= 0.0035) ||
+              (lower1S > 0 && (Math.abs(recentLow4 - lower1S) / lower1S <= 0.0035 || recentLow4 <= lower1S));
+            const testedCallWallOrPlus1S =
+              (intradayCw > 0 && Math.abs(recentHigh4 - intradayCw) / intradayCw <= 0.0035) ||
+              (upper1S > 0 && (Math.abs(recentHigh4 - upper1S) / upper1S <= 0.0035 || recentHigh4 >= upper1S));
+            const effDeltaChi6 =
+              dChi6 !== 0
+                ? dChi6
+                : dImpChi6 !== 0
+                  ? dImpChi6
+                  : dFlux6 > 0
+                    ? 0.04
+                    : dFlux6 < 0
+                      ? -0.04
+                      : 0;
+            const leg2Gate = evaluateLeg2StructuralGate({
+              direction: candDir,
+              etMins: bar.totalMinutes,
+              nowTsSec: bar.ts,
+              spotPrice: bar.close,
+              prevSpotPrice: prevBar.close,
+              zeroGamma: causalZeroGamma,
+              flowVwap: fvwap,
+              sma34: bar.sma34,
+              leg1Trade: {
+                contractType: lastClosedTrade.contractType,
+                closedTs: lastClosedTrade.closedTs,
+                btoSpotPrice: lastClosedTrade.btoSpotPrice,
+                closedSpotPrice: lastClosedTrade.closedSpotPrice,
+                pnlOptionPct: lastClosedTrade.pnlOptionPct,
+              },
+              testedPutWallOrMinus1Sigma: testedPutWallOrMinus1S,
+              testedCallWallOrPlus1Sigma: testedCallWallOrPlus1S,
+              has5mBullDiv: bullDiv5m,
+              has5mBearDiv: bearDiv5m,
+              impulseChi: impChi,
+              deltaChi6Bar: effDeltaChi6,
+              impulsePeclet: flowSnap?.impulsePeclet ?? flowSnap?.pecletNumber ?? 0,
+            });
+            if (!leg2Gate.allowed) {
+              skippedSetupsToday.push({
+                timestamp: bar.ts,
+                direction: candDir,
+                setupName: candSetupName,
+                regime: sessionPolicy?.regime ?? "POS_GAMMA_PIN",
+                entrySpot: bar.close,
+                target1Spot: candTarget1,
+                stopLossSpot: candStopLoss,
+                wasExecuted: false,
+                skipReason: leg2Gate.reason ?? "LEG2_CONVICTION_VETO",
+              });
+              candDir = null;
             }
           }
 
@@ -1079,6 +1331,11 @@ async function run10DaySniperAudit() {
               flowSnapshot: flowSnap,
               directionHint: candDir,
             });
+
+            const reqMinExpR =
+              tradeCountToday === 1
+                ? Math.max(sessionPolicy?.minExpectancyR ?? LEG2_MIN_EXPECTANCY_R, LEG2_MIN_EXPECTANCY_R)
+                : (sessionPolicy?.minExpectancyR ?? LEG1_MIN_EXPECTANCY_R);
 
             const alphaScore = scoreSetupExpectancy({
               direction: candDir,
@@ -1099,7 +1356,7 @@ async function run10DaySniperAudit() {
               priors: causalPriors,
               priorSamples: causalPriorSamples,
               minWinRatePct: sessionPolicy?.minWinRatePct ?? 58.0,
-              minExpectancyR: sessionPolicy?.minExpectancyR ?? 0.35,
+              minExpectancyR: reqMinExpR,
             });
 
             const supervisorVeto =
@@ -1128,6 +1385,7 @@ async function run10DaySniperAudit() {
               spot: bar.close,
               direction: isCall ? "LONG" : "SHORT",
               barTsSec: bar.ts,
+              etMins: bar.totalMinutes,
               sessionDate: date,
               atmIv: candAtmIv,
               target1Spot: candTarget1,
@@ -1160,6 +1418,7 @@ async function run10DaySniperAudit() {
               tYears: remainingYears,
               iv: candAtmIv,
               dteDays,
+              peakOptionPnlPct: 0,
               seenSmaSide: isCall ? bar.close >= bar.sma34 : bar.close <= bar.sma34,
               ratchetedBe: false,
               openedTimeEt: bar.timeEt,
@@ -1238,6 +1497,14 @@ async function run10DaySniperAudit() {
 
     const winRate = totalTradesExecuted > 0 ? (totalWinningTrades / totalTradesExecuted) * 100 : 0;
     const avgRMultiple = totalTradesExecuted > 0 ? sumRMultiple / totalTradesExecuted : 0;
+    const winsList = auditResults.filter((r) => r.optionPnlPct > 0);
+    const lossesList = auditResults.filter((r) => r.optionPnlPct <= 0);
+    const avgWinDollars = winsList.length > 0 ? grossWinDollars / winsList.length : 0;
+    const avgWinPct =
+      winsList.length > 0 ? winsList.reduce((s, r) => s + r.optionPnlPct, 0) / winsList.length : 0;
+    const avgLossDollars = lossesList.length > 0 ? grossLossDollars / lossesList.length : 0;
+    const avgLossPct =
+      lossesList.length > 0 ? lossesList.reduce((s, r) => s + r.optionPnlPct, 0) / lossesList.length : 0;
     const profitFactor =
       grossLossDollars > 0
         ? (grossWinDollars / grossLossDollars).toFixed(2)
@@ -1252,7 +1519,9 @@ async function run10DaySniperAudit() {
     console.log(`  Total Trades Executed:          ${totalTradesExecuted}`);
     console.log(`  Winning Trades:                 ${totalWinningTrades} (${winRate.toFixed(1)}% Win Rate)`);
     console.log(`  Losing Trades:                  ${totalLosingTrades}`);
-    console.log(`  Net Dollar P&L:                 ${equityDollars >= 0 ? "+" : ""}$${equityDollars.toFixed(2)}`);
+    console.log(`  Net Dollar P&L:                 ${equityDollars >= 0 ? "+" : ""}$${equityDollars.toFixed(2)} (Wins $${grossWinDollars.toFixed(2)} / Losses $${grossLossDollars.toFixed(2)})`);
+    console.log(`  Avg Win:                        +$${avgWinDollars.toFixed(2)} (+${avgWinPct.toFixed(1)}%)`);
+    console.log(`  Avg Loss:                       -$${avgLossDollars.toFixed(2)} (${avgLossPct.toFixed(1)}%)`);
     console.log(`  Profit Factor:                  ${profitFactor}`);
     console.log(`  Max Drawdown:                   $${maxDrawdownDollars.toFixed(2)}`);
     console.log(`  Net Expectancy:                 ${avgRMultiple >= 0 ? "+" : ""}${avgRMultiple.toFixed(2)}R per trade`);

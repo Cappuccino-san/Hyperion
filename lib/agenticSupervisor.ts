@@ -3,12 +3,15 @@ import {
   computeDailyOptionTheta,
   estimateRemainingYears,
   MarketRegimeClassification,
+  scoreSetupExpectancy,
 } from "@/lib/alphaScorer";
 import { FlowGammaVwapSnapshot } from "@/lib/flowGammaVwap";
 import { etMinutesOfDay, getTodayEt } from "@/lib/gaiaSessionGuards";
 import {
+  AlphaFeatureWeights,
   AlphaPriorsState,
   CounterfactualEvalRecord,
+  FeatureIcMap,
   MarketRegimeId,
   PostMarketAttributionReport,
   SessionPlaybookPolicy,
@@ -64,6 +67,12 @@ export interface AttributionCandidateSetup {
   realizedOptionR?: number;
 }
 
+export interface FeatureIcSample {
+  features: FeatureIcMap;
+  mfeR: number;
+  maeR: number;
+}
+
 export interface RunPostMarketAttributionInput {
   sessionDate: string;
   ticker: string;
@@ -75,6 +84,7 @@ export interface RunPostMarketAttributionInput {
   zeroDteKing?: number;
   executedTrades?: DailyTradeStore["closedPositions"];
   candidateSetups?: AttributionCandidateSetup[];
+  featureSamples?: FeatureIcSample[];
   atmIv?: number;
   force?: boolean;
   persist?: boolean;
@@ -395,10 +405,156 @@ function simulateCounterfactualSetup(params: {
   };
 }
 
+const FEATURE_KEYS: Array<keyof AlphaFeatureWeights> = [
+  "fluxAlignment",
+  "flowVwapBand",
+  "wallRoom",
+  "kingMagnet",
+  "mtfDivergence",
+  "regimeFit",
+];
+
+function zeroFeatureIc(): FeatureIcMap {
+  return {
+    fluxAlignment: 0,
+    flowVwapBand: 0,
+    wallRoom: 0,
+    kingMagnet: 0,
+    mtfDivergence: 0,
+    regimeFit: 0,
+  };
+}
+
+function pearsonCorrelation(xs: number[], ys: number[]): number {
+  const n = Math.min(xs.length, ys.length);
+  if (n < 3) return 0;
+  let sumX = 0;
+  let sumY = 0;
+  for (let i = 0; i < n; i++) {
+    sumX += xs[i];
+    sumY += ys[i];
+  }
+  const meanX = sumX / n;
+  const meanY = sumY / n;
+  let cov = 0;
+  let varX = 0;
+  let varY = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - meanX;
+    const dy = ys[i] - meanY;
+    cov += dx * dy;
+    varX += dx * dx;
+    varY += dy * dy;
+  }
+  if (varX <= 1e-9 || varY <= 1e-9) return 0;
+  const r = cov / Math.sqrt(varX * varY);
+  if (!Number.isFinite(r)) return 0;
+  return Number(Math.max(-1, Math.min(1, r)).toFixed(4));
+}
+
+/**
+ * Computes out-of-sample Information Coefficient (IC) for each alpha feature against
+ * forward 6-bar directional payoff asymmetry (mfeR - maeR).
+ */
+export function computeFeatureInformationCoefficients(input: {
+  bars?: AttributionBar[];
+  flowSeries?: FlowGammaVwapSnapshot[];
+  callWall?: number;
+  putWall?: number;
+  zeroGamma?: number;
+  zeroDteKing?: number;
+  priors?: AlphaPriorsState;
+  samples?: FeatureIcSample[];
+}): FeatureIcMap {
+  let samples: FeatureIcSample[] = input.samples ? [...input.samples] : [];
+
+  if (samples.length === 0 && Array.isArray(input.bars) && input.bars.length >= 13) {
+    const bars = [...input.bars].sort((a, b) => a.ts - b.ts);
+    const flowSeries = input.flowSeries ?? [];
+    for (let i = 6; i < bars.length - 6; i++) {
+      const b = bars[i];
+      const flow = flowSeries[i];
+      const priorSlice = bars.slice(0, i + 1);
+      const cw =
+        input.callWall && input.callWall > 0
+          ? input.callWall
+          : Math.ceil(Math.max(...priorSlice.map((x) => x.high)));
+      const pw =
+        input.putWall && input.putWall > 0
+          ? input.putWall
+          : Math.floor(Math.min(...priorSlice.map((x) => x.low)));
+      const zg = input.zeroGamma && input.zeroGamma > 0 ? input.zeroGamma : flow?.flowVwap ?? b.close;
+      const direction: "CALL" | "PUT" =
+        (flow?.netFluxJ ?? (b.close - b.open)) >= 0 ? "CALL" : "PUT";
+      const isCall = direction === "CALL";
+      const risk = Math.max(0.2, b.close * 0.0014);
+      const stopLossSpot = isCall ? b.close - risk : b.close + risk;
+      const target1Spot = isCall ? b.close + risk * 1.5 : b.close - risk * 1.5;
+      const target2Spot = isCall ? b.close + risk * 2.5 : b.close - risk * 2.5;
+
+      const regimeInfo = classifyMarketRegime({
+        spotPrice: b.close,
+        callWall: cw,
+        putWall: pw,
+        zeroGamma: zg,
+        zeroDteKing: input.zeroDteKing,
+        flowSnapshot: flow,
+        directionHint: direction,
+      });
+      const scored = scoreSetupExpectancy({
+        direction,
+        setupName: isCall ? "Impulse Flux Reclaim" : "Bearish Zero-Gamma Flush",
+        spotPrice: b.close,
+        stopLossSpot,
+        target1Spot,
+        target2Spot,
+        callWall: cw,
+        putWall: pw,
+        zeroGamma: zg,
+        zeroDteKing: input.zeroDteKing,
+        flowSnapshot: flow,
+        regimeClassification: regimeInfo,
+        priors: input.priors,
+      });
+
+      let mfe = 0;
+      let mae = 0;
+      const endIdx = Math.min(bars.length - 1, i + 6);
+      for (let j = i + 1; j <= endIdx; j++) {
+        const fb = bars[j];
+        const fav = isCall ? fb.high - b.close : b.close - fb.low;
+        const adv = isCall ? b.close - fb.low : fb.high - b.close;
+        mfe = Math.max(mfe, fav);
+        mae = Math.max(mae, adv);
+      }
+
+      samples.push({
+        features: scored.featureBreakdown,
+        mfeR: mfe / risk,
+        maeR: mae / risk,
+      });
+    }
+  }
+
+  if (samples.length < 3) {
+    return zeroFeatureIc();
+  }
+
+  const netR = samples.map((s) => s.mfeR - s.maeR);
+  const out = zeroFeatureIc();
+  for (const key of FEATURE_KEYS) {
+    out[key] = pearsonCorrelation(
+      samples.map((s) => s.features[key]),
+      netR
+    );
+  }
+  return out;
+}
+
 /**
  * Post-Market Counterfactual Attribution Engine (16:05 ET)
  * Replays the day's 5m bars, evaluates executed + skipped setups with pessimistic fills
- * and theta decay, and adapts Empirical Bayes priors for [D+1].
+ * and theta decay, computes rolling Feature ICs, and adapts Empirical Bayes priors for [D+1].
  */
 export async function runPostMarketAttribution(
   input: RunPostMarketAttributionInput
@@ -565,23 +721,61 @@ export async function runPostMarketAttribution(
     priors.regimeStats[rec.regime] = stat;
   }
 
-  // Gentle weight update: if skipped setups had positive missed alpha, slightly increase regimeFit weight;
-  // if executed trades lost in a choppy/unaligned way, tighten wallRoom / fluxAlignment weights.
+  // Gentle weight update + Information Coefficient decay:
+  // Compute out-of-sample Feature IC against forward 6-bar MFE/MAE; decay weights with negative IC toward 0.60 floor.
   const clampWeight = (val: number) => Number(Math.max(0.6, Math.min(1.6, val)).toFixed(3));
+  const sessionIc = computeFeatureInformationCoefficients({
+    bars,
+    flowSeries,
+    callWall: input.callWall,
+    putWall: input.putWall,
+    zeroGamma: input.zeroGamma,
+    zeroDteKing: input.zeroDteKing,
+    priors,
+    samples: input.featureSamples,
+  });
+
+  const prevRollingIc = priors.rollingFeatureIc ?? zeroFeatureIc();
+  const nextRollingIc = zeroFeatureIc();
+  for (const key of FEATURE_KEYS) {
+    nextRollingIc[key] = Number(
+      (priors.rollingFeatureIc
+        ? prevRollingIc[key] * 0.65 + sessionIc[key] * 0.35
+        : sessionIc[key]
+      ).toFixed(4)
+    );
+    const effectiveIc = sessionIc[key] < 0 ? sessionIc[key] : nextRollingIc[key];
+    if (effectiveIc < 0) {
+      const decayMagnitude = Math.max(0.03, Math.min(0.25, Math.abs(effectiveIc) * 0.35));
+      priors.featureWeights[key] = clampWeight(priors.featureWeights[key] - decayMagnitude);
+    } else if (sessionIc[key] > 0.15 && nextRollingIc[key] > 0.1) {
+      priors.featureWeights[key] = clampWeight(priors.featureWeights[key] + 0.02);
+    }
+  }
+  priors.rollingFeatureIc = nextRollingIc;
+
   if (executed.length > 0) {
     if (executedAvgR > 0.3) {
-      priors.featureWeights.fluxAlignment = clampWeight(priors.featureWeights.fluxAlignment + 0.03);
-      priors.featureWeights.wallRoom = clampWeight(priors.featureWeights.wallRoom + 0.02);
+      if (sessionIc.fluxAlignment >= 0) {
+        priors.featureWeights.fluxAlignment = clampWeight(priors.featureWeights.fluxAlignment + 0.03);
+      }
+      if (sessionIc.wallRoom >= 0) {
+        priors.featureWeights.wallRoom = clampWeight(priors.featureWeights.wallRoom + 0.02);
+      }
     } else if (executedAvgR < 0) {
-      priors.featureWeights.regimeFit = clampWeight(priors.featureWeights.regimeFit + 0.04);
-      priors.featureWeights.kingMagnet = clampWeight(priors.featureWeights.kingMagnet + 0.03);
+      if (sessionIc.regimeFit >= 0) {
+        priors.featureWeights.regimeFit = clampWeight(priors.featureWeights.regimeFit + 0.04);
+      }
+      if (sessionIc.kingMagnet >= 0) {
+        priors.featureWeights.kingMagnet = clampWeight(priors.featureWeights.kingMagnet + 0.03);
+      }
     }
   }
   if (missedAlphaCount > savedChopCount) {
     priors.baselineExpectancyR = Number(
       Math.max(0.28, Math.min(0.6, priors.baselineExpectancyR - 0.01)).toFixed(3)
     );
-  } else if (savedChopCount > missedAlphaCount) {
+  } else if (savedChopCount > missedAlphaCount && sessionIc.regimeFit >= 0) {
     priors.featureWeights.regimeFit = clampWeight(priors.featureWeights.regimeFit + 0.03);
   }
 
@@ -590,6 +784,7 @@ export async function runPostMarketAttribution(
 
   const updatedPriorsSummary =
     `RegimeFit=${priors.featureWeights.regimeFit.toFixed(2)} Flux=${priors.featureWeights.fluxAlignment.toFixed(2)} ` +
+    `IC(Flux=${sessionIc.fluxAlignment.toFixed(2)},Regime=${sessionIc.regimeFit.toFixed(2)}) ` +
     `SavedChop=${savedChopCount} MissedAlpha=${missedAlphaCount}`;
 
   const report: PostMarketAttributionReport = {
@@ -602,6 +797,7 @@ export async function runPostMarketAttribution(
     skippedCounterfactualAvgR,
     missedAlphaCount,
     savedChopCount,
+    featureIc: sessionIc,
     updatedPriorsSummary,
     records,
   };

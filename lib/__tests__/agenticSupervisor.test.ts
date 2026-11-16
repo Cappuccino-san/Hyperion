@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   AttributionBar,
   cloneDefaultAlphaPriors,
+  computeFeatureInformationCoefficients,
   evaluateSessionPlaybook,
   runPostMarketAttribution,
   shouldRefreshSupervisorCheckpoint,
@@ -284,3 +285,77 @@ test("runPostMarketAttribution runs counterfactual simulation and updates priors
     assert.ok(val >= 0.6 && val <= 1.6);
   }
 });
+
+test("computeFeatureInformationCoefficients and runPostMarketAttribution compute rolling IC and decay negative-IC weights toward 0.60", async () => {
+  const samples = [
+    // kingMagnet strongly negatively correlated with net forward payoff (mfeR - maeR),
+    // fluxAlignment strongly positively correlated.
+    {
+      features: { fluxAlignment: 0.9, flowVwapBand: 0.7, wallRoom: 0.6, kingMagnet: 0.2, mtfDivergence: 0.5, regimeFit: 0.8 },
+      mfeR: 2.4,
+      maeR: 0.2, // net +2.2
+    },
+    {
+      features: { fluxAlignment: 0.75, flowVwapBand: 0.65, wallRoom: 0.6, kingMagnet: 0.4, mtfDivergence: 0.5, regimeFit: 0.75 },
+      mfeR: 1.6,
+      maeR: 0.4, // net +1.2
+    },
+    {
+      features: { fluxAlignment: 0.45, flowVwapBand: 0.55, wallRoom: 0.6, kingMagnet: 0.7, mtfDivergence: 0.5, regimeFit: 0.55 },
+      mfeR: 0.5,
+      maeR: 0.8, // net -0.3
+    },
+    {
+      features: { fluxAlignment: 0.25, flowVwapBand: 0.4, wallRoom: 0.6, kingMagnet: 0.95, mtfDivergence: 0.5, regimeFit: 0.35 },
+      mfeR: 0.2,
+      maeR: 1.4, // net -1.2
+    },
+  ];
+
+  const ic = computeFeatureInformationCoefficients({ samples });
+  assert.ok(ic.fluxAlignment > 0.9, `Expected strong positive flux IC (got ${ic.fluxAlignment})`);
+  assert.ok(ic.kingMagnet < -0.9, `Expected strong negative kingMagnet IC (got ${ic.kingMagnet})`);
+  assert.equal(ic.wallRoom, 0);
+
+  const priors = cloneDefaultAlphaPriors();
+  const initialKingWeight = priors.featureWeights.kingMagnet;
+  const initialFluxWeight = priors.featureWeights.fluxAlignment;
+
+  const baseTs = Math.floor(Date.parse("2026-11-16T14:30:00Z") / 1000);
+  const bars: AttributionBar[] = Array.from({ length: 12 }, (_, i) => ({
+    ts: baseTs + i * 300,
+    open: 750 + i * 0.1,
+    high: 750.3 + i * 0.1,
+    low: 749.8 + i * 0.1,
+    close: 750.1 + i * 0.1,
+  }));
+
+  const report = await runPostMarketAttribution({
+    sessionDate: "2026-11-16",
+    ticker: "SPY",
+    bars,
+    flowSeries: [],
+    featureSamples: samples,
+    persist: true,
+    force: true,
+    priorsOverride: priors,
+  });
+
+  assert.ok(report.featureIc);
+  assert.ok((report.featureIc?.kingMagnet ?? 0) < -0.9);
+
+  const updatedPriors = JSON.parse(
+    fs.readFileSync(path.join(tempCacheDir, "alpha-priors.json"), "utf-8")
+  );
+  assert.ok(
+    updatedPriors.featureWeights.kingMagnet < initialKingWeight,
+    `Expected negative-IC kingMagnet weight (${updatedPriors.featureWeights.kingMagnet}) to decay below ${initialKingWeight}`
+  );
+  assert.ok(updatedPriors.featureWeights.kingMagnet >= 0.6);
+  assert.ok(
+    updatedPriors.featureWeights.fluxAlignment >= initialFluxWeight,
+    `Expected positive-IC fluxAlignment weight (${updatedPriors.featureWeights.fluxAlignment}) >= ${initialFluxWeight}`
+  );
+  assert.ok((updatedPriors.rollingFeatureIc?.kingMagnet ?? 0) < -0.2);
+});
+

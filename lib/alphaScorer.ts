@@ -9,8 +9,317 @@ import {
   MarketRegimeId,
   cloneDefaultAlphaPriors,
 } from "@/lib/persistenceStore";
+import { MAX_OPTION_DELTA, MIN_OPTION_DELTA, resolveMinOptionDelta } from "@/lib/positionSizer";
 
 export type { MarketRegimeId };
+
+export const LEG1_MIN_EXPECTANCY_R = 0.35;
+export const LEG2_MIN_EXPECTANCY_R = 0.65;
+export const LEG2_MIN_ABS_PECLET = 2.0;
+export const LEG2_POST_LOSS_MIN_ABS_PECLET = 2.2;
+
+export interface OpeningHorizonAlignmentInput {
+  etMins: number;
+  direction: "CALL" | "PUT";
+  spotPrice: number;
+  zeroDteKing?: number;
+  allExpKing?: number;
+  bookCenterHistory?: number[];
+}
+
+export interface OpeningHorizonAlignmentResult {
+  allowed: boolean;
+  deferredUntil1000: boolean;
+  reason: string | null;
+}
+
+/**
+ * Opening Horizon Alignment (09:35-10:00 ET):
+ * Before 10:00 ET (etMins < 600), requires 0DTE/Next-Exp King pull and Book Center
+ * 3-bar slope to agree with trade direction and not directly oppose All-Exp King
+ * across spot; otherwise defers entry until >= 10:00 ET opening range confirmation.
+ */
+export function evaluateOpeningHorizonAlignment(
+  input: OpeningHorizonAlignmentInput
+): OpeningHorizonAlignmentResult {
+  const { etMins, direction, spotPrice, zeroDteKing, allExpKing, bookCenterHistory } = input;
+  if (etMins >= 600) {
+    return { allowed: true, deferredUntil1000: false, reason: null };
+  }
+
+  const isCall = direction === "CALL";
+
+  if (typeof zeroDteKing === "number" && Number.isFinite(zeroDteKing) && zeroDteKing > 0) {
+    if (isCall && zeroDteKing < spotPrice) {
+      return {
+        allowed: false,
+        deferredUntil1000: true,
+        reason: `DEFERRED_PRE_1000_KING_OPPOSES: 0DTE King ($${zeroDteKing}) < spot ($${spotPrice.toFixed(2)}) for CALL`,
+      };
+    }
+    if (!isCall && zeroDteKing > spotPrice) {
+      return {
+        allowed: false,
+        deferredUntil1000: true,
+        reason: `DEFERRED_PRE_1000_KING_OPPOSES: 0DTE King ($${zeroDteKing}) > spot ($${spotPrice.toFixed(2)}) for PUT`,
+      };
+    }
+    if (typeof allExpKing === "number" && Number.isFinite(allExpKing) && allExpKing > 0) {
+      const opposesAcrossSpot =
+        (zeroDteKing > spotPrice && allExpKing < spotPrice) ||
+        (zeroDteKing < spotPrice && allExpKing > spotPrice);
+      if (opposesAcrossSpot) {
+        return {
+          allowed: false,
+          deferredUntil1000: true,
+          reason: `DEFERRED_PRE_1000_KING_CONFLICT: 0DTE King ($${zeroDteKing}) opposes All-Exp King ($${allExpKing}) across spot ($${spotPrice.toFixed(2)})`,
+        };
+      }
+    }
+  }
+
+  if (Array.isArray(bookCenterHistory)) {
+    const valid = bookCenterHistory.filter((v) => typeof v === "number" && Number.isFinite(v) && v > 0);
+    if (valid.length < 3) {
+      return {
+        allowed: false,
+        deferredUntil1000: true,
+        reason: `DEFERRED_PRE_1000_BOOK_CENTER_SLOPE: need 3 bars of Book Center history (got ${valid.length})`,
+      };
+    }
+    const recent3 = valid.slice(-3);
+    const slope3 = recent3[2] - recent3[0];
+    if (isCall && slope3 <= 0) {
+      return {
+        allowed: false,
+        deferredUntil1000: true,
+        reason: `DEFERRED_PRE_1000_BOOK_CENTER_SLOPE: Book Center 3-bar slope (${slope3.toFixed(3)}) <= 0 for CALL`,
+      };
+    }
+    if (!isCall && slope3 >= 0) {
+      return {
+        allowed: false,
+        deferredUntil1000: true,
+        reason: `DEFERRED_PRE_1000_BOOK_CENTER_SLOPE: Book Center 3-bar slope (${slope3.toFixed(3)}) >= 0 for PUT`,
+      };
+    }
+  }
+
+  return { allowed: true, deferredUntil1000: false, reason: null };
+}
+
+export interface Leg2StructuralGateInput {
+  direction: "CALL" | "PUT";
+  etMins: number;
+  nowTsSec: number;
+  spotPrice: number;
+  prevSpotPrice?: number;
+  zeroGamma: number;
+  flowVwap?: number;
+  sma34?: number;
+  leg1Trade: {
+    contractType: "CALL" | "PUT";
+    closedTs?: number;
+    btoSpotPrice: number;
+    closedSpotPrice?: number;
+    pnlOptionPct?: number;
+    realizedPnl?: number;
+  };
+  testedPutWallOrMinus1Sigma: boolean;
+  testedCallWallOrPlus1Sigma: boolean;
+  has5mBullDiv: boolean;
+  has5mBearDiv: boolean;
+  impulseChi: number;
+  deltaChi6Bar: number;
+  impulsePeclet: number;
+  calibratedExpectancyR?: number;
+}
+
+export interface Leg2StructuralGateResult {
+  allowed: boolean;
+  requiredMinExpectancyR: number;
+  reason: string | null;
+}
+
+/**
+ * Asymmetric Leg-2 Conviction & Anti-Whipsaw Firewall (10:30-14:30 ET):
+ * - Opposite direction only, >= 30m cooldown from Leg-1 exit
+ * - Requires minExpectancyR >= 0.65 and |impulsePeclet| >= 2.0
+ * - Requires confirmed structural transition:
+ *   - CALL: Put Wall / -1s sweep + 5m Bull Div + Flow VWAP/SMA34 reclaim (impulseChi >= 0.65, deltaChi6Bar >= 0.04)
+ *   - PUT: Call Wall / +1s rejection + 5m Bear Div + Flow VWAP/SMA34 loss (impulseChi <= 0.35, deltaChi6Bar <= -0.04)
+ * - Anti-Whipsaw Rule: If Leg-1 closed as a loss, blocks opposite-direction Leg-2 flips
+ *   unless spot cleanly crosses and holds across Zero Gamma with |impulsePeclet| >= 2.2.
+ */
+export function evaluateLeg2StructuralGate(
+  input: Leg2StructuralGateInput
+): Leg2StructuralGateResult {
+  const {
+    direction,
+    etMins,
+    nowTsSec,
+    spotPrice,
+    prevSpotPrice,
+    zeroGamma,
+    flowVwap,
+    sma34,
+    leg1Trade,
+    testedPutWallOrMinus1Sigma,
+    testedCallWallOrPlus1Sigma,
+    has5mBullDiv,
+    has5mBearDiv,
+    impulseChi,
+    deltaChi6Bar,
+    impulsePeclet,
+    calibratedExpectancyR,
+  } = input;
+
+  if (etMins < 630 || etMins > 870) {
+    return {
+      allowed: false,
+      requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+      reason: `LEG2_WINDOW_CLOSED: etMins=${etMins} outside [630, 870]`,
+    };
+  }
+
+  if (typeof leg1Trade.closedTs !== "number" || nowTsSec - leg1Trade.closedTs < 1800) {
+    return {
+      allowed: false,
+      requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+      reason: "LEG2_COOLDOWN_NOT_MET: < 30m elapsed since Leg-1 exit",
+    };
+  }
+
+  if (direction === leg1Trade.contractType) {
+    return {
+      allowed: false,
+      requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+      reason: `LEG2_SAME_DIRECTION_BLOCKED: Leg-1 was already ${leg1Trade.contractType}`,
+    };
+  }
+
+  const isCall = direction === "CALL";
+  const leg1Pnl =
+    typeof leg1Trade.realizedPnl === "number" && Number.isFinite(leg1Trade.realizedPnl)
+      ? leg1Trade.realizedPnl
+      : typeof leg1Trade.pnlOptionPct === "number" && Number.isFinite(leg1Trade.pnlOptionPct)
+        ? leg1Trade.pnlOptionPct
+        : 0;
+  const leg1ClosedAsLoss = leg1Pnl < 0;
+
+  if (leg1ClosedAsLoss) {
+    const minCrossDist = Math.max(0.15, spotPrice * 0.0002);
+    const heldAcrossZeroGamma =
+      zeroGamma > 0 &&
+      (isCall
+        ? spotPrice >= zeroGamma + minCrossDist &&
+          (prevSpotPrice === undefined || prevSpotPrice >= zeroGamma)
+        : spotPrice <= zeroGamma - minCrossDist &&
+          (prevSpotPrice === undefined || prevSpotPrice <= zeroGamma));
+    const strongFlipPeclet = isCall
+      ? impulsePeclet >= LEG2_POST_LOSS_MIN_ABS_PECLET
+      : impulsePeclet <= -LEG2_POST_LOSS_MIN_ABS_PECLET;
+
+    if (!heldAcrossZeroGamma || !strongFlipPeclet) {
+      return {
+        allowed: false,
+        requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+        reason: `LEG2_ANTI_WHIPSAW_VETO: Leg-1 closed as loss (${leg1Pnl.toFixed(1)}%); requires clean Zero Gamma hold & |Pe| >= ${LEG2_POST_LOSS_MIN_ABS_PECLET}`,
+      };
+    }
+  }
+
+  const alignedPeclet = isCall
+    ? impulsePeclet >= LEG2_MIN_ABS_PECLET
+    : impulsePeclet <= -LEG2_MIN_ABS_PECLET;
+  if (!alignedPeclet) {
+    return {
+      allowed: false,
+      requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+      reason: `LEG2_WEAK_PECLET: impulsePeclet=${impulsePeclet.toFixed(2)} misses ±${LEG2_MIN_ABS_PECLET}`,
+    };
+  }
+
+  if (isCall) {
+    const reclaimed =
+      (typeof flowVwap === "number" && flowVwap > 0 && spotPrice >= flowVwap) ||
+      (typeof sma34 === "number" && sma34 > 0 && spotPrice >= sma34);
+    if (!testedPutWallOrMinus1Sigma) {
+      return {
+        allowed: false,
+        requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+        reason: "LEG2_NO_PUT_WALL_OR_MINUS1S_SWEEP",
+      };
+    }
+    if (!has5mBullDiv) {
+      return {
+        allowed: false,
+        requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+        reason: "LEG2_NO_5M_BULL_DIVERGENCE",
+      };
+    }
+    if (!reclaimed) {
+      return {
+        allowed: false,
+        requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+        reason: "LEG2_NO_FLOW_VWAP_OR_SMA34_RECLAIM",
+      };
+    }
+    if (impulseChi < 0.65 || deltaChi6Bar < 0.04) {
+      return {
+        allowed: false,
+        requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+        reason: `LEG2_FLUX_INFLECTION_WEAK: impulseChi=${impulseChi.toFixed(2)}, deltaChi6=${deltaChi6Bar.toFixed(3)}`,
+      };
+    }
+  } else {
+    const lost =
+      (typeof flowVwap === "number" && flowVwap > 0 && spotPrice <= flowVwap) ||
+      (typeof sma34 === "number" && sma34 > 0 && spotPrice <= sma34);
+    if (!testedCallWallOrPlus1Sigma) {
+      return {
+        allowed: false,
+        requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+        reason: "LEG2_NO_CALL_WALL_OR_PLUS1S_REJECTION",
+      };
+    }
+    if (!has5mBearDiv) {
+      return {
+        allowed: false,
+        requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+        reason: "LEG2_NO_5M_BEAR_DIVERGENCE",
+      };
+    }
+    if (!lost) {
+      return {
+        allowed: false,
+        requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+        reason: "LEG2_NO_FLOW_VWAP_OR_SMA34_LOSS",
+      };
+    }
+    if (impulseChi > 0.35 || deltaChi6Bar > -0.04) {
+      return {
+        allowed: false,
+        requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+        reason: `LEG2_FLUX_INFLECTION_WEAK: impulseChi=${impulseChi.toFixed(2)}, deltaChi6=${deltaChi6Bar.toFixed(3)}`,
+      };
+    }
+  }
+
+  if (typeof calibratedExpectancyR === "number" && calibratedExpectancyR < LEG2_MIN_EXPECTANCY_R) {
+    return {
+      allowed: false,
+      requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+      reason: `LEG2_LOW_EXPECTANCY: +${calibratedExpectancyR.toFixed(2)}R < +${LEG2_MIN_EXPECTANCY_R.toFixed(2)}R`,
+    };
+  }
+
+  return {
+    allowed: true,
+    requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+    reason: null,
+  };
+}
 
 export interface ClassifyMarketRegimeInput {
   spotPrice: number;
@@ -120,10 +429,8 @@ function normCdfApprox(x: number): number {
   return x > 0 ? 1 - p : p;
 }
 
-export function estimateRemainingYears(nowMs: number, dteDays: number): number {
-  const safeDte = Math.max(0, dteDays);
+export function resolveEtMinutesFromMs(nowMs: number): number {
   const dt = new Date(nowMs);
-  let etMins = 10 * 60;
   try {
     const parts = new Intl.DateTimeFormat("en-US", {
       timeZone: "America/New_York",
@@ -133,10 +440,15 @@ export function estimateRemainingYears(nowMs: number, dteDays: number): number {
     }).formatToParts(dt);
     const h = Number(parts.find((p) => p.type === "hour")?.value ?? 10) % 24;
     const m = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
-    etMins = h * 60 + m;
+    return h * 60 + m;
   } catch {
-    etMins = dt.getHours() * 60 + dt.getMinutes();
+    return dt.getHours() * 60 + dt.getMinutes();
   }
+}
+
+export function estimateRemainingYears(nowMs: number, dteDays: number): number {
+  const safeDte = Math.max(0, dteDays);
+  const etMins = resolveEtMinutesFromMs(nowMs);
   const minsLeftToday = Math.max(15, RTH_CLOSE_MINS - etMins);
   const totalTradingMinutes = safeDte * 390 + (safeDte === 0 ? minsLeftToday : 240);
   return Math.max(15 / (252 * 390), totalTradingMinutes / (252 * 390));
@@ -674,11 +986,14 @@ export function scoreSetupExpectancy(
  * Greeks-Aware & Regime-Adaptive Contract Optimizer
  * Preserves ALL small-account hard invariants:
  * - Ask in [$0.15, $0.99] -> strictly 1 contract, <= $100 outlay
- * - |delta| >= 0.25
+ * - Time-of-Day Adaptive Delta Band:
+ *   - 09:35-10:29 ET (etMins < 630): 0.24 <= |delta| <= 0.50
+ *   - >= 10:30 ET (etMins >= 630):   0.35 <= |delta| <= 0.50
  * - Near-ATM / 1-3 OTM ceiling <= min($3.50, 0.45% of spot)
  * - Spread <= 24% and bid <= ask
  * - Expired contract firewall (dte >= 0 && expiration >= todayEt)
  * - Structural wall boundaries
+ * - Falls back to 1-2 DTE whenever 0DTE qualifying contracts exceed $0.99
  *
  * Ranks valid contracts by Gamma-to-Theta efficiency (Gamma / |Theta|),
  * IV skew attractiveness, spread tightness, wall affinity, and DTE regime preference.
@@ -694,6 +1009,7 @@ export function selectOptimalSmallAccountContract(params: {
   zeroDtePutWall?: number;
   isAfternoon: boolean;
   preferredDte?: "0DTE" | "1-2DTE" | "NONE";
+  etMins?: number;
   nowMs?: number;
 }): ScoredContractSelection | null {
   const {
@@ -707,10 +1023,18 @@ export function selectOptimalSmallAccountContract(params: {
     zeroDtePutWall,
     isAfternoon,
     preferredDte,
+    etMins,
     nowMs = Date.now(),
   } = params;
 
   if (!candidates || candidates.length === 0) return null;
+
+  const effectiveMinDelta =
+    typeof etMins === "number" && Number.isFinite(etMins)
+      ? resolveMinOptionDelta(etMins)
+      : params.nowMs !== undefined
+        ? resolveMinOptionDelta(resolveEtMinutesFromMs(params.nowMs))
+        : MIN_OPTION_DELTA;
 
   // Compute median ATM IV across valid candidates for IV-skew evaluation
   const nearAtmIvs = candidates
@@ -733,6 +1057,8 @@ export function selectOptimalSmallAccountContract(params: {
 
   const stage1: ScoredCand[] = [];
   const stage2: ScoredCand[] = [];
+  const stage3: ScoredCand[] = [];
+  const maxOtmDist = Math.min(3.5, spotPrice * 0.0045);
 
   for (const cand of candidates) {
     const c = cand.contract;
@@ -742,7 +1068,24 @@ export function selectOptimalSmallAccountContract(params: {
     const dte = cand.dte;
     const absDelta = cand.absDelta;
 
+    // Hard Time-of-Day Adaptive Delta Band ([0.24..0.50] pre-10:30 ET, [0.35..0.50] >=10:30 ET)
+    if (!Number.isFinite(absDelta) || absDelta < effectiveMinDelta || absDelta > MAX_OPTION_DELTA) {
+      continue;
+    }
+    if (!Number.isFinite(askPrice) || askPrice < 0.15 || askPrice > 0.99) {
+      continue;
+    }
+    if (!Number.isFinite(bidPrice) || bidPrice < 0 || bidPrice > askPrice) {
+      continue;
+    }
     const spreadPct = askPrice > 0 ? (askPrice - bidPrice) / askPrice : 1;
+    if (spreadPct > 0.24) {
+      continue;
+    }
+    if (Math.abs(c.strike - spotPrice) > maxOtmDist) {
+      continue;
+    }
+
     const priceScore = mid >= 0.35 && mid <= 0.85 ? 45 : 22;
 
     const distToTarget = Math.abs(c.strike - target1Spot);
@@ -752,9 +1095,7 @@ export function selectOptimalSmallAccountContract(params: {
     const gammaEst = Math.max(0, c.gamma || 0);
     const expMove = Math.max(spotPrice * 0.0007, Math.abs(target1Spot - spotPrice));
     const convexityPerDollar = (absDelta + 0.5 * gammaEst * expMove) / Math.max(0.15, askPrice);
-    const deltaScore =
-      (absDelta >= 0.25 && absDelta <= 0.45 ? 18 : 5) +
-      Math.min(30, convexityPerDollar * 18);
+    const deltaScore = 18 + Math.min(30, convexityPerDollar * 18);
 
     // Gamma-to-Theta efficiency: Γ / max(0.005, |Θ_daily|)
     const rawIv =
@@ -825,9 +1166,10 @@ export function selectOptimalSmallAccountContract(params: {
     };
 
     if (preferredDte === "0DTE") {
-      // NEG_GAMMA_TREND / ZERO_GAMMA_FLIP: prioritize 0DTE convexity unless only >=1DTE exists
+      // Prioritize 0DTE convexity when affordable <= $0.99; fall back to 1-2 DTE first, then 3+ DTE
       if (dte === 0) stage1.push(scoredObj);
-      else stage2.push(scoredObj);
+      else if (dte >= 1 && dte <= 2) stage2.push(scoredObj);
+      else stage3.push(scoredObj);
     } else if (preferredDte === "1-2DTE") {
       // POS_GAMMA_PIN: prioritize 1-2 DTE to minimize theta crush
       if (dte >= 1 && dte <= 2) {
@@ -836,7 +1178,7 @@ export function selectOptimalSmallAccountContract(params: {
         stage2.push(scoredObj);
       } else {
         if (isAfternoon) scoredObj.score -= 25;
-        stage2.push(scoredObj);
+        stage3.push(scoredObj);
       }
     } else if (isAfternoon) {
       // Default afternoon regime: 1-2 DTE Stage 1, 3+ DTE Stage 2, 0DTE penalized fallback
@@ -846,7 +1188,7 @@ export function selectOptimalSmallAccountContract(params: {
         stage2.push(scoredObj);
       } else {
         scoredObj.score -= 25;
-        stage2.push(scoredObj);
+        stage3.push(scoredObj);
       }
     } else {
       // Default morning regime: 0-2 DTE Stage 1, 3+ DTE Stage 2
@@ -857,7 +1199,8 @@ export function selectOptimalSmallAccountContract(params: {
 
   stage1.sort((a, b) => b.score - a.score);
   stage2.sort((a, b) => b.score - a.score);
-  const chosen = stage1[0] ?? stage2[0];
+  stage3.sort((a, b) => b.score - a.score);
+  const chosen = stage1[0] ?? stage2[0] ?? stage3[0];
   if (!chosen) return null;
 
   return {
