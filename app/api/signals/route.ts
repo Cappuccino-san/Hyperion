@@ -29,6 +29,11 @@ import {
   getLiveBotStatus,
 } from "@/lib/liveBotDaemon";
 import { sanitizeTickerSymbol } from "@/lib/marketCache";
+import {
+  readAlphaPriors,
+  readPostMarketAttribution,
+  readSupervisorPolicy,
+} from "@/lib/persistenceStore";
 
 export const dynamic = "force-dynamic";
 
@@ -425,11 +430,20 @@ export async function GET(req: NextRequest) {
 
     // Continuously evaluate all open positions across all tickers against live CBOE quotes
     const todayEt = getTodayEt();
+    const policyTicker = ticker || "SPY";
     if (requestedDate && requestedDate !== todayEt) {
+      const [supervisorPolicy, postMarketAttribution, alphaPriors] = await Promise.all([
+        readSupervisorPolicy(requestedDate, policyTicker).catch(() => null),
+        readPostMarketAttribution(requestedDate, policyTicker).catch(() => null),
+        readAlphaPriors().catch(() => null),
+      ]);
       return NextResponse.json({
         activePositions: getActivePositions(requestedDate),
         closedPositions: getClosedPositions(ticker, requestedDate),
         alerts: getDailyTradeAlerts(ticker, requestedDate),
+        supervisorPolicy,
+        postMarketAttribution,
+        alphaPriors,
         sessionDate: requestedDate,
         timestamp: new Date().toISOString(),
       });
@@ -467,11 +481,19 @@ export async function GET(req: NextRequest) {
     const activePositions = getActivePositions();
     const closedPositions = getClosedPositions(ticker);
     const alerts = getDailyTradeAlerts(ticker);
+    const [supervisorPolicy, postMarketAttribution, alphaPriors] = await Promise.all([
+      readSupervisorPolicy(todayEt, policyTicker).catch(() => null),
+      readPostMarketAttribution(todayEt, policyTicker).catch(() => null),
+      readAlphaPriors().catch(() => null),
+    ]);
 
     return NextResponse.json({
       activePositions,
       closedPositions,
       alerts,
+      supervisorPolicy,
+      postMarketAttribution,
+      alphaPriors,
       sessionDate: todayEt,
       timestamp: new Date().toISOString(),
     });

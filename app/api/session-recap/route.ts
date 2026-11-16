@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
+import { readHistoricalSessions, getPersistenceCacheDir } from "@/lib/persistenceStore";
 
 export const dynamic = "force-dynamic";
 
@@ -75,99 +76,91 @@ function firstFiniteNum(...vals: unknown[]): number | undefined {
   return undefined;
 }
 
-function buildRollingPortfolioSummary(): PortfolioRecapSummary {
-  const cacheDir = path.resolve(process.cwd(), ".cache");
+async function buildRollingPortfolioSummary(): Promise<PortfolioRecapSummary> {
+  const sessions = await readHistoricalSessions(7);
   const trades: PortfolioTradeRow[] = [];
   const dailyBreakdown: PortfolioDailyRow[] = [];
 
-  if (fs.existsSync(cacheDir)) {
-    const files = fs
-      .readdirSync(cacheDir)
-      .filter((f) => /^active-trades-\d{4}-\d{2}-\d{2}\.json$/.test(f))
-      .sort()
-      .slice(-7);
+  let runningEquity = 0;
+  for (const parsed of sessions) {
+    const fileDate = parsed.date;
+    try {
+      const closed = Array.isArray(parsed?.closedPositions) ? parsed.closedPositions : [];
+      let dayWins = 0;
+      let dayLosses = 0;
+      let dayPnl = 0;
 
-    let runningEquity = 0;
-    for (const file of files) {
-      const fileDate = file.slice("active-trades-".length, "active-trades-".length + 10);
-      try {
-        const parsed = JSON.parse(fs.readFileSync(path.join(cacheDir, file), "utf-8"));
-        const closed = Array.isArray(parsed?.closedPositions) ? parsed.closedPositions : [];
-        let dayWins = 0;
-        let dayLosses = 0;
-        let dayPnl = 0;
+      for (const p of closed) {
+        const raw = p as unknown as Record<string, unknown>;
+        const qty = Number(p.contractsQty) || 1;
+        const entryPx =
+          firstPositiveNum(
+            raw.btoOptionAsk,
+            p.optionAsk,
+            raw.btoPrice,
+            p.btoOptionMid,
+            raw.btoMid
+          ) ?? 0.5;
+        const exitPx =
+          firstFiniteNum(raw.closedOptionBid, raw.stcPrice, p.closedOptionMid) ?? 0;
+        const outlay =
+          entryPx > 0
+            ? Number((entryPx * 100 * qty).toFixed(2))
+            : Number(p.totalOutlay ?? 0);
+        const realizedDollarPnl = Number(
+          (
+            firstFiniteNum(raw.realizedPnlDollars, raw.pnlDollars) ??
+            (exitPx - entryPx) * 100 * qty
+          ).toFixed(2)
+        );
+        const pnlOptionPct = Number(
+          (
+            firstFiniteNum(p.pnlOptionPct, raw.realizedPnlPct) ??
+            (entryPx > 0 ? ((exitPx - entryPx) / entryPx) * 100 : 0)
+          ).toFixed(1)
+        );
+        const riskDollars = Math.max(10, outlay * 0.25);
+        const rMultiple = Number(
+          (firstFiniteNum(raw.realizedR) ?? realizedDollarPnl / riskDollars).toFixed(2)
+        );
 
-        for (const p of closed) {
-          const qty = Number(p.contractsQty) || 1;
-          const entryPx =
-            firstPositiveNum(
-              p.btoOptionAsk,
-              p.optionAsk,
-              p.btoPrice,
-              p.btoOptionMid,
-              p.btoMid
-            ) ?? 0.5;
-          const exitPx =
-            firstFiniteNum(p.closedOptionBid, p.stcPrice, p.closedOptionMid) ?? 0;
-          const outlay =
-            entryPx > 0
-              ? Number((entryPx * 100 * qty).toFixed(2))
-              : Number(p.totalOutlay ?? 0);
-          const realizedDollarPnl = Number(
-            (
-              firstFiniteNum(p.realizedPnlDollars, p.pnlDollars) ??
-              (exitPx - entryPx) * 100 * qty
-            ).toFixed(2)
-          );
-          const pnlOptionPct = Number(
-            (
-              firstFiniteNum(p.pnlOptionPct, p.realizedPnlPct) ??
-              (entryPx > 0 ? ((exitPx - entryPx) / entryPx) * 100 : 0)
-            ).toFixed(1)
-          );
-          const riskDollars = Math.max(10, outlay * 0.25);
-          const rMultiple = Number(
-            (firstFiniteNum(p.realizedR) ?? realizedDollarPnl / riskDollars).toFixed(2)
-          );
+        if (realizedDollarPnl > 0) dayWins++;
+        else if (realizedDollarPnl < 0) dayLosses++;
+        dayPnl += realizedDollarPnl;
 
-          if (realizedDollarPnl > 0) dayWins++;
-          else if (realizedDollarPnl < 0) dayLosses++;
-          dayPnl += realizedDollarPnl;
-
-          trades.push({
-            id: String(p.id || `${fileDate}-${p.ticker || "SPY"}-${trades.length}`),
-            date: fileDate,
-            ticker: String(p.ticker || "SPY").toUpperCase(),
-            contractType: p.contractType === "PUT" ? "PUT" : "CALL",
-            contractLabel: String(p.contractLabel || p.optionSymbol || ""),
-            setupName: String(p.setupName || ""),
-            openedAt: String(p.openedAt || "—"),
-            closedAt: String(p.closedAt || "—"),
-            openedTs: Number(p.openedTs || 0),
-            closedTs: Number(p.closedTs || 0),
-            entryOptionPrice: Number(entryPx.toFixed(2)),
-            exitOptionPrice: Number(exitPx.toFixed(2)),
-            contractsQty: qty,
-            outlay: Math.round(outlay),
-            realizedDollarPnl,
-            pnlOptionPct,
-            rMultiple,
-            exitReason: String(p.exitReason || "Closed"),
-          });
-        }
-
-        runningEquity = Number((runningEquity + dayPnl).toFixed(2));
-        dailyBreakdown.push({
+        trades.push({
+          id: String(p.id || `${fileDate}-${p.ticker || "SPY"}-${trades.length}`),
           date: fileDate,
-          trades: closed.length,
-          wins: dayWins,
-          losses: dayLosses,
-          netDollarPnl: Number(dayPnl.toFixed(2)),
-          equityAfter: runningEquity,
+          ticker: String(p.ticker || "SPY").toUpperCase(),
+          contractType: p.contractType === "PUT" ? "PUT" : "CALL",
+          contractLabel: String(p.contractLabel || raw.optionSymbol || ""),
+          setupName: String(p.setupName || ""),
+          openedAt: String(p.openedAt || "—"),
+          closedAt: String(p.closedAt || "—"),
+          openedTs: Number(p.openedTs || 0),
+          closedTs: Number(p.closedTs || 0),
+          entryOptionPrice: Number(entryPx.toFixed(2)),
+          exitOptionPrice: Number(exitPx.toFixed(2)),
+          contractsQty: qty,
+          outlay: Math.round(outlay),
+          realizedDollarPnl,
+          pnlOptionPct,
+          rMultiple,
+          exitReason: String(p.exitReason || "Closed"),
         });
-      } catch {
-        // Skip malformed cache files so healthy sessions remain visible
       }
+
+      runningEquity = Number((runningEquity + dayPnl).toFixed(2));
+      dailyBreakdown.push({
+        date: fileDate,
+        trades: closed.length,
+        wins: dayWins,
+        losses: dayLosses,
+        netDollarPnl: Number(dayPnl.toFixed(2)),
+        equityAfter: runningEquity,
+      });
+    } catch {
+      // Skip malformed session records so healthy sessions remain visible
     }
   }
 
@@ -253,16 +246,17 @@ export async function GET(req: Request) {
     const rawDay = searchParams.get("day")?.trim() || "";
     const requestedDay = /^\d{4}-\d{2}-\d{2}$/.test(rawDay) ? rawDay : "";
 
-    const portfolio = buildRollingPortfolioSummary();
+    const portfolio = await buildRollingPortfolioSummary();
+    const cacheDir = getPersistenceCacheDir();
     const possiblePaths = [
       ...(requestedDay
         ? [
             path.resolve(process.cwd(), `scratch/terrashade/api_recap_${requestedDay}.json`),
-            path.resolve(process.cwd(), `.cache/terrashade/api_recap_${requestedDay}.json`),
+            path.join(cacheDir, `terrashade/api_recap_${requestedDay}.json`),
           ]
         : []),
       path.resolve(process.cwd(), "scratch/terrashade/api_recap.json"),
-      path.resolve(process.cwd(), ".cache/terrashade/api_recap.json"),
+      path.join(cacheDir, "terrashade/api_recap.json"),
       ...(process.env.SESSION_RECAP_PATH ? [path.resolve(process.env.SESSION_RECAP_PATH)] : []),
     ];
 

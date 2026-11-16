@@ -13,6 +13,18 @@ import {
   deriveTacticalStructuralLevels,
   type NormalizedOptionContract,
 } from "@/lib/optionsExposure";
+import {
+  evaluateAndPersistSessionPlaybook,
+  runPostMarketAttribution,
+  shouldRefreshSupervisorCheckpoint,
+} from "@/lib/agenticSupervisor";
+import {
+  readAlphaPriorsSync,
+  readHistoricalSessions,
+  readSupervisorPolicySync,
+} from "@/lib/persistenceStore";
+import { getMergedIntradayHistory } from "@/lib/intradayHistory";
+import { computeBarFlowGammaVwapSeries } from "@/lib/flowGammaVwap";
 
 const POLL_INTERVAL_MS = 20_000; // 20 seconds during RTH
 const DEFAULT_WATCH_TICKERS = ["SPY"] as const;
@@ -373,8 +385,62 @@ export async function runLiveBotTick(): Promise<void> {
   const initialStore = loadTradeStore();
   const hasStrandedOpen = Object.keys(initialStore.activePositions || {}).length > 0;
   if (!rthOpen && !hasStrandedOpen) {
+    if (
+      startClock.isWeekday &&
+      startClock.etMins >= 965 &&
+      readAlphaPriorsSync().lastAttributionDate !== startClock.etDate
+    ) {
+      try {
+        const ticks = getMergedIntradayHistory("SPY", startClock.etDate);
+        if (ticks.length >= 6) {
+          const bucketMap = new Map<number, typeof ticks>();
+          for (const tick of ticks) {
+            const bucket = Math.floor(tick.ts / 300) * 300;
+            if (!bucketMap.has(bucket)) bucketMap.set(bucket, []);
+            bucketMap.get(bucket)!.push(tick);
+          }
+          const bars = Array.from(bucketMap.entries())
+            .sort((a, b) => a[0] - b[0])
+            .map(([bucketTs, group]) => ({
+              ts: bucketTs,
+              open: group[0].spot,
+              high: Math.max(...group.map((g) => g.spot)),
+              low: Math.min(...group.map((g) => g.spot)),
+              close: group[group.length - 1].spot,
+            }));
+          if (bars.length >= 6) {
+            const flowSeries = computeBarFlowGammaVwapSeries(
+              bars.map((b) => ({
+                timestamp: b.ts,
+                open: b.open,
+                high: b.high,
+                low: b.low,
+                close: b.close,
+              }))
+            );
+            const lastTick = ticks[ticks.length - 1];
+            await runPostMarketAttribution({
+              sessionDate: startClock.etDate,
+              ticker: "SPY",
+              bars,
+              flowSeries,
+              callWall: lastTick?.callWall || lastTick?.cw,
+              putWall: lastTick?.putWall || lastTick?.pw,
+              zeroGamma: lastTick?.zeroGamma || lastTick?.zg,
+              zeroDteKing: lastTick?.king,
+              executedTrades: initialStore.closedPositions,
+            });
+            if (!botState.isStopped) botState.lastStatus = "POST_MARKET_ATTRIBUTED";
+          }
+        }
+      } catch (attrErr) {
+        console.warn("[LiveBotDaemon] Post-market attribution failed:", attrErr);
+      }
+    }
     releaseBarEvaluationLock(lockToken);
-    if (!botState.isStopped) botState.lastStatus = "OUTSIDE_RTH";
+    if (!botState.isStopped && botState.lastStatus !== "POST_MARKET_ATTRIBUTED") {
+      botState.lastStatus = "OUTSIDE_RTH";
+    }
     return;
   }
   if (rthOpen && !hasStrandedOpen && startClock.etMins > 870) {
@@ -529,6 +595,53 @@ export async function runLiveBotTick(): Promise<void> {
             },
           });
           if (reanchored.candle) enrichedCandle = reanchored.candle;
+        }
+
+        const existingPolicy = readSupervisorPolicySync(todayStr, ticker);
+        const prevSpotForZg = currentStore.prevSpotPrices?.[ticker] ?? 0;
+        const zgLevel = resolvedLevels?.zeroGamma ?? 0;
+        const zeroGammaFlipped = Boolean(
+          zgLevel > 0 &&
+            prevSpotForZg > 0 &&
+            resolvedSpot > 0 &&
+            ((prevSpotForZg <= zgLevel && resolvedSpot > zgLevel) ||
+              (prevSpotForZg >= zgLevel && resolvedSpot < zgLevel))
+        );
+        const curAbsPe = Math.abs(
+          enrichedCandle?.flowSnapshot?.impulsePeclet ??
+            enrichedCandle?.flowSnapshot?.pecletNumber ??
+            0
+        );
+
+        let effectivePolicy = existingPolicy;
+        if (
+          resolvedSpot > 0 &&
+          shouldRefreshSupervisorCheckpoint(existingPolicy, nowClock.etMins, zeroGammaFlipped, curAbsPe)
+        ) {
+          const historicalSessions = await readHistoricalSessions(5);
+          effectivePolicy = await evaluateAndPersistSessionPlaybook({
+            sessionDate: todayStr,
+            ticker,
+            nowMs: Date.now(),
+            spotPrice: resolvedSpot,
+            prevSpotPrice: prevSpotForZg || resolvedSpot,
+            callWall: resolvedLevels?.callWall ?? 0,
+            putWall: resolvedLevels?.putWall ?? 0,
+            zeroGamma: zgLevel,
+            zeroDteKing: resolvedLevels?.kingNode?.zeroDteKing,
+            allExpKing: resolvedLevels?.tacticalKing,
+            bookCenter: zgLevel,
+            netGex: resolvedLevels?.netGexMillions,
+            flowSnapshot: enrichedCandle?.flowSnapshot ?? null,
+            historicalSessions,
+          });
+        }
+
+        if (effectivePolicy?.standAsideVetoReason) {
+          if (!botState.isStopped) {
+            botState.lastStatus = "SUPERVISOR_STAND_ASIDE";
+          }
+          continue;
         }
 
         const res = await evaluateTradeSignals({

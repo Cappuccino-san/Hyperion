@@ -43,9 +43,16 @@ import {
   isEvaluatingLiveBar,
   stopLiveBot,
 } from "../lib/liveBotDaemon";
+import fs from "fs";
+import os from "os";
+import path from "path";
 import { NormalizedOptionContract } from "../lib/optionsExposure";
 import { NextRequest } from "next/server";
 import { GET as getSignalsRoute, POST as postSignalsRoute } from "../app/api/signals/route";
+import {
+  getPersistenceCacheDir,
+  resetPersistenceMemCachesForTests,
+} from "../lib/persistenceStore";
 
 let totalTests = 0;
 let passedTests = 0;
@@ -911,6 +918,17 @@ async function runTestSuite() {
   let postClosedTradeReentryViolations = 0;
 
   try {
+    const fsMod = await import("fs");
+    const pathMod = await import("path");
+    const currentTestDate = getTodayEt();
+    const baseOpenEpoch = Math.floor(new Date(`${currentTestDate}T09:35:00-05:00`).getTime() / 1000);
+    const sig1Ts = baseOpenEpoch + 100; // 09:36:40 ET
+    const close1Ts = baseOpenEpoch + 1800; // 10:05:00 ET
+    const open2Ts = Math.floor(new Date(`${currentTestDate}T11:30:00-05:00`).getTime() / 1000);
+    const close2Ts = Math.floor(new Date(`${currentTestDate}T13:15:00-05:00`).getTime() / 1000);
+    const capSigTs = close2Ts + 500;
+    const expShort = currentTestDate.replace(/-/g, "").slice(2);
+
     for (let t = 1; t <= 500; t++) {
     // Random initial session state
     const rollState = rng10C();
@@ -924,9 +942,9 @@ async function runTestSuite() {
             id: `test-closed-${t}`,
             ticker: "SPY",
             contractType: "PUT",
-            contractLabel: "SPY 261105 765P",
+            contractLabel: `SPY ${expShort} 765P`,
             strike: 765,
-            expiration: "2026-11-05",
+            expiration: currentTestDate,
             setupName: "Resistance Rejection",
             status: "CLOSED",
             btoSpotPrice: 765.0,
@@ -938,9 +956,9 @@ async function runTestSuite() {
             target2Spot: 760.0,
             stopLossSpot: 766.5,
             openedAt: "09:35 AM",
-            openedTs: 1793889300,
+            openedTs: baseOpenEpoch,
             closedAt: "10:05 AM",
-            closedTs: 1793891100,
+            closedTs: close1Ts,
             exitReason: "TARGET 1 PROFIT SECURED",
           },
         ]
@@ -951,9 +969,9 @@ async function runTestSuite() {
           id: `test-active-${t}`,
           ticker: "SPY",
           contractType: "PUT",
-          contractLabel: "SPY 261105 765P",
+          contractLabel: `SPY ${expShort} 765P`,
           strike: 765,
-          expiration: "2026-11-05",
+          expiration: currentTestDate,
           setupName: "Resistance Rejection",
           status: "OPEN",
           btoSpotPrice: 765.0,
@@ -965,11 +983,10 @@ async function runTestSuite() {
           target2Spot: 760.0,
           stopLossSpot: 766.5,
           openedAt: "09:35 AM",
-          openedTs: 1793889300,
+          openedTs: baseOpenEpoch,
         }
       : null;
 
-    const currentTestDate = getTodayEt();
     const storeInstance: DailyTradeStore = {
       date: currentTestDate,
       activePositions: mockActivePosition ? { SPY: mockActivePosition } : {},
@@ -995,7 +1012,7 @@ async function runTestSuite() {
           id: `mc-short-${t}`,
           type: "SHORT",
           price: 764.5,
-          timestamp: 1793889400,
+          timestamp: sig1Ts,
           label: "SHORT · OPEN",
         },
       ],
@@ -1031,16 +1048,16 @@ async function runTestSuite() {
 
     // 10C-Phase2: Verify max 2 closed trades/day cap & gated Phase-2 opposite-regime bounds
     const maxCapStore: DailyTradeStore = {
-      date: getTodayEt(),
+      date: currentTestDate,
       activePositions: {},
       closedPositions: [
         {
           id: "phase2-closed-1",
           ticker: "SPY",
           contractType: "PUT",
-          contractLabel: "SPY 261105 765P",
+          contractLabel: `SPY ${expShort} 765P`,
           strike: 765,
-          expiration: "2026-11-05",
+          expiration: currentTestDate,
           setupName: "Resistance Rejection",
           status: "CLOSED",
           btoSpotPrice: 765.0,
@@ -1052,18 +1069,18 @@ async function runTestSuite() {
           target2Spot: 760.0,
           stopLossSpot: 766.5,
           openedAt: "09:35 AM",
-          openedTs: 1793889300,
+          openedTs: baseOpenEpoch,
           closedAt: "10:05 AM",
-          closedTs: 1793891100,
+          closedTs: close1Ts,
           exitReason: "TARGET 1 PROFIT SECURED",
         },
         {
           id: "phase2-closed-2",
           ticker: "SPY",
           contractType: "CALL",
-          contractLabel: "SPY 261105 762C",
+          contractLabel: `SPY ${expShort} 762C`,
           strike: 762,
-          expiration: "2026-11-05",
+          expiration: currentTestDate,
           setupName: "Impulse Flux Divergence Reclaim [BTO CALL]",
           status: "CLOSED",
           btoSpotPrice: 761.0,
@@ -1075,9 +1092,9 @@ async function runTestSuite() {
           target2Spot: 765.0,
           stopLossSpot: 759.5,
           openedAt: "11:30 AM",
-          openedTs: 1793896200,
+          openedTs: open2Ts,
           closedAt: "01:15 PM",
-          closedTs: 1793902500,
+          closedTs: close2Ts,
           exitReason: "TARGET 1 PROFIT SECURED",
         },
       ],
@@ -1089,11 +1106,13 @@ async function runTestSuite() {
     const capRes = await syncGaiaSpySignalsToDiscord({
       ticker: "SPY",
       spotPrice: 764.5,
-      sessionDate: getTodayEt(),
-      signals: [{ id: "mc-cap-long", type: "LONG", price: 764.5, timestamp: 1793903000, label: "LONG · OPEN" }],
+      sessionDate: currentTestDate,
+      signals: [{ id: "mc-cap-long", type: "LONG", price: 764.5, timestamp: capSigTs, label: "LONG · OPEN" }],
       zeroGamma: 762.0,
       activeFsmState: "LONG",
     });
+    void fsMod;
+    void pathMod;
     const capAfter = loadTradeStore();
     if (capRes.dispatchedCount > 0 || Object.keys(capAfter.activePositions || {}).length > 0) {
       postClosedTradeReentryViolations++;
@@ -1831,22 +1850,80 @@ async function runTestSuite() {
   );
 
   // Verify GET /api/signals?ticker=SPY&date=2026-11-13 returns historical session trades read-only on weekends/off-hours
-  const histSignalsReq = new NextRequest("http://localhost:3000/api/signals?ticker=SPY&date=2026-11-13");
-  const histSignalsRes = await getSignalsRoute(histSignalsReq);
-  const histSignalsBody = await histSignalsRes.json();
-  assert(
-    histSignalsRes.status === 200,
-    `GET /api/signals?ticker=SPY&date=2026-11-13 returns HTTP 200 (got ${histSignalsRes.status})`
-  );
-  assert(
-    histSignalsBody.sessionDate === "2026-11-13",
-    `GET /api/signals?date=2026-11-13 returns sessionDate === "2026-11-13" (got ${histSignalsBody.sessionDate})`
-  );
-  assert(
-    Array.isArray(histSignalsBody.closedPositions) &&
-      histSignalsBody.closedPositions.some((p: { id?: string }) => p.id === "SPY-PUT-1794581245"),
-    "GET /api/signals?ticker=SPY&date=2026-11-13 returns 2026-11-13 closed trade SPY-PUT-1794581245"
-  );
+  const fsHist = await import("fs");
+  const pathHist = await import("path");
+  const histCacheDir = getPersistenceCacheDir();
+  const histFixturePath = pathHist.join(histCacheDir, "active-trades-2026-11-13.json");
+  const hadHistFixture = fsHist.existsSync(histFixturePath);
+  if (!hadHistFixture) {
+    fsHist.mkdirSync(histCacheDir, { recursive: true });
+    const fixtureStore: DailyTradeStore = {
+      date: "2026-11-13",
+      version: 1,
+      updatedAtMs: 1794585000000,
+      activePositions: {},
+      closedPositions: [
+        {
+          id: "SPY-PUT-1794581245",
+          ticker: "SPY",
+          contractType: "PUT",
+          contractLabel: "SPY 261113 750P (0 DTE · $0.68)",
+          strike: 750,
+          expiration: "2026-11-13",
+          setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
+          status: "CLOSED",
+          btoSpotPrice: 751.2,
+          btoOptionMid: 0.68,
+          optionBid: 0.66,
+          optionAsk: 0.68,
+          contractsQty: 1,
+          remainingQty: 0,
+          totalOutlay: 68,
+          target1Spot: 749.2,
+          target2Spot: 748.0,
+          stopLossSpot: 752.4,
+          openedAt: "9:47 AM",
+          openedTs: 1794581245,
+          closedAt: "10:18 AM",
+          closedTs: 1794583080,
+          closedSpotPrice: 749.1,
+          closedOptionMid: 1.42,
+          pnlOptionPct: 108.8,
+          pnlSpotPct: 0.28,
+          exitReason: "TARGET 1 PROFIT SECURED",
+        },
+      ],
+      alerts: [],
+      prevSpotPrices: { SPY: 751.2 },
+    };
+    fsHist.writeFileSync(histFixturePath, JSON.stringify(fixtureStore, null, 2), "utf-8");
+  }
+  try {
+    const histSignalsReq = new NextRequest("http://localhost:3000/api/signals?ticker=SPY&date=2026-11-13");
+    const histSignalsRes = await getSignalsRoute(histSignalsReq);
+    const histSignalsBody = await histSignalsRes.json();
+    assert(
+      histSignalsRes.status === 200,
+      `GET /api/signals?ticker=SPY&date=2026-11-13 returns HTTP 200 (got ${histSignalsRes.status})`
+    );
+    assert(
+      histSignalsBody.sessionDate === "2026-11-13",
+      `GET /api/signals?date=2026-11-13 returns sessionDate === "2026-11-13" (got ${histSignalsBody.sessionDate})`
+    );
+    assert(
+      Array.isArray(histSignalsBody.closedPositions) &&
+        histSignalsBody.closedPositions.some((p: { id?: string }) => p.id === "SPY-PUT-1794581245"),
+      "GET /api/signals?ticker=SPY&date=2026-11-13 returns 2026-11-13 closed trade SPY-PUT-1794581245"
+    );
+  } finally {
+    if (!hadHistFixture && fsHist.existsSync(histFixturePath)) {
+      try {
+        fsHist.unlinkSync(histFixturePath);
+      } catch {
+        // Ignore cleanup failures
+      }
+    }
+  }
 
   // ===========================================================================
   // TEST SECTION 12: MULTI-TICKER IV & CONTRACT SELECTION (SPY/QQQ/IWM/NVDA 48% IV)
@@ -2174,7 +2251,29 @@ async function runTestSuite() {
   }
 }
 
-runTestSuite().catch((err) => {
+async function main() {
+  const prevCacheDirEnv = process.env.HYPERION_CACHE_DIR;
+  const isolatedCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "hyperion-invariants-"));
+  process.env.HYPERION_CACHE_DIR = isolatedCacheDir;
+  resetPersistenceMemCachesForTests();
+  try {
+    await runTestSuite();
+  } finally {
+    resetPersistenceMemCachesForTests();
+    if (prevCacheDirEnv === undefined) {
+      delete process.env.HYPERION_CACHE_DIR;
+    } else {
+      process.env.HYPERION_CACHE_DIR = prevCacheDirEnv;
+    }
+    try {
+      fs.rmSync(isolatedCacheDir, { recursive: true, force: true });
+    } catch {
+      // Non-fatal temp cleanup
+    }
+  }
+}
+
+main().catch((err) => {
   console.error("Test execution failed:", err);
   process.exit(1);
 });

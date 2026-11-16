@@ -14,6 +14,7 @@ import {
   GaiaCallPutBiasHud,
 } from "@/components/gaia/GaiaCallPutBiasHud";
 import { toEpochSec } from "@/lib/gaiaSessionGuards";
+import type { SessionPlaybookPolicy } from "@/lib/persistenceStore";
 import type {
   GaiaExpirationInfo,
   GaiaIntradayCandle,
@@ -573,12 +574,17 @@ export function GaiaView() {
   const storeTradeAlerts = useDashboardStore(
     (state) => state.serverTradeAlerts
   );
+  const storeSupervisorPolicy = useDashboardStore(
+    (state) => state.supervisorPolicy
+  );
 
   const [serverTrades, setServerTrades] = useState<ServerTradesState>({
     activePositions: storeActivePositions,
     closedPositions: storeClosedTrades,
     alerts: storeTradeAlerts,
   });
+  const [historicalSupervisorPolicy, setHistoricalSupervisorPolicy] =
+    useState<SessionPlaybookPolicy | null>(null);
 
   const [atlasPalette, setAtlasPalette] = useState<"ice" | "polarity">("polarity");
 
@@ -593,6 +599,7 @@ export function GaiaView() {
   useEffect(() => {
     setPrzmHudSignals([]);
     setServerTrades({ activePositions: {}, closedPositions: [], alerts: [] });
+    setHistoricalSupervisorPolicy(null);
   }, [loadedTicker]);
 
   const [livePayload, setLivePayload] = useState<GaiaLivePayload | null>(
@@ -940,6 +947,7 @@ export function GaiaView() {
   useEffect(() => {
     if (!selectedSessionIso) {
       setServerTrades({ activePositions: {}, closedPositions: [], alerts: [] });
+      setHistoricalSupervisorPolicy(null);
       return;
     }
     if (isReplaying || isReplayFrozen) return;
@@ -963,6 +971,7 @@ export function GaiaView() {
             closedPositions: data.closedPositions || [],
             alerts: data.alerts || [],
           });
+          setHistoricalSupervisorPolicy(data.supervisorPolicy ?? null);
         }
       } catch {
         // Silent fallback
@@ -3279,6 +3288,13 @@ export function GaiaView() {
         sigma1Move={dataset?.sigma1Move}
         liveSpot={activeCandle ? activeCandle.close : null}
         serverTrades={effectiveServerTrades}
+        supervisorPolicy={
+          selectedSessionIso
+            ? historicalSupervisorPolicy
+            : loadedTicker.toUpperCase() === storeTicker.toUpperCase()
+              ? storeSupervisorPolicy
+              : null
+        }
         sessionDate={chartSessionDate}
         dividerRatio={dividerRatio}
         isReplayMode={isHistoricalOrReplay}

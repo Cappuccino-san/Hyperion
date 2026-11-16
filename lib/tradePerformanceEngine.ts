@@ -7,6 +7,7 @@ import {
   getTodayEt,
   getNowEtTime,
 } from "./tradeSignalEngine";
+import { getPersistenceCacheDir } from "./persistenceStore";
 
 export interface TradePerformanceItem {
   id: string;
@@ -50,15 +51,7 @@ export interface DailyPerformanceReport {
 }
 
 function getCacheDir(): string {
-  const dir = path.join(process.cwd(), ".cache");
-  if (!fs.existsSync(dir)) {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-    } catch {
-      // Serverless/read-only filesystem fallback
-    }
-  }
-  return dir;
+  return getPersistenceCacheDir();
 }
 
 function firstPositiveNum(...vals: unknown[]): number | undefined {

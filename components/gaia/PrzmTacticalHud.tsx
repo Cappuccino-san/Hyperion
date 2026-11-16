@@ -7,6 +7,7 @@ import {
   RTH_OPEN_MINS,
   toEpochSec,
 } from "@/lib/gaiaSessionGuards";
+import type { SessionPlaybookPolicy } from "@/lib/persistenceStore";
 
 export interface PrzmCandlePoint {
   time: string;
@@ -547,19 +548,21 @@ export const PrzmTopDeck: React.FC<{
   straddleEm?: number;
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
   serverTrades?: ServerTradeData;
+  supervisorPolicy?: SessionPlaybookPolicy | null;
   isReplayMode?: boolean;
   replayBarTsSec?: number;
-}> = ({ ticker, liveSpot, series, signals, open930, straddleEm, activeFsmState, serverTrades, isReplayMode = false, replayBarTsSec }) => {
+}> = ({ ticker, liveSpot, series, signals, open930, straddleEm, activeFsmState, serverTrades, supervisorPolicy, isReplayMode = false, replayBarTsSec }) => {
   const displayTicker = (ticker || "SPY").trim().toUpperCase() || "SPY";
   const ledger = useMemo(
     () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, displayTicker, replayBarTsSec),
     [signals, series, liveSpot, activeFsmState, serverTrades, displayTicker, replayBarTsSec]
   );
 
-  // Live 1-second clock for "TO THE BELL" radial dial
-  const [nowDate, setNowDate] = useState<Date>(() => new Date());
+  // Live 1-second clock for "TO THE BELL" radial dial (client-only after mount to prevent SSR/CSR minute-rollover hydration mismatch)
+  const [nowDate, setNowDate] = useState<Date | null>(null);
   useEffect(() => {
     if (isReplayMode) return;
+    setNowDate(new Date());
     const id = setInterval(() => setNowDate(new Date()), 1000);
     return () => clearInterval(id);
   }, [isReplayMode]);
@@ -571,6 +574,16 @@ export const PrzmTopDeck: React.FC<{
         isReplayMode && typeof replayBarTsSec === "number" && replayBarTsSec > 0
           ? new Date(replayBarTsSec * 1000)
           : nowDate;
+      if (!refDate) {
+        return {
+          centerLabel: "--:--",
+          subLabel: isReplayMode ? "REPLAY 9:30>4:00" : "9:30 > 4:00",
+          progress: 0,
+          litTicks: 0,
+          isLiveRth: false,
+          isOffHours: false,
+        };
+      }
       const parts = new Intl.DateTimeFormat("en-US", {
         timeZone: "America/New_York",
         hour: "numeric",
@@ -709,8 +722,107 @@ export const PrzmTopDeck: React.FC<{
 
   const litSegments = Math.max(3, Math.min(24, Math.round((Math.abs(convictionScore) / 100) * 24)));
 
+  const effectivePolicy = useMemo(() => {
+    if (supervisorPolicy) return supervisorPolicy;
+    const derivedRegime: SessionPlaybookPolicy["regime"] =
+      activeFsmState === "STAND_ASIDE"
+        ? "LOW_EDGE_CHOP"
+        : Math.abs(drivers[2]?.value ?? 0) >= 45
+          ? "NEG_GAMMA_TREND"
+          : Math.abs(drivers[4]?.value ?? 0) <= 18
+            ? "POS_GAMMA_PIN"
+            : "ZERO_GAMMA_FLIP";
+    return {
+      sessionDate: "",
+      ticker: displayTicker,
+      checkpoint: "INTRADAY" as const,
+      evaluatedAtEt: isReplayMode ? "REPLAY" : "LIVE",
+      evaluatedAtTs: 0,
+      regime: derivedRegime,
+      allowedRegimes: derivedRegime === "LOW_EDGE_CHOP" ? [] : [derivedRegime],
+      preferredDte:
+        derivedRegime === "LOW_EDGE_CHOP"
+          ? ("NONE" as const)
+          : derivedRegime === "POS_GAMMA_PIN"
+            ? ("1-2DTE" as const)
+            : ("0DTE" as const),
+      minExpectancyR: 0.35,
+      minWinRatePct: 58,
+      standAsideVetoReason:
+        activeFsmState === "STAND_ASIDE"
+          ? "FSM Neutral / Compressed Advection Corridor"
+          : null,
+      kingDivergencePct: 0,
+      trailing5dDrawdownDollars: 0,
+      trailing5dPnlDollars: 0,
+      zeroGammaSide: "AT" as const,
+      wallCorridorPct: 0,
+      absPeclet: 0,
+      summary: "",
+    };
+  }, [supervisorPolicy, activeFsmState, drivers, displayTicker, isReplayMode]);
+
+  const regimeBadgeStyle =
+    effectivePolicy.regime === "POS_GAMMA_PIN"
+      ? "bg-cyan-500/15 text-[#00F5D4] border-cyan-500/40"
+      : effectivePolicy.regime === "NEG_GAMMA_TREND"
+        ? "bg-rose-500/15 text-[#FF2A55] border-rose-500/40"
+        : effectivePolicy.regime === "ZERO_GAMMA_FLIP"
+          ? "bg-amber-500/15 text-amber-300 border-amber-500/40"
+          : "bg-red-500/20 text-red-300 border-red-500/50";
+
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 mb-3.5">
+    <>
+      {/* SUPERVISOR POLICY STRIP */}
+      <div className="mb-3 rounded-lg bg-[#111322]/95 border border-slate-800/80 px-3.5 py-2 flex flex-wrap items-center justify-between gap-2.5 font-mono text-[11px] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <span className="text-[10px] font-bold tracking-[0.14em] text-slate-400 uppercase">
+            SUPERVISOR
+          </span>
+          <span
+            className={`px-2 py-0.5 rounded border text-[10px] font-bold tracking-wider ${regimeBadgeStyle}`}
+          >
+            {effectivePolicy.regime}
+          </span>
+          <span className="text-slate-400">
+            PREF{" "}
+            <strong className="text-slate-100">{effectivePolicy.preferredDte}</strong>
+          </span>
+          <span className="text-slate-600">|</span>
+          <span className="text-slate-400">
+            MIN E[R]{" "}
+            <strong className="text-emerald-300 tabular-nums">
+              +{effectivePolicy.minExpectancyR.toFixed(2)}R
+            </strong>{" "}
+            <span className="text-slate-500">
+              ({effectivePolicy.minWinRatePct.toFixed(0)}% WR)
+            </span>
+          </span>
+          <span className="text-slate-600 hidden sm:inline">|</span>
+          <span className="text-slate-400 hidden sm:inline">
+            CKPT{" "}
+            <strong className="text-slate-200">{effectivePolicy.checkpoint}</strong>
+            {effectivePolicy.evaluatedAtEt ? (
+              <span className="text-slate-500 ml-1">({effectivePolicy.evaluatedAtEt})</span>
+            ) : null}
+          </span>
+        </div>
+
+        {effectivePolicy.standAsideVetoReason ? (
+          <div className="px-2.5 py-0.5 rounded border border-red-500/50 bg-red-950/60 text-red-200 text-[10px] font-bold tracking-wide max-w-full truncate">
+            STAND ASIDE · {effectivePolicy.standAsideVetoReason}
+          </div>
+        ) : effectivePolicy.trailing5dDrawdownDollars > 0 ? (
+          <div className="text-[10px] text-slate-400 tabular-nums">
+            5D DD{" "}
+            <span className={effectivePolicy.trailing5dDrawdownDollars >= 150 ? "text-amber-300 font-bold" : "text-slate-300"}>
+              ${effectivePolicy.trailing5dDrawdownDollars.toFixed(0)}
+            </span>
+          </div>
+        ) : null}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 mb-3.5">
       {/* CARD 1: +--[ CALL ]----+ (5 Columns on lg) */}
       <div className="lg:col-span-5 rounded-xl bg-[#131424]/95 border border-slate-800/80 px-4 py-3.5 flex flex-col justify-between shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
         <PrzmAsciiHeader title="CALL" />
@@ -788,10 +900,10 @@ export const PrzmTopDeck: React.FC<{
               const angle = -Math.PI / 2 + (idx / 48) * Math.PI * 2;
               const rIn = 49;
               const rOut = 59;
-              const x1 = 72 + rIn * Math.cos(angle);
-              const y1 = 72 + rIn * Math.sin(angle);
-              const x2 = 72 + rOut * Math.cos(angle);
-              const y2 = 72 + rOut * Math.sin(angle);
+              const x1 = Number((72 + rIn * Math.cos(angle)).toFixed(3));
+              const y1 = Number((72 + rIn * Math.sin(angle)).toFixed(3));
+              const x2 = Number((72 + rOut * Math.cos(angle)).toFixed(3));
+              const y2 = Number((72 + rOut * Math.sin(angle)).toFixed(3));
               const isLit = idx < bellMetrics.litTicks;
               const isTip = idx === bellMetrics.litTicks - 1;
               return (
@@ -894,6 +1006,7 @@ export const PrzmTopDeck: React.FC<{
         </div>
       </div>
     </div>
+    </>
   );
 };
 
