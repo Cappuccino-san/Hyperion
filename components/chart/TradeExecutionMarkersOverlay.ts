@@ -82,10 +82,7 @@ export function parseTimeLabelToMinutes(label?: string): number | null {
   const meridiem = (match[3] || "").toUpperCase();
   if (meridiem === "PM" && hours < 12) hours += 12;
   if (meridiem === "AM" && hours === 12) hours = 0;
-  // Heuristic for trading session labels without AM/PM (e.g. "1:30" -> 13:30)
-  if (!meridiem && hours >= 1 && hours <= 6) {
-    hours += 12;
-  }
+  if (hours < 0 || hours >= 24 || mins < 0 || mins >= 60) return null;
   return hours * 60 + mins;
 }
 
@@ -149,7 +146,7 @@ export function matchTradeToCandleIndex(
       }
     }
 
-    if (bestIdx !== -1 && bestDiff <= Math.round(barStepSec * 1.5)) {
+    if (bestIdx !== -1 && bestDiff <= Math.round(barStepSec * 0.5)) {
       return bestIdx;
     }
     // Never fall through to time-of-day label fallback across different trading sessions/days
@@ -262,20 +259,40 @@ export function extractNormalizedTradesForTicker(
       (a) =>
         a &&
         String(a.ticker || "").toUpperCase() === sym &&
+        !String(a.id || "").startsWith("radar-") &&
+        a.setupName !== "Intraday Radar Briefing" &&
         a.action === "BUY_TO_OPEN"
     );
     const stcAlerts = serverTrades.alerts.filter(
       (a) =>
         a &&
         String(a.ticker || "").toUpperCase() === sym &&
+        !String(a.id || "").startsWith("radar-") &&
         a.action === "SELL_TO_CLOSE"
     );
 
+    const usedStcIds = new Set<string>();
     for (const bto of btoAlerts) {
       const baseId = String(bto.id || "").replace(/-bto$/, "");
-      const matchingStc = stcAlerts.find((stc) =>
-        baseId ? String(stc.id || "").startsWith(baseId) : stc.contractType === bto.contractType
-      );
+      const gaiaEntryMatch = baseId.match(/^(gaia-.+?)-entry-(\d+)/);
+      const gaiaPrefix = baseId.includes("-entry-") ? baseId.split("-entry-")[0] : "";
+      const matchingStc = stcAlerts.find((stc) => {
+        const stcId = String(stc.id || "");
+        if (stcId && usedStcIds.has(stcId)) return false;
+        if (gaiaEntryMatch) {
+          return (
+            stcId.startsWith(`${gaiaEntryMatch[1]}-exit-${gaiaEntryMatch[2]}`) ||
+            stcId.startsWith(`${gaiaEntryMatch[1]}-exit-`)
+          );
+        }
+        if (gaiaPrefix) {
+          return stcId.startsWith(`${gaiaPrefix}-exit-`);
+        }
+        return baseId ? stcId.startsWith(baseId) : stc.contractType === bto.contractType;
+      });
+      if (matchingStc?.id) {
+        usedStcIds.add(String(matchingStc.id));
+      }
       const id = baseId || `${sym}-${bto.contractType}-${bto.ts || bto.timestamp}`;
       byId.set(id, {
         id,
@@ -377,12 +394,15 @@ export function clampSpotToCandle(spot: number, candle: ChartCandleLike): number
   return Math.max(lo, Math.min(hi, spot));
 }
 
-let lastExtractCache: {
-  ticker: string;
-  serverTrades: ServerTradesState | null | undefined;
-  fsmSignals: any[] | undefined;
-  result: NormalizedChartTrade[];
-} | null = null;
+const extractCacheByCtx = new WeakMap<
+  CanvasRenderingContext2D,
+  {
+    ticker: string;
+    serverTrades: ServerTradesState | null | undefined;
+    fsmSignals: any[] | undefined;
+    result: NormalizedChartTrade[];
+  }
+>();
 
 /**
  * Draws the On-Chart Trade Execution Markers (`BTO` triangles + labels, `STC` cover markers,
@@ -409,18 +429,19 @@ export function drawTradeExecutionMarkers(
 
   if (!candles || candles.length === 0 || safeActiveIdx < 0) return;
   let trades: NormalizedChartTrade[];
+  const cached = extractCacheByCtx.get(ctx);
   if (precomputedTrades) {
     trades = precomputedTrades;
   } else if (
-    lastExtractCache &&
-    lastExtractCache.ticker === ticker &&
-    lastExtractCache.serverTrades === serverTrades &&
-    lastExtractCache.fsmSignals === fsmSignals
+    cached &&
+    cached.ticker === ticker &&
+    cached.serverTrades === serverTrades &&
+    cached.fsmSignals === fsmSignals
   ) {
-    trades = lastExtractCache.result;
+    trades = cached.result;
   } else {
     trades = extractNormalizedTradesForTicker(ticker, serverTrades, fsmSignals);
-    lastExtractCache = { ticker, serverTrades, fsmSignals, result: trades };
+    extractCacheByCtx.set(ctx, { ticker, serverTrades, fsmSignals, result: trades });
   }
   if (trades.length === 0) return;
 
@@ -459,7 +480,7 @@ export function drawTradeExecutionMarkers(
       const isProfit = (trade.pnlOptionPct ?? 0) >= 0;
 
       ctx.save();
-      ctx.strokeStyle = isPut ? "rgba(239, 68, 68, 0.78)" : "rgba(16, 185, 129, 0.78)";
+      ctx.strokeStyle = isProfit ? "rgba(16, 185, 129, 0.78)" : "rgba(239, 68, 68, 0.78)";
       ctx.lineWidth = 1.75;
       ctx.setLineDash([4, 4]);
       ctx.beginPath();
@@ -474,7 +495,7 @@ export function drawTradeExecutionMarkers(
       ctx.arc(entryX, entrySpotY, 2.8, 0, Math.PI * 2);
       ctx.fill();
 
-      ctx.fillStyle = btoColor;
+      ctx.fillStyle = isProfit ? "#10b981" : "#ef4444";
       ctx.beginPath();
       ctx.arc(exitX, exitSpotY, 2.8, 0, Math.PI * 2);
       ctx.fill();
@@ -611,16 +632,16 @@ export function drawTradeExecutionMarkers(
 
       const pnlPct = trade.pnlOptionPct ?? 0;
       const isProfit = pnlPct >= 0;
-      const stcColor = isPut ? "#ef4444" : "#10b981";
-      const stcFillBg = isPut
-        ? "rgba(239, 68, 68, 0.22)"
-        : "rgba(16, 185, 129, 0.22)";
+      const stcColor = isProfit ? "#10b981" : "#ef4444";
+      const stcFillBg = isProfit
+        ? "rgba(16, 185, 129, 0.22)"
+        : "rgba(239, 68, 68, 0.22)";
       const pnlFormatted = `${pnlPct >= 0 ? "+" : ""}${Math.round(pnlPct)}%`;
       const badgeText = `STC ${pnlFormatted}`;
 
       ctx.save();
       ctx.fillStyle = stcColor;
-      ctx.shadowColor = isPut ? "rgba(239, 68, 68, 0.9)" : "rgba(16, 185, 129, 0.9)";
+      ctx.shadowColor = isProfit ? "rgba(16, 185, 129, 0.9)" : "rgba(239, 68, 68, 0.9)";
       ctx.shadowBlur = 10;
 
       // For covering a Put (Short), draw an upward triangle below the closing candle's low wick.
@@ -675,7 +696,7 @@ export function drawTradeExecutionMarkers(
         ctx.fillStyle = stcFillBg;
         ctx.strokeStyle = stcColor;
         ctx.lineWidth = 1.4;
-        ctx.shadowColor = isPut ? "rgba(239, 68, 68, 0.55)" : "rgba(16, 185, 129, 0.55)";
+        ctx.shadowColor = isProfit ? "rgba(16, 185, 129, 0.55)" : "rgba(239, 68, 68, 0.55)";
         ctx.shadowBlur = 8;
         ctx.beginPath();
         ctx.roundRect(bx, by, badgeW, badgeH, 5);
@@ -726,7 +747,7 @@ export function drawTradeExecutionMarkers(
         ctx.fillStyle = stcFillBg;
         ctx.strokeStyle = stcColor;
         ctx.lineWidth = 1.4;
-        ctx.shadowColor = isPut ? "rgba(239, 68, 68, 0.55)" : "rgba(16, 185, 129, 0.55)";
+        ctx.shadowColor = isProfit ? "rgba(16, 185, 129, 0.55)" : "rgba(239, 68, 68, 0.55)";
         ctx.shadowBlur = 8;
         ctx.beginPath();
         ctx.roundRect(bx, by, badgeW, badgeH, 5);

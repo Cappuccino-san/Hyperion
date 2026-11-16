@@ -28,6 +28,7 @@ interface LiveBotGlobalState {
   isEvaluatingLiveBar: boolean;
   lockAcquiredAtMs: number;
   lockToken: number;
+  lockWaiters?: Set<() => void>;
   startedAtMs: number;
   lastPollAtMs: number;
   lastStatus: string;
@@ -197,16 +198,63 @@ export function isEvaluatingLiveBar(): boolean {
 export function acquireBarEvaluationLock(): number {
   const state = getBotState();
   const nowMs = Date.now();
-  if (state.inFlightTickPromise) {
-    return 0;
-  }
   if (state.isEvaluatingLiveBar && nowMs - state.lockAcquiredAtMs < 30_000) {
     return 0;
+  }
+  if (state.inFlightTickPromise) {
+    if (nowMs - state.lockAcquiredAtMs < 30_000) {
+      return 0;
+    }
+    try {
+      state.activeController?.abort();
+    } catch {}
+    state.inFlightTickPromise = null;
+    state.isPolling = false;
   }
   state.isEvaluatingLiveBar = true;
   state.lockAcquiredAtMs = nowMs;
   state.lockToken = (state.lockToken || 0) + 1;
   return state.lockToken;
+}
+
+export async function acquireBarEvaluationLockWithWait(
+  timeoutMs: number = 2500,
+  signal?: AbortSignal
+): Promise<number> {
+  const immediate = acquireBarEvaluationLock();
+  if (immediate) return immediate;
+
+  const state = getBotState();
+  if (!state.lockWaiters) {
+    state.lockWaiters = new Set<() => void>();
+  }
+
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (Date.now() < deadline) {
+    if (signal?.aborted) return 0;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        state.lockWaiters?.delete(done);
+        signal?.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, Math.min(50, remaining));
+      state.lockWaiters?.add(done);
+      signal?.addEventListener("abort", done, { once: true });
+    });
+
+    if (signal?.aborted) return 0;
+    const tok = acquireBarEvaluationLock();
+    if (tok) return tok;
+  }
+  return 0;
 }
 
 export function refreshBarEvaluationLock(token?: number): void {
@@ -228,6 +276,11 @@ export function releaseBarEvaluationLock(token?: number): void {
   }
   state.isEvaluatingLiveBar = false;
   state.lockAcquiredAtMs = 0;
+  if (state.lockWaiters && state.lockWaiters.size > 0) {
+    for (const wake of Array.from(state.lockWaiters)) {
+      wake();
+    }
+  }
 }
 
 /**
@@ -246,55 +299,63 @@ export async function ensureMocCutoffForRemainingPositions(
   );
   if (openEntries.length === 0) return 0;
 
+  const mocController = new AbortController();
+  const mocTimeout = setTimeout(() => mocController.abort(), 6_000);
   let dispatched = 0;
-  for (const [ticker, pos] of openEntries) {
-    if (!pos) continue;
-    const cachedSpot = Number(
-      getCachedSpotPrice(ticker) ||
-        store.prevSpotPrices?.[ticker] ||
-        store.prevSpotPrices?.[pos.ticker] ||
-        pos.btoSpotPrice ||
-        0
-    );
-    if (cachedSpot <= 0) continue;
-    const syntheticContract: NormalizedOptionContract = {
-      symbol: pos.contractLabel || ticker,
-      strike: pos.strike,
-      expiration: pos.expiration,
-      optionType: pos.contractType === "CALL" ? "C" : "P",
-      bid: pos.optionBid ?? pos.btoOptionMid,
-      ask: pos.optionAsk ?? pos.btoOptionMid,
-      last: pos.btoOptionMid,
-      volume: 1,
-      openInterest: 1,
-      delta: pos.contractType === "CALL" ? 0.5 : -0.5,
-      gamma: 0,
-      vega: 0,
-      iv: pos.entryIv ?? 0.25,
-      percentChange: 0,
-    };
-    const res = await evaluateTradeSignals({
-      ticker,
-      spotPrice: cachedSpot,
-      callWall: 0,
-      putWall: 0,
-      zeroGamma: 0,
-      contracts: [syntheticContract],
-      latest5mCandle: {
-        open: cachedSpot,
-        high: cachedSpot,
-        low: cachedSpot,
-        close: cachedSpot,
-        sma34: cachedSpot,
-      },
-      divergence5m: "NO",
-      divergence30m: "NO",
-      webhookUrl,
-      isHistoricalBackfill: false,
-    });
-    dispatched += res.emittedAlerts.filter(
-      (a) => !a.isHistoricalBackfill && Boolean(webhookUrl?.trim())
-    ).length;
+  try {
+    for (const [ticker, pos] of openEntries) {
+      if (mocController.signal.aborted) break;
+      if (!pos) continue;
+      const cachedSpot = Number(
+        getCachedSpotPrice(ticker) ||
+          store.prevSpotPrices?.[ticker] ||
+          store.prevSpotPrices?.[pos.ticker] ||
+          pos.btoSpotPrice ||
+          0
+      );
+      if (cachedSpot <= 0) continue;
+      const syntheticContract: NormalizedOptionContract = {
+        symbol: pos.contractLabel || ticker,
+        strike: pos.strike,
+        expiration: pos.expiration,
+        optionType: pos.contractType === "CALL" ? "C" : "P",
+        bid: pos.optionBid ?? pos.btoOptionMid,
+        ask: pos.optionAsk ?? pos.btoOptionMid,
+        last: pos.btoOptionMid,
+        volume: 1,
+        openInterest: 1,
+        delta: pos.contractType === "CALL" ? 0.5 : -0.5,
+        gamma: 0,
+        vega: 0,
+        iv: pos.entryIv ?? 0.25,
+        percentChange: 0,
+      };
+      const res = await evaluateTradeSignals({
+        ticker,
+        spotPrice: cachedSpot,
+        callWall: 0,
+        putWall: 0,
+        zeroGamma: 0,
+        contracts: [syntheticContract],
+        latest5mCandle: {
+          open: cachedSpot,
+          high: cachedSpot,
+          low: cachedSpot,
+          close: cachedSpot,
+          sma34: cachedSpot,
+        },
+        divergence5m: "NO",
+        divergence30m: "NO",
+        webhookUrl,
+        isHistoricalBackfill: false,
+        signal: mocController.signal,
+      });
+      dispatched += res.emittedAlerts.filter(
+        (a) => !a.isHistoricalBackfill && Boolean(webhookUrl?.trim())
+      ).length;
+    }
+  } finally {
+    clearTimeout(mocTimeout);
   }
   return dispatched;
 }
@@ -308,18 +369,26 @@ export async function runLiveBotTick(): Promise<void> {
   if (!lockToken) return;
 
   const rthOpen = isWithinRthWindow();
+  const startClock = getEtClockNow();
   const initialStore = loadTradeStore();
   const hasStrandedOpen = Object.keys(initialStore.activePositions || {}).length > 0;
   if (!rthOpen && !hasStrandedOpen) {
     releaseBarEvaluationLock(lockToken);
-    botState.lastStatus = "OUTSIDE_RTH";
+    if (!botState.isStopped) botState.lastStatus = "OUTSIDE_RTH";
+    return;
+  }
+  if (rthOpen && !hasStrandedOpen && startClock.etMins > 870) {
+    releaseBarEvaluationLock(lockToken);
+    if (!botState.isStopped) botState.lastStatus = "OUTSIDE_ENTRY_WINDOW";
     return;
   }
 
   botState.isPolling = true;
   botState.lastPollAtMs = Date.now();
   botState.pollCount += 1;
-  botState.lastStatus = rthOpen ? "POLLING_RTH" : "EOD_STRANDED_CLEANUP";
+  if (!botState.isStopped) {
+    botState.lastStatus = rthOpen ? "POLLING_RTH" : "EOD_STRANDED_CLEANUP";
+  }
 
   const controller = new AbortController();
   botState.activeController = controller;
@@ -343,7 +412,7 @@ export async function runLiveBotTick(): Promise<void> {
 
       // 1. Always evaluate active positions for STC / 15:55 ET MOC exit first (even after 16:00 ET if stranded)
       if (activeKeys.length > 0) {
-        botState.lastStatus = "ACTIVE_EVAL_STC";
+        if (!botState.isStopped) botState.lastStatus = "ACTIVE_EVAL_STC";
         try {
           const activeAlerts = await evaluateAllActivePositions({
             webhookUrl,
@@ -370,18 +439,23 @@ export async function runLiveBotTick(): Promise<void> {
 
       if (controller.signal.aborted || botState.isStopped) return;
       if (!isWithinRthWindow()) {
-        botState.lastStatus = "OUTSIDE_RTH";
+        if (!botState.isStopped) botState.lastStatus = "OUTSIDE_RTH";
         return;
       }
 
       // Poll tracked tickers for new BTO setups when flat (or Phase-2 opposite reclaim eligible)
-      botState.lastStatus = "FLAT_EVAL_BTO";
       const nowClock = getEtClockNow();
+      if (nowClock.etMins > 870) {
+        if (!botState.isStopped) botState.lastStatus = "OUTSIDE_ENTRY_WINDOW";
+        return;
+      }
+      if (!botState.isStopped) botState.lastStatus = "FLAT_EVAL_BTO";
       const nowTs = Math.floor(Date.now() / 1000);
       const trackedTickers = getActiveTrackedTickers();
       let evaluatedAny = false;
       for (const ticker of trackedTickers) {
         if (controller.signal.aborted || botState.isStopped) break;
+        refreshBarEvaluationLock(lockToken);
         const currentStore = loadTradeStore();
         if (Object.keys(currentStore.activePositions || {}).length > 0) break;
         const posKey = ticker === "SPXW" || ticker === "SPX" ? "SPY" : ticker;
@@ -492,13 +566,17 @@ export async function runLiveBotTick(): Promise<void> {
         }
       }
 
-      botState.lastStatus = controller.signal.aborted
-        ? "TIMEOUT_ABORTED"
-        : !evaluatedAny
-          ? "LOCKED_FOR_DAY"
-          : "ACTIVE_OK";
+      if (!botState.isStopped) {
+        botState.lastStatus = controller.signal.aborted
+          ? "TIMEOUT_ABORTED"
+          : !evaluatedAny
+            ? "LOCKED_FOR_DAY"
+            : "ACTIVE_OK";
+      }
     } catch (err) {
-      botState.lastStatus = `ERROR: ${err instanceof Error ? err.message : "unknown"}`;
+      if (!botState.isStopped) {
+        botState.lastStatus = `ERROR: ${err instanceof Error ? err.message : "unknown"}`;
+      }
     } finally {
       clearTimeout(timeoutId);
       if (botState.activeController === controller) botState.activeController = null;
@@ -520,7 +598,9 @@ export async function runLiveBotTick(): Promise<void> {
   try {
     await Promise.race([tickWork, timeoutPromise]);
   } catch (err) {
-    botState.lastStatus = `ERROR: ${err instanceof Error ? err.message : "unknown"}`;
+    if (!botState.isStopped) {
+      botState.lastStatus = `ERROR: ${err instanceof Error ? err.message : "unknown"}`;
+    }
   }
 }
 
@@ -557,12 +637,34 @@ export function stopLiveBot(): void {
     botState.isEvaluatingLiveBar = false;
     botState.lockAcquiredAtMs = 0;
     botState.lockToken = (botState.lockToken || 0) + 1;
+    if (botState.lockWaiters && botState.lockWaiters.size > 0) {
+      for (const wake of Array.from(botState.lockWaiters)) {
+        wake();
+      }
+    }
   }
   botState.lastStatus = "STOPPED";
 }
 
-// Register graceful shutdown hooks for container lifecycles
-if (typeof process !== "undefined" && typeof window === "undefined") {
+// Register graceful shutdown hooks for container lifecycles (guarded against HMR & test/CLI runs)
+const globalForShutdownHooks = globalThis as unknown as {
+  __hyperionShutdownHooksRegistered?: boolean;
+};
+const isTestOrCliRun =
+  typeof process !== "undefined" &&
+  (process.env.NODE_ENV === "test" ||
+    (Array.isArray(process.argv) &&
+      process.argv.some((arg) =>
+        /\.(test|spec)\.|verifyExecutionInvariants|audit10DayBacktest|verifyLiveRoutes/.test(arg)
+      )));
+
+if (
+  typeof process !== "undefined" &&
+  typeof window === "undefined" &&
+  !isTestOrCliRun &&
+  !globalForShutdownHooks.__hyperionShutdownHooksRegistered
+) {
+  globalForShutdownHooks.__hyperionShutdownHooksRegistered = true;
   const handleSignal = (signal: string) => {
     stopLiveBot();
     console.log(`[LIVE-BOT-DAEMON] Cleanly halted background poller on ${signal}.`);

@@ -7,24 +7,69 @@ import {
   deriveTacticalStructuralLevels,
 } from "@/lib/optionsExposure";
 import {
-  calculateSmallAccountSize,
-  assertSmallAccountInvariant,
-} from "@/lib/positionSizer";
-import {
   computeBarFlowGammaVwapSeries,
   FlowGammaVwapSnapshot,
   StructuralFlowNodes,
-  computeCeilingShareChi,
 } from "@/lib/flowGammaVwap";
 import { WATCH_LIST } from "@/lib/tickerPresets";
 import { computeAdaptiveQuantMetrics } from "@/lib/gaiaSignalFsm";
+import {
+  RTH_OPEN_MINS,
+  ENTRY_START_MINS,
+  ENTRY_CUTOFF_MINS,
+  EOD_FORCE_FLAT_MINS,
+  RTH_CLOSE_MINS,
+  getTodayEt,
+  etMinutesOfDay,
+} from "@/lib/gaiaSessionGuards";
+
+export { getTodayEt };
 
 export type ContractType = "CALL" | "PUT";
 export type PositionStatus = "OPEN" | "PARTIAL_TP1" | "CLOSED";
 export type SignalAction = "BUY_TO_OPEN" | "SELL_TO_CLOSE";
 export type DivergenceDirection = "BULL" | "BEAR" | "NO";
 
-export const DEFAULT_DISCORD_WEBHOOK_URL = "";
+const MAX_ENGINE_CACHE_ENTRIES = 64;
+
+function setBoundedMapEntry<K, V>(
+  map: Map<K, V>,
+  key: K,
+  value: V,
+  maxSize = MAX_ENGINE_CACHE_ENTRIES
+): void {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxSize) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) map.delete(oldestKey);
+  }
+  map.set(key, value);
+}
+
+function createLinkedTimeoutSignal(
+  signal?: AbortSignal,
+  timeoutMs = 8000
+): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("Request timeout")), timeoutMs);
+  const onAbort = () => controller.abort(signal?.reason);
+  if (signal) {
+    if (signal.aborted) {
+      clearTimeout(timer);
+      controller.abort(signal.reason);
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    },
+  };
+}
 
 export interface OptionTradePosition {
   id: string;
@@ -290,7 +335,7 @@ export interface WalkForwardCalibration {
   passesGate: boolean;
 }
 
-const calibrationCache: Record<string, { timestampMs: number; result: WalkForwardCalibration }> = {};
+const calibrationCache = new Map<string, { timestampMs: number; result: WalkForwardCalibration }>();
 
 /**
  * Calibrates rolling 10-day historical expectancy with Empirical Bayes shrinkage.
@@ -298,12 +343,14 @@ const calibrationCache: Record<string, { timestampMs: number; result: WalkForwar
  */
 export async function calibrateWalkForwardExpectancy(
   ticker: string,
-  sessionDate: string
+  sessionDate: string,
+  signal?: AbortSignal
 ): Promise<WalkForwardCalibration> {
   const cacheKey = `${ticker}:${sessionDate}`;
   const now = Date.now();
-  if (calibrationCache[cacheKey] && now - calibrationCache[cacheKey].timestampMs < 300_000) {
-    return calibrationCache[cacheKey].result;
+  const cachedEntry = calibrationCache.get(cacheKey);
+  if (cachedEntry && now - cachedEntry.timestampMs < 300_000) {
+    return cachedEntry.result;
   }
 
   // Default conservative fallback prior (Empirical Bayes baseline: W0=50%, E0=0.0R shrunk to safe starting prior)
@@ -315,6 +362,11 @@ export async function calibrateWalkForwardExpectancy(
     passesGate: true,
   };
 
+  if (signal?.aborted) {
+    return defaultResult;
+  }
+
+  const linked = createLinkedTimeoutSignal(signal, 8000);
   try {
     const yahooSym =
       ticker === "SPX" || ticker === "SPXW"
@@ -333,11 +385,12 @@ export async function calibrateWalkForwardExpectancy(
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
         },
         cache: "no-store",
+        signal: linked.signal,
       }
     );
 
     if (!res.ok) {
-      calibrationCache[cacheKey] = { timestampMs: now, result: defaultResult };
+      setBoundedMapEntry(calibrationCache, cacheKey, { timestampMs: now, result: defaultResult });
       return defaultResult;
     }
 
@@ -346,7 +399,7 @@ export async function calibrateWalkForwardExpectancy(
     const timestamps: number[] = result?.timestamp ?? [];
     const quote = result?.indicators?.quote?.[0];
     if (!quote || timestamps.length < 50) {
-      calibrationCache[cacheKey] = { timestampMs: now, result: defaultResult };
+      setBoundedMapEntry(calibrationCache, cacheKey, { timestampMs: now, result: defaultResult });
       return defaultResult;
     }
 
@@ -458,11 +511,15 @@ export async function calibrateWalkForwardExpectancy(
       passesGate,
     };
 
-    calibrationCache[cacheKey] = { timestampMs: now, result: finalResult };
+    setBoundedMapEntry(calibrationCache, cacheKey, { timestampMs: now, result: finalResult });
     return finalResult;
   } catch {
-    calibrationCache[cacheKey] = { timestampMs: now, result: defaultResult };
+    if (!signal?.aborted) {
+      setBoundedMapEntry(calibrationCache, cacheKey, { timestampMs: now, result: defaultResult });
+    }
     return defaultResult;
+  } finally {
+    linked.cleanup();
   }
 }
 
@@ -474,7 +531,11 @@ export function isSupportedTradeTicker(rawTicker: string): boolean {
   return SUPPORTED_TRADE_TICKERS.has(sym) || /^[A-Z0-9._-]{1,10}$/.test(sym);
 }
 
-let inMemoryTradeStore: DailyTradeStore | null = null;
+const globalForTradeStore = globalThis as unknown as {
+  __hyperionInMemoryTradeStore?: DailyTradeStore | null;
+  __hyperionTradeStoreMtimeMs?: number;
+};
+let inMemoryTradeStore: DailyTradeStore | null = globalForTradeStore.__hyperionInMemoryTradeStore ?? null;
 
 function getCacheDir(): string {
   const dir = path.join(process.cwd(), ".cache");
@@ -486,16 +547,6 @@ function getCacheDir(): string {
     }
   }
   return dir;
-}
-
-export function getTodayEt(): string {
-  try {
-    return new Date().toLocaleDateString("en-CA", {
-      timeZone: "America/New_York",
-    });
-  } catch {
-    return new Date().toISOString().slice(0, 10);
-  }
 }
 
 export function formatEtIsoDate(d: Date): string {
@@ -519,24 +570,35 @@ export function formatTimeEt(dateOrTs: Date | number): string {
   }
 }
 
+const ET_NOW_PARTS_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+  hourCycle: "h23",
+});
+
 export function getNowEtTime(date?: Date): { hours: number; minutes: number; totalMinutes: number } {
   const d = date ?? new Date();
   try {
-    const etString = d.toLocaleString("en-US", { timeZone: "America/New_York" });
-    const etDate = new Date(etString);
-    const hours = etDate.getHours();
-    const minutes = etDate.getMinutes();
-    return { hours, minutes, totalMinutes: hours * 60 + minutes };
+    const parts = ET_NOW_PARTS_FMT.formatToParts(d);
+    const hours = Number(parts.find((p) => p.type === "hour")?.value ?? 0) % 24;
+    const minutes = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
+    if (Number.isFinite(hours) && Number.isFinite(minutes)) {
+      return { hours, minutes, totalMinutes: hours * 60 + minutes };
+    }
   } catch {
-    const hours = d.getHours();
-    const minutes = d.getMinutes();
-    return { hours, minutes, totalMinutes: hours * 60 + minutes };
+    // Fallback to local clock if Intl fails
   }
+  const hours = d.getHours();
+  const minutes = d.getMinutes();
+  return { hours, minutes, totalMinutes: hours * 60 + minutes };
 }
 
 export function loadTradeStore(requestedDate?: string): DailyTradeStore {
   const today = getTodayEt();
   const cacheDir = getCacheDir();
+  inMemoryTradeStore = globalForTradeStore.__hyperionInMemoryTradeStore ?? inMemoryTradeStore;
 
   if (requestedDate && /^\d{4}-\d{2}-\d{2}$/.test(requestedDate) && requestedDate !== today) {
     const histPath = path.join(cacheDir, `active-trades-${requestedDate}.json`);
@@ -567,15 +629,19 @@ export function loadTradeStore(requestedDate?: string): DailyTradeStore {
   if (inMemoryTradeStore && inMemoryTradeStore.date === today) {
     if (fs.existsSync(filePath)) {
       try {
+        const stat = fs.statSync(filePath);
         const raw = fs.readFileSync(filePath, "utf-8");
         const parsed = JSON.parse(raw) as DailyTradeStore;
         if (
           parsed &&
           parsed.date === today &&
-          ((parsed.version ?? 0) > (inMemoryTradeStore.version ?? 0) ||
-           (Array.isArray(parsed.alerts) && parsed.alerts.length > inMemoryTradeStore.alerts.length))
+          (stat.mtimeMs > (globalForTradeStore.__hyperionTradeStoreMtimeMs ?? 0) ||
+            (parsed.version ?? 0) > (inMemoryTradeStore.version ?? 0) ||
+            (Array.isArray(parsed.alerts) && parsed.alerts.length > inMemoryTradeStore.alerts.length))
         ) {
           inMemoryTradeStore = parsed;
+          globalForTradeStore.__hyperionInMemoryTradeStore = parsed;
+          globalForTradeStore.__hyperionTradeStoreMtimeMs = stat.mtimeMs;
         }
       } catch {
         // ignore
@@ -622,10 +688,13 @@ export function loadTradeStore(requestedDate?: string): DailyTradeStore {
 
   if (fs.existsSync(filePath)) {
     try {
+      const stat = fs.statSync(filePath);
       const raw = fs.readFileSync(filePath, "utf-8");
       const parsed = JSON.parse(raw) as DailyTradeStore;
       if (parsed && parsed.date === today && parsed.activePositions) {
         inMemoryTradeStore = parsed;
+        globalForTradeStore.__hyperionInMemoryTradeStore = parsed;
+        globalForTradeStore.__hyperionTradeStoreMtimeMs = stat.mtimeMs;
         return inMemoryTradeStore;
       }
     } catch {
@@ -642,6 +711,8 @@ export function loadTradeStore(requestedDate?: string): DailyTradeStore {
     alerts: [],
     prevSpotPrices: {},
   };
+  globalForTradeStore.__hyperionInMemoryTradeStore = inMemoryTradeStore;
+  globalForTradeStore.__hyperionTradeStoreMtimeMs = 0;
   return inMemoryTradeStore;
 }
 
@@ -654,10 +725,18 @@ export function saveTradeStore(store: DailyTradeStore): void {
     store.version = (store.version ?? 0) + 1;
     store.updatedAtMs = Date.now();
     inMemoryTradeStore = store;
+    globalForTradeStore.__hyperionInMemoryTradeStore = store;
     fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), "utf-8");
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         fs.renameSync(tmpPath, filePath);
+        if (store.date === getTodayEt()) {
+          try {
+            globalForTradeStore.__hyperionTradeStoreMtimeMs = fs.statSync(filePath).mtimeMs;
+          } catch {
+            // ignore stat failures
+          }
+        }
         return;
       } catch (renameErr: any) {
         const code = renameErr?.code;
@@ -707,7 +786,10 @@ export function getDailyTradeAlerts(ticker?: string, date?: string): TradeLifecy
 
 export function clearDailyTrades(): void {
   const today = getTodayEt();
-  const prevVersion = inMemoryTradeStore?.date === today ? (inMemoryTradeStore.version ?? 0) : 0;
+  const currentMem = globalForTradeStore.__hyperionInMemoryTradeStore ?? inMemoryTradeStore;
+  const prevVersion = currentMem?.date === today ? (currentMem.version ?? 0) : 0;
+  globalForGaiaDiscord.__hyperionDispatchedGaiaKeys?.clear();
+  delete (globalForGaiaDiscord as { __hyperionDispatchedDate?: string }).__hyperionDispatchedDate;
   inMemoryTradeStore = {
     date: today,
     version: prevVersion,
@@ -717,6 +799,7 @@ export function clearDailyTrades(): void {
     prevSpotPrices: {},
     dailyRecapSent: false,
   };
+  globalForTradeStore.__hyperionInMemoryTradeStore = inMemoryTradeStore;
   saveTradeStore(inMemoryTradeStore);
 }
 
@@ -742,7 +825,8 @@ const CBOE_CACHE_TTL_MS = 10_000;
 
 export function getCachedSpotPrice(ticker: string): number | null {
   const sym = ticker.trim().toUpperCase();
-  const cboeSymbol = sym === "SPX" || sym === "SPXW" ? "_SPX" : sym;
+  const cboeSymbol =
+    sym === "SPX" || sym === "SPXW" ? "_SPX" : sym === "NDX" || sym === "NDXP" ? "_NDX" : sym;
   return spotPriceCache.get(cboeSymbol) ?? spotPriceCache.get(sym) ?? null;
 }
 
@@ -752,8 +836,9 @@ export async function fetchLiveCboeOptions(
 ): Promise<NormalizedOptionContract[]> {
   const sym = ticker.trim().toUpperCase();
   if (signal?.aborted) return [];
-  // SPX and SPXW index options trade under the CBOE ticker `_SPX`
-  const cboeSymbol = sym === "SPX" || sym === "SPXW" ? "_SPX" : sym;
+  // SPX/SPXW trade under CBOE `_SPX`; NDX/NDXP trade under CBOE `_NDX`
+  const cboeSymbol =
+    sym === "SPX" || sym === "SPXW" ? "_SPX" : sym === "NDX" || sym === "NDXP" ? "_NDX" : sym;
 
   const cached = cboeChainCache.get(cboeSymbol);
   if (cached && Date.now() - cached.ts < CBOE_CACHE_TTL_MS) {
@@ -777,34 +862,37 @@ export async function fetchLiveCboeOptions(
 
     const spot = Number(data.current_price ?? data.close ?? 0);
 
-    // Fetch live real-time spot price directly from Robinhood (sub-second OPRA/NLS feed)
-    const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym === "NDX" ? "QQQ" : sym;
+    // Fetch live real-time spot price directly from Robinhood (sub-second OPRA/NLS feed; skip index NDX/NDXP)
+    const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym;
     let realTimeSpot = spot;
-    try {
-      const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
-        headers: {
-          Accept: "application/json",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
-        },
-        cache: "no-store",
-        signal,
-      });
-      if (rhRes.ok) {
-        const rhJson = await rhRes.json();
-        const q = rhJson?.results?.[0];
-        const p = Number(q?.last_trade_price ?? q?.bid_price ?? 0);
-        if (p > 0 && Number.isFinite(p)) {
-          const mult = sym === "SPX" || sym === "SPXW" ? 10 : 1;
-          realTimeSpot = Number((p * mult).toFixed(2));
+    if (sym !== "NDX" && sym !== "NDXP") {
+      try {
+        const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
+          headers: {
+            Accept: "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
+          },
+          cache: "no-store",
+          signal,
+        });
+        if (rhRes.ok) {
+          const rhJson = await rhRes.json();
+          const q = rhJson?.results?.[0];
+          const p = Number(q?.last_trade_price ?? q?.bid_price ?? 0);
+          if (p > 0 && Number.isFinite(p)) {
+            const mult = sym === "SPX" || sym === "SPXW" ? 10 : 1;
+            realTimeSpot = Number((p * mult).toFixed(2));
+          }
         }
+      } catch {
+        // Non-fatal fallback
       }
-    } catch {
-      // Non-fatal fallback
     }
 
     // Secondary fallback: Yahoo Finance
     if (realTimeSpot <= 0 || realTimeSpot === spot) {
-      const yahooSym = sym === "SPX" || sym === "SPXW" ? "^GSPC" : sym === "NDX" ? "^NDX" : sym;
+      const yahooSym =
+        sym === "SPX" || sym === "SPXW" ? "^GSPC" : sym === "NDX" || sym === "NDXP" ? "^NDX" : sym;
       try {
         const yRes = await fetch(
           `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
@@ -833,10 +921,13 @@ export async function fetchLiveCboeOptions(
 
     const effectiveSpot = realTimeSpot > 0 ? realTimeSpot : spot;
     if (effectiveSpot > 0) {
-      spotPriceCache.set(cboeSymbol, effectiveSpot);
+      setBoundedMapEntry(spotPriceCache, cboeSymbol, effectiveSpot);
       if (cboeSymbol === "_SPX") {
-        spotPriceCache.set("SPX", effectiveSpot);
-        spotPriceCache.set("SPXW", effectiveSpot);
+        setBoundedMapEntry(spotPriceCache, "SPX", effectiveSpot);
+        setBoundedMapEntry(spotPriceCache, "SPXW", effectiveSpot);
+      } else if (cboeSymbol === "_NDX") {
+        setBoundedMapEntry(spotPriceCache, "NDX", effectiveSpot);
+        setBoundedMapEntry(spotPriceCache, "NDXP", effectiveSpot);
       }
     }
 
@@ -852,7 +943,7 @@ export async function fetchLiveCboeOptions(
       const match = occ.match(/^([A-Z0-9_]+?)(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/);
       if (!match) continue;
 
-      const [, root, yy, mm, dd, typeChar, strikeRaw] = match;
+      const [, , yy, mm, dd, typeChar, strikeRaw] = match;
       const expiration = `20${yy}-${mm}-${dd}`;
       const strike = parseInt(strikeRaw, 10) / 1000;
       if (!Number.isFinite(strike) || strike <= 0) continue;
@@ -899,7 +990,7 @@ export async function fetchLiveCboeOptions(
     }
 
     if (contracts.length > 0) {
-      cboeChainCache.set(cboeSymbol, { ts: Date.now(), contracts });
+      setBoundedMapEntry(cboeChainCache, cboeSymbol, { ts: Date.now(), contracts });
     }
     return contracts;
   } catch {
@@ -989,7 +1080,6 @@ export async function selectSmallAccountContract(params: {
     target1Spot,
     target2Spot,
     stopLossSpot,
-    conviction = 70,
     nowEt,
     zeroDteCallWall,
     zeroDtePutWall,
@@ -1022,8 +1112,13 @@ export async function selectSmallAccountContract(params: {
     altContractNote = `SPXW Index > $1.00/contract · Using SPY Equivalent for Sub-$1.00 Small Account`;
   }
 
-  // 1. If live contracts are missing or empty, fetch real CBOE chain directly
-  if (!contracts || contracts.length === 0) {
+  // 1. If live contracts are missing, empty, or still in 10x SPX scale for SPXW->SPY, fetch real CBOE chain directly
+  const hasSpxScaleChain =
+    isSpxw &&
+    Array.isArray(contracts) &&
+    contracts.length > 0 &&
+    contracts.some((c) => c.strike > effectiveSpot * 3);
+  if (!contracts || contracts.length === 0 || hasSpxScaleChain) {
     contracts = await fetchLiveCboeOptions(effectiveSym, signal);
     if (signal?.aborted) return null;
   }
@@ -1047,12 +1142,18 @@ export async function selectSmallAccountContract(params: {
     const stage2Candidates: Candidate[] = []; // Alternate DTEs
 
     const isAfternoon = etTime.hours > 11 || (etTime.hours === 11 && etTime.minutes >= 30);
+    const hasFutureExpirations = contracts.some(
+      (item) => typeof item.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(item.expiration) && item.expiration > todayEt
+    );
 
     for (const c of contracts) {
       if (c.optionType !== typeLetter) continue;
+      if (typeof c.expiration !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(c.expiration)) continue;
       const mid = getContractMidPrice(c);
 
-      const askPrice = c.ask && c.ask > 0 ? c.ask : mid;
+      const rawBid = typeof c.bid === "number" && Number.isFinite(c.bid) ? c.bid : undefined;
+      const rawAsk = typeof c.ask === "number" && Number.isFinite(c.ask) ? c.ask : undefined;
+      const askPrice = rawAsk !== undefined ? rawAsk : mid;
       // Strict Sub-$1.00 Ask Cap: retail buys at ASK ($0.15 <= ask <= $0.99)
       if (askPrice < 0.15 || askPrice > 0.99) continue;
 
@@ -1060,12 +1161,11 @@ export async function selectSmallAccountContract(params: {
       const absDelta = typeof c.delta === "number" && Number.isFinite(c.delta) ? Math.abs(c.delta) : 0;
       if (absDelta < 0.25) continue;
 
-      // Reject crossed/invalid quotes & wide-spread contracts (> 24% spread)
-      if (typeof c.bid === "number" && typeof c.ask === "number") {
-        if (c.bid < 0 || c.ask <= 0 || c.bid > c.ask) continue;
-        const spreadPct = (c.ask - c.bid) / c.ask;
-        if (spreadPct > 0.24) continue;
-      }
+      // Reject crossed/invalid quotes & wide-spread contracts (> 24% spread); never skip spread check when bid is missing
+      const effectiveBid = rawBid ?? (askPrice > 0 ? 0 : -1);
+      if (effectiveBid < 0 || askPrice <= 0 || effectiveBid > askPrice) continue;
+      const spreadPct = (askPrice - effectiveBid) / askPrice;
+      if (spreadPct > 0.24) continue;
 
       // Strike direction filter: OTM / near ATM in direction of move
       if (isCall && c.strike < effectiveSpot * 0.998) continue;
@@ -1076,6 +1176,15 @@ export async function selectSmallAccountContract(params: {
       if (Math.abs(c.strike - effectiveSpot) > maxOtmDistance) continue;
 
       const { expHuman, robinhoodExp, robinhoodTab, dte } = formatExpirationHuman(c.expiration, todayEt);
+      // Hard Invariant: Reject expired or malformed contracts (non-finite DTE, dte < 0, prior expiration dates, or post-close 0DTE)
+      if (
+        !Number.isFinite(dte) ||
+        dte < 0 ||
+        c.expiration < todayEt ||
+        ((Boolean(nowEt) || hasFutureExpirations) && etTime.totalMinutes >= RTH_CLOSE_MINS && dte <= 0)
+      ) {
+        continue;
+      }
 
       // Sweet spot distance ($0.35 - $0.85 preferred)
       let priceScore = 0;
@@ -1131,31 +1240,27 @@ export async function selectSmallAccountContract(params: {
 
       const totalScore = priceScore + targetScore + deltaScore + liqScore + wallAffinityScore;
 
-      // Hard Invariant: Reject expired contracts (dte < 0 or prior expiration dates)
-      if (dte < 0 || c.expiration < todayEt) {
-        continue;
-      }
       // Structural Wall Strike Ceiling: Never buy OTM Calls above an active overhead 0DTE Call Wall
-      const normZeroDteCw = typeof params.zeroDteCallWall === "number" && params.zeroDteCallWall > 0
-        ? (isSpxw ? params.zeroDteCallWall / 10 : params.zeroDteCallWall) : 0;
-      const normZeroDtePw = typeof params.zeroDtePutWall === "number" && params.zeroDtePutWall > 0
-        ? (isSpxw ? params.zeroDtePutWall / 10 : params.zeroDtePutWall) : 0;
+      const normZeroDteCw = typeof zeroDteCallWall === "number" && zeroDteCallWall > 0
+        ? (isSpxw ? zeroDteCallWall / 10 : zeroDteCallWall) : 0;
+      const normZeroDtePw = typeof zeroDtePutWall === "number" && zeroDtePutWall > 0
+        ? (isSpxw ? zeroDtePutWall / 10 : zeroDtePutWall) : 0;
       const overheadCeiling = normZeroDteCw > effectiveSpot ? normZeroDteCw : 0;
-      if (params.contractType === "CALL" && overheadCeiling > 0 && c.strike > overheadCeiling) {
+      if (contractType === "CALL" && overheadCeiling > 0 && c.strike > overheadCeiling) {
         continue;
       }
       // Structural Put Wall Floor: Never buy OTM Puts with strikes below the active Put Wall support
       const floorSupport = normZeroDtePw > 0 && normZeroDtePw < effectiveSpot ? normZeroDtePw : 0;
       const putFloorBuffer = Math.max(0.5, effectiveSpot * 0.0027);
-      if (params.contractType === "PUT" && floorSupport > 0 && c.strike < floorSupport - putFloorBuffer) {
+      if (contractType === "PUT" && floorSupport > 0 && c.strike < floorSupport - putFloorBuffer) {
         continue;
       }
 
       const candidateObj: Candidate = {
         contract: c,
         mid,
-        bid: c.bid ?? mid,
-        ask: c.ask ?? mid,
+        bid: effectiveBid,
+        ask: askPrice,
         dte,
         expHuman,
         robinhoodExp,
@@ -1215,7 +1320,7 @@ export async function selectSmallAccountContract(params: {
       }
 
       // Option target & stop estimates: honor live contract IV when present & valid, else invert BS IV
-      const tYears = Math.max(1 / (252 * 390), (dte || 0.2) / 365);
+      const tYears = computeRemainingYearsToExpiration((nowEt ?? new Date()).getTime(), Math.max(0, dte));
       const rawChainIv =
         typeof c.iv === "number" && Number.isFinite(c.iv) && c.iv > 0
           ? c.iv > 4
@@ -1247,7 +1352,7 @@ export async function selectSmallAccountContract(params: {
 
       const expClean = c.expiration.replace(/-/g, "").slice(2);
       const strikeLabel = Number.isInteger(c.strike) ? c.strike.toString() : c.strike.toFixed(1);
-      const displaySym = c.strike > 1000 ? "SPXW" : effectiveSym;
+      const displaySym = isSpxw && c.strike > 1000 ? "SPXW" : effectiveSym;
       const contractLabel = `${displaySym} ${expClean} ${strikeLabel}${typeLetter} (${expHuman} · $${entryAsk.toFixed(2)})`;
 
       return {
@@ -1376,27 +1481,29 @@ export async function fetchLive5mCandleAndDivergence(
           const latest = validBars[validBars.length - 1];
           const prevClosedBar = validBars[validBars.length - 2];
 
-          // Synchronize latest bar close with sub-second Robinhood live tick
-          const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym === "NDX" ? "QQQ" : sym;
-          try {
-            const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
-              headers: { "User-Agent": "Mozilla/5.0" },
-              cache: "no-store",
-              signal,
-            });
-            if (rhRes.ok) {
-              const rhJson = await rhRes.json();
-              const p = Number(rhJson?.results?.[0]?.last_trade_price ?? rhJson?.results?.[0]?.bid_price ?? 0);
-              if (p > 0 && Number.isFinite(p)) {
-                const mult = sym === "SPX" || sym === "SPXW" ? 10 : 1;
-                const liveP = Number((p * mult).toFixed(2));
-                latest.close = liveP;
-                latest.high = Math.max(latest.high, liveP);
-                latest.low = Math.min(latest.low, liveP);
+          // Synchronize latest bar close with sub-second Robinhood live tick (skip NDX/NDXP: never proxy to QQQ)
+          const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym;
+          if (rhSym !== "NDX" && rhSym !== "NDXP") {
+            try {
+              const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
+                headers: { "User-Agent": "Mozilla/5.0" },
+                cache: "no-store",
+                signal,
+              });
+              if (rhRes.ok) {
+                const rhJson = await rhRes.json();
+                const p = Number(rhJson?.results?.[0]?.last_trade_price ?? rhJson?.results?.[0]?.bid_price ?? 0);
+                if (p > 0 && Number.isFinite(p)) {
+                  const mult = sym === "SPX" || sym === "SPXW" ? 10 : 1;
+                  const liveP = Number((p * mult).toFixed(2));
+                  latest.close = liveP;
+                  latest.high = Math.max(latest.high, liveP);
+                  latest.low = Math.min(latest.low, liveP);
+                }
               }
+            } catch {
+              // Non-fatal
             }
-          } catch {
-            // Non-fatal
           }
 
           // Calculate SMA 34 across valid 5m closes
@@ -1464,13 +1571,18 @@ export async function fetchLive5mCandleAndDivergence(
   }
 
   if (candle) {
-    candleCache.set(sym, {
-      ts: Date.now(),
-      candle,
-      divergence5m,
-      divergence30m,
-      hasStructuralNodes: wantsStructural,
-    });
+    setBoundedMapEntry(
+      candleCache,
+      sym,
+      {
+        ts: Date.now(),
+        candle,
+        divergence5m,
+        divergence30m,
+        hasStructuralNodes: wantsStructural,
+      },
+      MAX_ENGINE_CACHE_ENTRIES
+    );
   }
 
   return { candle, divergence5m, divergence30m };
@@ -1825,11 +1937,28 @@ export async function sendDiscordTradeAlert(
       lastStatus = res.status;
 
       if (res.status === 429) {
+        if (options?.signal?.aborted) return false;
         const rateData = await res.json().catch(() => null);
         const retryAfterSec = typeof rateData?.retry_after === "number" ? rateData.retry_after : 1.5;
         const sleepMs = Math.min(Math.round(retryAfterSec * 1000) + 100, 5000);
         console.warn(`[DiscordTradeAlert] HTTP 429 rate limit encountered. Backing off for ${sleepMs}ms (attempt ${attempt}/3)...`);
-        await new Promise((r) => setTimeout(r, sleepMs));
+        await new Promise<void>((resolve) => {
+          if (options?.signal?.aborted) {
+            resolve();
+            return;
+          }
+          let timer: ReturnType<typeof setTimeout> | null = null;
+          const onAbort = () => {
+            if (timer) clearTimeout(timer);
+            resolve();
+          };
+          timer = setTimeout(() => {
+            options?.signal?.removeEventListener("abort", onAbort);
+            resolve();
+          }, sleepMs);
+          options?.signal?.addEventListener("abort", onAbort, { once: true });
+        });
+        if (options?.signal?.aborted) return false;
         continue;
       }
 
@@ -1860,9 +1989,9 @@ export async function sendDiscordTradeAlert(
 async function backfillIntradaySessionSignals(
   normalizedTicker: string,
   params: TradeEvaluationParams,
-  store: DailyTradeStore,
+  _store: DailyTradeStore,
   currentSpot: number
-): Promise<void> {
+): Promise<boolean> {
   const yahooSym =
     normalizedTicker === "SPX" || normalizedTicker === "SPXW"
       ? "^GSPC"
@@ -1870,7 +1999,7 @@ async function backfillIntradaySessionSignals(
         ? "^NDX"
         : normalizedTicker;
 
-  if (params.signal?.aborted) return;
+  if (params.signal?.aborted) return false;
   try {
     const res = await fetch(
       `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
@@ -1885,12 +2014,12 @@ async function backfillIntradaySessionSignals(
         signal: params.signal,
       }
     );
-    if (!res.ok) return;
+    if (!res.ok) return false;
     const json = await res.json();
     const result = json?.chart?.result?.[0];
     const timestamps: number[] = result?.timestamp ?? [];
     const quote = result?.indicators?.quote?.[0];
-    if (!quote || timestamps.length < 5) return;
+    if (!quote || timestamps.length < 5) return false;
 
     const opens: (number | null)[] = quote.open ?? [];
     const highs: (number | null)[] = quote.high ?? [];
@@ -1953,12 +2082,12 @@ async function backfillIntradaySessionSignals(
     // Filter to TODAY's trading session RTH bars only (9:30 AM to 3:55 PM ET; never backfill prior day)
     const todayEt = getTodayEt();
     const latestSessionDate = allValid[allValid.length - 1]?.dateEt;
-    if (!latestSessionDate || latestSessionDate !== todayEt) return;
+    if (!latestSessionDate || latestSessionDate !== todayEt) return false;
 
     const sessionBars = allValid.filter(
-      (b) => b.dateEt === latestSessionDate && b.totalMinutes >= 570 && b.totalMinutes <= 955
+      (b) => b.dateEt === latestSessionDate && b.totalMinutes >= RTH_OPEN_MINS && b.totalMinutes <= EOD_FORCE_FLAT_MINS
     );
-    if (sessionBars.length < 3) return;
+    if (sessionBars.length < 3) return false;
 
     // Compute intraday session SMA34 so 11:00 AM intraday trend reversals/covers trigger accurately
     for (let i = 0; i < sessionBars.length; i++) {
@@ -1972,20 +2101,25 @@ async function backfillIntradaySessionSignals(
       sessionBars[i].sma34 = Number((sum / Math.max(1, count)).toFixed(2));
     }
 
-    // Determine morning opening support and causal running session high (zero future lookahead)
-    const openingSlice = sessionBars.slice(0, Math.min(6, sessionBars.length));
-    const openingLow = Math.min(...openingSlice.map((b) => b.low));
+    // Determine morning opening support and running session high causally (zero future lookahead)
+    let runningOpeningLow = sessionBars[0].low;
     let runningSessionHigh = sessionBars[0].high;
+    let runningSliceLow = sessionBars[0].low;
 
-    const effectiveDailyLow =
-      params.dailyExpectedMove?.low &&
-      Math.abs(openingLow - params.dailyExpectedMove.low) / openingLow <= 0.008
-        ? Math.max(openingLow, params.dailyExpectedMove.low)
-        : openingLow;
-
-    const baseContracts = params.contracts ?? [];
+    const flowContracts = params.contracts ?? [];
+    let baseContracts = flowContracts;
     const isSpxw = normalizedTicker === "SPXW" || normalizedTicker === "SPX";
     const positionKey = isSpxw ? "SPY" : normalizedTicker;
+    const refSpySpot = isSpxw ? currentSpot / 10 : currentSpot;
+    if (
+      isSpxw &&
+      (baseContracts.length === 0 || (refSpySpot > 0 && baseContracts.some((c) => c.strike > refSpySpot * 3)))
+    ) {
+      const spyChain = await fetchLiveCboeOptions("SPY", params.signal);
+      if (params.signal?.aborted) return false;
+      if (spyChain.length > 0) baseContracts = spyChain;
+    }
+
     const sessionFlowSeries = computeBarFlowGammaVwapSeries(
       sessionBars.map((b) => ({
         timestamp: b.ts,
@@ -1996,35 +2130,65 @@ async function backfillIntradaySessionSignals(
         close: b.close,
         volume: 1000,
       })),
-      baseContracts
+      flowContracts
     );
 
     // Replay bar-by-bar chronologically through today's RTH session (starting at 9:35 AM to catch Opening Zero-Gamma Flushes)
     const replayStartIdx = Math.min(1, sessionBars.length - 1);
     const replayEndIdx = sessionBars.length;
     for (let idx = replayStartIdx; idx < replayEndIdx; idx++) {
-      if (params.signal?.aborted) return;
+      if (params.signal?.aborted) return false;
       const bar = sessionBars[idx];
       const prevBar = sessionBars[idx - 1];
+      if (idx < 6) {
+        runningOpeningLow = Math.min(runningOpeningLow, bar.low);
+      }
       runningSessionHigh = Math.max(runningSessionHigh, bar.high);
+      runningSliceLow = Math.min(runningSliceLow, bar.low);
+
+      const effectiveDailyLow =
+        params.dailyExpectedMove?.low &&
+        Math.abs(runningOpeningLow - params.dailyExpectedMove.low) / Math.max(1, runningOpeningLow) <= 0.008
+          ? Math.max(runningOpeningLow, params.dailyExpectedMove.low)
+          : runningOpeningLow;
       const effectiveDailyHigh = Math.max(
         runningSessionHigh,
         params.filteredKing ?? 0,
         params.dailyExpectedMove?.high ?? 0,
-        Number((openingLow * 1.0065).toFixed(2))
+        Number((runningOpeningLow * 1.0065).toFixed(2))
       );
       const barDate = new Date(bar.ts * 1000);
 
-      const openPos = store.activePositions[normalizedTicker] ?? store.activePositions[positionKey];
+      const latestStore = loadTradeStore();
+      const openPos = latestStore.activePositions[normalizedTicker] ?? latestStore.activePositions[positionKey];
+      const posScale = isSpxw && openPos?.ticker === "SPY" ? 10 : 1;
+      const barLowPos = bar.low / posScale;
+      const barHighPos = bar.high / posScale;
+      const barClosePos = bar.close / posScale;
+      const sliceLowPos = runningSliceLow / posScale;
+      const prevClosePos = prevBar.close / posScale;
       const isZeroGammaFlushPos = Boolean(openPos?.setupName?.includes("Bearish Zero-Gamma Flush"));
-      // Use intrabar high/low when an active position is open to capture real limit TP fills
-      // For Bearish Zero-Gamma Flush trend trades, ride the trend to Target 2 or Momentum Reversal Cover (SMA34 reclaim)
+      // Check stop-loss intrabar BEFORE target-profit intrabar to eliminate optimistic target-first lookahead
       let evalSpot = bar.close;
       if (openPos) {
-        if (openPos.contractType === "CALL" && bar.high >= openPos.target1Spot) {
-          evalSpot = bar.high >= openPos.target2Spot ? bar.high : Math.max(bar.close, openPos.target1Spot);
-        } else if (openPos.contractType === "PUT" && !isZeroGammaFlushPos && bar.low <= openPos.target1Spot) {
-          evalSpot = bar.low <= openPos.target2Spot ? bar.low : Math.min(bar.close, openPos.target1Spot);
+        if (openPos.contractType === "CALL") {
+          if (barLowPos <= openPos.stopLossSpot) {
+            evalSpot = Math.min(bar.close, Number((openPos.stopLossSpot * posScale).toFixed(2)));
+          } else if (barHighPos >= openPos.target1Spot) {
+            evalSpot =
+              barHighPos >= openPos.target2Spot
+                ? bar.high
+                : Math.max(bar.close, Number((openPos.target1Spot * posScale).toFixed(2)));
+          }
+        } else {
+          if (barHighPos >= openPos.stopLossSpot) {
+            evalSpot = Math.max(bar.close, Number((openPos.stopLossSpot * posScale).toFixed(2)));
+          } else if (!isZeroGammaFlushPos && barLowPos <= openPos.target1Spot) {
+            evalSpot =
+              barLowPos <= openPos.target2Spot
+                ? bar.low
+                : Math.min(bar.close, Number((openPos.target1Spot * posScale).toFixed(2)));
+          }
         }
       }
 
@@ -2038,6 +2202,7 @@ async function backfillIntradaySessionSignals(
         const distOtm = isCallOpt
           ? c.strike - refSpotForChain
           : refSpotForChain - c.strike;
+        const distOtmPct = distOtm / Math.max(1, refSpotForChain);
         const distOtmSpyScaled = (Math.max(0, distOtm) / Math.max(1, refSpotForChain)) * 750;
         const estDelta = Number(
           Math.max(0.20, Math.min(0.45, 0.42 * Math.exp(-0.18 * distOtmSpyScaled))).toFixed(2)
@@ -2065,9 +2230,9 @@ async function backfillIntradaySessionSignals(
             bid = Number(Math.max(0.18, shiftedMid - 0.02).toFixed(2));
             ask = Number(Math.min(0.98, shiftedMid + 0.02).toFixed(2));
             last = Number(shiftedMid.toFixed(2));
-          } else if (distOtm >= -0.5 && distOtm <= 4.5) {
+          } else if (distOtmPct >= -0.001 && distOtmPct <= 0.006) {
             // If current EOD chain has decayed, restore intraday time value for near-OTM strikes
-            const modelMid = Number(Math.max(0.26, Math.min(0.78, 0.72 * Math.exp(-0.22 * Math.max(0, distOtm)))).toFixed(2));
+            const modelMid = Number(Math.max(0.26, Math.min(0.78, 0.72 * Math.exp(-0.22 * distOtmSpyScaled))).toFixed(2));
             bid = Number((modelMid - 0.02).toFixed(2));
             ask = Number((modelMid + 0.02).toFixed(2));
             last = modelMid;
@@ -2083,15 +2248,16 @@ async function backfillIntradaySessionSignals(
         };
       });
 
-      // Detect 5m Bullish Momentum Reversal / Divergence after major morning flush (>= $10 drop and >= $3 bounce off session low)
-      const sliceLowSoFar = Math.min(...sessionBars.slice(0, idx + 1).map((b) => b.low));
+      // Detect 5m Bullish Momentum Reversal / Divergence after major morning flush (pct-scaled across underlyings)
+      const dropFromBtoPct = openPos ? (openPos.btoSpotPrice - sliceLowPos) / Math.max(1, openPos.btoSpotPrice) : 0;
+      const bounceFromLowPct = (barClosePos - sliceLowPos) / Math.max(1, sliceLowPos);
       const isPostFlushBullReversal =
         Boolean(openPos && openPos.contractType === "PUT") &&
         bar.totalMinutes >= 630 && // >= 10:30 AM ET
-        (openPos!.btoSpotPrice - sliceLowSoFar >= 8.0) &&
-        (bar.close - sliceLowSoFar >= 2.2) &&
-        bar.close > bar.open &&
-        bar.close > prevBar.close;
+        dropFromBtoPct >= 0.0105 &&
+        bounceFromLowPct >= 0.0029 &&
+        barClosePos > bar.open / posScale &&
+        barClosePos > prevClosePos;
 
       await evaluateTradeSignals({
         ...params,
@@ -2120,8 +2286,10 @@ async function backfillIntradaySessionSignals(
         isHistoricalBackfill: true,
       });
     }
+    return true;
   } catch {
     // Non-fatal if Yahoo 5m history fetch fails
+    return false;
   }
 }
 
@@ -2144,8 +2312,10 @@ export function clampOptionPriceToGreekEnvelope(
   const effectiveDelta = Math.min(0.8, Math.max(0.25, baseEntry / 1.8));
   const minDelta = Math.min(0.2, effectiveDelta * 0.45);
   const thetaDecay = Math.min(baseEntry * 0.15, Math.max(0, elapsedMinutes) * 0.0012);
+  const minMoveEps = Math.max(0.02, Math.max(1, entrySpot) * 0.00003);
+  const gammaScale = 750 / Math.max(1, entrySpot);
 
-  if (dirSpotMove <= -0.02) {
+  if (dirSpotMove <= -minMoveEps) {
     // Underlying moved adversely: option price MUST NOT exceed entry price
     const maxLossDelta = Math.max(
       -0.95 * baseEntry,
@@ -2161,7 +2331,7 @@ export function clampOptionPriceToGreekEnvelope(
 
   const posMove = Math.max(0, dirSpotMove);
   const maxGainDelta =
-    effectiveDelta * posMove + 0.06 * posMove * posMove + 0.02;
+    effectiveDelta * posMove + 0.06 * gammaScale * posMove * posMove + 0.02;
   const minGainDelta = Math.max(
     -0.08 * baseEntry,
     minDelta * dirSpotMove - thetaDecay
@@ -2201,7 +2371,7 @@ export async function evaluateTradeSignals(
 
   const isSpxw = normalizedTicker === "SPXW" || normalizedTicker === "SPX";
   const positionKey = isSpxw ? "SPY" : normalizedTicker;
-  const store = loadTradeStore();
+  let store = loadTradeStore();
 
   if (params.signal?.aborted) {
     return {
@@ -2243,8 +2413,10 @@ export async function evaluateTradeSignals(
   if (!params.contracts || params.contracts.length === 0) {
     params.contracts = await fetchLiveCboeOptions(normalizedTicker, params.signal);
     if (params.signal?.aborted) {
-      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: store.alerts };
+      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadTradeStore().alerts };
     }
+    store = loadTradeStore();
+    store.prevSpotPrices[normalizedTicker] = spotPrice;
   }
   if (spotPrice <= 0) {
     const cached = getCachedSpotPrice(normalizedTicker);
@@ -2312,8 +2484,10 @@ export async function evaluateTradeSignals(
       structuralNodes,
     });
     if (params.signal?.aborted) {
-      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: store.alerts };
+      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadTradeStore().alerts };
     }
+    store = loadTradeStore();
+    store.prevSpotPrices[normalizedTicker] = spotPrice;
     if (!latest5mCandle) latest5mCandle = fetched.candle;
     if (!divergence5m || divergence5m === "NO") divergence5m = fetched.divergence5m;
     if (!divergence30m || divergence30m === "NO") divergence30m = fetched.divergence30m;
@@ -2322,6 +2496,7 @@ export async function evaluateTradeSignals(
   if (spotPrice <= 0 && latest5mCandle && latest5mCandle.close > 0) {
     spotPrice = latest5mCandle.close;
     populateMissingWallsFromChain();
+    store.prevSpotPrices[normalizedTicker] = spotPrice;
   }
 
   // Reconstruct today's intraday RTH session BTO/STC signals if server started mid-session
@@ -2331,10 +2506,14 @@ export async function evaluateTradeSignals(
     Boolean(store.activePositions[normalizedTicker] || store.activePositions[positionKey]);
 
   if (!params.nowEt && !hasTickerHistoryToday && !store.backfilledTickers?.[normalizedTicker]) {
-    store.backfilledTickers = { ...(store.backfilledTickers || {}), [normalizedTicker]: true };
-    await backfillIntradaySessionSignals(normalizedTicker, params, store, spotPrice);
+    const completedBackfill = await backfillIntradaySessionSignals(normalizedTicker, params, store, spotPrice);
     if (params.signal?.aborted) {
-      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: store.alerts };
+      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadTradeStore().alerts };
+    }
+    store = loadTradeStore();
+    if (completedBackfill) {
+      store.backfilledTickers = { ...(store.backfilledTickers || {}), [normalizedTicker]: true };
+      saveTradeStore(store);
     }
   }
 
@@ -2365,7 +2544,7 @@ export async function evaluateTradeSignals(
     closedForTickerEarly.length === 1 &&
     phase1CooldownOk &&
     etTime.totalMinutes >= 630 &&
-    etTime.totalMinutes <= 870;
+    etTime.totalMinutes <= ENTRY_CUTOFF_MINS;
   if ((closedForTickerEarly.length >= 2 || (closedForTickerEarly.length >= 1 && !canTryPhase2Reclaim)) && !activePos) {
     return {
       ticker: normalizedTicker,
@@ -2387,9 +2566,34 @@ export async function evaluateTradeSignals(
   }
 
   // Hard Market-On-Close Cutoff at 15:55 ET (protect against Robinhood 3:55 PM forced liquidation)
-  const isEodCutoff = (etTime.hours === 15 && etTime.minutes >= 55) || etTime.hours >= 16;
+  const isEodCutoff = etTime.totalMinutes >= EOD_FORCE_FLAT_MINS;
 
   const emittedAlerts: TradeLifecycleAlert[] = [];
+  if (
+    activePos &&
+    (activePos.status === "OPEN" || activePos.status === "PARTIAL_TP1") &&
+    isSpxw &&
+    activePos.ticker === "SPY" &&
+    (!params.contracts || params.contracts.length === 0 || params.contracts.some((c) => c.strike > (spotPrice / 10) * 3))
+  ) {
+    const spyChain = await fetchLiveCboeOptions("SPY", params.signal);
+    if (params.signal?.aborted) {
+      const latestAbortStore = loadTradeStore();
+      return {
+        ticker: normalizedTicker,
+        activePosition:
+          latestAbortStore.activePositions[normalizedTicker] ??
+          latestAbortStore.activePositions[positionKey] ??
+          activePos,
+        emittedAlerts,
+        allAlerts: latestAbortStore.alerts,
+      };
+    }
+    if (spyChain.length > 0) params.contracts = spyChain;
+    store = loadTradeStore();
+    store.prevSpotPrices[normalizedTicker] = spotPrice;
+    activePos = store.activePositions[normalizedTicker] ?? store.activePositions[positionKey] ?? null;
+  }
   const hadActivePositionAtStart = Boolean(activePos);
 
   // --------------------------------------------------------------------------
@@ -2453,7 +2657,7 @@ export async function evaluateTradeSignals(
     );
 
     // Helper to close position (clamps spotPrice to [candle.low, candle.high] for ALL tickers including SPXW->SPY)
-    const closePosition = (reason: string, _statusText: string) => {
+    const closePosition = (reason: string) => {
       activePos!.status = "CLOSED";
       activePos!.remainingQty = 0;
       activePos!.closedAt = timeStr;
@@ -2629,21 +2833,36 @@ export async function evaluateTradeSignals(
       }
     }
 
+    const resolvedOpenedEtMins = (() => {
+      if (typeof activePos.openedTs === "number" && Number.isFinite(activePos.openedTs) && activePos.openedTs > 0) {
+        return etMinutesOfDay(activePos.openedTs);
+      }
+      const match = activePos.openedAt?.match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?/i);
+      if (!match) return -1;
+      let h = Number(match[1]);
+      const m = Number(match[2]);
+      const meridiem = match[3]?.toUpperCase();
+      if (meridiem === "PM" && h < 12) h += 12;
+      if (meridiem === "AM" && h === 12) h = 0;
+      return h * 60 + m;
+    })();
+
     // 1. STC (15:55 PM ET HARD CUTOFF / EOD THETA EXIT)
     if (isEodCutoff) {
-      closePosition("15:55 PM ET HARD MARKET CLOSE CUTOFF", "MOC Close");
+      closePosition("15:55 PM ET HARD MARKET CLOSE CUTOFF");
     }
     // 2. STC: 10:45 AM MORNING CHOP TIME STOP (Protect profits before midday theta crush)
     else if (
       activePos.status === "OPEN" &&
       rawHeldMin >= 10 &&
-      (activePos.openedAt.includes("9:") || activePos.openedAt.includes("10:0") || activePos.openedAt.includes("10:1")) &&
+      resolvedOpenedEtMins >= RTH_OPEN_MINS &&
+      resolvedOpenedEtMins < 615 &&
       ((etTime.hours === 10 && etTime.minutes >= 45) || etTime.hours === 11) &&
       pnlOptionPct >= 10 && pnlOptionPct < 25 &&
       ((isCall && posCandle && posCandle.close < posCandle.sma34) ||
         (!isCall && posCandle && posCandle.close > posCandle.sma34))
     ) {
-      closePosition("10:45 AM MOMENTUM CUTOFF (PROTECT PROFITS / AVOID MIDDAY CHOP)", "Chop Time Stop");
+      closePosition("10:45 AM MOMENTUM CUTOFF (PROTECT PROFITS / AVOID MIDDAY CHOP)");
     }
     // 3. STC (MOMENTUM REVERSAL / DIVERGENCE COVER — DYNAMIC TREND EXIT)
     // Enforce minimum hold (rawHeldMin >= 10m / 2 bars) + confirmed adverse move or >= 10% profit lock
@@ -2678,7 +2897,7 @@ export async function evaluateTradeSignals(
         pnlOptionPct >= 10
           ? "MOMENTUM REVERSAL PROFIT LOCK"
           : "MOMENTUM DIVERGENCE SCRATCH";
-      closePosition(exitReason, "Momentum Reversal Cover");
+      closePosition(exitReason);
     }
     // 4. STC (TARGET 2 HIT · FULL PROFIT EXIT — bypassed for active Bearish Zero-Gamma Flush while below SMA34 so trend runners ride until Momentum Reversal Cover)
     else if (
@@ -2687,7 +2906,7 @@ export async function evaluateTradeSignals(
         (!isCall && posSpotPrice <= activePos.target2Spot) ||
         pnlOptionPct >= (activePos.tp2Pct || 50))
     ) {
-      closePosition("TARGET 2 HIT · FULL PROFIT EXIT", "Target 2 Full Profit");
+      closePosition("TARGET 2 HIT · FULL PROFIT EXIT");
     }
     // 5. STC (TARGET 1 HIT · 1 CONTRACT SNIPER FULL EXIT — retained on non-ZGF/non-Flux trades per Pitfall A)
     else if (
@@ -2699,7 +2918,7 @@ export async function evaluateTradeSignals(
         pnlOptionPct >= (activePos.tp1Pct || 25))
     ) {
       // Strict 1-Contract Sniper Automaton: 1 BTO -> 1 STC (No multi-contract partial scaling)
-      closePosition("TARGET 1 HIT · FULL PROFIT EXIT (1 CONTRACT)", "Target 1 Hit");
+      closePosition("TARGET 1 HIT · FULL PROFIT EXIT (1 CONTRACT)");
     }
     // 5. STC (STOP LOSS / LEVEL INVALIDATION / OPTION HARD STOP HIT)
     else if (
@@ -2724,17 +2943,11 @@ export async function evaluateTradeSignals(
           : isOptionHardStop
             ? "OPTION HARD STOP HIT (-25% MAX LOSS)"
             : "STOP LOSS / LEVEL INVALIDATION";
-      closePosition(
-        reason,
-        isTrailingProfit
-          ? "Trailing Profit"
-          : isBreakeven
-            ? "Breakeven Stop"
-            : isOptionHardStop
-              ? "Option Hard Stop"
-              : "Stop Loss"
-      );
+      closePosition(reason);
     }
+  }
+  if (hadActivePositionAtStart) {
+    saveTradeStore(store);
   }
 
   // --------------------------------------------------------------------------
@@ -2756,7 +2969,7 @@ export async function evaluateTradeSignals(
     sameTickerClosed.length === 1 &&
     isPhase2CooldownMet &&
     etTime.totalMinutes >= 630 &&
-    etTime.totalMinutes <= 870;
+    etTime.totalMinutes <= ENTRY_CUTOFF_MINS;
   const hasCompletedTradeToday =
     sameTickerClosed.length >= 2 ||
     (sameTickerClosed.length >= 1 && !isPhase2ReclaimWindow);
@@ -2768,7 +2981,7 @@ export async function evaluateTradeSignals(
     Object.keys(store.activePositions || {}).length > 0
   );
 
-  const isWithinRthEntryWindow = etTime.totalMinutes >= 575 && etTime.totalMinutes <= 870;
+  const isWithinRthEntryWindow = etTime.totalMinutes >= ENTRY_START_MINS && etTime.totalMinutes <= ENTRY_CUTOFF_MINS;
   if (!hasActiveTrade && !hasCompletedTradeToday && !isEodCutoff && isWithinRthEntryWindow) {
     const {
       callWall,
@@ -2816,15 +3029,18 @@ export async function evaluateTradeSignals(
             ? dailyExpectedMove.low
             : Number((spotPrice * 0.992).toFixed(2));
 
-    // Anti-Distant-King Put Trap Sanitizer:
-    // If rawTacticalPw is a distant multi-day Put Wall / All-Exp King (> 0.95% below spot, e.g. $755 when SPY is $766),
-    // anchor intraday tactical support to dailyExpectedMove.low or -0.65% so we never chase deep OTM puts!
+    // Anti-Distant-King Put Trap Sanitizer (scales PUT_WALL cap with expected move for high-IV equities)
+    const emPctForPw =
+      dailyExpectedMove?.low && dailyExpectedMove.low > 0 && dailyExpectedMove.low < spotPrice
+        ? (spotPrice - dailyExpectedMove.low) / spotPrice
+        : 0;
+    const maxPwDistPct = Math.max(0.0095, emPctForPw * 1.1);
     const tacticalPw =
-      rawTacticalPw > 0 && (spotPrice - rawTacticalPw) / spotPrice > 0.0095
+      rawTacticalPw > 0 && (spotPrice - rawTacticalPw) / spotPrice > maxPwDistPct
         ? dailyExpectedMove?.low &&
           dailyExpectedMove.low < spotPrice &&
-          (spotPrice - dailyExpectedMove.low) / spotPrice <= 0.01
-          ? Math.round(dailyExpectedMove.low)
+          (spotPrice - dailyExpectedMove.low) / spotPrice <= Math.max(0.01, emPctForPw * 1.1)
+          ? Number(dailyExpectedMove.low.toFixed(2))
           : Number((spotPrice * 0.9935).toFixed(2))
         : rawTacticalPw;
 
@@ -2905,8 +3121,14 @@ export async function evaluateTradeSignals(
           ? latest5mCandle.high - latest5mCandle.low
           : spotPrice * 0.0015;
     const entryMetrics = computeAdaptiveQuantMetrics(spotPrice, entryAtr5m);
+    const signalBodyBaselineAtr: number =
+      flowSnap && typeof flowSnap.atr5m === "number" && flowSnap.atr5m > 0
+        ? flowSnap.atr5m
+        : flowSnap && typeof flowSnap.sigma === "number" && flowSnap.sigma > 0
+          ? flowSnap.sigma
+          : spotPrice * 0.0015;
+    const maxSignalBarBody = computeAdaptiveQuantMetrics(spotPrice, signalBodyBaselineAtr).maxSignalBarBody;
     const minRiskFloor = Math.max(0.05, spotPrice * 0.00067);
-    const microTargetPad = Math.max(0.05, spotPrice * 0.00067);
     const stopWickBuf = entryMetrics.stopWickBuffer;
     const smallTargetTrim = Math.max(0.02, spotPrice * 0.00013);
     const barBody = latest5mCandle ? latest5mCandle.close - latest5mCandle.open : 0;
@@ -2933,8 +3155,6 @@ export async function evaluateTradeSignals(
         : Math.max(0.05, spotPrice * 0.0025);
     const fluxZScore =
         effectiveFlowVwap > 0 ? (spotPrice - effectiveFlowVwap) / fluxSigma : 0;
-      const fluxUpper2Sigma = effectiveFlowVwap > 0 ? Number((effectiveFlowVwap + 2.0 * fluxSigma).toFixed(2)) : 0;
-      const fluxLower2Sigma = effectiveFlowVwap > 0 ? Number((effectiveFlowVwap - 2.0 * fluxSigma).toFixed(2)) : 0;
     const isMomentumDecelerating = currentNetFlux >= 0 || currentPe > -0.75;
     const maxAllowedNegZ = isMomentumDecelerating ? -1.0 : -1.25;
     const vwapStretchPct =
@@ -2983,27 +3203,38 @@ export async function evaluateTradeSignals(
       const stopAnchor = Math.min(rawStructuralStop, spotPrice + maxTacticalSpotRisk);
       const stopLoss = Number((Math.max(spotPrice + entryMetrics.minReversalInvalidation * 0.85, stopAnchor) * 1.001).toFixed(2));
       const risk = Math.max(minRiskFloor, stopLoss - spotPrice);
-      const target1 = Number((spotPrice - Math.max(entryMetrics.minWallRoom, risk * 1.65)).toFixed(2));
-      const target2 = Number(
-        Math.min(
-          target1 - entryMetrics.wallProximityBuffer,
-          tacticalPw > 0 && tacticalPw < target1 ? tacticalPw : spotPrice - Math.max(spotPrice * 0.0047, risk * 3.0)
-        ).toFixed(2)
-      );
+      const pwFloor = tacticalPw > 0 && tacticalPw < spotPrice ? tacticalPw : 0;
+      if (pwFloor === 0 || spotPrice - pwFloor >= risk * 1.5) {
+        const maxT1 = Math.floor((spotPrice - risk * 1.5 + 1e-9) * 100) / 100;
+        const uncappedT1 = Math.min(maxT1, Number((spotPrice - Math.max(entryMetrics.minWallRoom, risk * 1.65)).toFixed(2)));
+        const target1 = pwFloor > 0 ? Math.max(pwFloor, uncappedT1) : uncappedT1;
+        const uncappedT2 = Number(
+          Math.min(
+            target1 - entryMetrics.wallProximityBuffer,
+            spotPrice - Math.max(spotPrice * 0.0047, risk * 3.0)
+          ).toFixed(2)
+        );
+        const target2 =
+          pwFloor > 0
+            ? Number(Math.min(target1, Math.max(pwFloor, uncappedT2)).toFixed(2))
+            : Number(Math.min(target1, uncappedT2).toFixed(2));
 
-      candidateBto = {
-        contractType: "PUT",
-        setupName: (etTime.totalMinutes >= 575 && etTime.totalMinutes <= 615)
-            ? "Pre-Market Flux High Rejection & Bearish Open [BTO PUT]"
-            : "Bearish Zero-Gamma Flush [BTO PUT]",
-        stopLossSpot: stopLoss,
-        target1Spot: target1,
-        target2Spot: target2,
-      };
+        if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
+          candidateBto = {
+            contractType: "PUT",
+            setupName: (etTime.totalMinutes >= ENTRY_START_MINS && etTime.totalMinutes <= 615)
+              ? "Pre-Market Flux High Rejection & Bearish Open [BTO PUT]"
+              : "Bearish Zero-Gamma Flush [BTO PUT]",
+            stopLossSpot: stopLoss,
+            target1Spot: target1,
+            target2Spot: target2,
+          };
+        }
+      }
     }
 
     // --- SETUP 1B: Dynamic LOD Put Wall, King Node & Flux-Extremity Reclaim [BTO CALL] ---
-    const isMiddayReclaimWindow = etTime.totalMinutes >= 600 && etTime.totalMinutes <= 870; // 10:00 AM - 2:30 PM ET
+    const isMiddayReclaimWindow = etTime.totalMinutes >= 600 && etTime.totalMinutes <= ENTRY_CUTOFF_MINS; // 10:00 AM - 2:30 PM ET
     const activeKingNode = (filteredKing && filteredKing > 0) ? filteredKing : ((params as any).allExpKing && (params as any).allExpKing > 0 ? Number((params as any).allExpKing) : 0);
     const tacticalBookCenter = (activeKingNode > 0 && Math.abs(activeKingNode - spotPrice) / spotPrice <= 0.012)
       ? activeKingNode
@@ -3032,20 +3263,26 @@ export async function evaluateTradeSignals(
       reclaimedKingOrSma &&
       hasAdequateCallRoomToWall &&
       callRoomToWall >= entryMetrics.minWallRoom &&
-      Math.abs(barBody) <= entryMetrics.maxSignalBarBody
+      Math.abs(barBody) <= maxSignalBarBody
     ) {
       const stopLoss = Number((Math.min(recent5mLow - stopWickBuf, spotPrice - Math.max(entryMetrics.minReversalInvalidation, spotPrice * 0.0011))).toFixed(2));
       const risk = Math.max(minRiskFloor, spotPrice - stopLoss);
-      if (callRoomToWall >= risk * 1.5) {
-        const target1 = Number((spotPrice + Math.min(callRoomToWall * 0.60, Math.max(entryMetrics.wallProximityBuffer, risk * 1.50))).toFixed(2));
-        const target2 = Number((callMagnetTarget - smallTargetTrim).toFixed(2));
-        candidateBto = {
-          contractType: "CALL",
-          setupName: "Put Wall / King Node & Flux Extremity Reclaim [BTO CALL]",
-          stopLossSpot: stopLoss,
-          target1Spot: target1,
-          target2Spot: Math.max(target1 + microTargetPad, target2),
-        };
+      const cwWallBound = tacticalCw > spotPrice ? Math.min(tacticalCw, callMagnetTarget) : callMagnetTarget;
+      if (callRoomToWall >= risk * 1.5 && cwWallBound - spotPrice >= risk * 1.5) {
+        const minT1 = Math.ceil((spotPrice + risk * 1.5 - 1e-9) * 100) / 100;
+        const uncappedT1 = Number((spotPrice + Math.max(entryMetrics.wallProximityBuffer, callRoomToWall * 0.60)).toFixed(2));
+        const target1 = Number(Math.min(cwWallBound, Math.max(minT1, uncappedT1)).toFixed(2));
+        const rawT2 = Number((cwWallBound - smallTargetTrim).toFixed(2));
+        const target2 = Number(Math.min(cwWallBound, Math.max(target1, rawT2)).toFixed(2));
+        if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+          candidateBto = {
+            contractType: "CALL",
+            setupName: "Put Wall / King Node & Flux Extremity Reclaim [BTO CALL]",
+            stopLossSpot: stopLoss,
+            target1Spot: target1,
+            target2Spot: target2,
+          };
+        }
       }
     }
 
@@ -3066,20 +3303,26 @@ export async function evaluateTradeSignals(
         hasAdequateCallRoomToWall &&
         (!latest5mCandle || latest5mCandle.close >= latest5mCandle.open) &&
         callRoomToWall >= entryMetrics.minWallRoom &&
-        Math.abs(barBody) <= entryMetrics.maxSignalBarBody
+        Math.abs(barBody) <= maxSignalBarBody
       ) {
         const stopLoss = Number((Math.min(effectiveFlowVwap - stopWickBuf, spotPrice - entryMetrics.minReversalInvalidation)).toFixed(2));
         const risk = Math.max(minRiskFloor, spotPrice - stopLoss);
-        if (callRoomToWall >= risk * 1.5) {
-          const target1 = Number((spotPrice + Math.min(callRoomToWall * 0.65, Math.max(entryMetrics.wallProximityBuffer, risk * 1.60))).toFixed(2));
-          const target2 = Number(((typeof callMagnetTarget === "number" ? callMagnetTarget : tacticalCw) - Math.max(0.02, spotPrice * 0.00016)).toFixed(2));
-          candidateBto = {
-            contractType: "CALL",
-            setupName: "Zero-Gamma Flip & Flux Reclaim [BTO CALL]",
-            stopLossSpot: stopLoss,
-            target1Spot: target1,
-            target2Spot: Math.max(target1 + microTargetPad, target2),
-          };
+        const cwWallBound = tacticalCw > spotPrice ? Math.min(tacticalCw, callMagnetTarget) : callMagnetTarget;
+        if (callRoomToWall >= risk * 1.5 && cwWallBound - spotPrice >= risk * 1.5) {
+          const minT1 = Math.ceil((spotPrice + risk * 1.5 - 1e-9) * 100) / 100;
+          const uncappedT1 = Number((spotPrice + Math.max(entryMetrics.wallProximityBuffer, callRoomToWall * 0.65)).toFixed(2));
+          const target1 = Number(Math.min(cwWallBound, Math.max(minT1, uncappedT1)).toFixed(2));
+          const rawT2 = Number((cwWallBound - Math.max(0.02, spotPrice * 0.00016)).toFixed(2));
+          const target2 = Number(Math.min(cwWallBound, Math.max(target1, rawT2)).toFixed(2));
+          if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+            candidateBto = {
+              contractType: "CALL",
+              setupName: "Zero-Gamma Flip & Flux Reclaim [BTO CALL]",
+              stopLossSpot: stopLoss,
+              target1Spot: target1,
+              target2Spot: target2,
+            };
+          }
         }
       }
 
@@ -3107,18 +3350,24 @@ export async function evaluateTradeSignals(
             : Math.min(latest5mCandle.low, flowSnap.lower1Sigma);
         const stopLoss = Number((floorStopRef - spotPrice * 0.0006).toFixed(2));
         const risk = Math.max(Math.max(0.05, spotPrice * 0.00033), spotPrice - stopLoss);
-        const target1 = Number((Math.ceil((Math.max(spotPrice + risk * 1.5, flowSnap.flowVwap) - 1e-9) * 100) / 100).toFixed(2));
-        const target2 = Number(
-          Math.max(target1 + Math.max(0.05, spotPrice * 0.0005), flowSnap.upper1Sigma, tacticalCw > spotPrice ? tacticalCw : flowSnap.upper2Sigma).toFixed(2)
-        );
-        if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
-          candidateBto = {
-            contractType: "CALL",
-            setupName: `Gaia Call Regime -2σ Flow Bounce (χ=${(currentChi * 100).toFixed(0)}%)`,
-            stopLossSpot: stopLoss,
-            target1Spot: target1,
-            target2Spot: target2,
-          };
+        const cwCeiling = tacticalCw > spotPrice ? tacticalCw : 0;
+        if (cwCeiling === 0 || cwCeiling - spotPrice >= risk * 1.5) {
+          const minT1 = Math.ceil((spotPrice + risk * 1.5 - 1e-9) * 100) / 100;
+          const desiredT1 = Number((Math.ceil((Math.max(minT1, flowSnap.flowVwap) - 1e-9) * 100) / 100).toFixed(2));
+          const target1 = cwCeiling > 0 ? Math.min(cwCeiling, desiredT1) : desiredT1;
+          const desiredT2 = Number(
+            Math.max(target1 + Math.max(0.05, spotPrice * 0.0005), flowSnap.upper1Sigma, cwCeiling > 0 ? cwCeiling : flowSnap.upper2Sigma).toFixed(2)
+          );
+          const target2 = cwCeiling > 0 ? Number(Math.max(target1, Math.min(cwCeiling, desiredT2)).toFixed(2)) : desiredT2;
+          if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+            candidateBto = {
+              contractType: "CALL",
+              setupName: `Gaia Call Regime -2σ Flow Bounce (χ=${(currentChi * 100).toFixed(0)}%)`,
+              stopLossSpot: stopLoss,
+              target1Spot: target1,
+              target2Spot: target2,
+            };
+          }
         }
       }
       // 1C. Gaia Put Regime: Flow VWAP +2σ or +1σ Wick Rejection / Positive-Gamma Sweep Rejection
@@ -3142,18 +3391,24 @@ export async function evaluateTradeSignals(
             : Math.max(latest5mCandle.high, flowSnap.upper1Sigma);
         const stopLoss = Number((ceilStopRef + spotPrice * 0.0006).toFixed(2));
         const risk = Math.max(Math.max(0.05, spotPrice * 0.00033), stopLoss - spotPrice);
-        const target1 = Number((Math.floor((Math.min(spotPrice - risk * 1.5, flowSnap.flowVwap) + 1e-9) * 100) / 100).toFixed(2));
-        const target2 = Number(
-          Math.min(target1 - Math.max(0.05, spotPrice * 0.0005), flowSnap.lower1Sigma, tacticalPw < spotPrice && tacticalPw > 0 ? tacticalPw : flowSnap.lower2Sigma).toFixed(2)
-        );
-        if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
-          candidateBto = {
-            contractType: "PUT",
-            setupName: `Gaia Put Regime +2σ Flow Rejection (χ=${(currentChi * 100).toFixed(0)}%)`,
-            stopLossSpot: stopLoss,
-            target1Spot: target1,
-            target2Spot: target2,
-          };
+        const pwFloor = tacticalPw > 0 && tacticalPw < spotPrice ? tacticalPw : 0;
+        if (pwFloor === 0 || spotPrice - pwFloor >= risk * 1.5) {
+          const maxT1 = Math.floor((spotPrice - risk * 1.5 + 1e-9) * 100) / 100;
+          const desiredT1 = Number((Math.floor((Math.min(maxT1, flowSnap.flowVwap) + 1e-9) * 100) / 100).toFixed(2));
+          const target1 = pwFloor > 0 ? Math.max(pwFloor, desiredT1) : desiredT1;
+          const desiredT2 = Number(
+            Math.min(target1 - Math.max(0.05, spotPrice * 0.0005), flowSnap.lower1Sigma, pwFloor > 0 ? pwFloor : flowSnap.lower2Sigma).toFixed(2)
+          );
+          const target2 = pwFloor > 0 ? Number(Math.min(target1, Math.max(pwFloor, desiredT2)).toFixed(2)) : desiredT2;
+          if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
+            candidateBto = {
+              contractType: "PUT",
+              setupName: `Gaia Put Regime +2σ Flow Rejection (χ=${(currentChi * 100).toFixed(0)}%)`,
+              stopLossSpot: stopLoss,
+              target1Spot: target1,
+              target2Spot: target2,
+            };
+          }
         }
       }
       // 1D. Gaia Flux Field Advection Breakout (High Péclet Momentum; deferred in Positive Gamma low-|Pe| chop)
@@ -3166,20 +3421,34 @@ export async function evaluateTradeSignals(
         spotPrice > flowSnap.flowVwap &&
         latest5mCandle.close > latest5mCandle.sma34 &&
         latest5mCandle.close > latest5mCandle.open &&
-        Math.abs(barBody) <= entryMetrics.maxSignalBarBody
+        Math.abs(barBody) <= maxSignalBarBody
       ) {
-        const stopLoss = Number((Math.min(flowSnap.flowVwap, latest5mCandle.low) - spotPrice * 0.0005).toFixed(2));
-        const risk = Math.max(Math.max(0.05, spotPrice * 0.00033), spotPrice - stopLoss);
-        const target1 = Number((Math.ceil((Math.max(spotPrice + risk * 1.5, flowSnap.upper1Sigma) - 1e-9) * 100) / 100).toFixed(2));
-        const target2 = Number(Math.max(target1 + Math.max(0.05, spotPrice * 0.0005), flowSnap.upper2Sigma, tacticalCw).toFixed(2));
-        if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
-          candidateBto = {
-            contractType: "CALL",
-            setupName: `Gaia Advection Breakout (χ=${(currentChi * 100).toFixed(0)}%, Pe=+${currentPe.toFixed(2)})`,
-            stopLossSpot: stopLoss,
-            target1Spot: target1,
-            target2Spot: target2,
-          };
+        const candleStop = Number((Math.min(flowSnap.flowVwap, latest5mCandle.low) - spotPrice * 0.0005).toFixed(2));
+        const candleRisk = Math.max(minRiskFloor, spotPrice - candleStop);
+        const vwapStop = Number((flowSnap.flowVwap - spotPrice * 0.0005).toFixed(2));
+        const vwapRisk = Math.max(minRiskFloor, spotPrice - vwapStop);
+        const cwCeiling = tacticalCw > spotPrice ? tacticalCw : 0;
+        const stopLoss =
+          cwCeiling > 0 && cwCeiling - spotPrice < candleRisk * 1.5 && cwCeiling - spotPrice >= vwapRisk * 1.5
+            ? vwapStop
+            : candleStop;
+        const risk = Math.max(minRiskFloor, spotPrice - stopLoss);
+        if (cwCeiling === 0 || cwCeiling - spotPrice >= risk * 1.5) {
+          const minT1 = Math.ceil((spotPrice + risk * 1.5 - 1e-9) * 100) / 100;
+          const sigma1Target = cwCeiling > 0 ? Math.min(cwCeiling, flowSnap.upper1Sigma) : flowSnap.upper1Sigma;
+          const rawT1 = Number((Math.ceil((Math.max(minT1, sigma1Target) - 1e-9) * 100) / 100).toFixed(2));
+          const target1 = cwCeiling > 0 ? Math.min(cwCeiling, rawT1) : rawT1;
+          const rawT2 = Number(Math.max(target1 + Math.max(0.05, spotPrice * 0.0005), flowSnap.upper2Sigma, cwCeiling).toFixed(2));
+          const target2 = cwCeiling > 0 ? Number(Math.max(target1, Math.min(cwCeiling, rawT2)).toFixed(2)) : rawT2;
+          if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+            candidateBto = {
+              contractType: "CALL",
+              setupName: `Gaia Advection Breakout (χ=${(currentChi * 100).toFixed(0)}%, Pe=+${currentPe.toFixed(2)})`,
+              stopLossSpot: stopLoss,
+              target1Spot: target1,
+              target2Spot: target2,
+            };
+          }
         }
       } else if (
         (!isPositiveGammaRegime || Math.abs(currentPe) >= 1.5) &&
@@ -3190,22 +3459,36 @@ export async function evaluateTradeSignals(
         spotPrice < flowSnap.flowVwap &&
         latest5mCandle.close < latest5mCandle.sma34 &&
         latest5mCandle.close < latest5mCandle.open &&
-        Math.abs(barBody) <= entryMetrics.maxSignalBarBody
+        Math.abs(barBody) <= maxSignalBarBody
       ) {
-        const stopLoss = Number((Math.max(flowSnap.flowVwap, latest5mCandle.high) + spotPrice * 0.0005).toFixed(2));
-        const risk = Math.max(Math.max(0.05, spotPrice * 0.00033), stopLoss - spotPrice);
-        const target1 = Number((Math.floor((Math.min(spotPrice - risk * 1.5, flowSnap.lower1Sigma) + 1e-9) * 100) / 100).toFixed(2));
-        const target2 = Number(
-          Math.min(target1 - Math.max(0.05, spotPrice * 0.0005), flowSnap.lower2Sigma, tacticalPw < spotPrice && tacticalPw > 0 ? tacticalPw : flowSnap.lower2Sigma).toFixed(2)
-        );
-        if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
-          candidateBto = {
-            contractType: "PUT",
-            setupName: `Gaia Advection Breakdown (χ=${(currentChi * 100).toFixed(0)}%, Pe=${currentPe.toFixed(2)})`,
-            stopLossSpot: stopLoss,
-            target1Spot: target1,
-            target2Spot: target2,
-          };
+        const candleStop = Number((Math.max(flowSnap.flowVwap, latest5mCandle.high) + spotPrice * 0.0005).toFixed(2));
+        const candleRisk = Math.max(minRiskFloor, candleStop - spotPrice);
+        const vwapStop = Number((flowSnap.flowVwap + spotPrice * 0.0005).toFixed(2));
+        const vwapRisk = Math.max(minRiskFloor, vwapStop - spotPrice);
+        const pwFloor = tacticalPw > 0 && tacticalPw < spotPrice ? tacticalPw : 0;
+        const stopLoss =
+          pwFloor > 0 && spotPrice - pwFloor < candleRisk * 1.5 && spotPrice - pwFloor >= vwapRisk * 1.5
+            ? vwapStop
+            : candleStop;
+        const risk = Math.max(minRiskFloor, stopLoss - spotPrice);
+        if (pwFloor === 0 || spotPrice - pwFloor >= risk * 1.5) {
+          const maxT1 = Math.floor((spotPrice - risk * 1.5 + 1e-9) * 100) / 100;
+          const sigma1Target = pwFloor > 0 ? Math.max(pwFloor, flowSnap.lower1Sigma) : flowSnap.lower1Sigma;
+          const rawT1 = Number((Math.floor((Math.min(maxT1, sigma1Target) + 1e-9) * 100) / 100).toFixed(2));
+          const target1 = pwFloor > 0 ? Math.max(pwFloor, rawT1) : rawT1;
+          const rawT2 = Number(
+            Math.min(target1 - Math.max(0.05, spotPrice * 0.0005), flowSnap.lower2Sigma, pwFloor > 0 ? pwFloor : flowSnap.lower2Sigma).toFixed(2)
+          );
+          const target2 = pwFloor > 0 ? Number(Math.min(target1, Math.max(pwFloor, rawT2)).toFixed(2)) : rawT2;
+          if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
+            candidateBto = {
+              contractType: "PUT",
+              setupName: `Gaia Advection Breakdown (χ=${(currentChi * 100).toFixed(0)}%, Pe=${currentPe.toFixed(2)})`,
+              stopLossSpot: stopLoss,
+              target1Spot: target1,
+              target2Spot: target2,
+            };
+          }
         }
       }
     }
@@ -3216,7 +3499,7 @@ export async function evaluateTradeSignals(
       dailyExpectedMove.low > 0 &&
       dailyExpectedMove.low > tacticalPw &&
       Math.abs(spotPrice - dailyExpectedMove.low) / spotPrice <= 0.015
-        ? Math.round(dailyExpectedMove.low)
+        ? Number(dailyExpectedMove.low.toFixed(2))
         : tacticalPw > 0
           ? tacticalPw
           : Number((spotPrice * 0.992).toFixed(2));
@@ -3291,7 +3574,7 @@ export async function evaluateTradeSignals(
       impChi >= 0.60 &&
       (deltaChi6 >= 0.03 || deltaImpulseChi6 >= 0.06 || deltaFlux6 > 0 || spotPrice >= effectiveFlowVwap || spotPrice >= effectiveSma34) &&
       (deltaFlux6 > 0 || impPe >= 0.40 || spotPrice >= effectiveFlowVwap || spotPrice >= effectiveSma34) &&
-      barBody <= entryMetrics.maxSignalBarBody &&
+      barBody <= maxSignalBarBody &&
       (!isPhase2ReclaimWindow || (testedPutWallOrMinus1Sigma && leg2CallRoom >= entryMetrics.minWallRoom)) &&
       (divergence5m === "BULL" ||
         divergence30m === "BULL" ||
@@ -3307,7 +3590,7 @@ export async function evaluateTradeSignals(
       impChi <= 0.40 &&
       (deltaChi6 <= -0.03 || deltaImpulseChi6 <= -0.06 || deltaFlux6 < 0 || spotPrice <= effectiveFlowVwap || spotPrice <= effectiveSma34) &&
       (deltaFlux6 < 0 || impPe <= -0.40 || spotPrice <= effectiveFlowVwap || spotPrice <= effectiveSma34) &&
-      -barBody <= entryMetrics.maxSignalBarBody &&
+      -barBody <= maxSignalBarBody &&
       (!isPhase2ReclaimWindow || (testedCallWallOrPlus1Sigma && leg2PutRoom >= entryMetrics.minWallRoom)) &&
       (divergence5m === "BEAR" ||
         divergence30m === "BEAR" ||
@@ -3367,7 +3650,7 @@ export async function evaluateTradeSignals(
           : tacticalCw > spotPrice + entryMetrics.minWallRoom
             ? tacticalCw
             : dailyExpectedMove?.high && dailyExpectedMove.high > spotPrice
-              ? Math.round(dailyExpectedMove.high)
+              ? Number(dailyExpectedMove.high.toFixed(2))
               : Number((spotPrice * 1.008).toFixed(2));
 
       // Stop loss sits strictly below the support wall (never above putBounceRef)
@@ -3439,7 +3722,7 @@ export async function evaluateTradeSignals(
         dailyExpectedMove.high > 0 &&
         dailyExpectedMove.high < tacticalCw &&
         Math.abs(dailyExpectedMove.high - spotPrice) / spotPrice <= 0.015
-          ? Math.round(dailyExpectedMove.high)
+          ? Number(dailyExpectedMove.high.toFixed(2))
           : tacticalCw > 0
             ? tacticalCw
             : Number((spotPrice * 1.008).toFixed(2));
@@ -3497,10 +3780,10 @@ export async function evaluateTradeSignals(
         const target2 =
           tacticalPw < spotPrice && tacticalPw > 0
             ? (dailyExpectedMove?.low && dailyExpectedMove.low > tacticalPw && dailyExpectedMove.low < spotPrice
-                ? Math.round(dailyExpectedMove.low)
+                ? Number(dailyExpectedMove.low.toFixed(2))
                 : tacticalPw)
             : dailyExpectedMove?.low && dailyExpectedMove.low < spotPrice
-              ? Math.round(dailyExpectedMove.low)
+              ? Number(dailyExpectedMove.low.toFixed(2))
               : Number((spotPrice * 0.993).toFixed(2));
 
         // Stop loss must sit strictly above the resistance wall & rejection candle high (never below callRejectRef)
@@ -3545,20 +3828,26 @@ export async function evaluateTradeSignals(
         (callWall - spotPrice) / spotPrice >= 0.0025
       ) {
         const stopLoss = Number((zeroGamma * (1 - 0.0012)).toFixed(2));
-        const target1 =
-          filteredKing && filteredKing > spotPrice
-            ? filteredKing
-            : dailyExpectedMove?.high && dailyExpectedMove.high > spotPrice
-              ? Number((spotPrice + 0.5 * (dailyExpectedMove.high - spotPrice)).toFixed(2))
-              : Number((spotPrice + 0.5 * (callWall - spotPrice)).toFixed(2));
-
-        candidateBto = {
-          contractType: "CALL",
-          setupName: "Zero-Gamma Bullish Volatility Breakout",
-          stopLossSpot: stopLoss,
-          target1Spot: Number(target1.toFixed(2)),
-          target2Spot: callWall,
-        };
+        const risk = Math.max(minRiskFloor, spotPrice - stopLoss);
+        if (callWall - spotPrice >= risk * 1.5) {
+          const minT1 = Math.ceil((spotPrice + risk * 1.5 - 1e-9) * 100) / 100;
+          const rawT1 =
+            filteredKing && filteredKing >= minT1 && filteredKing < callWall
+              ? filteredKing
+              : dailyExpectedMove?.high && dailyExpectedMove.high > spotPrice
+                ? Number((spotPrice + 0.5 * (Math.min(callWall, dailyExpectedMove.high) - spotPrice)).toFixed(2))
+                : Number((spotPrice + 0.5 * (callWall - spotPrice)).toFixed(2));
+          const target1 = Number(Math.min(callWall, Math.max(minT1, rawT1)).toFixed(2));
+          if (target1 > spotPrice && callWall >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+            candidateBto = {
+              contractType: "CALL",
+              setupName: "Zero-Gamma Bullish Volatility Breakout",
+              stopLossSpot: stopLoss,
+              target1Spot: target1,
+              target2Spot: Number(Math.max(target1, callWall).toFixed(2)),
+            };
+          }
+        }
       }
       // Bearish Zero-Gamma Flush (Crosses or Opens Below zeroGamma)
       else if (
@@ -3573,20 +3862,26 @@ export async function evaluateTradeSignals(
         (spotPrice - tacticalPw) / spotPrice >= 0.0025
       ) {
         const stopLoss = Number((zeroGamma * (1 + 0.0012)).toFixed(2));
-        const target1 =
-          filteredKing && filteredKing < spotPrice && filteredKing > tacticalPw
-            ? filteredKing
-            : dailyExpectedMove?.low && dailyExpectedMove.low < spotPrice
-              ? Number((spotPrice - 0.5 * (spotPrice - dailyExpectedMove.low)).toFixed(2))
-              : Number((spotPrice - 0.5 * (spotPrice - tacticalPw)).toFixed(2));
-
-        candidateBto = {
-          contractType: "PUT",
-          setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
-          stopLossSpot: stopLoss,
-          target1Spot: Number(target1.toFixed(2)),
-          target2Spot: tacticalPw,
-        };
+        const risk = Math.max(minRiskFloor, stopLoss - spotPrice);
+        if (spotPrice - tacticalPw >= risk * 1.5) {
+          const maxT1 = Math.floor((spotPrice - risk * 1.5 + 1e-9) * 100) / 100;
+          const rawT1 =
+            filteredKing && filteredKing <= maxT1 && filteredKing > tacticalPw
+              ? filteredKing
+              : dailyExpectedMove?.low && dailyExpectedMove.low < spotPrice && dailyExpectedMove.low > tacticalPw
+                ? Number((spotPrice - 0.5 * (spotPrice - dailyExpectedMove.low)).toFixed(2))
+                : Number((spotPrice - 0.5 * (spotPrice - tacticalPw)).toFixed(2));
+          const target1 = Number(Math.max(tacticalPw, Math.min(maxT1, rawT1)).toFixed(2));
+          if (target1 < spotPrice && tacticalPw <= target1 && (spotPrice - target1) / risk >= 1.5) {
+            candidateBto = {
+              contractType: "PUT",
+              setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
+              stopLossSpot: stopLoss,
+              target1Spot: target1,
+              target2Spot: Number(Math.min(target1, tacticalPw).toFixed(2)),
+            };
+          }
+        }
       }
     }
 
@@ -3630,16 +3925,23 @@ export async function evaluateTradeSignals(
         ) {
           const stopBase = Math.min(latest5mCandle.sma34, latest5mCandle.low);
           const stopLoss = Number((stopBase * (1 - 0.001)).toFixed(2));
-          const target1 = Number(((spotPrice + activeKingMagnet) / 2).toFixed(2));
-          candidateBto = {
-            contractType: "CALL",
-            setupName: isTacticalMagnet
-              ? `Tactical King Magnet Pull ($${activeKingMagnet})`
-              : "Uncontested King Magnet Pull",
-            stopLossSpot: stopLoss,
-            target1Spot: target1,
-            target2Spot: activeKingMagnet,
-          };
+          const risk = Math.max(minRiskFloor, spotPrice - stopLoss);
+          const cwMagnetCap = tacticalCw > spotPrice ? Math.min(tacticalCw, activeKingMagnet) : activeKingMagnet;
+          if (cwMagnetCap - spotPrice >= risk * 1.5) {
+            const minT1 = Math.ceil((spotPrice + risk * 1.5 - 1e-9) * 100) / 100;
+            const target1 = Number(Math.min(cwMagnetCap, Math.max(minT1, (spotPrice + cwMagnetCap) / 2)).toFixed(2));
+            if (target1 > spotPrice && cwMagnetCap >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+              candidateBto = {
+                contractType: "CALL",
+                setupName: isTacticalMagnet
+                  ? `Tactical King Magnet Pull ($${activeKingMagnet})`
+                  : "Uncontested King Magnet Pull",
+                stopLossSpot: stopLoss,
+                target1Spot: target1,
+                target2Spot: Number(cwMagnetCap.toFixed(2)),
+              };
+            }
+          }
         }
         // Bearish King Magnet: activeKingMagnet < spotPrice
         // Anti-Trap Guardrail: Only allow Bearish King Magnet if activeKingMagnet is within 0.85% of spot
@@ -3655,16 +3957,23 @@ export async function evaluateTradeSignals(
         ) {
           const stopBase = Math.max(latest5mCandle.sma34, latest5mCandle.high);
           const stopLoss = Number((stopBase * (1 + 0.001)).toFixed(2));
-          const target1 = Number(((spotPrice + activeKingMagnet) / 2).toFixed(2));
-          candidateBto = {
-            contractType: "PUT",
-            setupName: isTacticalMagnet
-              ? `Tactical King Magnet Pull ($${activeKingMagnet})`
-              : "Uncontested King Magnet Pull",
-            stopLossSpot: stopLoss,
-            target1Spot: target1,
-            target2Spot: activeKingMagnet,
-          };
+          const risk = Math.max(minRiskFloor, stopLoss - spotPrice);
+          const pwMagnetCap = tacticalPw > 0 && tacticalPw < spotPrice ? Math.max(tacticalPw, activeKingMagnet) : activeKingMagnet;
+          if (spotPrice - pwMagnetCap >= risk * 1.5) {
+            const maxT1 = Math.floor((spotPrice - risk * 1.5 + 1e-9) * 100) / 100;
+            const target1 = Number(Math.max(pwMagnetCap, Math.min(maxT1, (spotPrice + pwMagnetCap) / 2)).toFixed(2));
+            if (target1 < spotPrice && pwMagnetCap <= target1 && (spotPrice - target1) / risk >= 1.5) {
+              candidateBto = {
+                contractType: "PUT",
+                setupName: isTacticalMagnet
+                  ? `Tactical King Magnet Pull ($${activeKingMagnet})`
+                  : "Uncontested King Magnet Pull",
+                stopLossSpot: stopLoss,
+                target1Spot: target1,
+                target2Spot: Number(pwMagnetCap.toFixed(2)),
+              };
+            }
+          }
         }
       }
     }
@@ -3689,17 +3998,24 @@ export async function evaluateTradeSignals(
       const reclaimFloor = Math.max(spotPrice - entryMetrics.minWallRoom, Math.min(latest5mCandle?.low ?? spotPrice, tacticalPw > 0 && tacticalPw <= spotPrice ? tacticalPw : spotPrice));
       const stopLoss = Number((Math.min(reclaimFloor - stopWickBuf, spotPrice - Math.max(entryMetrics.minReversalInvalidation, spotPrice * 0.0011))).toFixed(2));
       const risk = Math.max(minRiskFloor, spotPrice - stopLoss);
-      const callTargetWall = callMagnetTarget > spotPrice + entryMetrics.minWallRoom ? callMagnetTarget : Number((spotPrice + risk * 2.5).toFixed(2));
-      if (callTargetWall - spotPrice >= risk * 1.5) {
-        const target1 = Number((spotPrice + Math.max(entryMetrics.wallProximityBuffer, risk * 1.5)).toFixed(2));
-        const target2 = Number(Math.max(target1 + microTargetPad, callTargetWall - smallTargetTrim).toFixed(2));
-        candidateBto = {
-          contractType: "CALL",
-          setupName: "Impulse Flux & Divergence Reclaim [BTO CALL]",
-          stopLossSpot: stopLoss,
-          target1Spot: target1,
-          target2Spot: target2,
-        };
+      const activeCallWall = tacticalCw > spotPrice ? tacticalCw : 0;
+      const callTargetWall =
+        activeCallWall > 0
+          ? (callMagnetTarget > spotPrice && callMagnetTarget <= activeCallWall ? callMagnetTarget : activeCallWall)
+          : (callMagnetTarget > spotPrice + entryMetrics.minWallRoom ? callMagnetTarget : Number((spotPrice + risk * 2.5).toFixed(2)));
+      if (callTargetWall - spotPrice >= risk * 1.5 && (activeCallWall === 0 || activeCallWall - spotPrice >= risk * 1.5)) {
+        const minT1 = Math.ceil((spotPrice + Math.max(entryMetrics.wallProximityBuffer, risk * 1.5) - 1e-9) * 100) / 100;
+        const target1 = Number(Math.min(callTargetWall, minT1).toFixed(2));
+        const target2 = Number(Math.min(callTargetWall, Math.max(target1, callTargetWall - smallTargetTrim)).toFixed(2));
+        if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+          candidateBto = {
+            contractType: "CALL",
+            setupName: "Impulse Flux & Divergence Reclaim [BTO CALL]",
+            stopLossSpot: stopLoss,
+            target1Spot: target1,
+            target2Spot: target2,
+          };
+        }
       }
     }
 
@@ -3713,20 +4029,26 @@ export async function evaluateTradeSignals(
       const rejectCeil = Math.min(spotPrice + entryMetrics.minWallRoom, Math.max(latest5mCandle?.high ?? spotPrice, tacticalCw > 0 && tacticalCw >= spotPrice ? tacticalCw : spotPrice));
       const stopLoss = Number((Math.max(rejectCeil + stopWickBuf, spotPrice + Math.max(entryMetrics.minReversalInvalidation, spotPrice * 0.0011))).toFixed(2));
       const risk = Math.max(minRiskFloor, stopLoss - spotPrice);
+      const activePutWall = tacticalPw > 0 && tacticalPw < spotPrice ? tacticalPw : 0;
       const putTargetWall =
-        leg2PutLowerTarget > 0 && spotPrice - leg2PutLowerTarget >= entryMetrics.minWallRoom
-          ? leg2PutLowerTarget
-          : Number((spotPrice - risk * 2.5).toFixed(2));
-      if (spotPrice - putTargetWall >= risk * 1.5) {
-        const target1 = Number((spotPrice - Math.max(entryMetrics.wallProximityBuffer, risk * 1.5)).toFixed(2));
-        const target2 = Number(Math.min(target1 - microTargetPad, putTargetWall + smallTargetTrim).toFixed(2));
-        candidateBto = {
-          contractType: "PUT",
-          setupName: "Impulse Flux & Divergence Rejection [BTO PUT]",
-          stopLossSpot: stopLoss,
-          target1Spot: target1,
-          target2Spot: target2,
-        };
+        activePutWall > 0
+          ? (leg2PutLowerTarget > 0 && leg2PutLowerTarget >= activePutWall && leg2PutLowerTarget < spotPrice ? leg2PutLowerTarget : activePutWall)
+          : (leg2PutLowerTarget > 0 && spotPrice - leg2PutLowerTarget >= entryMetrics.minWallRoom
+              ? leg2PutLowerTarget
+              : Number((spotPrice - risk * 2.5).toFixed(2)));
+      if (spotPrice - putTargetWall >= risk * 1.5 && (activePutWall === 0 || spotPrice - activePutWall >= risk * 1.5)) {
+        const maxT1 = Math.floor((spotPrice - Math.max(entryMetrics.wallProximityBuffer, risk * 1.5) + 1e-9) * 100) / 100;
+        const target1 = Number(Math.max(putTargetWall, maxT1).toFixed(2));
+        const target2 = Number(Math.max(putTargetWall, Math.min(target1, putTargetWall + smallTargetTrim)).toFixed(2));
+        if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
+          candidateBto = {
+            contractType: "PUT",
+            setupName: "Impulse Flux & Divergence Rejection [BTO PUT]",
+            stopLossSpot: stopLoss,
+            target1Spot: target1,
+            target2Spot: target2,
+          };
+        }
       }
     }
 
@@ -3768,13 +4090,17 @@ export async function evaluateTradeSignals(
         const sessionDate = new Date(nowTs * 1000).toLocaleDateString("en-CA", {
           timeZone: "America/New_York",
         });
-        const calibration = await calibrateWalkForwardExpectancy(normalizedTicker, sessionDate);
+        const calibration = await calibrateWalkForwardExpectancy(normalizedTicker, sessionDate, params.signal);
         if (params.signal?.aborted || !calibration.passesGate) {
+          const freshAbortStore = loadTradeStore();
           return {
             ticker: normalizedTicker,
-            activePosition: null,
+            activePosition:
+              freshAbortStore.activePositions[normalizedTicker] ??
+              freshAbortStore.activePositions[positionKey] ??
+              null,
             emittedAlerts,
-            allAlerts: store.alerts,
+            allAlerts: freshAbortStore.alerts,
           };
         }
 
@@ -3795,23 +4121,31 @@ export async function evaluateTradeSignals(
         });
 
         if (params.signal?.aborted || !optimalContract) {
+          const freshAbortStore = loadTradeStore();
           return {
             ticker: normalizedTicker,
-            activePosition: null,
+            activePosition:
+              freshAbortStore.activePositions[normalizedTicker] ??
+              freshAbortStore.activePositions[positionKey] ??
+              null,
             emittedAlerts,
-            allAlerts: store.alerts,
+            allAlerts: freshAbortStore.alerts,
           };
         }
 
         // Post-await RTH cutoff re-check (prevents late async completion from committing entries > 14:30 ET)
         if (!params.nowEt) {
           const postAwaitEt = getNowEtTime(new Date());
-          if (postAwaitEt.totalMinutes < 575 || postAwaitEt.totalMinutes > 870) {
+          if (postAwaitEt.totalMinutes < ENTRY_START_MINS || postAwaitEt.totalMinutes > ENTRY_CUTOFF_MINS) {
+            const freshAbortStore = loadTradeStore();
             return {
               ticker: normalizedTicker,
-              activePosition: null,
+              activePosition:
+                freshAbortStore.activePositions[normalizedTicker] ??
+                freshAbortStore.activePositions[positionKey] ??
+                null,
               emittedAlerts,
-              allAlerts: store.alerts,
+              allAlerts: freshAbortStore.alerts,
             };
           }
         }
@@ -3941,22 +4275,34 @@ export async function evaluateTradeSignals(
         };
 
         const latestStoreBeforeCommit = loadTradeStore();
+        latestStoreBeforeCommit.prevSpotPrices[normalizedTicker] = spotPrice;
         if (Object.keys(latestStoreBeforeCommit.activePositions || {}).length > 0) {
           console.warn(
             `[evaluateTradeSignals] Aborted ${positionTicker} BTO commit: global slot already occupied (${Object.keys(latestStoreBeforeCommit.activePositions).join(", ")}).`
           );
+          saveTradeStore(latestStoreBeforeCommit);
+          store = latestStoreBeforeCommit;
         } else {
-          store.activePositions[positionTicker] = newPosition;
-          store.alerts.push(alert);
+          latestStoreBeforeCommit.activePositions[positionTicker] = newPosition;
+          latestStoreBeforeCommit.alerts.push(alert);
           emittedAlerts.push(alert);
           activePos = newPosition;
+          saveTradeStore(latestStoreBeforeCommit);
+          store = latestStoreBeforeCommit;
         }
       }
     }
   }
 
-  // Save updated store to persistent cache
-  saveTradeStore(store);
+  // Persist prevSpotPrices onto latest store when no commit/STEP-A write occurred after any await
+  if (emittedAlerts.length === 0 && !hadActivePositionAtStart) {
+    const latestIdleStore = loadTradeStore();
+    if (latestIdleStore.prevSpotPrices[normalizedTicker] !== spotPrice) {
+      latestIdleStore.prevSpotPrices[normalizedTicker] = spotPrice;
+      saveTradeStore(latestIdleStore);
+    }
+    store = latestIdleStore;
+  }
 
   // Strict Live Discord Firewall:
   // NEVER dispatch alerts to Discord if:
@@ -3966,18 +4312,18 @@ export async function evaluateTradeSignals(
   // 4. Current execution time is outside RTH (09:30 - 16:00 ET)
   const realNowTs = Math.floor(Date.now() / 1000);
   const isLiveWithin180s = Math.abs(realNowTs - nowTs) <= 180;
-  const isRthWindow = etTime.totalMinutes >= 570 && etTime.totalMinutes < 960;
+  const isRthWindow = etTime.totalMinutes >= RTH_OPEN_MINS && etTime.totalMinutes < RTH_CLOSE_MINS;
 
   if (!params.isHistoricalBackfill && isLiveWithin180s && isRthWindow) {
-    store.dispatchedAlertIds = store.dispatchedAlertIds || {};
-    const unsentTodayAlerts = store.alerts.filter(
+    const preDiscordStore = loadTradeStore();
+    const unsentTodayAlerts = preDiscordStore.alerts.filter(
       (a) =>
         (a.ticker === normalizedTicker || a.ticker === positionKey) &&
         !a.isHistoricalBackfill &&
-        !store.dispatchedAlertIds?.[a.id]
+        !preDiscordStore.dispatchedAlertIds?.[a.id]
     );
     if (unsentTodayAlerts.length > 0) {
-      let anyMarked = false;
+      const sentIds: string[] = [];
       for (const alert of unsentTodayAlerts) {
         if (params.signal?.aborted) break;
         const sent = await sendDiscordTradeAlert(
@@ -3986,19 +4332,27 @@ export async function evaluateTradeSignals(
           { signal: params.signal }
         ).catch(() => false);
         if (sent) {
-          store.dispatchedAlertIds[alert.id] = true;
-          anyMarked = true;
+          sentIds.push(alert.id);
         }
       }
-      if (anyMarked) saveTradeStore(store);
+      if (sentIds.length > 0) {
+        const afterDiscordStore = loadTradeStore();
+        afterDiscordStore.dispatchedAlertIds = afterDiscordStore.dispatchedAlertIds || {};
+        for (const id of sentIds) {
+          afterDiscordStore.dispatchedAlertIds[id] = true;
+        }
+        saveTradeStore(afterDiscordStore);
+        store = afterDiscordStore;
+      }
     }
   }
 
+  const finalStore = loadTradeStore();
   return {
     ticker: normalizedTicker,
     activePosition: activePos,
     emittedAlerts,
-    allAlerts: store.alerts.slice(-50),
+    allAlerts: finalStore.alerts.slice(-50),
   };
 }
 
@@ -4021,19 +4375,20 @@ export async function evaluateAllActivePositions(params?: {
 
   for (const ticker of activeKeys) {
     if (params?.signal?.aborted) break;
-    const pos = store.activePositions[ticker];
+    const pos = loadTradeStore().activePositions[ticker];
     if (!pos || (pos.status !== "OPEN" && pos.status !== "PARTIAL_TP1")) continue;
 
     // FSM State Consistency Guard per ticker: Purge any position that contradicts canonical Call/Put Regime
-    const tickerFsm = store.gaiaStateByTicker?.[ticker];
-    const fsmState = tickerFsm?.activeFsmState ?? (ticker === "SPY" ? store.activeFsmState : undefined);
-    const tickerMacroRegime = tickerFsm?.macroRegime ?? (ticker === "SPY" ? store.macroRegime : undefined);
-    const tickerChiPct = tickerFsm?.chiPct ?? (ticker === "SPY" ? store.chiPct : undefined);
+    const latestGuardStore = loadTradeStore();
+    const tickerFsm = latestGuardStore.gaiaStateByTicker?.[ticker];
+    const fsmState = tickerFsm?.activeFsmState ?? (ticker === "SPY" ? latestGuardStore.activeFsmState : undefined);
+    const tickerMacroRegime = tickerFsm?.macroRegime ?? (ticker === "SPY" ? latestGuardStore.macroRegime : undefined);
+    const tickerChiPct = tickerFsm?.chiPct ?? (ticker === "SPY" ? latestGuardStore.chiPct : undefined);
     if (fsmState !== undefined || tickerMacroRegime !== undefined || tickerChiPct !== undefined) {
       const isStructuralSetup = !pos.setupName.includes("Gaia Tactical HUD");
       if (fsmState === "STAND_ASIDE" && !isStructuralSetup) {
-        delete store.activePositions[ticker];
-        saveTradeStore(store);
+        delete latestGuardStore.activePositions[ticker];
+        saveTradeStore(latestGuardStore);
         continue;
       }
       if (
@@ -4042,8 +4397,8 @@ export async function evaluateAllActivePositions(params?: {
         (fsmState === "LONG" || tickerMacroRegime === "CALL" || (tickerChiPct ?? 50) >= 50)
       ) {
         console.warn(`[evaluateAllActivePositions] Purging zombie ${ticker} PUT position while FSM is LONG/CALL.`);
-        delete store.activePositions[ticker];
-        saveTradeStore(store);
+        delete latestGuardStore.activePositions[ticker];
+        saveTradeStore(latestGuardStore);
         continue;
       }
       if (
@@ -4052,8 +4407,8 @@ export async function evaluateAllActivePositions(params?: {
         (fsmState === "SHORT" || tickerMacroRegime === "PUT" || (tickerChiPct ?? 50) < 50)
       ) {
         console.warn(`[evaluateAllActivePositions] Purging zombie ${ticker} CALL position while FSM is SHORT/PUT.`);
-        delete store.activePositions[ticker];
-        saveTradeStore(store);
+        delete latestGuardStore.activePositions[ticker];
+        saveTradeStore(latestGuardStore);
         continue;
       }
     }
@@ -4094,11 +4449,13 @@ export async function evaluateAllActivePositions(params?: {
   }
 
   // Check if after-market-close daily performance recap should be dispatched
-  try {
-    const { checkAndSendMarketCloseRecap } = await import("./tradePerformanceEngine");
-    await checkAndSendMarketCloseRecap({ webhookUrl: params?.webhookUrl });
-  } catch {
-    // Non-fatal
+  if (!params?.signal?.aborted) {
+    try {
+      const { checkAndSendMarketCloseRecap } = await import("./tradePerformanceEngine");
+      await checkAndSendMarketCloseRecap({ webhookUrl: params?.webhookUrl });
+    } catch {
+      // Non-fatal
+    }
   }
 
   return allEmitted;
@@ -4183,9 +4540,11 @@ export function computeRemainingYearsToExpiration(
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
+    hourCycle: "h23",
   });
   const parts = fmt.formatToParts(dt);
-  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 9);
+  const rawHour = Number(parts.find((p) => p.type === "hour")?.value ?? 9);
+  const hour = rawHour % 24;
   const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 30);
   const second = Number(parts.find((p) => p.type === "second")?.value ?? 0);
 
@@ -4206,7 +4565,7 @@ export function computeRemainingYearsToExpiration(
  * scaled by the Variance Risk Premium (VRP).
  */
 export function estimateDynamicAtmIv(
-  bars: Array<{ close: number; high?: number; low?: number }>,
+  bars: Array<{ close: number; high?: number; low?: number; timestamp?: number; timestampMs?: number }>,
   idx: number,
   baseIvFloor: number = 0.085,
   referenceChainIv?: number
@@ -4229,8 +4588,25 @@ export function estimateDynamicAtmIv(
   const start = Math.max(1, idx - 20);
   const sqReturns: number[] = [];
   for (let i = start; i <= idx; i++) {
-    const prev = bars[i - 1]?.close || 0;
-    const curr = bars[i]?.close || 0;
+    const prevBar = bars[i - 1];
+    const currBar = bars[i];
+    const prevTsMs =
+      typeof prevBar?.timestampMs === "number"
+        ? prevBar.timestampMs
+        : typeof prevBar?.timestamp === "number"
+          ? (prevBar.timestamp > 1e11 ? prevBar.timestamp : prevBar.timestamp * 1000)
+          : 0;
+    const currTsMs =
+      typeof currBar?.timestampMs === "number"
+        ? currBar.timestampMs
+        : typeof currBar?.timestamp === "number"
+          ? (currBar.timestamp > 1e11 ? currBar.timestamp : currBar.timestamp * 1000)
+          : 0;
+    if (prevTsMs > 0 && currTsMs > prevTsMs && currTsMs - prevTsMs > 15 * 60 * 1000) {
+      continue;
+    }
+    const prev = prevBar?.close || 0;
+    const curr = currBar?.close || 0;
     if (prev > 0 && curr > 0) {
       const r = Math.log(curr / prev);
       sqReturns.push(r * r);
@@ -4285,7 +4661,7 @@ export function priceOptionWithSkew(input: SkewBlackScholesInput): SkewBlackScho
     : discK * normCdf(-d2) - discS * normCdf(-d1);
 
   const mid = Math.max(0.02, rawMid);
-  const halfSpread = Math.max(0.01, Math.min(0.12, mid * halfSpreadPct));
+  const halfSpread = Math.max(0.01, Math.min(Math.max(0.12, mid * 0.025), mid * halfSpreadPct));
 
   const bid = Math.max(0.01, Math.round((mid - halfSpread) * 100) / 100);
   const ask = Math.max(bid + 0.01, Math.round((mid + halfSpread) * 100) / 100);
@@ -4331,6 +4707,17 @@ export interface UnifiedSniperCandidate {
   target1Spot: number;
   target2Spot: number;
   features: UnifiedBarFeatures;
+}
+
+function inferStrikeStep(spot: number): number {
+  if (spot >= 15000) return 25;
+  if (spot >= 1500) return 5;
+  if (spot >= 250) return 1;
+  return 0.5;
+}
+
+function roundToStrikeStep(price: number, step: number): number {
+  return Number((Math.round(price / step) * step).toFixed(2));
 }
 
 /**
@@ -4393,11 +4780,12 @@ export function computeUnifiedSniperFeatures(
   const projectedMagnet = isBullishDrift
     ? Math.max(sessionHigh, openSpot + Math.max(openSpot * 0.0047, atr * 4.2))
     : Math.min(sessionLow, openSpot - Math.max(openSpot * 0.0047, atr * 4.2));
-  const kingStrike = explicitKingStrike ?? Math.round(projectedMagnet);
+  const strikeStep = inferStrikeStep(spot);
+  const kingStrike = explicitKingStrike ?? roundToStrikeStep(projectedMagnet, strikeStep);
 
   const activeRange = Math.max(atr * 3.0, sessionHigh - sessionLow);
-  const supportStrike = Math.round((sessionLow + activeRange * 0.22) * 2) / 2;
-  const resistStrike = Math.round((sessionHigh - activeRange * 0.22) * 2) / 2;
+  const supportStrike = roundToStrikeStep(sessionLow + activeRange * 0.22, strikeStep);
+  const resistStrike = roundToStrikeStep(sessionHigh - activeRange * 0.22, strikeStep);
 
   const recent6 = slice.slice(-6);
   const firstHalf = recent6.slice(0, Math.max(1, Math.floor(recent6.length / 2)));
@@ -4464,14 +4852,15 @@ export function evaluateUnifiedSniperSetup(
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
+    hourCycle: "h23",
   });
   const parts = fmt.formatToParts(dt);
-  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 0);
+  const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 0) % 24;
   const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
   const etMins = hour * 60 + minute;
 
   // Mandatory RTH Entry Window: 09:35 ET (575) through 14:30 ET (870)
-  if (etMins < 575 || etMins > 870) return null;
+  if (etMins < ENTRY_START_MINS || etMins > ENTRY_CUTOFF_MINS) return null;
 
   const features = computeUnifiedSniperFeatures(bars, idx, explicitKingStrike, referenceChainIv);
   const spot = bar.close;
@@ -4489,18 +4878,17 @@ export function evaluateUnifiedSniperSetup(
 
   const distSupport = spot - supportStrike;
   const distResist = resistStrike - spot;
-  const kingUpsideRoom = kingStrike - spot;
-  const kingDownsideRoom = spot - kingStrike;
+  const minVwapSlope = Math.max(0.002, spot * 0.00003);
 
   // Regime Locks: Block counter-trend entries against strong trend + Tactical King pull
   const isBullishRegimeLocked =
     (spot > vwap && spot > sma34 && kingStrike > spot) ||
-    (spot > vwap && vwapSlope > 0.02 && isHigherHighs);
+    (spot > vwap && vwapSlope > minVwapSlope && isHigherHighs);
 
   const isBearishRegimeLocked =
     (spot < vwap && spot < sma34) ||
     (spot < vwap && kingStrike < spot) ||
-    (spot < vwap && vwapSlope < -0.02 && isLowerLows);
+    (spot < vwap && vwapSlope < -minVwapSlope && isLowerLows);
 
   const isMorningMomentumWindow = etMins >= 575 && etMins <= 11 * 60;
   const isOpeningHourFlushWindow = etMins >= 575 && etMins <= 10 * 60 + 30;
@@ -4576,13 +4964,19 @@ export function evaluateUnifiedSniperSetup(
   if (!direction) return null;
 
   const stopDist = Math.max(spot * 0.0011, atr * 1.35);
-  const t1Dist = Math.max(spot * 0.0016, stopDist * 1.45);
+  const t1Dist = Math.max(spot * 0.0016, stopDist * 1.5);
   const t2Dist =
     direction === "LONG" && kingStrike > spot + t1Dist
-      ? Math.min(kingStrike - spot, stopDist * 3.0)
-      : Math.max(spot * 0.0028, stopDist * 2.35);
+      ? Math.max(t1Dist, Math.min(kingStrike - spot, stopDist * 3.0))
+      : direction === "SHORT" && kingStrike > 0 && kingStrike < spot - t1Dist
+        ? Math.max(t1Dist, Math.min(spot - kingStrike, stopDist * 3.0))
+        : Math.max(t1Dist, Math.max(spot * 0.0028, stopDist * 2.35));
 
-  const strike = direction === "LONG" ? Math.ceil(spot) : Math.floor(spot);
+  const strikeStep = inferStrikeStep(spot);
+  const strike =
+    direction === "LONG"
+      ? Number((Math.ceil(spot / strikeStep) * strikeStep).toFixed(2))
+      : Number((Math.floor(spot / strikeStep) * strikeStep).toFixed(2));
 
   return {
     direction,
@@ -4665,10 +5059,11 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
   if (!isSupportedTradeTicker(normalizedTicker)) {
     return { dispatchedCount: 0, keys: [] };
   }
-  const positionTicker = normalizedTicker === "SPXW" ? "SPY" : normalizedTicker;
+  const isSpxwSync = normalizedTicker === "SPXW";
+  const positionTicker = isSpxwSync ? "SPY" : normalizedTicker;
   const tickerSlug = positionTicker.toLowerCase().replace(/[^a-z0-9]/g, "") || "ticker";
 
-  const store = loadTradeStore();
+  let store = loadTradeStore();
   store.gaiaStateByTicker = store.gaiaStateByTicker || {};
   const prevTickerState = store.gaiaStateByTicker[positionTicker] || {};
   const updatedTickerState = {
@@ -4689,22 +5084,51 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         ? params.zeroGamma
         : prevTickerState.zeroGamma ?? (positionTicker === "SPY" ? store.zeroGamma : undefined),
   };
-  store.gaiaStateByTicker[positionTicker] = updatedTickerState;
-  if (positionTicker === "SPY") {
-    if (params.activeFsmState) store.activeFsmState = params.activeFsmState;
-    if (params.macroRegime) store.macroRegime = params.macroRegime;
-    if (typeof params.chiPct === "number") store.chiPct = params.chiPct;
-    if (typeof params.zeroGamma === "number" && params.zeroGamma > 0) {
-      store.zeroGamma = params.zeroGamma;
-    }
-  }
 
-  // Consistency Guard: Transition active Gaia HUD position to CLOSED if FSM is STAND_ASIDE or in opposite regime
+  const applyGaiaStateToStore = (targetStore: DailyTradeStore): boolean => {
+    targetStore.gaiaStateByTicker = targetStore.gaiaStateByTicker || {};
+    const existing = targetStore.gaiaStateByTicker[positionTicker] || {};
+    let changed =
+      existing.activeFsmState !== updatedTickerState.activeFsmState ||
+      existing.macroRegime !== updatedTickerState.macroRegime ||
+      existing.chiPct !== updatedTickerState.chiPct ||
+      existing.zeroGamma !== updatedTickerState.zeroGamma;
+    targetStore.gaiaStateByTicker[positionTicker] = updatedTickerState;
+    if (positionTicker === "SPY") {
+      if (params.activeFsmState && targetStore.activeFsmState !== params.activeFsmState) {
+        targetStore.activeFsmState = params.activeFsmState;
+        changed = true;
+      }
+      if (params.macroRegime && targetStore.macroRegime !== params.macroRegime) {
+        targetStore.macroRegime = params.macroRegime;
+        changed = true;
+      }
+      if (typeof params.chiPct === "number" && targetStore.chiPct !== params.chiPct) {
+        targetStore.chiPct = params.chiPct;
+        changed = true;
+      }
+      if (typeof params.zeroGamma === "number" && params.zeroGamma > 0 && targetStore.zeroGamma !== params.zeroGamma) {
+        targetStore.zeroGamma = params.zeroGamma;
+        changed = true;
+      }
+    }
+    return changed;
+  };
+  const gaiaStateChanged = applyGaiaStateToStore(store);
+
+  // Consistency Guard: Transition active Gaia HUD position to CLOSED on MOC cutoff, STAND_ASIDE, or regime flip
   const tickerPos = store.activePositions[positionTicker];
   const isTickerStructural = Boolean(tickerPos && !tickerPos.setupName.includes("Gaia Tactical HUD"));
-  const guardNowTs = Math.floor(Date.now() / 1000);
+  const guardNowDate = new Date();
+  const guardNowTs = Math.floor(guardNowDate.getTime() / 1000);
+  const guardNowEt = getNowEtTime(guardNowDate);
+  const isGuardMocCutoff = !params.isHistoricalBackfill && guardNowEt.totalMinutes >= EOD_FORCE_FLAT_MINS;
   const guardHeldSec = tickerPos ? guardNowTs - (tickerPos.openedTs || guardNowTs) : 0;
-  const guardCloseSpot = Number(params.spotPrice) > 0 ? Number(params.spotPrice) : tickerPos?.btoSpotPrice ?? 0;
+  const rawParamsSpot = Number(params.spotPrice);
+  const guardCloseSpot =
+    rawParamsSpot > 0
+      ? (isSpxwSync ? Number((rawParamsSpot / 10).toFixed(2)) : Number(rawParamsSpot.toFixed(2)))
+      : (tickerPos?.btoSpotPrice ?? 0);
   const guardAdverseMove = tickerPos
     ? (tickerPos.contractType === "CALL" ? tickerPos.btoSpotPrice - guardCloseSpot : guardCloseSpot - tickerPos.btoSpotPrice)
     : 0;
@@ -4712,64 +5136,136 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
     guardCloseSpot,
     tickerPos?.atr5m ?? guardCloseSpot * 0.0018
   ).minReversalInvalidation;
-  const guardCanExit = Boolean(
-    tickerPos && !isTickerStructural && guardHeldSec >= 600 && guardAdverseMove >= guardMinInvalidation
-  );
-  if (params.activeFsmState === "STAND_ASIDE" && guardCanExit && tickerPos) {
-    const nowTs = Math.floor(Date.now() / 1000);
-    const closeSpot = Number(params.spotPrice) > 0 ? Number(params.spotPrice) : tickerPos.btoSpotPrice;
+
+  let guardExitReason: string | null = null;
+  if (tickerPos && !isTickerStructural) {
+    const isGuardCall = tickerPos.contractType === "CALL";
+    const isGuardWinning = isGuardCall
+      ? guardCloseSpot > tickerPos.btoSpotPrice
+      : guardCloseSpot < tickerPos.btoSpotPrice;
+    if (isGuardMocCutoff) {
+      guardExitReason = "15:55 PM ET HARD MARKET CLOSE CUTOFF";
+    } else if (
+      params.activeFsmState === "STAND_ASIDE" &&
+      guardHeldSec >= 600 &&
+      (guardAdverseMove >= guardMinInvalidation || isGuardWinning)
+    ) {
+      guardExitReason = "Gaia FSM Neutralization to STAND_ASIDE";
+    } else if (
+      guardHeldSec >= 600 &&
+      guardAdverseMove >= guardMinInvalidation &&
+      !isGuardCall &&
+      (params.activeFsmState === "LONG" || (updatedTickerState.macroRegime === "CALL" && (updatedTickerState.chiPct ?? 50) > 52))
+    ) {
+      guardExitReason = "Macro Rotation to Bull Regime";
+    } else if (
+      guardHeldSec >= 600 &&
+      guardAdverseMove >= guardMinInvalidation &&
+      isGuardCall &&
+      (params.activeFsmState === "SHORT" || (updatedTickerState.macroRegime === "PUT" && (updatedTickerState.chiPct ?? 50) < 48))
+    ) {
+      guardExitReason = "Macro Rotation to Bear Regime";
+    }
+  }
+
+  let guardSaved = false;
+  if (guardExitReason && tickerPos) {
+    console.warn(`[GaiaSync] Closed ${positionTicker} ${tickerPos.contractType} position: ${guardExitReason}`);
+    const isGuardCall = tickerPos.contractType === "CALL";
+    const entryOptPrice = tickerPos.btoOptionMid || tickerPos.optionAsk || 0.50;
+    const dirMove = isGuardCall ? guardCloseSpot - tickerPos.btoSpotPrice : tickerPos.btoSpotPrice - guardCloseSpot;
+    const spotMovePct = Number(((dirMove / Math.max(0.01, tickerPos.btoSpotPrice)) * 100).toFixed(2));
+    const rawEstOpt = Math.max(0.05, Number((entryOptPrice + dirMove * 0.45).toFixed(2)));
+    const closedOptMid = clampOptionPriceToGreekEnvelope(
+      tickerPos.btoSpotPrice,
+      guardCloseSpot,
+      entryOptPrice,
+      rawEstOpt,
+      isGuardCall,
+      Math.max(1, guardHeldSec / 60)
+    );
+    const pnlOptionPct = Number((((closedOptMid - entryOptPrice) / Math.max(0.01, entryOptPrice)) * 100).toFixed(2));
+    const guardTimeStr = formatTimeEt(guardNowDate);
+    const isGuardLiveRth = guardNowEt.totalMinutes >= RTH_OPEN_MINS && guardNowEt.totalMinutes < RTH_CLOSE_MINS;
+    const isGuardHistorical = Boolean(params.isHistoricalBackfill) || !isGuardLiveRth;
+    const guardExitAlertId = `${tickerPos.id}-guard-stc-${guardNowTs}`;
+
     tickerPos.status = "CLOSED";
-    tickerPos.closedTs = nowTs;
-    tickerPos.closedAt = formatTimeEt(new Date());
-    tickerPos.closedSpotPrice = closeSpot;
-    tickerPos.exitReason = "Gaia FSM Neutralization to STAND_ASIDE";
-    const isCall = tickerPos.contractType === "CALL";
-    const dirMove = isCall ? closeSpot - tickerPos.btoSpotPrice : tickerPos.btoSpotPrice - closeSpot;
-    tickerPos.pnlSpotPct = Number(((dirMove / Math.max(0.01, tickerPos.btoSpotPrice)) * 100).toFixed(2));
+    tickerPos.remainingQty = 0;
+    tickerPos.closedTs = guardNowTs;
+    tickerPos.closedAt = guardTimeStr;
+    tickerPos.closedSpotPrice = guardCloseSpot;
+    tickerPos.closedOptionMid = closedOptMid;
+    tickerPos.pnlSpotPct = spotMovePct;
+    tickerPos.pnlOptionPct = pnlOptionPct;
+    tickerPos.exitReason = guardExitReason;
+
+    const guardExitAlert: TradeLifecycleAlert = {
+      id: guardExitAlertId,
+      timestamp: guardTimeStr,
+      ts: guardNowTs,
+      ticker: positionTicker,
+      action: "SELL_TO_CLOSE",
+      contractType: tickerPos.contractType,
+      contractLabel: tickerPos.contractLabel,
+      strike: tickerPos.strike,
+      expiration: tickerPos.expiration,
+      expHuman: tickerPos.expHuman,
+      robinhoodExp: tickerPos.robinhoodExp,
+      setupName: tickerPos.setupName,
+      reason: guardExitReason,
+      status: "CLOSED",
+      spotPrice: guardCloseSpot,
+      btoSpotPrice: tickerPos.btoSpotPrice,
+      target1Spot: tickerPos.target1Spot,
+      target2Spot: tickerPos.target2Spot,
+      stopLossSpot: tickerPos.stopLossSpot,
+      optionMid: closedOptMid,
+      optionBid: closedOptMid,
+      optionAsk: closedOptMid,
+      btoOptionMid: entryOptPrice,
+      contractsQty: tickerPos.contractsQty,
+      remainingQty: 0,
+      totalOutlay: tickerPos.totalOutlay,
+      pnlSpotPct: spotMovePct,
+      pnlOptionPct,
+      isHistoricalBackfill: isGuardHistorical,
+      eventId: guardExitAlertId,
+      message: `🔴 STC · ${tickerPos.contractLabel} [${guardExitReason}] @ $${guardCloseSpot.toFixed(2)} · Spot ${spotMovePct >= 0 ? "+" : ""}${spotMovePct}% (${pnlOptionPct >= 0 ? "+" : ""}${pnlOptionPct}%)`,
+    };
+
     store.closedPositions.push(tickerPos);
     delete store.activePositions[positionTicker];
+    store.alerts.push(guardExitAlert);
     saveTradeStore(store);
-  } else if (
-    (params.activeFsmState === "LONG" || (updatedTickerState.macroRegime === "CALL" && (updatedTickerState.chiPct ?? 50) > 52)) &&
-    tickerPos?.contractType === "PUT" &&
-    guardCanExit
-  ) {
-    console.warn(`[GaiaSync] Closed contradicting ${positionTicker} PUT position on rotation to Bull Regime.`);
-    const nowTs = Math.floor(Date.now() / 1000);
-    const closeSpot = Number(params.spotPrice) > 0 ? Number(params.spotPrice) : tickerPos.btoSpotPrice;
-    tickerPos.status = "CLOSED";
-    tickerPos.closedTs = nowTs;
-    tickerPos.closedAt = formatTimeEt(new Date());
-    tickerPos.closedSpotPrice = closeSpot;
-    tickerPos.exitReason = "Macro Rotation to Bull Regime";
-    const dirMove = tickerPos.btoSpotPrice - closeSpot;
-    tickerPos.pnlSpotPct = Number(((dirMove / Math.max(0.01, tickerPos.btoSpotPrice)) * 100).toFixed(2));
-    store.closedPositions.push(tickerPos);
-    delete store.activePositions[positionTicker];
-    saveTradeStore(store);
-  } else if (
-    (params.activeFsmState === "SHORT" || (updatedTickerState.macroRegime === "PUT" && (updatedTickerState.chiPct ?? 50) < 48)) &&
-    tickerPos?.contractType === "CALL" &&
-    guardCanExit
-  ) {
-    console.warn(`[GaiaSync] Closed contradicting ${positionTicker} CALL position on rotation to Bear Regime.`);
-    const nowTs = Math.floor(Date.now() / 1000);
-    const closeSpot = Number(params.spotPrice) > 0 ? Number(params.spotPrice) : tickerPos.btoSpotPrice;
-    tickerPos.status = "CLOSED";
-    tickerPos.closedTs = nowTs;
-    tickerPos.closedAt = formatTimeEt(new Date());
-    tickerPos.closedSpotPrice = closeSpot;
-    tickerPos.exitReason = "Macro Rotation to Bear Regime";
-    const dirMove = closeSpot - tickerPos.btoSpotPrice;
-    tickerPos.pnlSpotPct = Number(((dirMove / Math.max(0.01, tickerPos.btoSpotPrice)) * 100).toFixed(2));
-    store.closedPositions.push(tickerPos);
-    delete store.activePositions[positionTicker];
-    saveTradeStore(store);
+    guardSaved = true;
+
+    if (!isGuardHistorical && !params.signal?.aborted) {
+      const sent = await sendDiscordTradeAlert(guardExitAlert, params.webhookUrl, { signal: params.signal }).catch(
+        (err) => {
+          console.error("[GaiaSync] Failed to dispatch Consistency Guard STC alert to Discord:", err);
+          return false;
+        }
+      );
+      if (sent) {
+        const afterGuardSend = loadTradeStore();
+        afterGuardSend.dispatchedAlertIds = afterGuardSend.dispatchedAlertIds || {};
+        afterGuardSend.dispatchedAlertIds[guardExitAlertId] = true;
+        saveTradeStore(afterGuardSend);
+        store = afterGuardSend;
+      }
+    }
   }
 
   const rawSignals = Array.isArray(params.signals) ? params.signals : [];
   if (rawSignals.length === 0 || params.activeFsmState === "STAND_ASIDE") {
+    if (gaiaStateChanged && !guardSaved) {
+      saveTradeStore(store);
+    }
     return { dispatchedCount: 0, keys: [] };
+  }
+  if (gaiaStateChanged && !guardSaved) {
+    saveTradeStore(store);
   }
 
   if (!globalForGaiaDiscord.__hyperionDispatchedGaiaKeys) {
@@ -4786,6 +5282,7 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
 
   for (let i = 0; i < sorted.length; i++) {
     if (params.signal?.aborted) break;
+    store = loadTradeStore();
     const sig = sorted[i];
     const nextSig = sorted[i + 1];
     const slot = getCanonicalGaiaSlot(sig);
@@ -4826,14 +5323,20 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
     // Opening-range firewall check (< 9:45 AM ET, i.e. totalMinutes < 585):
     const sigDate = new Date(eventTs * 1000);
     const sigEt = getNowEtTime(sigDate);
-    if (sigEt.totalMinutes < 575 || sigEt.totalMinutes > 870) {
+    if (sigEt.totalMinutes < ENTRY_START_MINS || sigEt.totalMinutes > ENTRY_CUTOFF_MINS) {
       console.warn(`[GaiaSync FIREWALL] Blocked signal outside entry window (09:35-14:30 ET): ${sigEt.hours}:${sigEt.minutes}`);
       continue;
     }
+    const storedSpotNorm = store.prevSpotPrices[normalizedTicker];
+    const storedSpotPos = store.prevSpotPrices[positionTicker];
+    const scaledStoredPos =
+      typeof storedSpotPos === "number" && storedSpotPos > 0
+        ? (isSpxwSync ? storedSpotPos * 10 : storedSpotPos)
+        : undefined;
     const liveSpotRef =
       Number(params.spotPrice) > 0
         ? Number(params.spotPrice)
-        : (store.prevSpotPrices[positionTicker] ?? store.prevSpotPrices[normalizedTicker]);
+        : (storedSpotNorm ?? scaledStoredPos);
     if (typeof liveSpotRef === "number" && liveSpotRef > 0) {
       const basisDiffPct = Math.abs(sig.price - liveSpotRef) / liveSpotRef;
       if (basisDiffPct > 0.0075) {
@@ -4843,10 +5346,10 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
     }
     const isOpeningRangeSig = sigEt.totalMinutes < 585;
     const priorCloseRef =
-      typeof store.prevSpotPrices[positionTicker] === "number" && store.prevSpotPrices[positionTicker] > 0
-        ? store.prevSpotPrices[positionTicker]
-        : typeof store.prevSpotPrices[normalizedTicker] === "number" && store.prevSpotPrices[normalizedTicker] > 0
-          ? store.prevSpotPrices[normalizedTicker]
+      typeof storedSpotNorm === "number" && storedSpotNorm > 0
+        ? storedSpotNorm
+        : typeof scaledStoredPos === "number" && scaledStoredPos > 0
+          ? scaledStoredPos
           : Number(params.spotPrice) > 0
             ? Number(params.spotPrice)
             : undefined;
@@ -4893,7 +5396,7 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         closedCount === 1 &&
         prevCooldownMet &&
         sigEt.totalMinutes >= 630 &&
-        sigEt.totalMinutes <= 870 &&
+        sigEt.totalMinutes <= ENTRY_CUTOFF_MINS &&
         prevClosed?.contractType !== direction;
       if (closedCount >= 2 || (closedCount >= 1 && !canPhase2OppositeReclaim)) {
         console.warn(`[GaiaSync FIREWALL] Blocked ${positionTicker} trade dispatch: Day is LOCKED_FOR_DAY (${closedCount} closed trades on ${positionTicker}).`);
@@ -4909,27 +5412,32 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         continue;
       }
 
-      const syncStopDist = Math.max(0.05, Number((sig.price * 0.0016).toFixed(2)));
-      const syncTp1Dist = Number((syncStopDist * 1.5).toFixed(2));
-      const syncTp2Dist = Math.max(syncTp1Dist + 0.05, Number((sig.price * 0.0047).toFixed(2)));
+      const posSigPrice = isSpxwSync ? Number((sig.price / 10).toFixed(2)) : Number(sig.price.toFixed(2));
+      const syncStopDist = Math.max(0.05, Number((posSigPrice * 0.0016).toFixed(2)));
+      const syncTp1Dist = Math.ceil((syncStopDist * 1.5 - 1e-9) * 100) / 100;
+      const syncTp2Dist = Math.max(syncTp1Dist + 0.05, Number((posSigPrice * 0.0047).toFixed(2)));
       const target1Spot = isCall
-        ? Number((sig.price + syncTp1Dist).toFixed(2))
-        : Number((sig.price - syncTp1Dist).toFixed(2));
+        ? Number((posSigPrice + syncTp1Dist).toFixed(2))
+        : Number((posSigPrice - syncTp1Dist).toFixed(2));
       const target2Spot = isCall
-        ? Number((sig.price + syncTp2Dist).toFixed(2))
-        : Number((sig.price - syncTp2Dist).toFixed(2));
+        ? Number((posSigPrice + syncTp2Dist).toFixed(2))
+        : Number((posSigPrice - syncTp2Dist).toFixed(2));
       const stopLossSpot = isCall
-        ? Number((sig.price - syncStopDist).toFixed(2))
-        : Number((sig.price + syncStopDist).toFixed(2));
+        ? Number((posSigPrice - syncStopDist).toFixed(2))
+        : Number((posSigPrice + syncStopDist).toFixed(2));
 
       // Attempt to find optimal live contract under $1.00 — fail closed when none qualifies
+      const contractSpot = isSpxwSync ? Number((posSigPrice * 10).toFixed(2)) : posSigPrice;
+      const contractT1 = isSpxwSync ? Number((target1Spot * 10).toFixed(2)) : target1Spot;
+      const contractT2 = isSpxwSync ? Number((target2Spot * 10).toFixed(2)) : target2Spot;
+      const contractSl = isSpxwSync ? Number((stopLossSpot * 10).toFixed(2)) : stopLossSpot;
       const optimal = await selectSmallAccountContract({
         ticker: normalizedTicker,
         contractType: direction,
-        spotPrice: sig.price,
-        target1Spot,
-        target2Spot,
-        stopLossSpot,
+        spotPrice: contractSpot,
+        target1Spot: contractT1,
+        target2Spot: contractT2,
+        stopLossSpot: contractSl,
         conviction: 92,
         nowEt: sigDate,
         signal: params.signal,
@@ -4937,7 +5445,7 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
 
       if (params.signal?.aborted) break;
       if (!optimal) {
-        console.warn(`[GaiaSync FIREWALL] No qualifying live contract under $1.00 for ${normalizedTicker} ${direction} @ $${sig.price.toFixed(2)} — skipping synthetic fallback.`);
+        console.warn(`[GaiaSync FIREWALL] No qualifying live contract under $1.00 for ${normalizedTicker} ${direction} @ $${posSigPrice.toFixed(2)} — skipping synthetic fallback.`);
         continue;
       }
 
@@ -4958,7 +5466,7 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
       const estStop = Math.max(maxStopLossFloor, optimal.estStopMid);
       const tp1Pct = Math.round(((estTp1 - entryAsk) / Math.max(0.01, entryAsk)) * 100);
       const tp2Pct = Math.round(((estTp2 - entryAsk) / Math.max(0.01, entryAsk)) * 100);
-      const alertTimeStr = sig.time || sig.timeLabel || formatTimeEt(new Date());
+      const alertTimeStr = sig.time || sig.timeLabel || formatTimeEt(sigDate);
 
       // Dynamic Freshness Gate: Compute staleness relative to dynamic bar close timestamp
       const inferredIntervalSec =
@@ -4967,7 +5475,7 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
           : 300;
       const eventCloseTs = sig.barCloseTimestamp || (eventTs + inferredIntervalSec);
       const isStale = nowTs - eventCloseTs > Math.round(inferredIntervalSec * 1.5);
-      const isRthWindow = sigEt.totalMinutes >= 570 && sigEt.totalMinutes < 960;
+      const isRthWindow = sigEt.totalMinutes >= RTH_OPEN_MINS && sigEt.totalMinutes < RTH_CLOSE_MINS;
       const isHistoricalBackfill = isStale || !isRthWindow || Boolean(params.isHistoricalBackfill);
       const alertId = `gaia-${tickerSlug}-${entryKey.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
 
@@ -4986,10 +5494,10 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         robinhoodExp: optimal.robinhoodExp,
         robinhoodTab: optimal.robinhoodTab,
         setupName: `Gaia Tactical HUD [${sig.label || sig.type}]`,
-        reason: `Gaia Intraday ${sig.label || sig.type} signal at $${sig.price.toFixed(2)}`,
+        reason: `Gaia Intraday ${sig.label || sig.type} signal at $${posSigPrice.toFixed(2)}`,
         status: "OPEN",
-        spotPrice: sig.price,
-        btoSpotPrice: sig.price,
+        spotPrice: posSigPrice,
+        btoSpotPrice: posSigPrice,
         target1Spot,
         target2Spot,
         stopLossSpot,
@@ -5006,12 +5514,13 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         tp1Pct,
         tp2Pct,
         rrRatio: 1.5,
+        altContractNote: optimal.altContractNote,
         calibratedWinRate: 68,
         calibratedExpectancyR: 0.45,
         dataConvictionScore: 92,
         isHistoricalBackfill,
         eventId: alertId,
-        message: `${isCall ? "🟢" : "🟣"} BUY TO OPEN (${contractsQty}x @ $${entryAsk.toFixed(2)}) · ${positionTicker} [Gaia ${sig.label || sig.type}] @ $${sig.price.toFixed(2)} · SL: $${stopLossSpot}, TP1: $${target1Spot}, TP2: $${target2Spot}`,
+        message: `${isCall ? "🟢" : "🟣"} BUY TO OPEN (${contractsQty}x @ $${entryAsk.toFixed(2)}) · ${positionTicker} [Gaia ${sig.label || sig.type}] @ $${posSigPrice.toFixed(2)} · SL: $${stopLossSpot}, TP1: $${target1Spot}, TP2: $${target2Spot}`,
       };
 
       // Create tracking position
@@ -5027,7 +5536,7 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         robinhoodTab: optimal.robinhoodTab,
         setupName: btoAlert.setupName,
         status: "OPEN",
-        btoSpotPrice: sig.price,
+        btoSpotPrice: posSigPrice,
         btoOptionMid: entryAsk,
         optionBid: optimal.optionBid,
         optionAsk: entryAsk,
@@ -5045,8 +5554,9 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         openedAt: alertTimeStr,
         openedTs: eventTs,
         rrRatio: 1.5,
-        initialRisk: Number(Math.max(0.05, Math.abs(sig.price - stopLossSpot)).toFixed(2)),
-        atr5m: Number((sig.price * 0.0018).toFixed(4)),
+        initialRisk: Number(Math.max(0.05, Math.abs(posSigPrice - stopLossSpot)).toFixed(2)),
+        atr5m: Number((posSigPrice * 0.0018).toFixed(4)),
+        altContractNote: optimal.altContractNote,
         calibratedWinRate: 68,
         calibratedExpectancyR: 0.45,
         dataConvictionScore: 92,
@@ -5058,17 +5568,20 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         console.warn(`[GaiaSync FIREWALL] Aborted ${positionTicker} commit: global slot became occupied during option lookup.`);
         continue;
       }
-      store.activePositions[positionTicker] = newPos;
-      store.alerts.push(btoAlert);
-      store.dispatchedAlertIds = store.dispatchedAlertIds || {};
+      applyGaiaStateToStore(latestStoreBeforeCommit);
+      latestStoreBeforeCommit.activePositions[positionTicker] = newPos;
+      latestStoreBeforeCommit.alerts.push(btoAlert);
+      latestStoreBeforeCommit.dispatchedAlertIds = latestStoreBeforeCommit.dispatchedAlertIds || {};
       if (isHistoricalBackfill) {
         dispatchedSet.add(entryKey);
         newlyDispatched.push(entryKey);
-        store.dispatchedAlertIds[btoAlert.id] = true;
-        store.dispatchedAlertIds[idempotencyKey] = true;
-        saveTradeStore(store);
+        latestStoreBeforeCommit.dispatchedAlertIds[btoAlert.id] = true;
+        latestStoreBeforeCommit.dispatchedAlertIds[idempotencyKey] = true;
+        saveTradeStore(latestStoreBeforeCommit);
+        store = latestStoreBeforeCommit;
       } else {
-        saveTradeStore(store);
+        saveTradeStore(latestStoreBeforeCommit);
+        store = latestStoreBeforeCommit;
         const sent = await sendDiscordTradeAlert(btoAlert, params.webhookUrl, { signal: params.signal }).catch((err) => {
           console.error("[GaiaSync] Failed to dispatch BTO alert to Discord:", err);
           return false;
@@ -5076,9 +5589,12 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         if (sent) {
           dispatchedSet.add(entryKey);
           newlyDispatched.push(entryKey);
-          store.dispatchedAlertIds[btoAlert.id] = true;
-          store.dispatchedAlertIds[idempotencyKey] = true;
-          saveTradeStore(store);
+          const afterSendStore = loadTradeStore();
+          afterSendStore.dispatchedAlertIds = afterSendStore.dispatchedAlertIds || {};
+          afterSendStore.dispatchedAlertIds[btoAlert.id] = true;
+          afterSendStore.dispatchedAlertIds[idempotencyKey] = true;
+          saveTradeStore(afterSendStore);
+          store = afterSendStore;
         }
       }
     }
@@ -5086,18 +5602,20 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
     // Handle Opposing Reversal Exit — strictly require matching open ticker position (no phantom STC fabrication)
     if (nextSig && nextSig.type !== sig.type) {
       if (params.signal?.aborted) break;
-      const openPos = store.activePositions[positionTicker];
+      const latestExitStore = loadTradeStore();
+      const openPos = latestExitStore.activePositions[positionTicker];
       if (!openPos || openPos.contractType !== direction) {
         continue;
       }
-      const nextSigTsRaw = nextSig.timestamp || nextSig.barTimestamp || Math.floor(Date.now() / 1000);
-      const nextSigTsSec = nextSigTsRaw > 1e11 ? Math.floor(nextSigTsRaw / 1000) : nextSigTsRaw;
-      const heldSeconds = nextSigTsSec - (openPos.openedTs || nextSigTsSec);
-      const adverseSpot = isCall ? openPos.btoSpotPrice - nextSig.price : nextSig.price - openPos.btoSpotPrice;
-      const estOptMovePct = (((isCall ? nextSig.price - openPos.btoSpotPrice : openPos.btoSpotPrice - nextSig.price) * 0.45) / Math.max(0.01, openPos.btoOptionMid || 0.5)) * 100;
+      const nextSigRawTs = nextSig.timestamp || nextSig.barTimestamp || Math.floor(Date.now() / 1000);
+      const nextSigEpochSec = nextSigRawTs > 1e11 ? Math.floor(nextSigRawTs / 1000) : nextSigRawTs;
+      const nextPosPrice = isSpxwSync ? Number((nextSig.price / 10).toFixed(2)) : Number(nextSig.price.toFixed(2));
+      const heldSeconds = nextSigEpochSec - (openPos.openedTs || nextSigEpochSec);
+      const adverseSpot = isCall ? openPos.btoSpotPrice - nextPosPrice : nextPosPrice - openPos.btoSpotPrice;
+      const estOptMovePct = (((isCall ? nextPosPrice - openPos.btoSpotPrice : openPos.btoSpotPrice - nextPosPrice) * 0.45) / Math.max(0.01, openPos.btoOptionMid || 0.5)) * 100;
       const minSyncRev = computeAdaptiveQuantMetrics(
-        nextSig.price,
-        openPos.atr5m ?? nextSig.price * 0.0018
+        nextPosPrice,
+        openPos.atr5m ?? nextPosPrice * 0.0018
       ).minReversalInvalidation;
       if (heldSeconds < 600 || (adverseSpot < minSyncRev && estOptMovePct < 10)) {
         continue;
@@ -5105,28 +5623,33 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
 
       const exitKey = `${resolvedDate}:${positionTicker}:EXIT:${slot}`;
       const dedupExitAlertId = `gaia-${tickerSlug}-${exitKey.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
-      if (!dispatchedSet.has(exitKey) && !store.dispatchedAlertIds?.[dedupExitAlertId]) {
+      if (!dispatchedSet.has(exitKey) && !latestExitStore.dispatchedAlertIds?.[dedupExitAlertId]) {
         const entrySpot = openPos.btoSpotPrice;
         const entryOptMid = openPos.btoOptionMid || openPos.optionAsk || 0.50;
-        const underlyingMove = isCall ? nextSig.price - entrySpot : entrySpot - nextSig.price;
+        const underlyingMove = isCall ? nextPosPrice - entrySpot : entrySpot - nextPosPrice;
         const spotMovePct = Number(((underlyingMove / Math.max(0.01, entrySpot)) * 100).toFixed(2));
-        const estExitPrice = Math.max(0.05, Number((entryOptMid + underlyingMove * 0.45).toFixed(2)));
+        const rawEstExit = Math.max(0.05, Number((entryOptMid + underlyingMove * 0.45).toFixed(2)));
+        const estExitPrice = clampOptionPriceToGreekEnvelope(
+          entrySpot,
+          nextPosPrice,
+          entryOptMid,
+          rawEstExit,
+          isCall,
+          Math.max(1, heldSeconds / 60)
+        );
         const pnlOptionPct = Number((((estExitPrice - entryOptMid) / Math.max(0.01, entryOptMid)) * 100).toFixed(1));
-        const exitAlertId = `gaia-${tickerSlug}-${exitKey.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
-        const exitTimeStr = nextSig.time || nextSig.timeLabel || formatTimeEt(new Date());
-
-        const nextSigRawTs = nextSig.timestamp || nextSig.barTimestamp || Math.floor(Date.now() / 1000);
-        const nextSigEpochSec = nextSigRawTs > 1e11 ? Math.floor(nextSigRawTs / 1000) : nextSigRawTs;
+        const exitAlertId = dedupExitAlertId;
         const nextSigDate = new Date(nextSigEpochSec * 1000);
+        const exitTimeStr = nextSig.time || nextSig.timeLabel || formatTimeEt(nextSigDate);
         const nextSigEt = getNowEtTime(nextSigDate);
-        const isExitRthWindow = nextSigEt.totalMinutes >= 570 && nextSigEt.totalMinutes < 960;
+        const isExitRthWindow = nextSigEt.totalMinutes >= RTH_OPEN_MINS && nextSigEt.totalMinutes < RTH_CLOSE_MINS;
         const isExitStale = Math.floor(Date.now() / 1000) - nextSigEpochSec > 450;
         const isExitHistorical = isExitStale || !isExitRthWindow || Boolean(params.isHistoricalBackfill);
 
         const exitAlert: TradeLifecycleAlert = {
           id: exitAlertId,
           timestamp: exitTimeStr,
-          ts: Math.floor(Date.now() / 1000),
+          ts: nextSigEpochSec,
           ticker: positionTicker,
           action: "SELL_TO_CLOSE",
           contractType: direction,
@@ -5136,7 +5659,7 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
           setupName: openPos.setupName,
           reason: `Gaia closed on reversal transition to ${nextSig.label || nextSig.type}`,
           status: "CLOSED",
-          spotPrice: nextSig.price,
+          spotPrice: nextPosPrice,
           btoSpotPrice: entrySpot,
           target1Spot: openPos.target1Spot,
           target2Spot: openPos.target2Spot,
@@ -5152,30 +5675,32 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
           pnlOptionPct,
           isHistoricalBackfill: isExitHistorical,
           eventId: exitAlertId,
-          message: `🔴 SELL TO CLOSE · ${openPos.contractLabel} [Gaia ${sig.label || sig.type}] @ $${nextSig.price.toFixed(2)} · Spot ${spotMovePct >= 0 ? "+" : ""}${spotMovePct}% (${pnlOptionPct >= 0 ? "+" : ""}${pnlOptionPct}%)`,
+          message: `🔴 SELL TO CLOSE · ${openPos.contractLabel} [Gaia ${sig.label || sig.type}] @ $${nextPosPrice.toFixed(2)} · Spot ${spotMovePct >= 0 ? "+" : ""}${spotMovePct}% (${pnlOptionPct >= 0 ? "+" : ""}${pnlOptionPct}%)`,
         };
 
         openPos.status = "CLOSED";
         openPos.remainingQty = 0;
         openPos.closedAt = exitTimeStr;
-        openPos.closedTs = Math.floor(Date.now() / 1000);
-        openPos.closedSpotPrice = nextSig.price;
+        openPos.closedTs = nextSigEpochSec;
+        openPos.closedSpotPrice = nextPosPrice;
         openPos.closedOptionMid = estExitPrice;
         openPos.pnlOptionPct = pnlOptionPct;
         openPos.pnlSpotPct = spotMovePct;
         openPos.exitReason = exitAlert.reason;
-        store.closedPositions.push(openPos);
-        delete store.activePositions[positionTicker];
+        latestExitStore.closedPositions.push(openPos);
+        delete latestExitStore.activePositions[positionTicker];
 
-        store.alerts.push(exitAlert);
-        store.dispatchedAlertIds = store.dispatchedAlertIds || {};
+        latestExitStore.alerts.push(exitAlert);
+        latestExitStore.dispatchedAlertIds = latestExitStore.dispatchedAlertIds || {};
         if (isExitHistorical) {
           dispatchedSet.add(exitKey);
           newlyDispatched.push(exitKey);
-          store.dispatchedAlertIds[exitAlert.id] = true;
-          saveTradeStore(store);
+          latestExitStore.dispatchedAlertIds[exitAlert.id] = true;
+          saveTradeStore(latestExitStore);
+          store = latestExitStore;
         } else {
-          saveTradeStore(store);
+          saveTradeStore(latestExitStore);
+          store = latestExitStore;
           const sent = await sendDiscordTradeAlert(exitAlert, params.webhookUrl, { signal: params.signal }).catch((err) => {
             console.error("[GaiaSync] Failed to dispatch STC alert to Discord:", err);
             return false;
@@ -5183,8 +5708,11 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
           if (sent) {
             dispatchedSet.add(exitKey);
             newlyDispatched.push(exitKey);
-            store.dispatchedAlertIds[exitAlert.id] = true;
-            saveTradeStore(store);
+            const afterExitSend = loadTradeStore();
+            afterExitSend.dispatchedAlertIds = afterExitSend.dispatchedAlertIds || {};
+            afterExitSend.dispatchedAlertIds[exitAlert.id] = true;
+            saveTradeStore(afterExitSend);
+            store = afterExitSend;
           }
         }
       }

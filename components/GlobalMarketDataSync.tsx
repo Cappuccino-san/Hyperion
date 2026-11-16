@@ -20,8 +20,11 @@ export function GlobalMarketDataSync() {
     void fetchOptionsChain(activeTicker);
     void fetchServerTrades(activeTicker);
 
-    // Continuous 5-second market heartbeat
+    // Continuous 5-second market heartbeat (skip while tab is backgrounded)
     const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        return;
+      }
       void fetchOptionsChain(activeTicker);
       void fetchServerTrades(activeTicker);
     }, 5_000);

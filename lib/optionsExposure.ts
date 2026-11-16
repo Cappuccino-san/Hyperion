@@ -1,11 +1,10 @@
 import {
-  calculateKingStrength,
   getTickerPreset,
   KingNodeMetrics,
   TickerSymbol,
   GammaLevels,
-  TickerPreset,
 } from "@/lib/tickerPresets";
+import { RTH_OPEN_MINS, RTH_CLOSE_MINS } from "@/lib/gaiaSessionGuards";
 
 export type DataSourceType = "TRADIER_LIVE" | "CBOE_MARKET_DATA" | "ROBINHOOD_LIVE";
 
@@ -26,7 +25,16 @@ export interface NormalizedOptionContract {
   last?: number;
 }
 
-export const globalContractsCache = new Map<string, NormalizedOptionContract[]>();
+const globalForOptionsExposure = globalThis as unknown as {
+  __hyperionGlobalContractsCache?: Map<string, NormalizedOptionContract[]>;
+};
+
+export const globalContractsCache: Map<string, NormalizedOptionContract[]> =
+  globalForOptionsExposure.__hyperionGlobalContractsCache ??
+  (globalForOptionsExposure.__hyperionGlobalContractsCache = new Map<
+    string,
+    NormalizedOptionContract[]
+  >());
 
 export interface ExpirationColumnSpec {
   id: string;
@@ -146,7 +154,7 @@ export interface OptionsAnalyticsPayload {
 export const normPDF = (x: number): number =>
   Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
 
-export const normCDF = (x: number): number => {
+const normCDF = (x: number): number => {
   const a1 = 0.254829592,
     a2 = -0.284496736,
     a3 = 1.421413741,
@@ -360,10 +368,10 @@ export function getActiveExpirationSelection(allRawExpirations: string[]): {
     };
   }
 
-  const isRegularSession = isWeekday && mins >= 570 && mins < 960;
+  const isRegularSession = isWeekday && mins >= RTH_OPEN_MINS && mins < RTH_CLOSE_MINS;
 
   // Strict Expired-Contract Firewall: always purge exp < todayEt (and exp === todayEt post-close/weekend)
-  if (isWeekday && mins < 960) {
+  if (isWeekday && mins < RTH_CLOSE_MINS) {
     const active = sorted.filter((exp) => exp >= nowEtIso);
     return {
       referenceDate: nowEtIso,
@@ -743,12 +751,6 @@ export function computeOptionsAnalytics(params: {
   let totalNetDexMillions = 0;
   let totalNetCharmMillions = 0;
 
-  let bestCallWallStrike = safeSpot + detectedStep * 5;
-  let bestCallWallGamma = 0;
-
-  let bestPutWallStrike = safeSpot - detectedStep * 5;
-  let bestPutWallGamma = 0;
-
   const computedRowsAsc: ComputedStrikeRow[] = [];
 
   for (const strike of uniqueStrikesAsc) {
@@ -841,18 +843,6 @@ export function computeOptionsAnalytics(params: {
         maxColAbsGex = Math.abs(cellGexM);
         kingPeakColId = exp.id;
       }
-    }
-
-    // Call Wall: Strike >= safeSpot with largest positive Call-only Gamma across all active expirations
-    if (strike >= safeSpot && rowCallGamma > bestCallWallGamma) {
-      bestCallWallGamma = rowCallGamma;
-      bestCallWallStrike = strike;
-    }
-
-    // Put Wall: Strike <= safeSpot with largest Put-only Gamma across all active expirations
-    if (strike <= safeSpot && rowPutGamma > bestPutWallGamma) {
-      bestPutWallGamma = rowPutGamma;
-      bestPutWallStrike = strike;
     }
 
     computedRowsAsc.push({
@@ -1046,9 +1036,9 @@ export function computeOptionsAnalytics(params: {
     const days = isoToDays.get(c.expiration) ?? 0;
     let T: number;
     if (days === 0) {
-      const closeEtMinutes = 16 * 60; // 16:00 ET
+      const closeEtMinutes = RTH_CLOSE_MINS; // 16:00 ET
       const remainingMin = Math.max(5, Math.min(390, closeEtMinutes - currentEtMinutes));
-      T = remainingMin / (252 * 390);
+      T = remainingMin / (365 * 390);
     } else {
       T = Math.max(1 / 365, days / 365);
     }
@@ -1144,9 +1134,6 @@ export function computeOptionsAnalytics(params: {
     }
     return { zeroGamma: zgPrice, hasZeroGammaFlip: flip };
   };
-
-  const { zeroGamma: zeroGammaPrice, hasZeroGammaFlip } =
-    solveZeroGamma(zgContracts);
 
   const computeLevelsForCols = (targetCols: ExpirationColumnSpec[]) => {
     const targetIsoSet = new Set(targetCols.map((c) => c.isoDate));
@@ -1412,9 +1399,14 @@ export function deriveTacticalStructuralLevels(
 
   let putWall = rawPutWall;
   const minStepOffset = Math.min(0.5, Math.max(0.05, payload.spotPrice * 0.001));
+  const emPct =
+    payload.expectedMoves?.daily?.em && payload.spotPrice > 0
+      ? payload.expectedMoves.daily.em / payload.spotPrice
+      : 0;
+  const maxPutWallDistPct = Math.max(0.0095, emPct * 1.1);
   if (
     rawPutWall > 0 &&
-    (payload.spotPrice - rawPutWall) / Math.max(1, payload.spotPrice) > 0.0095 &&
+    (payload.spotPrice - rawPutWall) / Math.max(1, payload.spotPrice) > maxPutWallDistPct &&
     Array.isArray(payload.strikes) &&
     payload.expirations.length > 0
   ) {
@@ -1424,7 +1416,7 @@ export function deriveTacticalStructuralLevels(
     for (const row of payload.strikes) {
       if (
         row.strike < payload.spotPrice - minStepOffset &&
-        (payload.spotPrice - row.strike) / payload.spotPrice <= 0.0095
+        (payload.spotPrice - row.strike) / Math.max(1, payload.spotPrice) <= maxPutWallDistPct
       ) {
         const g = row.gex[nearExpId] ?? 0;
         if (g < minNearPutGex) {

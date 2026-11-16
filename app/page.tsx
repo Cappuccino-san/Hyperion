@@ -17,10 +17,14 @@ import { useDashboardStore } from "@/store/useDashboardStore";
 
 export default function DashboardPage() {
   const activeView = useDashboardStore((state) => state.activeView);
-  const activeTicker = useDashboardStore((state) => state.activeTicker);
+  const setActiveView = useDashboardStore((state) => state.setActiveView);
   const setSetupModalOpen = useDashboardStore(
     (state) => state.setSetupModalOpen
   );
+
+  useEffect(() => {
+    setActiveView("Heatmap");
+  }, [setActiveView]);
 
   return (
     <div className="min-h-screen bg-[#0b0d17] text-argon-text flex flex-col">

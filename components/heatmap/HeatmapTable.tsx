@@ -11,7 +11,6 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   ExposureMetric,
-  getTickerPreset,
   useDashboardStore,
 } from "@/store/useDashboardStore";
 import { cn } from "@/lib/utils";
@@ -28,21 +27,6 @@ export interface ExpirationColMeta {
   dateLabel: string;
   dteWeight: number;
 }
-
-export const FALLBACK_EXPIRATION_COLUMNS: ExpirationColMeta[] = [
-  { id: "exp_0", isoDate: "2026-10-21", tag: "0DTE", filterGroup: "0DTE", inThisWeek: true, dateLabel: "10-21", dteWeight: 1.45 },
-  { id: "exp_1", isoDate: "2026-10-22", tag: "1D", filterGroup: "THIS_WEEK", inThisWeek: true, dateLabel: "10-22", dteWeight: 0.95 },
-  { id: "exp_2", isoDate: "2026-10-23", tag: "2D", filterGroup: "THIS_WEEK", inThisWeek: true, dateLabel: "10-23", dteWeight: 1.15 },
-  { id: "exp_3", isoDate: "2026-10-26", tag: "5D", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "10-26", dteWeight: 0.78 },
-  { id: "exp_4", isoDate: "2026-10-27", tag: "6D", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "10-27", dteWeight: 0.74 },
-  { id: "exp_5", isoDate: "2026-10-28", tag: "7D", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "10-28", dteWeight: 0.74 },
-  { id: "exp_6", isoDate: "2026-10-30", tag: "WKLY", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "10-30", dteWeight: 1.1 },
-  { id: "exp_7", isoDate: "2026-11-06", tag: "WKLY", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "11-06", dteWeight: 0.85 },
-  { id: "exp_8", isoDate: "2026-11-13", tag: "WKLY", filterGroup: "THIS_WEEK", inThisWeek: false, dateLabel: "11-13", dteWeight: 0.75 },
-  { id: "exp_9", isoDate: "2026-11-20", tag: "OPEX", filterGroup: "OPEX", inThisWeek: false, dateLabel: "11-20", dteWeight: 1.65 },
-  { id: "exp_10", isoDate: "2026-12-18", tag: "OPEX", filterGroup: "OPEX", inThisWeek: false, dateLabel: "12-18", dteWeight: 1.35 },
-  { id: "exp_11", isoDate: "2027-01-15", tag: "OPEX", filterGroup: "OPEX", inThisWeek: false, dateLabel: "01-15", dteWeight: 1.05 },
-];
 
 export interface EmMarkerTag {
   tag: string;
@@ -152,6 +136,11 @@ export function getHyperionCellStyle(
   };
 }
 
+function formatHeatmapStrike(strike: number): string {
+  if (!Number.isFinite(strike) || strike <= 0) return "—";
+  return strike % 1 !== 0 ? Number(strike.toFixed(2)).toString() : strike.toFixed(0);
+}
+
 export function HeatmapTable() {
   const activeTicker = useDashboardStore((state) => state.activeTicker);
   const spotPrice = useDashboardStore((state) => state.spotPrice);
@@ -183,25 +172,23 @@ export function HeatmapTable() {
   useEffect(() => {
     setPickedDateCol("");
     setInspectedCell(null);
+    setReplayIndex(100);
   }, [activeTicker]);
 
-  const preset = getTickerPreset(activeTicker);
-  const hasZeroDte = kingNode.hasZeroDte ?? true;
+  const hasZeroDte =
+    kingNode.hasZeroDte ?? chainExpirations.some((c) => c.tag === "0DTE");
 
   // All available columns in the chain
   const allColumns: ExpirationColMeta[] = useMemo(() => {
-    if (chainExpirations.length > 0) {
-      return chainExpirations.map((exp, idx) => ({
-        id: exp.id,
-        isoDate: exp.isoDate,
-        tag: exp.tag,
-        filterGroup: exp.filterGroup,
-        inThisWeek: exp.inThisWeek,
-        dateLabel: exp.dateLabel,
-        dteWeight: idx === 0 ? 1.45 : idx >= 8 ? 1.5 : 0.85,
-      }));
-    }
-    return FALLBACK_EXPIRATION_COLUMNS;
+    return chainExpirations.map((exp, idx) => ({
+      id: exp.id,
+      isoDate: exp.isoDate,
+      tag: exp.tag,
+      filterGroup: exp.filterGroup,
+      inThisWeek: exp.inThisWeek,
+      dateLabel: exp.dateLabel,
+      dteWeight: idx === 0 ? 1.45 : idx >= 8 ? 1.5 : 0.85,
+    }));
   }, [chainExpirations]);
 
   // Visible columns filtered by active expiration filter (matching TerraShade cols())
@@ -234,8 +221,16 @@ export function HeatmapTable() {
 
   // 4-Horizon Expected Move bounds (Daily D, Weekly W, Monthly M, Annual A)
   const emHorizons = useMemo(() => {
+    const hasLiveInputs =
+      Number.isFinite(spotPrice) &&
+      spotPrice > 0 &&
+      Number.isFinite(impliedVolatility) &&
+      impliedVolatility > 0;
+    if (!expectedMoves && !hasLiveInputs) {
+      return [];
+    }
     const approx = (days: number) =>
-      spotPrice * (impliedVolatility / Math.sqrt(252)) * Math.sqrt(days);
+      hasLiveInputs ? spotPrice * (impliedVolatility / Math.sqrt(252)) * Math.sqrt(days) : 0;
 
     const dLow = expectedMoves?.daily?.low ?? spotPrice - approx(1);
     const dHigh = expectedMoves?.daily?.high ?? spotPrice + approx(1);
@@ -386,7 +381,8 @@ export function HeatmapTable() {
 
         let allSum = 0;
         for (const col of allColumns) {
-          allSum += metricValues[col.id] ?? 0;
+          const raw = metricValues[col.id] ?? 0;
+          allSum += Number.isFinite(raw) ? raw : 0;
         }
         if (Math.abs(allSum) > maxAllRowAbs) {
           maxAllRowAbs = Math.abs(allSum);
@@ -395,7 +391,8 @@ export function HeatmapTable() {
 
         let activeSum = 0;
         for (const col of activeColumns) {
-          activeSum += metricValues[col.id] ?? 0;
+          const raw = metricValues[col.id] ?? 0;
+          activeSum += Number.isFinite(raw) ? raw : 0;
         }
         if (Math.abs(activeSum) > maxFilteredRowAbs) {
           maxFilteredRowAbs = Math.abs(activeSum);
@@ -427,7 +424,8 @@ export function HeatmapTable() {
           Math.abs(sRow.strike - resolvedKingStrike) < strikeStep * 0.4;
 
         for (const col of activeColumns) {
-          const val = metricValues[col.id] ?? 0;
+          const rawVal = metricValues[col.id] ?? 0;
+          const val = Number.isFinite(rawVal) ? rawVal : 0;
           const absVal = Math.abs(val);
           if (absVal > colMax[col.id]) {
             colMax[col.id] = absVal;
@@ -492,9 +490,8 @@ export function HeatmapTable() {
     };
   }, [
     chainStrikes,
+    allColumns,
     activeColumns,
-    activeTicker,
-    preset.spotPrice,
     strikeStep,
     spotPrice,
     gammaLevels,
@@ -554,7 +551,7 @@ export function HeatmapTable() {
                   : "bg-[#0b1220] text-slate-200 font-bold"
             )}
           >
-            <span>{strike.toFixed(strike % 1 !== 0 ? 1 : 0)}</span>
+            <span>{formatHeatmapStrike(strike)}</span>
             {emMarkers.length > 0 && (
               <div className="flex items-center justify-center gap-0.5 mt-[2px]">
                 {emMarkers.map((m) => (
@@ -597,13 +594,12 @@ export function HeatmapTable() {
             </div>
           ),
           cell: ({ row }) => {
-            const rawCellValue = row.original.values[expCol.id] ?? 0;
-            const replayScale =
-              replayIndex < 100 ? 0.72 + (replayIndex / 100) * 0.28 : 1;
+            const rawVal = row.original.values[expCol.id] ?? 0;
+            const rawCellValue = Number.isFinite(rawVal) ? rawVal : 0;
             const cellValue =
               cellMode === "Velocity"
                 ? rawCellValue * ((row.original.openPctChange[expCol.id] ?? 0) / 100)
-                : rawCellValue * replayScale;
+                : rawCellValue;
 
             const maxMatrixValue =
               cellMode === "Velocity"
@@ -725,7 +721,6 @@ export function HeatmapTable() {
     globalMaxAbs,
     activeKingColId,
     cellMode,
-    replayIndex,
     metric,
     spotPrice,
     topFiveCellKeys,
@@ -751,7 +746,9 @@ export function HeatmapTable() {
 
   const resetZoomAndCenter = () => {
     setZoom(1);
-    rowVirtualizer.scrollToIndex(atmRowIndex, { align: "center" });
+    if (atmRowIndex >= 0 && atmRowIndex < tableRows.length) {
+      rowVirtualizer.scrollToIndex(atmRowIndex, { align: "center" });
+    }
   };
 
   const jumpToKingRow = () => {
@@ -815,15 +812,21 @@ export function HeatmapTable() {
   }, [inspectedCell, rowsData, atmRowIndex, activeKingColId, activeColumns, metric, spotPrice]);
 
   useEffect(() => {
+    if (atmRowIndex < 0 || rowsData.length === 0) return;
     const timer = setTimeout(() => {
       rowVirtualizer.scrollToIndex(atmRowIndex, { align: "center" });
     }, 60);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTicker, chainStrikes.length]);
+  }, [activeTicker, chainStrikes.length, atmRowIndex]);
 
   const handleShareToX = () => {
-    const text = `${activeTicker} $${spotPrice.toFixed(2)} Options Positioning via Hyperion:\n• All-exp King: $${kingNode.allExpKing.toFixed(0)} (${kingNode.kingStrength}/100)\n• Call Wall: $${gammaLevels.callWall.toFixed(0)} | Put Wall: $${gammaLevels.putWall.toFixed(0)}\n• Zero γ: $${gammaLevels.zeroGamma.toFixed(2)}`;
+    const spotLabel = Number.isFinite(spotPrice) && spotPrice > 0 ? spotPrice.toFixed(2) : "—";
+    const zgLabel =
+      Number.isFinite(gammaLevels.zeroGamma) && gammaLevels.zeroGamma > 0
+        ? gammaLevels.zeroGamma.toFixed(2)
+        : "—";
+    const text = `${activeTicker} $${spotLabel} Options Positioning via Hyperion:\n• All-exp King: $${formatHeatmapStrike(kingNode.allExpKing)} (${kingNode.kingStrength}/100)\n• Call Wall: $${formatHeatmapStrike(gammaLevels.callWall)} | Put Wall: $${formatHeatmapStrike(gammaLevels.putWall)}\n• Zero γ: $${zgLabel}`;
     window.open(
       `https://x.com/intent/tweet?text=${encodeURIComponent(text)}`,
       "_blank",
@@ -1069,9 +1072,11 @@ export function HeatmapTable() {
             min={0}
             max={100}
             value={replayIndex}
+            disabled
             aria-label="Heatmap snapshot replay"
+            title="Live matrix only (per-strike historical matrix snapshots are not stored)"
             onChange={(e) => setReplayIndex(Number(e.target.value))}
-            className="flex-1 accent-[#38bdf8] cursor-pointer"
+            className="flex-1 accent-[#38bdf8] opacity-50 cursor-not-allowed"
           />
           <span className="text-[11px] text-slate-400 min-w-[60px] text-right tabular-nums">
             {cellMode === "Velocity" ? "Δ$ Vel" : replayTimeLabel}
@@ -1086,7 +1091,7 @@ export function HeatmapTable() {
             <span className="inline-flex items-center gap-1 text-cyan-300 font-bold">
               {activeInspectDetails.isPinned && <Pin className="w-3 h-3 text-amber-400" />}
               <span>
-                Strike ${activeInspectDetails.rowObj.strike.toFixed(activeInspectDetails.rowObj.strike % 1 !== 0 ? 1 : 0)}
+                Strike ${formatHeatmapStrike(activeInspectDetails.rowObj.strike)}
               </span>
             </span>
             <span className="text-slate-400">
@@ -1171,10 +1176,19 @@ export function HeatmapTable() {
         <div className="flex flex-wrap items-center gap-3 text-slate-400">
           <span className="text-[#facc15] font-bold">
             ★{" "}
-            {expirationFilter === "ALL" && !pickedDateCol
-              ? `All-exp King ${kingNode.allExpKing.toFixed(0)}`
-              : `${kingNode.filteredLabel} · All-exp King ${kingNode.allExpKing.toFixed(0)}`}
-            {kingNode.isContested ? " · contested" : ""}
+            {kingNode.allExpKing > 0 ? (
+              <>
+                {expirationFilter === "ALL" && !pickedDateCol
+                  ? `All-exp King ${formatHeatmapStrike(kingNode.allExpKing)}`
+                  : `${kingNode.filteredLabel} · All-exp King ${formatHeatmapStrike(kingNode.allExpKing)}`}
+                {metric !== "GEX" && activeKingStrike > 0
+                  ? ` · ${metric} Peak ${formatHeatmapStrike(activeKingStrike)}`
+                  : ""}
+                {kingNode.isContested ? " · contested" : ""}
+              </>
+            ) : (
+              "Syncing King Node..."
+            )}
           </span>
           <span className="inline-flex items-center gap-1">
             <span className="h-2.5 w-2.5 rounded-sm bg-[#440154] inline-block" />

@@ -1,15 +1,11 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { cn } from "@/lib/utils";
 
 const MAIN = ["SPY", "QQQ", "SPXW", "NDXP", "IWM"];
-
-interface RecapNode {
-  [key: string]: any;
-}
 
 interface RecapTicker {
   label: string;
@@ -191,6 +187,7 @@ export function RecapView() {
   const [loading, setLoading] = useState<boolean>(true);
   const [postingDiscord, setPostingDiscord] = useState<boolean>(false);
   const [discordStatus, setDiscordStatus] = useState<{ ok: boolean; msg: string } | null>(null);
+  const initialResolvedDayRef = useRef<string | null>(null);
   const setActiveView = useDashboardStore((state) => state.setActiveView);
   const setTicker = useDashboardStore((state) => state.setTicker);
   const discordWebhookUrl = useDashboardStore((state) => state.discordConfig.webhookUrl);
@@ -211,6 +208,7 @@ export function RecapView() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "send_daily_recap",
+          date: selectedDay || undefined,
           webhookUrl: discordWebhookUrl,
         }),
       });
@@ -228,25 +226,34 @@ export function RecapView() {
   };
 
   useEffect(() => {
+    if (selectedDay && initialResolvedDayRef.current === selectedDay) {
+      initialResolvedDayRef.current = null;
+      return;
+    }
     let active = true;
+    const controller = new AbortController();
     const fetchRecap = async () => {
       try {
         const url = `/api/session-recap${selectedDay ? `?day=${encodeURIComponent(selectedDay)}` : ""}`;
-        const res = await fetch(url, { cache: "no-store" });
+        const res = await fetch(url, { cache: "no-store", signal: controller.signal });
         if (!res.ok) return;
         const j: RecapPayload = await res.json();
-        if (active) {
+        if (active && !controller.signal.aborted) {
           setData(j);
-          if (!selectedDay && j.day) setSelectedDay(j.day);
+          if (!selectedDay && j.day && j.days?.includes(j.day)) {
+            initialResolvedDayRef.current = j.day;
+            setSelectedDay(j.day);
+          }
           setLoading(false);
         }
       } catch {
-        if (active) setLoading(false);
+        if (active && !controller.signal.aborted) setLoading(false);
       }
     };
-    fetchRecap();
+    void fetchRecap();
     return () => {
       active = false;
+      controller.abort();
     };
   }, [selectedDay]);
 

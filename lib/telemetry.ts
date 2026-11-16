@@ -38,6 +38,8 @@ export interface TelemetryData {
   };
 }
 
+const MAX_ACTIVE_SUBSCRIPTIONS = 64;
+
 class TelemetryTracker {
   private lastLatencyMs: number = 0;
   private lastSuccessfulFetch: number | null = null;
@@ -54,9 +56,23 @@ class TelemetryTracker {
     "TSLA",
   ]);
 
+  private trackSubscription(ticker: string) {
+    const clean = ticker.trim().toUpperCase();
+    if (!clean) return;
+    if (this.activeSubscriptions.has(clean)) {
+      this.activeSubscriptions.delete(clean);
+    }
+    this.activeSubscriptions.add(clean);
+    while (this.activeSubscriptions.size > MAX_ACTIVE_SUBSCRIPTIONS) {
+      const oldest = this.activeSubscriptions.values().next().value;
+      if (oldest === undefined) break;
+      this.activeSubscriptions.delete(oldest);
+    }
+  }
+
   recordAttempt(ticker: string) {
     this.lastAttemptTimestamp = Date.now();
-    this.activeSubscriptions.add(ticker.toUpperCase());
+    this.trackSubscription(ticker);
   }
 
   recordSuccess(ticker: string, latencyMs: number) {
@@ -65,7 +81,7 @@ class TelemetryTracker {
     this.lastAttemptTimestamp = Date.now();
     this.lastError = null;
     this.consecutiveFailures = 0;
-    this.activeSubscriptions.add(ticker.toUpperCase());
+    this.trackSubscription(ticker);
   }
 
   recordFailure(ticker: string, error: string, latencyMs: number = 0) {
@@ -73,7 +89,7 @@ class TelemetryTracker {
     this.lastAttemptTimestamp = Date.now();
     this.lastError = error;
     this.consecutiveFailures += 1;
-    this.activeSubscriptions.add(ticker.toUpperCase());
+    this.trackSubscription(ticker);
   }
 
   getMetrics(cacheEntries?: { ticker: string; timestamp: number }[]): TelemetryData {
@@ -142,4 +158,10 @@ class TelemetryTracker {
   }
 }
 
-export const globalTelemetry = new TelemetryTracker();
+const globalForTelemetry = globalThis as unknown as {
+  __hyperionGlobalTelemetry?: TelemetryTracker;
+};
+
+export const globalTelemetry =
+  globalForTelemetry.__hyperionGlobalTelemetry ??
+  (globalForTelemetry.__hyperionGlobalTelemetry = new TelemetryTracker());

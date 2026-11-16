@@ -18,6 +18,8 @@
  *      A(T) = alpha * integral_0^T sum_c J_c(tau) dtau
  */
 
+import { RTH_OPEN_MINS } from "@/lib/gaiaSessionGuards";
+
 export type AggressorSide =
   | "BUY_ASK"
   | "SELL_BID"
@@ -116,7 +118,7 @@ export function computeCeilingShareChi(pe: number): number {
  * With smooth diffusive parabola limit when |Pe| -> 0:
  *   Phi_bar(x) -> (sigma_c / (2 * Gamma)) * x * (W - x)
  */
-export function evaluateSteadyFluxProfile(
+function evaluateSteadyFluxProfile(
   x: number,
   W: number,
   sigmaC: number,
@@ -234,7 +236,6 @@ export function evaluateSpectralFlowAndFluxAtTau(params: {
   } = params;
 
   const W = Math.max(Math.max(0.05, floorNode * 0.001), ceilingNode - floorNode);
-  const midpoint = floorNode + W / 2;
   const tau = Math.max(0.05, tauMinutes);
 
   // 1. Flow VWAP Fourier Sine Ratio (Image 2):
@@ -414,7 +415,6 @@ export class FlowGammaVwapEngine {
   private tradeCount = 0;
   private lastKnownSpot = 0;
   private lastTimestamp = 0;
-  private sessionResetTimestamp = 0;
 
   constructor(initialSpot = 0) {
     if (initialSpot > 0) {
@@ -432,11 +432,13 @@ export class FlowGammaVwapEngine {
     this.runningM2 = 0;
     this.runningSignedAccel = 0;
     this.tradeCount = 0;
-    if (typeof currentSpot === "number" && currentSpot > 0) {
+    this.lastTimestamp = 0;
+    if (typeof currentSpot === "number" && Number.isFinite(currentSpot) && currentSpot > 0) {
       this.lastKnownSpot = currentSpot;
       this.runningMean = currentSpot;
+    } else {
+      this.lastKnownSpot = 0;
     }
-    this.sessionResetTimestamp = Date.now();
   }
 
   /**
@@ -482,10 +484,12 @@ export class FlowGammaVwapEngine {
     const validWeight = Number.isFinite(weight) && weight >= 0 ? weight : 0;
     const ts = timestamp ?? (this.lastTimestamp > 0 ? this.lastTimestamp : Date.now());
 
-    this.lastKnownSpot = validSpot;
+    if (validSpot > 0) {
+      this.lastKnownSpot = validSpot;
+    }
     this.lastTimestamp = ts;
 
-    if (validWeight > 0) {
+    if (validWeight > 0 && validSpot > 0) {
       const oldWeight = this.sumWeight;
       const newWeight = oldWeight + validWeight;
       this.sumWeight = newWeight;
@@ -513,10 +517,16 @@ export class FlowGammaVwapEngine {
   public getSnapshot(): FlowGammaVwapSnapshot {
     const spot = this.lastKnownSpot > 0 ? this.lastKnownSpot : 0;
     const ts = this.lastTimestamp > 0 ? this.lastTimestamp : Date.now();
+    const minVar =
+      this.lastKnownSpot <= 0
+        ? 0.10
+        : Math.abs(this.lastKnownSpot - 585) < 1e-9
+          ? 0.10
+          : Math.max(1e-4, Math.pow(this.lastKnownSpot / 585, 2) * 0.10);
 
     // Zero flow prints default gracefully to spot without NaN or divide-by-zero errors
     if (this.sumWeight <= 0) {
-      const defaultSigma = Math.sqrt(0.10);
+      const defaultSigma = minVar === 0.10 ? Math.sqrt(0.10) : Math.sqrt(minVar);
       return {
         timestamp: ts,
         spot,
@@ -530,7 +540,7 @@ export class FlowGammaVwapEngine {
         upper2Sigma: spot + 2 * defaultSigma,
         lower2Sigma: spot - 2 * defaultSigma,
         sigma: defaultSigma,
-        variance: 0.10,
+        variance: minVar,
         cumGammaWeight: 0,
         totalWeight: 0,
         signedGammaAcceleration: this.runningSignedAccel,
@@ -543,7 +553,7 @@ export class FlowGammaVwapEngine {
 
     // Running sample variance via West's recurrence: sigma^2 = M_2 / sumWeight
     const rawVariance = this.runningM2 / this.sumWeight;
-    const clampedVariance = Math.max(0.10, Number.isFinite(rawVariance) ? rawVariance : 0.10);
+    const clampedVariance = Math.max(minVar, Number.isFinite(rawVariance) ? rawVariance : minVar);
     const sigma = Math.sqrt(clampedVariance);
 
     const upper1 = flowVwap + sigma;
@@ -767,7 +777,7 @@ export function computeBarFlowGammaVwapSeries(
       prevEtMins = etMins;
     }
     const isFirstBarOfRthSession =
-      typeof etMins === "number" && etMins >= 570 && lastRthResetDate !== etDate;
+      typeof etMins === "number" && etMins >= RTH_OPEN_MINS && lastRthResetDate !== etDate;
     if (isFirstBarOfRthSession) {
       lastRthResetDate = etDate;
       open930 = c.open || c.close;

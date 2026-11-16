@@ -2,7 +2,6 @@ import fs from "fs";
 import path from "path";
 import {
   OptionTradePosition,
-  DailyTradeStore,
   loadTradeStore,
   saveTradeStore,
   getTodayEt,
@@ -62,26 +61,67 @@ function getCacheDir(): string {
   return dir;
 }
 
+function firstPositiveNum(...vals: unknown[]): number | undefined {
+  for (const v of vals) {
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
+  }
+  return undefined;
+}
+
+function firstFiniteNum(...vals: unknown[]): number | undefined {
+  for (const v of vals) {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+  }
+  return undefined;
+}
+
 /**
  * Compiles a structured Daily Performance Report from the day's closed positions
  */
 export function generateDailyPerformanceReport(date?: string): DailyPerformanceReport {
   const targetDate = date || getTodayEt();
-  const store = loadTradeStore();
+  let store = loadTradeStore(targetDate);
+  if (store.date !== targetDate) {
+    try {
+      const dayPath = path.join(getCacheDir(), `active-trades-${targetDate}.json`);
+      if (fs.existsSync(dayPath)) {
+        const parsed = JSON.parse(fs.readFileSync(dayPath, "utf-8"));
+        if (parsed && parsed.date === targetDate) {
+          store = parsed;
+        }
+      }
+    } catch {
+      // Non-fatal fallback
+    }
+  }
 
   const closedPositions: OptionTradePosition[] =
-    store.date === targetDate ? store.closedPositions : [];
+    store.date === targetDate && Array.isArray(store.closedPositions) ? store.closedPositions : [];
 
   const tradeItems: TradePerformanceItem[] = closedPositions.map((p) => {
+    const raw = p as OptionTradePosition & Record<string, unknown>;
     // Realistic retail options execution accounting: Buy at Ask, Sell at Bid
-    const entryPrice = p.optionAsk && p.optionAsk > 0 ? p.optionAsk : (p.btoOptionMid || 0.5);
-    const exitPrice = p.closedOptionMid != null ? p.closedOptionMid : 0.0;
+    const entryPrice =
+      firstPositiveNum(
+        raw.btoOptionAsk,
+        raw.optionAsk,
+        raw.btoPrice,
+        raw.btoOptionMid,
+        raw.btoMid
+      ) ?? 0.5;
+    const exitPrice =
+      firstFiniteNum(raw.closedOptionBid, raw.stcPrice, raw.closedOptionMid) ?? 0.0;
     const qty = p.contractsQty || 1;
-    const realizedDollarPnl = Number(((exitPrice - entryPrice) * 100 * qty).toFixed(2));
+    const totalOutlay = Number((entryPrice * 100 * qty).toFixed(2));
+    const realizedDollarPnl = Number(
+      (
+        firstFiniteNum(raw.realizedPnlDollars, raw.pnlDollars) ??
+        (exitPrice - entryPrice) * 100 * qty
+      ).toFixed(2)
+    );
     const pnlOptionPct =
-      p.pnlOptionPct != null
-        ? p.pnlOptionPct
-        : Number((((exitPrice - entryPrice) / Math.max(0.01, entryPrice)) * 100).toFixed(2));
+      firstFiniteNum(p.pnlOptionPct, raw.realizedPnlPct) ??
+      Number((((exitPrice - entryPrice) / Math.max(0.01, entryPrice)) * 100).toFixed(2));
     const pnlSpotPct = p.pnlSpotPct ?? 0;
 
     return {
@@ -96,10 +136,10 @@ export function generateDailyPerformanceReport(date?: string): DailyPerformanceR
       closedAt: p.closedAt || "N/A",
       btoSpotPrice: p.btoSpotPrice,
       closedSpotPrice: p.closedSpotPrice || p.btoSpotPrice,
-      btoOptionMid: entryPrice,
-      closedOptionMid: exitPrice,
+      btoOptionMid: Number(entryPrice.toFixed(2)),
+      closedOptionMid: Number(exitPrice.toFixed(2)),
       contractsQty: qty,
-      totalOutlay: p.totalOutlay || Number((entryPrice * 100 * qty).toFixed(0)),
+      totalOutlay,
       realizedDollarPnl,
       pnlOptionPct,
       pnlSpotPct,
@@ -191,14 +231,26 @@ export function generateDailyPerformanceReport(date?: string): DailyPerformanceR
  * Saves daily performance to persistent disk cache (.cache/daily-performance-YYYY-MM-DD.json and .md)
  */
 export function saveDailyPerformanceReport(report: DailyPerformanceReport): void {
+  const dir = getCacheDir();
+  const jsonPath = path.join(dir, `daily-performance-${report.date}.json`);
+  const mdPath = path.join(dir, `daily-performance-${report.date}.md`);
+  const suffix = `.tmp.${process.pid}.${Date.now()}`;
+  const jsonTmp = `${jsonPath}${suffix}`;
+  const mdTmp = `${mdPath}${suffix}`;
   try {
-    const dir = getCacheDir();
-    const jsonPath = path.join(dir, `daily-performance-${report.date}.json`);
-    const mdPath = path.join(dir, `daily-performance-${report.date}.md`);
-    fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2), "utf-8");
-    fs.writeFileSync(mdPath, report.markdownReport, "utf-8");
+    fs.writeFileSync(jsonTmp, JSON.stringify(report, null, 2), "utf-8");
+    fs.renameSync(jsonTmp, jsonPath);
+    fs.writeFileSync(mdTmp, report.markdownReport, "utf-8");
+    fs.renameSync(mdTmp, mdPath);
   } catch {
     // ignore filesystem write errors in read-only runtimes
+  } finally {
+    try {
+      if (fs.existsSync(jsonTmp)) fs.unlinkSync(jsonTmp);
+    } catch {}
+    try {
+      if (fs.existsSync(mdTmp)) fs.unlinkSync(mdTmp);
+    } catch {}
   }
 }
 
@@ -207,14 +259,30 @@ export function saveDailyPerformanceReport(report: DailyPerformanceReport): void
  */
 export async function sendDailyPerformanceDiscordRecap(
   report: DailyPerformanceReport,
-  customWebhookUrl?: string
+  customWebhookUrl?: string,
+  options?: { signal?: AbortSignal; isHistoricalBackfill?: boolean }
 ): Promise<boolean> {
+  if (options?.isHistoricalBackfill) {
+    return false;
+  }
   const webhookUrl =
     (customWebhookUrl || process.env.DISCORD_WEBHOOK_URL)?.trim() || "";
   if (!webhookUrl) {
     console.warn("[TradePerformanceEngine] Skipping daily recap Discord dispatch: DISCORD_WEBHOOK_URL is not configured.");
     return false;
   }
+  if (!/^https:\/\//i.test(webhookUrl)) {
+    console.warn("[TradePerformanceEngine] Rejecting non-HTTPS Discord webhook URL.");
+    return false;
+  }
+  if (options?.signal?.aborted) {
+    return false;
+  }
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  options?.signal?.addEventListener("abort", onAbort, { once: true });
+  const timeoutId = setTimeout(() => controller.abort(), 8_000);
 
   try {
     const isProfitable = report.totalRealizedDollarPnl > 0;
@@ -277,11 +345,15 @@ export async function sendDailyPerformanceDiscordRecap(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
 
     return res.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timeoutId);
+    options?.signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -289,11 +361,32 @@ export async function sendDailyPerformanceDiscordRecap(
  * Checks if market is closed (ET >= 4:00 PM / 16:00) and triggers the daily recap if not already sent.
  * STRICT ENFORCEMENT: Never dispatches to Discord before 16:00 ET.
  */
-export async function checkAndSendMarketCloseRecap(params?: {
-  webhookUrl?: string;
-  force?: boolean;
-}): Promise<DailyPerformanceReport | null> {
-  const store = loadTradeStore();
+export async function checkAndSendMarketCloseRecap(
+  params?: {
+    webhookUrl?: string;
+    force?: boolean;
+    date?: string;
+    signal?: AbortSignal;
+    isHistoricalBackfill?: boolean;
+  },
+  options?: {
+    signal?: AbortSignal;
+    isHistoricalBackfill?: boolean;
+    date?: string;
+  }
+): Promise<DailyPerformanceReport | null> {
+  const signal = params?.signal ?? options?.signal;
+  if (signal?.aborted) {
+    return null;
+  }
+  const targetDate = params?.date ?? options?.date;
+  const todayEt = getTodayEt();
+  const isHistoricalBackfill =
+    params?.isHistoricalBackfill ??
+    options?.isHistoricalBackfill ??
+    Boolean(targetDate && targetDate !== todayEt);
+
+  const store = loadTradeStore(targetDate);
   const etTime = getNowEtTime();
 
   // STRICT RULE: Absolutely NO End-of-Day recap prior to 16:00 (4:00 PM ET)
@@ -311,16 +404,25 @@ export async function checkAndSendMarketCloseRecap(params?: {
     return null;
   }
 
-  const report = generateDailyPerformanceReport(store.date);
+  const report = generateDailyPerformanceReport(targetDate || store.date);
   saveDailyPerformanceReport(report);
 
-  await sendDailyPerformanceDiscordRecap(report, params?.webhookUrl);
-
-  if (isMarketClosed) {
-    (store as any).eodRecapSent = true;
+  if (!isHistoricalBackfill) {
+    await sendDailyPerformanceDiscordRecap(report, params?.webhookUrl, {
+      signal,
+      isHistoricalBackfill,
+    });
   }
-  store.dailyRecapSent = true;
-  saveTradeStore(store);
+
+  // Reload latest trade store post-await before persisting flags so concurrent updates aren't clobbered
+  if (store.date === todayEt) {
+    const latestStore = loadTradeStore();
+    if (isMarketClosed) {
+      (latestStore as any).eodRecapSent = true;
+    }
+    latestStore.dailyRecapSent = true;
+    saveTradeStore(latestStore);
+  }
 
   return report;
 }

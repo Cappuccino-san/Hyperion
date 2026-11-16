@@ -2,6 +2,11 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
+import {
+  RTH_CLOSE_MINS,
+  RTH_OPEN_MINS,
+  toEpochSec,
+} from "@/lib/gaiaSessionGuards";
 
 export interface PrzmCandlePoint {
   time: string;
@@ -106,7 +111,7 @@ function formatPrzmTime(rawTime: string = "", timestamp?: number): string {
 
 function toEpochSeconds(ts?: number): number {
   if (!ts || !Number.isFinite(ts) || ts <= 0) return 0;
-  return ts > 1e11 ? Math.floor(ts / 1000) : Math.floor(ts);
+  return toEpochSec(ts);
 }
 
 function formatHeldDuration(minutes: number): string {
@@ -143,6 +148,22 @@ export function evaluatePrzmCallLedger(
 ): PrzmLedgerSummary {
   const normTicker = (ticker || "SPY").trim().toUpperCase();
   const hasReplayCutoff = typeof replayBarTsSec === "number" && replayBarTsSec > 0;
+  let barStepSec = 300;
+  if (series.length >= 2) {
+    const intervals: number[] = [];
+    const limit = Math.min(series.length - 1, 10);
+    for (let k = 0; k < limit; k++) {
+      const t0 = toEpochSeconds(series[k]?.timestamp);
+      const t1 = toEpochSeconds(series[k + 1]?.timestamp);
+      const step = Math.abs(t1 - t0);
+      if (step >= 60 && step <= 3600) intervals.push(step);
+    }
+    if (intervals.length > 0) {
+      intervals.sort((a, b) => a - b);
+      barStepSec = intervals[Math.floor(intervals.length / 2)];
+    }
+  }
+  const replayBarEndSec = hasReplayCutoff ? replayBarTsSec! + barStepSec - 1 : 0;
   const storeState = serverTrades === undefined ? useDashboardStore.getState() : null;
   const rawClosed =
     Array.isArray(serverTrades?.closedPositions)
@@ -215,9 +236,9 @@ export function evaluatePrzmCallLedger(
   for (const pos of serverClosed) {
     if (!pos || !pos.id || String(pos.id).startsWith("test-")) continue;
     const openedSec = pos.openedTs ? toEpochSeconds(pos.openedTs) : 0;
-    if (hasReplayCutoff && (openedSec === 0 || openedSec > replayBarTsSec!)) continue;
+    if (hasReplayCutoff && (openedSec === 0 || openedSec > replayBarEndSec)) continue;
     const closedSec = pos.closedTs ? toEpochSeconds(pos.closedTs) : 0;
-    const isStillOpenInReplay = hasReplayCutoff && (closedSec === 0 || closedSec > replayBarTsSec!);
+    const isStillOpenInReplay = hasReplayCutoff && (closedSec === 0 || closedSec > replayBarEndSec);
 
     const isShort = isShortOrPutTrade(pos);
     const isCall = !isShort;
@@ -242,9 +263,10 @@ export function evaluatePrzmCallLedger(
     if (isStillOpenInReplay) {
       const currentSpot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : clampedBto;
       const delta = Number((isCall ? currentSpot - clampedBto : clampedBto - currentSpot).toFixed(2));
+      const refReplaySec = openedSec <= replayBarTsSec! ? replayBarTsSec! : replayBarEndSec;
       const heldMin =
-        openedSec > 0 && replayBarTsSec! > openedSec
-          ? Math.max(1, Math.round((replayBarTsSec! - openedSec) / 60))
+        openedSec > 0 && refReplaySec > openedSec
+          ? Math.max(1, Math.round((refReplaySec - openedSec) / 60))
           : 5;
       serverEntries.push({
         id: pos.id,
@@ -264,23 +286,18 @@ export function evaluatePrzmCallLedger(
     }
 
     const delta = Number((isCall ? clampedClosed - clampedBto : clampedBto - clampedClosed).toFixed(2));
-    const isWin =
-      pos.pnlOptionPct > 0 ||
-      delta > 0.05 ||
-      pos.exitReason?.includes("TARGET") ||
-      pos.exitReason?.includes("TP1") ||
-      pos.exitReason?.includes("TP2") ||
-      pos.exitReason?.includes("COVER") ||
-      (typeof pos.pnlSpotPct === "number" && (isCall ? pos.pnlSpotPct > 0 : pos.pnlSpotPct > 0 || delta > 0.05));
-    const isLoss =
-      pos.pnlOptionPct < -5 ||
-      pos.exitReason?.includes("STOP") ||
-      delta < -0.05 ||
-      (typeof pos.pnlSpotPct === "number" && isCall && pos.pnlSpotPct < 0);
+    const flatTol = Math.max(0.05, clampedBto * 0.0001);
+    const hasOptPnl = typeof pos.pnlOptionPct === "number" && Number.isFinite(pos.pnlOptionPct);
+    const isWin = hasOptPnl
+      ? pos.pnlOptionPct > 0
+      : delta > flatTol || (typeof pos.pnlSpotPct === "number" && pos.pnlSpotPct > 0);
+    const isLoss = hasOptPnl
+      ? pos.pnlOptionPct < 0
+      : delta < -flatTol || pos.exitReason?.includes("STOP") || (typeof pos.pnlSpotPct === "number" && pos.pnlSpotPct < 0);
     const status: "RIGHT" | "WRONG" | "FLAT" = isWin ? "RIGHT" : isLoss ? "WRONG" : "FLAT";
     const heldMin =
-      pos.openedTs && pos.closedTs && pos.closedTs > pos.openedTs
-        ? Math.max(1, Math.round((pos.closedTs - pos.openedTs) / 60))
+      openedSec > 0 && closedSec > openedSec
+        ? Math.max(1, Math.round((closedSec - openedSec) / 60))
         : 5;
 
     serverEntries.push({
@@ -306,7 +323,7 @@ export function evaluatePrzmCallLedger(
   for (const pos of serverActive) {
     if (!pos || !pos.id) continue;
     const openedSec = pos.openedTs ? toEpochSeconds(pos.openedTs) : 0;
-    if (hasReplayCutoff && (openedSec === 0 || openedSec > replayBarTsSec!)) continue;
+    if (hasReplayCutoff && (openedSec === 0 || openedSec > replayBarEndSec)) continue;
     const isShort = isShortOrPutTrade(pos);
     const isCall = !isShort;
     const type: "LONG" | "SHORT" = isShort ? "SHORT" : "LONG";
@@ -320,7 +337,9 @@ export function evaluatePrzmCallLedger(
     const clampedBto = entryBar && btoSpot > 0 ? Math.max(entryBar.low, Math.min(entryBar.high, btoSpot)) : btoSpot;
     const currentSpot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : clampedBto;
     const delta = Number((isCall ? currentSpot - clampedBto : clampedBto - currentSpot).toFixed(2));
-    const nowTs = hasReplayCutoff ? replayBarTsSec! : Math.floor(Date.now() / 1000);
+    const nowTs = hasReplayCutoff
+      ? (openedSec <= replayBarTsSec! ? replayBarTsSec! : replayBarEndSec)
+      : Math.floor(Date.now() / 1000);
     const heldMin =
       openedSec > 0 && nowTs > openedSec
         ? Math.max(1, Math.round((nowTs - openedSec) / 60))
@@ -351,7 +370,7 @@ export function evaluatePrzmCallLedger(
       wrongCount: 0,
       flatCount: 0,
       decisiveCount: 0,
-      winRatePct: 100,
+      winRatePct: 0,
     };
   }
 
@@ -359,7 +378,7 @@ export function evaluatePrzmCallLedger(
     .filter((s) => {
       if (!hasReplayCutoff) return true;
       const barTs = toEpochSeconds(s.timestamp ?? series[s.index]?.timestamp);
-      return barTs === 0 || barTs <= replayBarTsSec!;
+      return barTs === 0 || barTs <= replayBarEndSec;
     })
     .sort((a, b) => a.index - b.index);
   const lastBarIdx = series.length > 0 ? series.length - 1 : 0;
@@ -387,7 +406,7 @@ export function evaluatePrzmCallLedger(
     const endTsSec = toEpochSeconds(endBar?.timestamp);
     const exitTsSec = sig.exitTimestamp ? toEpochSeconds(sig.exitTimestamp) : endTsSec;
     const maskedFutureExit =
-      hasReplayCutoff && sig.isClosed === true && (exitTsSec === 0 || exitTsSec > replayBarTsSec!);
+      hasReplayCutoff && sig.isClosed === true && (exitTsSec === 0 || exitTsSec > replayBarEndSec);
     const barSpanMinutes = Math.max(1, (endIdx - sig.index) * 5);
 
     const isCurrentlyOpen =
@@ -423,13 +442,14 @@ export function evaluatePrzmCallLedger(
     // Strict Realized P&L Math: (Exit - Entry) * (LONG ? 1 : -1)
     const realizedDelta =
       sig.type === "LONG" ? finalMarkPrice - sig.price : sig.price - finalMarkPrice;
+    const sigFlatTol = Math.max(0.05, sig.price * 0.0001);
 
     let status: "OPEN" | "RIGHT" | "FLAT" | "WRONG";
     if (isCurrentlyOpen) {
       status = "OPEN";
-    } else if (realizedDelta > 0.05) {
+    } else if (realizedDelta > sigFlatTol) {
       status = "RIGHT";
-    } else if (realizedDelta < -0.05) {
+    } else if (realizedDelta < -sigFlatTol) {
       status = "WRONG";
     } else {
       status = "FLAT";
@@ -459,25 +479,24 @@ export function evaluatePrzmCallLedger(
 
   const completedDecisive = rightCount + wrongCount;
   let decisiveCount = completedDecisive;
-  let winRatePct = 100;
+  let winRatePct = 0;
 
   if (completedDecisive > 0) {
     winRatePct = Math.round((rightCount / completedDecisive) * 100);
   } else {
     const openEntry = mergedEntries.find((e) => e.status === "OPEN");
-    if (openEntry) {
+    if (openEntry && openEntry.delta !== 0) {
       decisiveCount = 1;
-      rightCount = openEntry.delta >= 0 ? 1 : 0;
-      winRatePct = openEntry.delta >= 0 ? 100 : 0;
+      rightCount = openEntry.delta > 0 ? 1 : 0;
+      winRatePct = openEntry.delta > 0 ? 100 : 0;
     } else {
       decisiveCount = 0;
-      winRatePct = 100;
+      winRatePct = 0;
     }
   }
 
-  const newest = mergedEntries[mergedEntries.length - 1] ?? null;
   const openEntry = mergedEntries.find((e) => e.status === "OPEN") ?? null;
-  const activeCall = activeFsmState === "STAND_ASIDE" ? null : (openEntry || newest);
+  const activeCall = activeFsmState === "STAND_ASIDE" ? null : openEntry;
 
   return {
     entries: [...mergedEntries].reverse(),
@@ -565,9 +584,9 @@ export const PrzmTopDeck: React.FC<{
       const sec = parseInt(parts.find((p) => p.type === "second")?.value ?? "0", 10);
       const etMins = hr * 60 + min + sec / 60;
 
-      const rthOpen = 9 * 60 + 30; // 570
-      const rthClose = 16 * 60; // 960
-      const totalRth = 390;
+      const rthOpen = RTH_OPEN_MINS; // 570
+      const rthClose = RTH_CLOSE_MINS; // 960
+      const totalRth = rthClose - rthOpen;
 
       if (etMins >= rthOpen && etMins < rthClose) {
         const elapsed = etMins - rthOpen;
@@ -631,7 +650,7 @@ export const PrzmTopDeck: React.FC<{
 
     const last = series[n - 1];
     const spot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : last.close;
-    const em = Math.max(0.5, straddleEm || spot * 0.0048);
+    const em = Math.max(Math.max(0.05, spot * 0.0005), straddleEm || spot * 0.0048);
 
     // 1. SES: Session bias relative to 9:30 Open
     const baseOpen = open930 || series[0]?.open || spot;
@@ -683,7 +702,7 @@ export const PrzmTopDeck: React.FC<{
     if (!activeCall) return drivers[2].value;
     const dir = activeCall.type === "LONG" ? 1 : -1;
     const deltaPts = (liveSpot - activeCall.entryPrice) * dir;
-    const em = Math.max(0.5, straddleEm || liveSpot * 0.0048);
+    const em = Math.max(Math.max(0.05, liveSpot * 0.0005), straddleEm || liveSpot * 0.0048);
     const raw = Math.round((deltaPts / (em * 0.4)) * 45) + Math.round(drivers[2].value * 0.35 * dir);
     return Math.max(-99, Math.min(99, raw === 0 ? 12 : raw));
   }, [activeCall, liveSpot, straddleEm, drivers]);
@@ -896,11 +915,15 @@ export const PrzmTheCallStrip: React.FC<{
       <div className="flex-1 flex items-center gap-[2px] h-3.5">
         {series.map((bar, idx) => {
           const rawTs = Number(bar.timestamp ?? 0);
-          const barSec = rawTs > 1e11 ? Math.floor(rawTs / 1000) : rawTs;
+          const barSec = toEpochSeconds(rawTs);
           const isFuture = barSec > 0 && barSec > refNowSec;
           const refVwap = bar.flowVwap || bar.vwap || bar.close;
           const spread = bar.close - refVwap;
-          const bandSpan = Math.max(0.15, ((bar.upperBand ?? refVwap + 1.25) - (bar.lowerBand ?? refVwap - 1.25)) * 0.12);
+          const fallbackWing = Math.max(0.05, bar.close * 0.0015);
+          const bandSpan = Math.max(
+            Math.max(0.02, bar.close * 0.0003),
+            ((bar.upperBand ?? refVwap + fallbackWing) - (bar.lowerBand ?? refVwap - fallbackWing)) * 0.12
+          );
           let bg = "bg-[#8B5CF6]/70";
           if (isFuture) {
             bg = "bg-slate-800/40";
@@ -1005,6 +1028,9 @@ export const PrzmCallLogDeck: React.FC<{
                 >
                   <span className="text-slate-300 font-semibold tabular-nums min-w-[72px] shrink-0">
                     {entry.timeFormatted}
+                  </span>
+                  <span className="text-slate-500 text-[10.5px] tabular-nums shrink-0">
+                    {entry.heldLabel}
                   </span>
                   <span className={`font-bold tracking-wider min-w-[88px] shrink-0 ${sideColor}`}>
                     {dirLabel}

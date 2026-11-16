@@ -128,19 +128,24 @@ export function IntradayChart({
   }, []);
 
   const rawPoints = propPoints ?? storePoints ?? [];
-  const sigma = flowGammaVwapData?.sigma ?? 0;
+  const sigma =
+    typeof flowGammaVwapData?.sigma === "number" && Number.isFinite(flowGammaVwapData.sigma)
+      ? flowGammaVwapData.sigma
+      : 0;
 
   const displayData = useMemo(() => {
     if (!rawPoints || rawPoints.length === 0) return [];
     const valid = rawPoints.filter(
       (d) => typeof d.spot === "number" && Number.isFinite(d.spot) && d.spot > 0
     );
+    const validNum = (v: unknown) =>
+      typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
     return valid.map((d) => {
-      const fw = d.flowVwap ?? flowGammaVwapData?.flowVwap;
-      const u1 = d.upper1s ?? (fw && sigma > 0 ? Number((fw + sigma).toFixed(2)) : undefined);
-      const l1 = d.lower1s ?? (fw && sigma > 0 ? Number((fw - sigma).toFixed(2)) : undefined);
-      const u2 = d.upper2s ?? (fw && sigma > 0 ? Number((fw + 2 * sigma).toFixed(2)) : undefined);
-      const l2 = d.lower2s ?? (fw && sigma > 0 ? Number((fw - 2 * sigma).toFixed(2)) : undefined);
+      const fw = validNum(d.flowVwap) ?? validNum(flowGammaVwapData?.flowVwap);
+      const u1 = validNum(d.upper1s) ?? (fw && sigma > 0 ? Number((fw + sigma).toFixed(2)) : undefined);
+      const l1 = validNum(d.lower1s) ?? (fw && sigma > 0 ? Number((fw - sigma).toFixed(2)) : undefined);
+      const u2 = validNum(d.upper2s) ?? (fw && sigma > 0 ? Number((fw + 2 * sigma).toFixed(2)) : undefined);
+      const l2 = validNum(d.lower2s) ?? (fw && sigma > 0 ? Number((fw - 2 * sigma).toFixed(2)) : undefined);
       return {
         ...d,
         flowVwap: fw,
@@ -179,12 +184,19 @@ export function IntradayChart({
     const lastIdx = displayData.length - 1;
     const latestSpot = displayData[lastIdx].spot;
     const latestVwap = displayData[lastIdx].flowVwap;
-    const latestCallWall = gammaLevels?.callWall || stabilizedSeries.callWalls[lastIdx] || 0;
-    const latestPutWall = gammaLevels?.putWall || stabilizedSeries.putWalls[lastIdx] || 0;
-    const latestZeroGamma = gammaLevels?.zeroGamma || stabilizedSeries.zeroGammas[lastIdx] || 0;
+    const safeFinitePos = (v: unknown) =>
+      typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
+    const latestCallWall =
+      safeFinitePos(gammaLevels?.callWall) || safeFinitePos(stabilizedSeries.callWalls[lastIdx]);
+    const latestPutWall =
+      safeFinitePos(gammaLevels?.putWall) || safeFinitePos(stabilizedSeries.putWalls[lastIdx]);
+    const latestZeroGamma =
+      safeFinitePos(gammaLevels?.zeroGamma) || safeFinitePos(stabilizedSeries.zeroGammas[lastIdx]);
 
     // 1. Compute Core Price-Action Domain (Spot + Flow VWAP + ±1sigma envelope)
-    const coreValues = [...spots, ...vwaps, ...upper1s, ...lower1s];
+    const coreValues = [...spots, ...vwaps, ...upper1s, ...lower1s].filter(
+      (v) => Number.isFinite(v) && v > 0
+    );
     const coreMin = Math.min(...coreValues);
     const coreMax = Math.max(...coreValues);
     const minCoreSpan = Math.max(latestSpot * 0.0022, 1.2); // Minimum 0.22% or $1.20 span
@@ -199,7 +211,7 @@ export function IntradayChart({
       // Pull in any structural level that lies within 1.65x of the core span.
       const proximityThreshold = rawCoreSpan * 1.65;
       const nearbyWalls = [latestCallWall, latestPutWall, latestZeroGamma].filter(
-        (w) => w > 0 && Math.abs(w - latestSpot) <= proximityThreshold
+        (w) => Number.isFinite(w) && w > 0 && Math.abs(w - latestSpot) <= proximityThreshold
       );
 
       const focusPool = [...coreValues, ...nearbyWalls];
@@ -215,13 +227,13 @@ export function IntradayChart({
       // Full Macro Range: include all structural walls
       const allPool = [
         ...coreValues,
-        ...stabilizedSeries.callWalls.filter((w) => w > 0),
-        ...stabilizedSeries.putWalls.filter((w) => w > 0),
-        ...stabilizedSeries.zeroGammas.filter((w) => w > 0),
+        ...stabilizedSeries.callWalls.filter((w) => Number.isFinite(w) && w > 0),
+        ...stabilizedSeries.putWalls.filter((w) => Number.isFinite(w) && w > 0),
+        ...stabilizedSeries.zeroGammas.filter((w) => Number.isFinite(w) && w > 0),
         latestCallWall,
         latestPutWall,
         latestZeroGamma,
-      ].filter((v) => v > 0);
+      ].filter((v) => Number.isFinite(v) && v > 0);
       const aMin = Math.min(...allPool);
       const aMax = Math.max(...allPool);
       const aSpan = Math.max(aMax - aMin, minCoreSpan);
@@ -291,11 +303,13 @@ export function IntradayChart({
     displayData.length - 1
   ).toFixed(1)},${(padT + innerH).toFixed(1)}`;
 
-  const hasFlowVwap = displayData.some((d) => typeof d.flowVwap === "number" && d.flowVwap > 0);
+  const hasFlowVwap = displayData.some(
+    (d) => typeof d.flowVwap === "number" && Number.isFinite(d.flowVwap) && d.flowVwap > 0
+  );
   const vwapPoints = hasFlowVwap
     ? displayData
         .map((d, i) =>
-          typeof d.flowVwap === "number" && d.flowVwap > 0
+          typeof d.flowVwap === "number" && Number.isFinite(d.flowVwap) && d.flowVwap > 0
             ? `${toX(i).toFixed(1)},${toY(d.flowVwap).toFixed(1)}`
             : null
         )
@@ -305,12 +319,16 @@ export function IntradayChart({
 
   // ±1 Sigma & ±2 Sigma Volatility Envelope Polygons
   const hasBands = displayData.some(
-    (d) => typeof d.upper1s === "number" && typeof d.lower1s === "number"
+    (d) =>
+      typeof d.upper1s === "number" &&
+      Number.isFinite(d.upper1s) &&
+      typeof d.lower1s === "number" &&
+      Number.isFinite(d.lower1s)
   );
   const bandPolygon = hasBands
     ? [
         ...displayData.map((d, i) =>
-          typeof d.upper1s === "number"
+          typeof d.upper1s === "number" && Number.isFinite(d.upper1s)
             ? `${toX(i).toFixed(1)},${Math.max(padT, Math.min(padT + innerH, toY(d.upper1s))).toFixed(1)}`
             : null
         ),
@@ -319,7 +337,7 @@ export function IntradayChart({
           .reverse()
           .map((d, idx) => {
             const i = displayData.length - 1 - idx;
-            return typeof d.lower1s === "number"
+            return typeof d.lower1s === "number" && Number.isFinite(d.lower1s)
               ? `${toX(i).toFixed(1)},${Math.max(padT, Math.min(padT + innerH, toY(d.lower1s))).toFixed(1)}`
               : null;
           }),
@@ -331,7 +349,7 @@ export function IntradayChart({
   const upper2Points = hasBands
     ? displayData
         .map((d, i) =>
-          typeof d.upper2s === "number"
+          typeof d.upper2s === "number" && Number.isFinite(d.upper2s)
             ? `${toX(i).toFixed(1)},${Math.max(padT, Math.min(padT + innerH, toY(d.upper2s))).toFixed(1)}`
             : null
         )
@@ -342,7 +360,7 @@ export function IntradayChart({
   const lower2Points = hasBands
     ? displayData
         .map((d, i) =>
-          typeof d.lower2s === "number"
+          typeof d.lower2s === "number" && Number.isFinite(d.lower2s)
             ? `${toX(i).toFixed(1)},${Math.max(padT, Math.min(padT + innerH, toY(d.lower2s))).toFixed(1)}`
             : null
         )
@@ -351,7 +369,11 @@ export function IntradayChart({
     : "";
 
   // Flux Field PDE Péclet number & Ceiling Share chi
-  const corridorWidth = Math.max(1.0, Math.abs(latestCallWall - latestPutWall) || yRange);
+  const hasDualWalls = latestCallWall > 0 && latestPutWall > 0;
+  const corridorWidth = Math.max(
+    1.0,
+    hasDualWalls ? Math.abs(latestCallWall - latestPutWall) : yRange
+  );
   const driftEst =
     displayData.length >= 2
       ? (displayData[displayData.length - 1].spot - displayData[0].spot) /
@@ -540,7 +562,9 @@ export function IntradayChart({
             >
               <span className="h-2 w-2 rounded-full bg-teal-400" />
               <span className="text-slate-400">CALL</span>
-              <span className="font-semibold text-teal-300">{activeCall.toFixed(0)}</span>
+              <span className="font-semibold text-teal-300">
+                {activeCall.toFixed(activeCall % 1 !== 0 ? 1 : 0)}
+              </span>
               <span className="text-[10px] text-slate-400">({formatDist(activeCall)})</span>
               {!isInViewport(activeCall) && (
                 <span className="text-[10px] text-teal-400 font-bold">▲</span>
@@ -563,7 +587,9 @@ export function IntradayChart({
             >
               <span className="h-2 w-2 rounded-full bg-fuchsia-400" />
               <span className="text-slate-400">PUT</span>
-              <span className="font-semibold text-fuchsia-300">{activePut.toFixed(0)}</span>
+              <span className="font-semibold text-fuchsia-300">
+                {activePut.toFixed(activePut % 1 !== 0 ? 1 : 0)}
+              </span>
               <span className="text-[10px] text-slate-400">({formatDist(activePut)})</span>
               {!isInViewport(activePut) && (
                 <span className="text-[10px] text-fuchsia-400 font-bold">▼</span>
@@ -581,7 +607,9 @@ export function IntradayChart({
             >
               <span className="h-2 w-2 rounded-full bg-orange-400" />
               <span className="text-slate-400">0γ</span>
-              <span className="font-semibold text-orange-300">{activeZG.toFixed(0)}</span>
+              <span className="font-semibold text-orange-300">
+                {activeZG.toFixed(activeZG % 1 !== 0 ? 1 : 0)}
+              </span>
               <span className="text-[10px] text-slate-400">({formatDist(activeZG)})</span>
             </div>
           )}

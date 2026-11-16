@@ -5,6 +5,7 @@ import {
   parseOccSymbol,
 } from "@/lib/optionsExposure";
 import { getMergedIntradayHistory, getEtMinutesFromTs } from "@/lib/intradayHistory";
+import { BoundedMap, sanitizeTickerSymbol } from "@/lib/marketCache";
 
 export const dynamic = "force-dynamic";
 
@@ -13,7 +14,7 @@ type GaiaCoalescedResult =
   | { ok: false; error: string; status: number };
 
 const gaiaInFlight = new Map<string, Promise<GaiaCoalescedResult>>();
-const gaiaShortCache = new Map<string, { tsMs: number; payload: GaiaLivePayload }>();
+const gaiaShortCache = new BoundedMap<string, { tsMs: number; payload: GaiaLivePayload }>(32);
 const GAIA_SHORT_CACHE_MS = 3_000;
 
 export type DivergenceStatus = "BULL" | "BEAR" | "NO";
@@ -184,7 +185,8 @@ async function fetchYahooSeries(
   interval: string,
   range: string,
   includePrePost: boolean = false,
-  startHour: number = 0
+  startHour: number = 0,
+  signal?: AbortSignal
 ): Promise<RawYahooBar[]> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
     yahooSymbol
@@ -196,6 +198,7 @@ async function fetchYahooSeries(
       "User-Agent": "Mozilla/5.0 (compatible; HyperionAnalytics/1.0)",
     },
     cache: "no-store",
+    signal,
   });
 
   if (!res.ok) {
@@ -467,7 +470,8 @@ async function fetchLiveOptionsBuckets(
   ticker: string,
   referenceSpot: number,
   priorClose: number,
-  latestSessionDate: string
+  latestSessionDate: string,
+  signal?: AbortSignal
 ): Promise<{
   dataSource: "TRADIER_LIVE" | "CBOE_MARKET_DATA";
   spotPrice: number;
@@ -488,6 +492,7 @@ async function fetchLiveOptionsBuckets(
       "User-Agent": "Mozilla/5.0 (compatible; HyperionAnalytics/1.0)",
     },
     cache: "no-store",
+    signal,
   });
 
   if (!response.ok) {
@@ -512,6 +517,7 @@ async function fetchLiveOptionsBuckets(
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
       },
       cache: "no-store",
+      signal,
     });
     if (rhRes.ok) {
       const rhJson = await rhRes.json();
@@ -840,7 +846,6 @@ async function fetchLiveOptionsBuckets(
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
-  const rawTicker = (searchParams.get("ticker") ?? "SPY").trim().toUpperCase();
   const requestedSession = (searchParams.get("session") ?? "").trim();
   const rawStart = (searchParams.get("start") ?? searchParams.get("startHour") ?? "0").trim().toLowerCase();
   const startHour =
@@ -852,7 +857,7 @@ export async function GET(request: NextRequest) {
           ? 7
           : 0;
 
-  const ticker = /^[A-Z0-9._-]{1,10}$/.test(rawTicker) ? rawTicker : "SPY";
+  const ticker = sanitizeTickerSymbol(searchParams.get("ticker"), "SPY");
   const yahooSymbol = mapYahooSymbol(ticker);
   const cacheKey = `${ticker}:${requestedSession || "latest"}:${startHour}`;
 
@@ -863,21 +868,25 @@ export async function GET(request: NextRequest) {
 
   let pending = gaiaInFlight.get(cacheKey);
   if (!pending) {
-    pending = (async (): Promise<GaiaCoalescedResult> => {
-      // Fetch live multi-timeframe candle series from Yahoo Finance in parallel
-      // 5m series includes pre-market starting from 7:00 AM ET (or 8:00 AM / 9:30 AM if requested)
-      const [bars5mRaw, bars30mRaw, bars60mRaw, bars1dRaw, bars1wkRaw] =
-        await Promise.all([
-          fetchYahooSeries(yahooSymbol, "5m", "1mo", true, startHour),
-          fetchYahooSeries(yahooSymbol, "30m", "1mo"),
-          fetchYahooSeries(yahooSymbol, "60m", "3mo"),
-          fetchYahooSeries(yahooSymbol, "1d", "6mo"),
-          fetchYahooSeries(yahooSymbol, "1wk", "2y"),
-        ]);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15_000);
+    let createdPromise: Promise<GaiaCoalescedResult> | undefined;
+    createdPromise = (async (): Promise<GaiaCoalescedResult> => {
+      try {
+        // Fetch live multi-timeframe candle series from Yahoo Finance in parallel
+        // 5m series includes pre-market starting from 7:00 AM ET (or 8:00 AM / 9:30 AM if requested)
+        const [bars5mRaw, bars30mRaw, bars60mRaw, bars1dRaw, bars1wkRaw] =
+          await Promise.all([
+            fetchYahooSeries(yahooSymbol, "5m", "1mo", true, startHour, controller.signal),
+            fetchYahooSeries(yahooSymbol, "30m", "1mo", false, 0, controller.signal),
+            fetchYahooSeries(yahooSymbol, "60m", "3mo", false, 0, controller.signal),
+            fetchYahooSeries(yahooSymbol, "1d", "6mo", false, 0, controller.signal),
+            fetchYahooSeries(yahooSymbol, "1wk", "2y", false, 0, controller.signal),
+          ]);
 
-      if (bars5mRaw.length === 0 || bars1dRaw.length === 0) {
-        return { ok: false, error: `No live market bars returned for ${ticker}`, status: 502 };
-      }
+        if (bars5mRaw.length === 0 || bars1dRaw.length === 0) {
+          return { ok: false, error: `No live market bars returned for ${ticker}`, status: 502 };
+        }
 
     // Group 5m bars by ET trading session date
     const sessionDatesDesc = Array.from(
@@ -1118,7 +1127,8 @@ export async function GET(request: NextRequest) {
       ticker,
       lastSessionClose,
       priorClose,
-      sessionDatesDesc[0]
+      sessionDatesDesc[0],
+      controller.signal
     );
 
     const payload: AntaeusLivePayload = {
@@ -1142,7 +1152,14 @@ export async function GET(request: NextRequest) {
     };
 
       return { ok: true, payload };
+      } finally {
+        clearTimeout(timeoutId);
+        if (gaiaInFlight.get(cacheKey) === createdPromise) {
+          gaiaInFlight.delete(cacheKey);
+        }
+      }
     })();
+    pending = createdPromise;
     gaiaInFlight.set(cacheKey, pending);
   }
 
@@ -1152,10 +1169,6 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: result.error }, { status: result.status });
     }
     gaiaShortCache.set(cacheKey, { tsMs: Date.now(), payload: result.payload });
-    if (gaiaShortCache.size > 32) {
-      const oldestKey = gaiaShortCache.keys().next().value;
-      if (oldestKey) gaiaShortCache.delete(oldestKey);
-    }
     return NextResponse.json(result.payload);
   } catch (err) {
     const message =

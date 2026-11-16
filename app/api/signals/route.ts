@@ -8,7 +8,6 @@ import {
   clearDailyTrades,
   getTodayEt,
   selectOptimalContract,
-  sendDiscordTradeAlert,
   generateDailyPerformanceReport,
   checkAndSendMarketCloseRecap,
   TradeLifecycleAlert,
@@ -20,15 +19,31 @@ import {
 } from "@/lib/tradeRadar";
 import {
   acquireBarEvaluationLock,
+  acquireBarEvaluationLockWithWait,
   releaseBarEvaluationLock,
   ensureLiveBotRunning,
   ensureMocCutoffForRemainingPositions,
   getActiveTrackedTickers,
   registerActiveTrackedTicker,
   getEtClockNow,
+  getLiveBotStatus,
 } from "@/lib/liveBotDaemon";
+import { sanitizeTickerSymbol } from "@/lib/marketCache";
 
 export const dynamic = "force-dynamic";
+
+const globalForSignals = globalThis as unknown as {
+  __hyperionLastGetEvalAtMs?: number;
+};
+
+function sanitizeWebhookUrl(raw: unknown): { url?: string; invalid: boolean } {
+  if (raw == null) return { url: undefined, invalid: false };
+  if (typeof raw !== "string") return { url: undefined, invalid: true };
+  const trimmed = raw.trim();
+  if (!trimmed) return { url: undefined, invalid: false };
+  if (!/^https:\/\//i.test(trimmed)) return { url: undefined, invalid: true };
+  return { url: trimmed, invalid: false };
+}
 
 function parseIsoDateParam(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
@@ -74,13 +89,21 @@ function isHistoricalBackfillRequest(opts: {
   return false;
 }
 
-async function withBoundedWait<T>(work: Promise<T>, timeoutMs = 15_000): Promise<T> {
+async function withBoundedWait<T>(
+  work: Promise<T>,
+  timeoutMs = 15_000,
+  controller?: AbortController
+): Promise<T> {
+  work.catch(() => {});
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       work,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("Signal operation timed out")), timeoutMs);
+        timer = setTimeout(() => {
+          controller?.abort();
+          reject(new Error("Signal operation timed out"));
+        }, timeoutMs);
       }),
     ]);
   } finally {
@@ -92,14 +115,21 @@ export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
     const rawTicker = searchParams.get("ticker") || searchParams.get("symbol") || "";
-    const ticker = rawTicker ? rawTicker.trim().toUpperCase() : undefined;
+    const ticker = rawTicker ? sanitizeTickerSymbol(rawTicker, "") || undefined : undefined;
     const rawDate = searchParams.get("date")?.trim();
     if (rawDate && !/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
       return NextResponse.json({ error: "Invalid date format. Expected YYYY-MM-DD." }, { status: 400 });
     }
     const requestedDate = rawDate || undefined;
     const testAction = searchParams.get("test");
-    const webhookUrl = searchParams.get("webhookUrl") || undefined;
+    const webhookValidation = sanitizeWebhookUrl(searchParams.get("webhookUrl"));
+    if (webhookValidation.invalid) {
+      return NextResponse.json(
+        { error: "Invalid Discord Webhook URL protocol; HTTPS required." },
+        { status: 400 }
+      );
+    }
+    const webhookUrl = webhookValidation.url;
 
     // Manual inspection endpoint (Does NOT post simulations to Discord)
     if (testAction === "bto_call" || testAction === "bto_put") {
@@ -322,13 +352,19 @@ export async function GET(req: NextRequest) {
     }
 
     if (searchParams.get("performance") === "true") {
-      const report = generateDailyPerformanceReport();
+      const report = generateDailyPerformanceReport(requestedDate);
       return NextResponse.json({ success: true, report });
     }
 
     if (searchParams.get("radar") === "true") {
-      const radar = await getPreTradeRadarData();
-      return NextResponse.json({ success: true, radar });
+      const radarController = new AbortController();
+      const radarTimeout = setTimeout(() => radarController.abort(), 12_000);
+      try {
+        const radar = await getPreTradeRadarData({ signal: radarController.signal });
+        return NextResponse.json({ success: true, radar });
+      } finally {
+        clearTimeout(radarTimeout);
+      }
     }
 
     if (searchParams.get("action") === "send_radar") {
@@ -349,18 +385,20 @@ export async function GET(req: NextRequest) {
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
       }
-      const work = sendPreTradeRadarDiscordCard(webhookUrl).finally(() =>
-        releaseBarEvaluationLock(lockToken)
-      );
-      const sent = await withBoundedWait(work, 15_000);
+      const radarController = new AbortController();
+      const work = sendPreTradeRadarDiscordCard(webhookUrl, {
+        signal: radarController.signal,
+      }).finally(() => releaseBarEvaluationLock(lockToken));
+      const sent = await withBoundedWait(work, 15_000, radarController);
       return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
     }
 
     if (searchParams.get("action") === "send_recap") {
+      const recapDate = requestedDate ?? parseIsoDateParam(searchParams.get("sessionDate"));
       if (
         isHistoricalBackfillRequest({
           explicitFlag: searchParams.get("isHistoricalBackfill"),
-          requestedDate: requestedDate ?? parseIsoDateParam(searchParams.get("sessionDate")),
+          requestedDate: recapDate,
           nowEt: searchParams.get("nowEt"),
         })
       ) {
@@ -374,10 +412,14 @@ export async function GET(req: NextRequest) {
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
       }
-      const work = checkAndSendMarketCloseRecap({ force: true, webhookUrl }).finally(() =>
-        releaseBarEvaluationLock(lockToken)
-      );
-      const report = await withBoundedWait(work, 15_000);
+      const recapController = new AbortController();
+      const work = checkAndSendMarketCloseRecap({
+        force: true,
+        webhookUrl,
+        date: recapDate,
+        signal: recapController.signal,
+      }).finally(() => releaseBarEvaluationLock(lockToken));
+      const report = await withBoundedWait(work, 15_000, recapController);
       return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
     }
 
@@ -395,8 +437,16 @@ export async function GET(req: NextRequest) {
 
     ensureLiveBotRunning();
     if (ticker) registerActiveTrackedTicker(ticker);
-    const getLockToken = acquireBarEvaluationLock();
+    const botStatus = getLiveBotStatus();
+    const nowMs = Date.now();
+    const shouldThrottleEval =
+      botStatus.isEvaluatingLiveBar ||
+      (botStatus.lastPollAtMs > 0 && nowMs - botStatus.lastPollAtMs < 5_000) ||
+      (globalForSignals.__hyperionLastGetEvalAtMs != null &&
+        nowMs - globalForSignals.__hyperionLastGetEvalAtMs < 5_000);
+    const getLockToken = shouldThrottleEval ? 0 : acquireBarEvaluationLock();
     if (getLockToken) {
+      globalForSignals.__hyperionLastGetEvalAtMs = nowMs;
       const evalController = new AbortController();
       const evalTimeout = setTimeout(() => evalController.abort(), 12_000);
       try {
@@ -431,6 +481,14 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+    const webhookValidation = sanitizeWebhookUrl(body.webhookUrl);
+    if (webhookValidation.invalid) {
+      return NextResponse.json(
+        { error: "Invalid Discord Webhook URL protocol; HTTPS required." },
+        { status: 400 }
+      );
+    }
+    const validWebhookUrl = webhookValidation.url;
 
     if (body.action === "REGISTER_TRACKED_TICKER") {
       const trackedTickers = registerActiveTrackedTicker(body.ticker);
@@ -457,11 +515,13 @@ export async function POST(req: NextRequest) {
       if (!backfill && typeof body.ticker === "string" && body.ticker.trim()) {
         registerActiveTrackedTicker(body.ticker);
       }
-      const lockToken = acquireBarEvaluationLock();
+      const lockToken = await acquireBarEvaluationLockWithWait(2500, req.signal);
       if (!lockToken) {
         return NextResponse.json({ success: false, busy: true, dispatchedCount: 0, keys: [] }, { status: 409 });
       }
       const syncController = new AbortController();
+      const onReqAbort = () => syncController.abort();
+      req.signal?.addEventListener("abort", onReqAbort, { once: true });
       const syncTimeout = setTimeout(() => syncController.abort(), 12_000);
       try {
         const res = await syncGaiaTickerSignalsToDiscord({
@@ -474,23 +534,24 @@ export async function POST(req: NextRequest) {
           impulseChi: typeof body.impulseChi === "number" ? body.impulseChi : undefined,
           zeroGamma: typeof body.zeroGamma === "number" ? body.zeroGamma : undefined,
           sessionDate,
-          webhookUrl: backfill ? undefined : body.webhookUrl,
+          webhookUrl: backfill ? undefined : validWebhookUrl,
           isHistoricalBackfill: backfill,
           signal: syncController.signal,
         });
         const clock = getEtClockNow();
         if (!backfill && clock.etMins >= 955) {
-          await ensureMocCutoffForRemainingPositions(body.webhookUrl, clock);
+          await ensureMocCutoffForRemainingPositions(validWebhookUrl, clock);
         }
         return NextResponse.json({ success: true, ...res });
       } finally {
         clearTimeout(syncTimeout);
+        req.signal?.removeEventListener("abort", onReqAbort);
         releaseBarEvaluationLock(lockToken);
       }
     }
 
     if (body.action === "clear") {
-      const lockToken = acquireBarEvaluationLock();
+      const lockToken = await acquireBarEvaluationLockWithWait(2500, req.signal);
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
       }
@@ -503,10 +564,11 @@ export async function POST(req: NextRequest) {
     }
 
     if (body.action === "send_daily_recap") {
+      const recapDate = parseIsoDateParam(body.date ?? body.sessionDate);
       if (
         isHistoricalBackfillRequest({
           explicitFlag: body.isHistoricalBackfill,
-          requestedDate: parseIsoDateParam(body.sessionDate ?? body.date),
+          requestedDate: recapDate,
           nowEt: body.nowEt,
         })
       ) {
@@ -516,15 +578,18 @@ export async function POST(req: NextRequest) {
           reason: "DISCORD_SILENCED_HISTORICAL_BACKFILL",
         });
       }
-      const lockToken = acquireBarEvaluationLock();
+      const lockToken = await acquireBarEvaluationLockWithWait(2500, req.signal);
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
       }
+      const recapController = new AbortController();
       const work = checkAndSendMarketCloseRecap({
         force: true,
-        webhookUrl: body.webhookUrl,
+        webhookUrl: validWebhookUrl,
+        date: recapDate,
+        signal: recapController.signal,
       }).finally(() => releaseBarEvaluationLock(lockToken));
-      const report = await withBoundedWait(work, 15_000);
+      const report = await withBoundedWait(work, 15_000, recapController);
       return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
     }
 
@@ -542,22 +607,25 @@ export async function POST(req: NextRequest) {
           reason: "DISCORD_SILENCED_HISTORICAL_BACKFILL",
         });
       }
-      const lockToken = acquireBarEvaluationLock();
+      const lockToken = await acquireBarEvaluationLockWithWait(2500, req.signal);
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
       }
-      const work = sendPreTradeRadarDiscordCard(body.webhookUrl).finally(() =>
-        releaseBarEvaluationLock(lockToken)
-      );
-      const sent = await withBoundedWait(work, 15_000);
+      const radarController = new AbortController();
+      const work = sendPreTradeRadarDiscordCard(validWebhookUrl, {
+        signal: radarController.signal,
+      }).finally(() => releaseBarEvaluationLock(lockToken));
+      const sent = await withBoundedWait(work, 15_000, radarController);
       return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
     }
 
-    const lockToken = acquireBarEvaluationLock();
+    const lockToken = await acquireBarEvaluationLockWithWait(2500, req.signal);
     if (!lockToken) {
       return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
     }
     const postController = new AbortController();
+    const onReqAbort = () => postController.abort();
+    req.signal?.addEventListener("abort", onReqAbort, { once: true });
     const postTimeout = setTimeout(() => postController.abort(), 12_000);
     try {
       const backfill = isHistoricalBackfillRequest({
@@ -571,7 +639,7 @@ export async function POST(req: NextRequest) {
       }
       const normalizedBody = {
         ...body,
-        webhookUrl: backfill ? undefined : body.webhookUrl,
+        webhookUrl: backfill ? undefined : validWebhookUrl,
         isHistoricalBackfill: backfill,
         signal: postController.signal,
         ...(body.nowEt ? { nowEt: new Date(body.nowEt) } : {}),
@@ -579,11 +647,12 @@ export async function POST(req: NextRequest) {
       const result = await evaluateTradeSignals(normalizedBody);
       const clock = getEtClockNow();
       if (!backfill && clock.etMins >= 955) {
-        await ensureMocCutoffForRemainingPositions(body.webhookUrl, clock);
+        await ensureMocCutoffForRemainingPositions(validWebhookUrl, clock);
       }
       return NextResponse.json(result);
     } finally {
       clearTimeout(postTimeout);
+      req.signal?.removeEventListener("abort", onReqAbort);
       releaseBarEvaluationLock(lockToken);
     }
   } catch (err: unknown) {

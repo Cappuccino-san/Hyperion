@@ -18,8 +18,14 @@ import {
 import {
   GaiaSignalFsm,
   GaiaBarData,
-  GaiaCommittedSignal,
+  computeCausalEquilibriumDispersion,
 } from "@/lib/gaiaSignalFsm";
+import {
+  RTH_OPEN_MINS as GUARD_RTH_OPEN_MINS,
+  RTH_CLOSE_MINS as GUARD_RTH_CLOSE_MINS,
+  getTodayEt,
+  toEpochSec,
+} from "@/lib/gaiaSessionGuards";
 import {
   extractNormalizedTradesForTicker,
   matchTradeToCandleIndex,
@@ -37,15 +43,6 @@ export interface GaiaHudCandle {
   timeLabel?: string;
 }
 
-export interface GaiaHudTradeSignal {
-  timestamp: number;
-  action: "BUY_TO_OPEN" | "SELL_TO_CLOSE";
-  contractType: "CALL" | "PUT";
-  spotPrice: number;
-  setupName?: string;
-  isWin?: boolean;
-}
-
 export interface GaiaCallPutBiasHudProps {
   symbol?: string;
   ticker?: string;
@@ -55,7 +52,6 @@ export interface GaiaCallPutBiasHudProps {
   sigma1Move?: number;
   liveSpot?: number | null;
   spot?: number | null;
-  tradeSignals?: GaiaHudTradeSignal[];
   serverTrades?: ServerTradeData;
   sessionDate?: string;
   onSymbolChange?: (symbol: string) => void;
@@ -121,8 +117,8 @@ interface TimeTick {
 export const EXTENDED_SESSION_START_MINS = 0; // 12:00 AM ET (0 * 60)
 export const EXTENDED_SESSION_END_MINS = 1440;  // 12:00 AM next day ET (24 * 60)
 export const EXTENDED_SESSION_SPAN_MINS = 1440; // Full 24 hours (1440 mins, 288 5m slots)
-export const RTH_OPEN_MINS = 570;               // 09:30 AM ET (9 * 60 + 30)
-export const RTH_CLOSE_MINS = 960;              // 04:00 PM ET (16 * 60)
+export const RTH_OPEN_MINS = GUARD_RTH_OPEN_MINS;               // 09:30 AM ET (9 * 60 + 30)
+export const RTH_CLOSE_MINS = GUARD_RTH_CLOSE_MINS;              // 04:00 PM ET (16 * 60)
 
 export interface SessionTickMilestone {
   etMins: number;
@@ -248,7 +244,6 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   sigma1Move,
   liveSpot,
   spot,
-  tradeSignals = [],
   serverTrades: serverTradesProp,
   sessionDate,
   onSymbolChange,
@@ -267,6 +262,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 }) => {
   const uid = useId().replace(/:/g, "");
   const activeSymbol = (symbol || ticker || "SPY").trim().toUpperCase() || "SPY";
+  const storeActiveTicker = useDashboardStore((s) => s.activeTicker);
   const liveTickPrice = useDashboardStore((s) => s.liveTickPrice);
   const liveTickCount = useDashboardStore((s) => s.liveTickCount);
   const gammaLevels = useDashboardStore((s) => s.gammaLevels);
@@ -287,6 +283,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   useEffect(() => {
     if (serverTradesProp !== undefined || isReplayMode) return;
     let isMounted = true;
+    const controller = new AbortController();
     async function syncServerTrades() {
       try {
         const dateParam =
@@ -297,11 +294,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           `/api/signals?ticker=${encodeURIComponent(activeSymbol)}${dateParam}`,
           {
             cache: "no-store",
+            signal: controller.signal,
           }
         );
         if (!res.ok) return;
         const data = await res.json();
-        if (isMounted) {
+        if (isMounted && !controller.signal.aborted) {
           setInternalServerTrades({
             activePositions: data?.activePositions || {},
             closedPositions: data?.closedPositions || [],
@@ -316,6 +314,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     const interval = setInterval(syncServerTrades, 5000);
     return () => {
       isMounted = false;
+      controller.abort();
       clearInterval(interval);
     };
   }, [activeSymbol, sessionDate, serverTradesProp, isReplayMode]);
@@ -425,7 +424,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           return Math.max(c.high - c.low, Math.abs(c.close - p));
         })
         .sort((a, b) => a - b);
-      const medianTr = trs.length > 0 ? trs[Math.floor(trs.length / 2)] : 0.35;
+      const medianTr = trs.length > 0 ? trs[Math.floor(trs.length / 2)] : Math.max(0.01, prevClose * 0.0005);
       const maxAllowedJump = Math.max(medianTr * 2.8, prevClose * 0.002);
 
       const isPresetPoisoned =
@@ -440,9 +439,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       }
 
       // Live Sub-Second Real-Time Tick Sync (800ms stream from /api/tick or verified liveSpot)
+      const tickerMatchedTick = storeActiveTicker.toUpperCase() === activeSymbol ? liveTickPrice : null;
       const verifiedLivePrice =
-        typeof liveTickPrice === "number" && liveTickPrice > 0 && !STATIC_PRESET_SPOTS.has(Number(liveTickPrice.toFixed(2)))
-          ? liveTickPrice
+        typeof tickerMatchedTick === "number" && tickerMatchedTick > 0 && !STATIC_PRESET_SPOTS.has(Number(tickerMatchedTick.toFixed(2)))
+          ? tickerMatchedTick
           : typeof rawLiveSpot === "number" && rawLiveSpot > 0 && !STATIC_PRESET_SPOTS.has(Number(rawLiveSpot.toFixed(2)))
             ? rawLiveSpot
             : null;
@@ -458,7 +458,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     }
 
     return cloned;
-  }, [candles, bars, rawLiveSpot, liveTickPrice, liveTickCount, activeSymbol, isReplayMode]);
+  }, [candles, bars, rawLiveSpot, storeActiveTicker, liveTickPrice, liveTickCount, activeSymbol, isReplayMode]);
 
   // 2. Compute Bar-by-Bar Flow VWAP & Spectral Flux Series (preferring canonical parent series)
   const pdeSeries = useMemo(() => {
@@ -525,9 +525,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       if (c.high > max) max = c.high;
     }
     const current = effectiveCandles[effectiveCandles.length - 1].close;
-    const baseSpan = Math.max(0.6, max - min);
+    const baseSpan = Math.max(Math.max(0.05, current * 0.001), max - min);
     const mid = (min + max) / 2 + yPanOffset;
-    const adjustedSpan = Math.max(0.4, (baseSpan * 1.25) / Math.max(0.2, yScale));
+    const adjustedSpan = Math.max(Math.max(0.04, current * 0.0006), (baseSpan * 1.25) / Math.max(0.2, yScale));
 
     return {
       min: mid - adjustedSpan / 2,
@@ -540,18 +540,17 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   // Coordinate Projection Helpers (Left-Anchored 1:1 with GaiaView minsToX)
   const xFromEtMins = useCallback(
     (etMins: number) => {
-      const clampedMins = Math.max(axisStartMins, Math.min(axisEndMins, etMins));
-      const rawRatio = (clampedMins - axisStartMins) / axisSpanMins;
+      const rawRatio = (etMins - axisStartMins) / axisSpanMins;
       return padLeft + currentXPanOffset + rawRatio * plotW * currentXScale;
     },
-    [axisStartMins, axisEndMins, axisSpanMins, padLeft, plotW, currentXScale, currentXPanOffset]
+    [axisStartMins, axisSpanMins, padLeft, plotW, currentXScale, currentXPanOffset]
   );
 
   const xForIdx = useCallback(
     (idx: number) => {
       if (idx >= 0 && idx < effectiveCandles.length) {
         const et = resolveBarEtMinutes(effectiveCandles[idx], idx, effectiveCandles.length);
-        return xFromEtMins(et);
+        return xFromEtMins(et + 2.5);
       }
       const n = Math.max(1, effectiveCandles.length - 1);
       const ratio = idx / n;
@@ -637,7 +636,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       const deltaNetFlux6Bar = typeof snap?.deltaNetFlux6Bar === "number" && Number.isFinite(snap.deltaNetFlux6Bar) ? snap.deltaNetFlux6Bar : 0.0;
       const netFlux = typeof snap?.netFluxJ === "number" && Number.isFinite(snap.netFluxJ) ? snap.netFluxJ : 0.0;
       const fvwap = typeof snap?.flowVwap === "number" && Number.isFinite(snap.flowVwap) ? snap.flowVwap : c.close;
-      const sigma = typeof snap?.sigma === "number" && Number.isFinite(snap.sigma) ? snap.sigma : Math.max(c.close * 0.0015, 0.35);
+      const sigma = typeof snap?.sigma === "number" && Number.isFinite(snap.sigma) ? snap.sigma : Math.max(c.close * 0.0015, 0.02);
       const upper1Sigma = typeof snap?.upper1Sigma === "number" && Number.isFinite(snap.upper1Sigma) ? snap.upper1Sigma : fvwap + sigma;
       const lower1Sigma = typeof snap?.lower1Sigma === "number" && Number.isFinite(snap.lower1Sigma) ? snap.lower1Sigma : fvwap - sigma;
 
@@ -667,7 +666,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         bias,
         regime,
         histValue,
-        baseX: xFromEtMins(etMins),
+        baseX: xFromEtMins(etMins + 2.5),
         baseY: yForPrice(c.close),
       };
     });
@@ -753,25 +752,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       return { signals: [], committedState: "STAND_ASIDE" as const };
     }
 
-    // 1. Identify 9:30 AM Session Open Anchor & Expected Move Multiples
-    const open930Idx = enrichedPoints.findIndex((b) => b.etMins >= 570);
-    const anchorIdx = open930Idx >= 0 ? open930Idx : 0;
-    const open930 =
-      enrichedPoints[anchorIdx]?.open > 0
-        ? enrichedPoints[anchorIdx].open
-        : enrichedPoints[anchorIdx]?.close ?? 0;
-
-    const expectedMove = intrinsicExpectedMove;
-    const putTrigger = Number((open930 - 0.25 * expectedMove).toFixed(2));
-
-    if (!enrichedPoints || enrichedPoints.length === 0) {
-      return { signals: [], committedState: "STAND_ASIDE" as const };
-    }
-
     // STRICT NON-REPAINTING FINITE STATE MACHINE (Causal Equilibrium Dispersion, Closed-Bar Append-Only)
     const fsm = new GaiaSignalFsm();
     const bars: GaiaBarData[] = enrichedPoints.map((pt, i) => {
-      const tsSec = pt.timestamp > 1e11 ? Math.floor(pt.timestamp / 1000) : pt.timestamp;
+      const tsSec = toEpochSec(pt.timestamp);
       const prevPt = i > 0 ? enrichedPoints[i - 1] : undefined;
       const vwapSlope =
         prevPt && typeof pt.flowVwap === "number" && typeof prevPt.flowVwap === "number"
@@ -782,8 +766,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       const recentHigh3 = Math.max(...enrichedPoints.slice(Math.max(0, i - 3), i + 1).map((p) => p.high));
       const recentHigh4 = Math.max(...enrichedPoints.slice(Math.max(0, i - 4), i + 1).map((p) => p.high));
       const recentLow4 = Math.min(...enrichedPoints.slice(Math.max(0, i - 4), i + 1).map((p) => p.low));
-      const fluxLowerExtremity = (pt.flowVwap ?? pt.close) - 1.25 * (pt.sigma ?? 1.0);
-      const fluxUpperExtremity = (pt.flowVwap ?? pt.close) + 1.25 * (pt.sigma ?? 1.0);
+      const fallbackSigma = Math.max(0.02, pt.close * 0.0015);
+      const fluxLowerExtremity = (pt.flowVwap ?? pt.close) - 1.25 * (pt.sigma ?? fallbackSigma);
+      const fluxUpperExtremity = (pt.flowVwap ?? pt.close) + 1.25 * (pt.sigma ?? fallbackSigma);
       const bullDiv5m = recentLow4 <= fluxLowerExtremity && pt.close > pt.open && (prevPt ? pt.close > prevPt.close : false);
       const bearDiv5m = recentHigh4 >= fluxUpperExtremity && pt.close < pt.open && (prevPt ? pt.close < prevPt.close : false);
       return {
@@ -817,26 +802,81 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       };
     });
 
-    const rthPts = enrichedPoints.filter((p) => p.etMins >= 570 && p.etMins <= 960);
-    const wallPts = rthPts.length > 0 ? rthPts : enrichedPoints;
-    const sessionLow = wallPts.length > 0 ? Math.min(...wallPts.map((p) => p.low)) : 0;
-    const sessionHigh = wallPts.length > 0 ? Math.max(...wallPts.map((p) => p.high)) : 0;
-    const resolvedPutWall = (!isReplayMode && gammaLevels?.putWall && gammaLevels.putWall > 0)
-      ? gammaLevels.putWall
-      : (sessionLow > 0 ? Math.floor(sessionLow) : 0);
-    const resolvedCallWall = (!isReplayMode && gammaLevels?.callWall && gammaLevels.callWall > 0)
-      ? gammaLevels.callWall
-      : (sessionHigh > 0 ? Math.round((sessionLow + sessionHigh) / 2 + 1.5) : 0);
-    const bookCenter = Number(((resolvedCallWall + resolvedPutWall) / 2).toFixed(2));
-    const { snapshot } = fsm.commitSeries(bars, {
+    // Causal bar-by-bar evaluation (zero lookahead from future RTH highs/lows or end-of-slice activeRegime)
+    let causalLow = Infinity;
+    let causalHigh = -Infinity;
+    const nowEpochSec = Math.floor(Date.now() / 1000);
+    for (let i = 0; i < bars.length; i++) {
+      const pt = enrichedPoints[i];
+      if (pt.etMins >= RTH_OPEN_MINS && pt.etMins < RTH_CLOSE_MINS) {
+        if (pt.low < causalLow) causalLow = pt.low;
+        if (pt.high > causalHigh) causalHigh = pt.high;
+      }
+      if (!bars[i].isClosed) continue;
+      const refLow = Number.isFinite(causalLow) ? causalLow : pt.low;
+      const refHigh = Number.isFinite(causalHigh) ? causalHigh : pt.high;
+      const spotScale = Math.max(0.01, pt.close * 0.002);
+      const resolvedPutWall =
+        !isReplayMode && gammaLevels?.putWall && gammaLevels.putWall > 0
+          ? gammaLevels.putWall
+          : Number(refLow.toFixed(2));
+      const resolvedCallWall =
+        !isReplayMode && gammaLevels?.callWall && gammaLevels.callWall > 0
+          ? gammaLevels.callWall
+          : Number(((refLow + refHigh) / 2 + spotScale).toFixed(2));
+      const resolvedZg =
+        !isReplayMode && gammaLevels?.zeroGamma && gammaLevels.zeroGamma > 0
+          ? gammaLevels.zeroGamma
+          : Number((refHigh + spotScale * 1.5).toFixed(2));
+      const disp = computeCausalEquilibriumDispersion(bars, i);
+      const barCloseTs = bars[i].barCloseTimestamp || bars[i].barTimestamp + disp.barDurationSec;
+      const barRegime: "CALL" | "PUT" = pt.chi >= 0.5 ? "CALL" : "PUT";
+      fsm.commitClosedBar(
+        bars[i],
+        disp,
+        {
+          macroRegime: barRegime,
+          callDominancePct: Math.round(pt.chi * 100),
+          netGex: !isReplayMode && typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
+          structuralLevels: {
+            zeroGamma: resolvedZg,
+            callWall: resolvedCallWall,
+            putWall: resolvedPutWall,
+            bookCenter: Number(((resolvedCallWall + resolvedPutWall) / 2).toFixed(2)),
+          },
+        },
+        { isHistoricalBackfill: nowEpochSec - barCloseTs > Math.round(disp.barDurationSec * 1.5) }
+      );
+    }
+
+    const lastIdx = bars.length - 1;
+    const unclosedBar = bars.length > 0 && !bars[lastIdx].isClosed ? bars[lastIdx] : undefined;
+    const lastDisp = bars.length > 0 ? computeCausalEquilibriumDispersion(bars, lastIdx) : undefined;
+    const lastPtRef = enrichedPoints[lastIdx];
+    const lastRefLow = Number.isFinite(causalLow) ? causalLow : (lastPtRef?.low ?? 0);
+    const lastRefHigh = Number.isFinite(causalHigh) ? causalHigh : (lastPtRef?.high ?? 0);
+    const lastSpotScale = Math.max(0.01, (lastPtRef?.close ?? 0) * 0.002);
+    const finalPutWall =
+      !isReplayMode && gammaLevels?.putWall && gammaLevels.putWall > 0
+        ? gammaLevels.putWall
+        : Number(lastRefLow.toFixed(2));
+    const finalCallWall =
+      !isReplayMode && gammaLevels?.callWall && gammaLevels.callWall > 0
+        ? gammaLevels.callWall
+        : Number(((lastRefLow + lastRefHigh) / 2 + lastSpotScale).toFixed(2));
+    const finalZg =
+      !isReplayMode && gammaLevels?.zeroGamma && gammaLevels.zeroGamma > 0
+        ? gammaLevels.zeroGamma
+        : Number((lastRefHigh + lastSpotScale * 1.5).toFixed(2));
+    const snapshot = fsm.getSnapshot(unclosedBar, lastDisp, {
       macroRegime: activeRegime,
       callDominancePct: activeChiPct,
       netGex: !isReplayMode && typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
       structuralLevels: {
-        zeroGamma: (!isReplayMode && gammaLevels?.zeroGamma) || Number((sessionHigh + 2.5).toFixed(1)),
-        callWall: resolvedCallWall,
-        putWall: resolvedPutWall,
-        bookCenter,
+        zeroGamma: finalZg,
+        callWall: finalCallWall,
+        putWall: finalPutWall,
+        bookCenter: Number(((finalCallWall + finalPutWall) / 2).toFixed(2)),
       },
     });
 
@@ -1004,6 +1044,11 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     }
   }, [przmSignals, activeSymbol]);
 
+  const lastCandleTsRaw = Number(effectiveCandles[effectiveCandles.length - 1]?.timestamp ?? 0);
+  const lastCandleTsSec = lastCandleTsRaw > 0 ? toEpochSec(lastCandleTsRaw) : 0;
+  const effectiveReplayTsSec =
+    isReplayMode ? (typeof replayBarTsSec === "number" && replayBarTsSec > 0 ? replayBarTsSec : lastCandleTsSec) : 0;
+
   // Project authoritative server trades (BTO / STC + PnL badges + trajectory) onto SVG coordinates
   const svgServerTradeMarkers = useMemo(() => {
     const trades = extractNormalizedTradesForTicker(
@@ -1012,7 +1057,24 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       przmSignals
     ).filter((t) => !String(t.id).startsWith("test-"));
     if (trades.length === 0 || enrichedPoints.length === 0) return [];
+    let barStepSec = 300;
+    if (enrichedPoints.length >= 2) {
+      const intervals: number[] = [];
+      const limit = Math.min(enrichedPoints.length - 1, 10);
+      for (let k = 0; k < limit; k++) {
+        const t0 = toEpochSec(enrichedPoints[k].timestamp);
+        const t1 = toEpochSec(enrichedPoints[k + 1].timestamp);
+        const step = Math.abs(t1 - t0);
+        if (step >= 60 && step <= 3600) intervals.push(step);
+      }
+      if (intervals.length > 0) {
+        intervals.sort((a, b) => a - b);
+        barStepSec = intervals[Math.floor(intervals.length / 2)];
+      }
+    }
+    const cutoffSec = effectiveReplayTsSec > 0 ? effectiveReplayTsSec + barStepSec - 1 : Infinity;
     return trades
+      .filter((t) => !t.openedTs || toEpochSec(t.openedTs) <= cutoffSec)
       .map((trade) => {
         // Match authoritative server trade timestamp/label ("10:15 AM ET", "1:15 PM ET") directly to candle index
         let entryIdx = matchTradeToCandleIndex(
@@ -1021,8 +1083,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
           trade.openedAt
         );
         if (entryIdx < 0) return null;
+        const closedSec = trade.closedTs ? toEpochSec(trade.closedTs) : 0;
+        const exitVisible =
+          trade.status === "CLOSED" &&
+          (!isReplayMode || (closedSec > 0 && closedSec <= cutoffSec));
         const exitIdx =
-          trade.status === "CLOSED"
+          exitVisible
             ? matchTradeToCandleIndex(enrichedPoints, trade.closedTs, trade.closedAt)
             : -1;
         const entryBar = enrichedPoints[entryIdx];
@@ -1032,7 +1098,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         const entryHighY = yForPrice(entryBar.high);
         const entryLowY = yForPrice(entryBar.low);
 
-        const isClosed = trade.status === "CLOSED" && exitIdx >= 0;
+        const isClosed = exitVisible && exitIdx >= 0;
         const exitBar = isClosed ? enrichedPoints[exitIdx] : enrichedPoints[enrichedPoints.length - 1];
         const exitSpot = isClosed
           ? clampSpotToCandle(trade.closedSpotPrice ?? exitBar.close, exitBar)
@@ -1058,7 +1124,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         };
       })
       .filter((item): item is NonNullable<typeof item> => item !== null);
-  }, [activeSymbol, internalServerTrades, przmSignals, enrichedPoints, xForIdx, yForPrice]);
+  }, [activeSymbol, internalServerTrades, przmSignals, enrichedPoints, xForIdx, yForPrice, effectiveReplayTsSec, isReplayMode]);
 
   // Structural Metrics (Open 9:30 & Straddle Expected Move) - Strictly Viewport-Invariant
   const structuralMetrics = useMemo(() => {
@@ -1076,15 +1142,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     return { open930, expectedMove };
   }, [enrichedPoints, intrinsicExpectedMove]);
 
-  const lastCandleTsRaw = Number(effectiveCandles[effectiveCandles.length - 1]?.timestamp ?? 0);
-  const lastCandleTsSec = lastCandleTsRaw > 1e11 ? Math.floor(lastCandleTsRaw / 1000) : lastCandleTsRaw;
-  const effectiveReplayTsSec =
-    isReplayMode ? (typeof replayBarTsSec === "number" && replayBarTsSec > 0 ? replayBarTsSec : lastCandleTsSec) : 0;
-
   const activeSpotPrice =
     isReplayMode && typeof replayBarClose === "number" && replayBarClose > 0
       ? replayBarClose
-      : !isReplayMode && typeof liveTickPrice === "number" && liveTickPrice > 0
+      : !isReplayMode && storeActiveTicker.toUpperCase() === activeSymbol && typeof liveTickPrice === "number" && liveTickPrice > 0
       ? liveTickPrice
       : !isReplayMode && typeof rawLiveSpot === "number" && rawLiveSpot > 0
       ? rawLiveSpot
@@ -1110,21 +1171,35 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   // Auto-sync active Gaia signals directly to Discord trade-signals engine
   const lastSyncedGaiaSigFingerprint = useRef<string>("");
   useEffect(() => {
-    if (isReplayMode || !activeSymbol || effectiveCandles.length === 0 || !przmSignals || przmSignals.length === 0 || !activeSpotPrice || activeSpotPrice <= 0) return;
+    const todayEt = getTodayEt();
+    if (
+      isReplayMode ||
+      (sessionDate && sessionDate !== todayEt) ||
+      !activeSymbol ||
+      effectiveCandles.length === 0 ||
+      !przmSignals ||
+      przmSignals.length === 0 ||
+      !activeSpotPrice ||
+      activeSpotPrice <= 0
+    ) {
+      return;
+    }
     const fingerprint =
       `${activeSymbol}::` +
       przmSignals
         .map((s) => `${s.id}:${s.type}:${s.time}:${s.price.toFixed(2)}`)
         .join("|");
     if (fingerprint === lastSyncedGaiaSigFingerprint.current) return;
-    lastSyncedGaiaSigFingerprint.current = fingerprint;
 
+    const controller = new AbortController();
     fetch("/api/signals", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         action: "SYNC_GAIA_TICKER_SIGNALS",
         ticker: activeSymbol,
+        sessionDate,
+        isHistoricalBackfill: Boolean(sessionDate && sessionDate !== todayEt),
         signals: przmSignals,
         spotPrice: activeSpotPrice,
         activeFsmState: fsmCommittedState,
@@ -1133,8 +1208,16 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         impulseChi: latestPt?.impulseChi,
         zeroGamma: typeof gammaLevels?.zeroGamma === "number" && gammaLevels.zeroGamma > 0 ? gammaLevels.zeroGamma : undefined,
       }),
-    }).catch(() => {});
-  }, [isReplayMode, activeSymbol, effectiveCandles.length, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, latestPt?.impulseChi, gammaLevels?.zeroGamma]);
+      signal: controller.signal,
+    })
+      .then((res) => {
+        if (res.ok && !controller.signal.aborted) {
+          lastSyncedGaiaSigFingerprint.current = fingerprint;
+        }
+      })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [isReplayMode, sessionDate, activeSymbol, effectiveCandles.length, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, latestPt?.impulseChi, gammaLevels?.zeroGamma]);
 
   const invalidateSvgCtm = useCallback(() => {
     cachedInverseCtmRef.current = null;
@@ -1213,8 +1296,11 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
   const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
     if (dragMode === "pan") {
-      const deltaX = (e.clientX - dragStartRef.current.clientX) * 1.2;
-      const deltaY = (e.clientY - dragStartRef.current.clientY) * (priceDomain.span / plotH);
+      const rect = svgRef.current?.getBoundingClientRect();
+      const scaleRatioX = rect && rect.width > 0 ? svgWidth / rect.width : 1;
+      const scaleRatioY = rect && rect.height > 0 ? svgHeight / rect.height : 1;
+      const deltaX = (e.clientX - dragStartRef.current.clientX) * scaleRatioX;
+      const deltaY = (e.clientY - dragStartRef.current.clientY) * scaleRatioY * (priceDomain.span / plotH);
       setXPanOffset(dragStartRef.current.startXPan + deltaX);
       setYPanOffset(dragStartRef.current.startYPan + deltaY);
       return;
@@ -1745,10 +1831,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             const btoLabel = isPut ? "BTO PUT" : "BTO CALL";
             const pnlPct = st.pnlOptionPct ?? 0;
             const isProfit = pnlPct >= 0;
-            const stcColor = isPut ? "#ef4444" : "#10b981";
-            const stcFill = isPut
-              ? "rgba(239, 68, 68, 0.22)"
-              : "rgba(16, 185, 129, 0.22)";
+            const stcColor = isProfit ? "#10b981" : "#ef4444";
+            const stcFill = isProfit
+              ? "rgba(16, 185, 129, 0.22)"
+              : "rgba(239, 68, 68, 0.22)";
             const stcText = `STC ${pnlPct >= 0 ? "+" : ""}${Math.round(pnlPct)}%`;
             const stcBadgeW = Math.max(86, stcText.length * 8.5 + 16);
 
@@ -2005,6 +2091,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
             <g clipPath={`url(#plot-clip-${uid})`}>
             {enrichedPoints.map((pt, i) => {
+              const rawSlotTs = Number((pt as any)?.ts ?? (pt as any)?.timestamp ?? (pt as any)?.startSec ?? 0);
+              const normSlotTs = rawSlotTs > 0 ? toEpochSec(rawSlotTs) : 0;
+              const latestActualRaw = enrichedPoints.length > 0 ? Number(enrichedPoints[enrichedPoints.length - 1]?.timestamp ?? 0) : 0;
+              const latestActualSec = latestActualRaw > 0 ? toEpochSec(latestActualRaw) : 0;
+              const nowSec = effectiveReplayTsSec > 0 ? effectiveReplayTsSec : Math.floor(Date.now() / 1000);
+              const slotIsFuture = normSlotTs > 0 && (normSlotTs > nowSec || (latestActualSec > 0 && normSlotTs > latestActualSec));
               if (pt.baseX < padLeft || pt.baseX > padLeft + plotW + 2) return null;
               const slotW = (plotW / Math.max(1, totalSessionSlots)) * currentXScale;
               const barW = Math.max(2.4, slotW - 2.0);
@@ -2012,10 +2104,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
               const barH = Math.max(2, Math.abs(val) * histHalfH);
               const isPos = val >= 0;
               const y = isPos ? histZeroY - barH : histZeroY;
-              const col = isPos ? "#00F5D4" : "#FF2A55";
+              const col = slotIsFuture ? "rgba(148, 163, 184, 0.25)" : isPos ? "#00F5D4" : "#FF2A55";
               const isExtendedHours = pt.etMins < 570 || pt.etMins >= 960;
-              const baseOp = Math.max(0.45, Math.min(0.95, 0.45 + Math.abs(val) * 0.5));
-              const op = isExtendedHours ? Number((baseOp * 0.55).toFixed(2)) : baseOp;
+              const baseOp = slotIsFuture ? 0.22 : Math.max(0.45, Math.min(0.95, 0.45 + Math.abs(val) * 0.5));
+              const op = !slotIsFuture && isExtendedHours ? Number((baseOp * 0.55).toFixed(2)) : baseOp;
 
               return (
                 <rect

@@ -19,11 +19,6 @@
 
 import { FlowGammaVwapSnapshot } from "@/lib/flowGammaVwap";
 
-export interface ConfluenceLevel {
-  name: string;
-  strike: number;
-}
-
 export interface StrikeNodeOverlayItem {
   strike: number;
   y?: number;
@@ -63,7 +58,6 @@ export interface RenderFlowGammaVwapOptions {
   padBottom: number;
   chartHeight: number;
   rightAxisWidth?: number;
-  confluenceLevels?: ConfluenceLevel[];
   showCenterline?: boolean;
   showBands?: boolean;
   showShading?: boolean;
@@ -73,7 +67,6 @@ export interface RenderFlowGammaVwapOptions {
   showBandWickSignals?: boolean;
   strikeNodes?: StrikeNodeOverlayItem[];
   referenceBadges?: ReferenceBadgeItem[];
-  showBeadedStrikes?: boolean;
   candles?: OverlayCandleBar[];
 }
 
@@ -100,7 +93,6 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     padBottom,
     chartHeight,
     rightAxisWidth = 74,
-    confluenceLevels = [],
     showCenterline = true,
     showBands = false,
     showShading = false,
@@ -110,7 +102,6 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     showBandWickSignals = false,
     strikeNodes = [],
     referenceBadges = [],
-    showBeadedStrikes = false,
     candles = [],
   } = options;
 
@@ -522,103 +513,114 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
   }
 
   // -------------------------------------------------------------
-  // 5. Contextual Right-Axis Badges (PDH, PMH, PML, Day ±1σ)
+  // 5 & 6. Unified Right-Axis Badges (PDH, PMH, PML, Day ±1σ, FVWAP)
   // -------------------------------------------------------------
-  if (referenceBadges.length > 0) {
-    const validBadges = referenceBadges
-      .map((b) => ({
-        ...b,
-        y: b.y !== undefined ? b.y : priceToY(b.price),
-      }))
-      .filter((b) => Number.isFinite(b.y) && b.y >= padTop + 8 && b.y <= chartHeight - padBottom - 8)
-      .sort((a, b) => a.y - b.y);
+  const combinedBadges: Array<ReferenceBadgeItem & { y: number; isFvwap?: boolean }> = referenceBadges
+    .map((b) => ({
+      ...b,
+      y: b.y !== undefined ? b.y : priceToY(b.price),
+      isFvwap: false,
+    }))
+    .filter((b) => Number.isFinite(b.y) && b.y >= padTop + 8 && b.y <= chartHeight - padBottom - 8);
 
-    if (validBadges.length > 0) {
-      const minGap = 17;
-      const resolvedY = validBadges.map((v) => v.y);
-      for (let i = 1; i < resolvedY.length; i++) {
-        if (resolvedY[i] - resolvedY[i - 1] < minGap) {
-          resolvedY[i] = resolvedY[i - 1] + minGap;
-        }
-      }
-
-      ctx.save();
-      ctx.font = 'bold 9px ui-monospace, SFMono-Regular, "JetBrains Mono", monospace';
-      ctx.textBaseline = "middle";
-
-      for (let i = 0; i < validBadges.length; i++) {
-        const item = validBadges[i];
-        const badgeY = Math.min(chartHeight - padBottom - 8, Math.max(padTop + 8, resolvedY[i]));
-        const text = item.label;
-        const textW = ctx.measureText(text).width;
-        const padX = 5;
-        const badgeW = textW + padX * 2;
-        const badgeH = 15;
-        const badgeX = plotRightX + 3;
-
-        // Dashed lead-in reference tick
-        ctx.save();
-        ctx.setLineDash([2, 3]);
-        ctx.lineWidth = 0.9;
-        ctx.strokeStyle = item.lineColor ?? "rgba(148, 163, 184, 0.45)";
-        ctx.beginPath();
-        ctx.moveTo(plotRightX - 28, item.y);
-        ctx.lineTo(badgeX - 2, badgeY);
-        ctx.stroke();
-        ctx.restore();
-
-        // Badge pill fill
-        ctx.fillStyle = item.bg ?? "#111422";
-        ctx.strokeStyle = item.border ?? "rgba(148, 163, 184, 0.6)";
-        ctx.lineWidth = 1.0;
-        ctx.beginPath();
-        ctx.roundRect(badgeX, badgeY - badgeH / 2, badgeW, badgeH, 3);
-        ctx.fill();
-        ctx.stroke();
-
-        // Badge text
-        ctx.fillStyle = item.text ?? "#ffffff";
-        ctx.fillText(text, badgeX + padX, badgeY + 0.5);
-      }
-      ctx.restore();
+  if (showRightAxisBadge && activePt && activePt.flowVwap > 0) {
+    const fvwapY = priceToY(activePt.flowVwap);
+    if (Number.isFinite(fvwapY) && fvwapY >= padTop + 8 && fvwapY <= chartHeight - padBottom - 8) {
+      combinedBadges.push({
+        label: `FVWAP ${activePt.flowVwap.toFixed(2)}`,
+        price: activePt.flowVwap,
+        y: fvwapY,
+        isFvwap: true,
+      });
     }
   }
 
-  // -------------------------------------------------------------
-  // 6. Right Price Axis Tag: Gold Badge `FVWAP {val}`
-  // -------------------------------------------------------------
-  if (showRightAxisBadge && activePt && activePt.flowVwap > 0) {
-    const fvwapY = priceToY(activePt.flowVwap);
+  if (combinedBadges.length > 0) {
+    combinedBadges.sort((a, b) => a.y - b.y);
+    const minGap = 17;
+    const minYBound = padTop + 8;
+    const maxYBound = chartHeight - padBottom - 8;
+    const resolvedY = combinedBadges.map((v) => v.y);
+    for (let i = 1; i < resolvedY.length; i++) {
+      if (resolvedY[i] - resolvedY[i - 1] < minGap) {
+        resolvedY[i] = resolvedY[i - 1] + minGap;
+      }
+    }
+    // Clamp bottom overflow upward while preserving >= minGap separation
+    if (resolvedY[resolvedY.length - 1] > maxYBound) {
+      resolvedY[resolvedY.length - 1] = maxYBound;
+      for (let i = resolvedY.length - 2; i >= 0; i--) {
+        if (resolvedY[i + 1] - resolvedY[i] < minGap) {
+          resolvedY[i] = Math.max(minYBound, resolvedY[i + 1] - minGap);
+        }
+      }
+    }
 
-    if (fvwapY >= padTop && fvwapY <= chartHeight - padBottom) {
-      ctx.save();
+    ctx.save();
+    ctx.font = 'bold 9px ui-monospace, SFMono-Regular, "JetBrains Mono", monospace';
+    ctx.textBaseline = "middle";
+    const maxBadgeW = Math.max(24, rightAxisWidth - 6);
+
+    for (let i = 0; i < combinedBadges.length; i++) {
+      const item = combinedBadges[i];
+      const badgeY = Math.min(maxYBound, Math.max(minYBound, resolvedY[i]));
+      const text = item.label;
+      const textW = ctx.measureText(text).width;
+      const padX = 5;
       const badgeX = plotRightX + 3;
-      const badgeW = Math.min(rightAxisWidth - 6, 76);
-      const badgeH = 17;
-      const badgeY = fvwapY - badgeH / 2;
 
-      ctx.shadowBlur = 8;
-      ctx.shadowColor = "rgba(245, 158, 11, 0.75)";
-      ctx.fillStyle = "rgba(245, 158, 11, 0.95)";
-      ctx.strokeStyle = "#fef08a";
-      ctx.lineWidth = 1;
+      if (item.isFvwap) {
+        const badgeW = Math.min(maxBadgeW, Math.max(62, textW + padX * 2));
+        const badgeH = 17;
+        const topY = badgeY - badgeH / 2;
 
+        ctx.save();
+        ctx.shadowBlur = 8;
+        ctx.shadowColor = "rgba(245, 158, 11, 0.75)";
+        ctx.fillStyle = "rgba(245, 158, 11, 0.95)";
+        ctx.strokeStyle = "#fef08a";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.roundRect(badgeX, topY, badgeW, badgeH, 3);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = "#000000";
+        ctx.textAlign = "center";
+        ctx.fillText(text, badgeX + badgeW / 2, badgeY + 0.5, Math.max(12, badgeW - 6));
+        ctx.restore();
+        continue;
+      }
+
+      const badgeW = Math.min(maxBadgeW, textW + padX * 2);
+      const badgeH = 15;
+
+      // Dashed lead-in reference tick
+      ctx.save();
+      ctx.setLineDash([2, 3]);
+      ctx.lineWidth = 0.9;
+      ctx.strokeStyle = item.lineColor ?? "rgba(148, 163, 184, 0.45)";
       ctx.beginPath();
-      ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 3);
+      ctx.moveTo(plotRightX - 28, item.y);
+      ctx.lineTo(badgeX - 2, badgeY);
+      ctx.stroke();
+      ctx.restore();
+
+      // Badge pill fill
+      ctx.fillStyle = item.bg ?? "#111422";
+      ctx.strokeStyle = item.border ?? "rgba(148, 163, 184, 0.6)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      ctx.roundRect(badgeX, badgeY - badgeH / 2, badgeW, badgeH, 3);
       ctx.fill();
       ctx.stroke();
 
-      ctx.shadowBlur = 0;
-      ctx.fillStyle = "#000000";
-      ctx.font = 'bold 9px ui-monospace, SFMono-Regular, "JetBrains Mono", monospace';
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText(
-        `FVWAP ${activePt.flowVwap.toFixed(1)}`,
-        badgeX + badgeW / 2,
-        badgeY + badgeH / 2 + 0.5
-      );
-      ctx.restore();
+      // Badge text
+      ctx.textAlign = "left";
+      ctx.fillStyle = item.text ?? "#ffffff";
+      ctx.fillText(text, badgeX + padX, badgeY + 0.5, Math.max(12, badgeW - padX * 2));
     }
+    ctx.restore();
   }
 }

@@ -140,7 +140,12 @@ function auditAndPruneCache() {
   for (const f of files) {
     if (f.includes(".json.tmp.")) continue;
     const fullPath = path.join(cacheDir, f);
-    const stat = fs.statSync(fullPath);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(fullPath);
+    } catch {
+      continue;
+    }
     const ageMs = nowMs - stat.mtimeMs;
 
     // Prune active-trades (>7 days) or intraday JSON (>3 days)
@@ -205,7 +210,8 @@ function auditDiscordGatewayGuards() {
   const criticalFiles = [
     "lib/tradeSignalEngine.ts",
     "lib/liveBotDaemon.ts",
-    "lib/gaiaSpyEngine.ts",
+    "lib/tradeRadar.ts",
+    "lib/tradePerformanceEngine.ts",
   ];
 
   for (const relPath of criticalFiles) {
@@ -361,19 +367,29 @@ async function main() {
 
   if (isDaemonMode) {
     let lastPostCloseDateEt = "";
+    let isCycleRunning = false;
     log(
       isPostCloseSchedule
         ? "Daemon mode active. Scheduled weekday post-close audit at 16:15 ET."
         : `Daemon mode active. Recurring audit every ${Math.round(intervalMs / 60000)} minutes.`
     );
     setInterval(async () => {
+      if (isCycleRunning) {
+        log("  [SKIP] Previous audit cycle is still running; skipping overlapping tick.");
+        return;
+      }
       if (isPostCloseSchedule) {
         const { dateEt, weekday, etMins } = getEtClock();
         if (weekday === "Sat" || weekday === "Sun") return;
         if (etMins < 16 * 60 + 15 || lastPostCloseDateEt === dateEt) return;
         lastPostCloseDateEt = dateEt;
       }
-      await runAuditCycle();
+      isCycleRunning = true;
+      try {
+        await runAuditCycle();
+      } finally {
+        isCycleRunning = false;
+      }
     }, isPostCloseSchedule ? 60_000 : intervalMs);
   }
 }

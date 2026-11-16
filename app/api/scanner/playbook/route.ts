@@ -25,6 +25,7 @@ export async function GET() {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
           },
           cache: "no-store",
+          signal: AbortSignal.timeout(3000),
         }
       );
       if (rhRes.ok) {
@@ -54,7 +55,7 @@ export async function GET() {
         // If not cached, dynamically ingest live CBOE chain for today's session:
         if (!payload || payload.strikes.length === 0) {
           try {
-            const contracts = await fetchLiveCboeOptions(sUpper);
+            const contracts = await fetchLiveCboeOptions(sUpper, AbortSignal.timeout(6000));
             const liveSpot = telemetryOverrides[sUpper]?.spotPrice;
             const prevClose = telemetryOverrides[sUpper]?.previousClose ?? liveSpot;
             if (contracts.length > 0 && liveSpot && liveSpot > 0) {
@@ -110,7 +111,7 @@ export async function GET() {
         "Cache-Control": "no-store, max-age=0",
       },
     });
-  } catch (error) {
+  } catch {
     return NextResponse.json(
       { error: "Failed to generate dynamic 0DTE playbook" },
       { status: 500 }

@@ -16,7 +16,8 @@ import {
   RTH_CLOSE_MINS,
   RTH_OPEN_MINS,
   etMinutesOfDay,
-} from "./gaiaSessionGuards";
+  getTodayEt,
+} from "@/lib/gaiaSessionGuards";
 
 export type GaiaFsmState = "STAND_ASIDE" | "LONG" | "SHORT";
 
@@ -33,14 +34,6 @@ export interface GaiaStructuralLevels {
   sigma1dUpper?: number;
 }
 
-export const GAIA_RTH_OPEN_MINS = RTH_OPEN_MINS;
-export const GAIA_ENTRY_START_MINS = ENTRY_START_MINS;
-export const GAIA_ENTRY_CUTOFF_MINS = ENTRY_CUTOFF_MINS;
-export const GAIA_EOD_FORCE_FLAT_MINS = EOD_FORCE_FLAT_MINS;
-export const GAIA_RTH_CLOSE_MINS = RTH_CLOSE_MINS;
-
-/** Structural take-profit fires when price trades within this distance of the target wall. */
-const TARGET_TOUCH_DOLLARS = 0.25;
 /** Minimum hold before non-stop reversal exits (2 closed 5m bars = 10 min). */
 const MIN_HOLD_BARS = 2;
 /** Cooldown between Phase 1 exit and Phase 2 opposite-regime entry (30 min = 1800s). */
@@ -120,7 +113,7 @@ export interface GaiaMacroContext {
  * it from a real epoch timestamp. Returns undefined for synthetic timestamps (legacy/test
  * bars without time info), in which case time gates are not applied.
  */
-export function resolveGaiaBarEtMinutes(bar: Pick<GaiaBarData, "etMins" | "barTimestamp">): number | undefined {
+function resolveGaiaBarEtMinutes(bar: Pick<GaiaBarData, "etMins" | "barTimestamp">): number | undefined {
   if (typeof bar.etMins === "number" && Number.isFinite(bar.etMins)) return bar.etMins;
   if (typeof bar.barTimestamp === "number" && bar.barTimestamp > 1e9) return etMinutesOfDay(bar.barTimestamp);
   return undefined;
@@ -181,6 +174,14 @@ export function computeCausalEquilibriumDispersion(
   bars: GaiaBarData[],
   uptoIndex: number
 ): GaiaEquilibriumDispersion {
+  if (!Array.isArray(bars) || bars.length === 0 || uptoIndex < 0) {
+    return {
+      sigmaChi: 0.035,
+      sigmaFlux: 0.045,
+      barDurationSec: 300,
+      atr: 0.08,
+    };
+  }
   const k = Math.min(bars.length, Math.max(1, uptoIndex + 1));
   const slice = bars.slice(0, k);
 
@@ -240,6 +241,8 @@ export class GaiaSignalFsm {
   private committedState: GaiaFsmState = "STAND_ASIDE";
   private committedCallLog: GaiaCommittedSignal[] = [];
   private committedBarTimestamps = new Set<number>();
+  private currentSessionEtDate: string = "";
+  private lastEtMinsSeen: number | undefined = undefined;
   private localExtremePrice: number = 0;
   private currentEntryPrice: number = 0;
   private activeTargetWall: number = 0;
@@ -260,6 +263,8 @@ export class GaiaSignalFsm {
     this.committedState = initialState;
     this.committedCallLog = [];
     this.committedBarTimestamps.clear();
+    this.currentSessionEtDate = "";
+    this.lastEtMinsSeen = undefined;
     this.localExtremePrice = 0;
     this.currentEntryPrice = 0;
     this.activeTargetWall = 0;
@@ -288,13 +293,16 @@ export class GaiaSignalFsm {
   ): TransitionResult {
     const etMins = resolveGaiaBarEtMinutes(bar);
 
-    // 1. Strict After-Hours & Pre-Market Firewall (< 09:30 ET or >= 16:00 ET)
-    if (typeof etMins === "number" && (etMins < GAIA_RTH_OPEN_MINS || etMins >= GAIA_RTH_CLOSE_MINS)) {
+    // 1. Strict After-Hours & Pre-Market Firewall (< 09:30 ET, or >= 16:00 ET when already flat)
+    if (
+      typeof etMins === "number" &&
+      (etMins < RTH_OPEN_MINS || (etMins >= RTH_CLOSE_MINS && currentState === "STAND_ASIDE"))
+    ) {
       return { nextState: currentState };
     }
 
-    // 2. Mandatory 15:55 ET Hard EOD Flat Liquidation
-    if (typeof etMins === "number" && etMins >= GAIA_EOD_FORCE_FLAT_MINS) {
+    // 2. Mandatory 15:55 ET Hard EOD Flat Liquidation (also force-closes open state if >= 16:00 ET bar arrives)
+    if (typeof etMins === "number" && etMins >= EOD_FORCE_FLAT_MINS) {
       if (currentState !== "STAND_ASIDE") {
         return { nextState: "STAND_ASIDE", reason: "EOD_1555_FORCE_CLOSE", fillPrice: bar.close };
       }
@@ -303,7 +311,7 @@ export class GaiaSignalFsm {
 
     // 3. Strict Entry Window (09:30 open bar / 09:35 closed bar through 14:30 ET)
     const isWithinEntryWindow = typeof etMins === "number"
-      ? (etMins >= GAIA_ENTRY_START_MINS && etMins <= GAIA_ENTRY_CUTOFF_MINS)
+      ? (etMins >= ENTRY_START_MINS && etMins <= ENTRY_CUTOFF_MINS)
       : false;
 
     // Excursion from structural equilibrium (chi=0.5, flux=0.0)
@@ -438,6 +446,11 @@ export class GaiaSignalFsm {
           putWall !== undefined ? bar.close - putWall : 0
         );
 
+        const leg2LongStop = Number((leg2TestLow - qm.stopWickBuffer).toFixed(2));
+        const leg2LongRisk = Math.max(bar.close * 0.0012, bar.close - leg2LongStop);
+        const leg2LongDest =
+          leg2CallTarget ??
+          Number((bar.close + Math.max(bar.close * 0.0027, 2.0 * dispersion.atr, MIN_REWARD_RISK * leg2LongRisk)).toFixed(2));
         if (
           allowLong &&
           testedPutWallOrSigma1 &&
@@ -445,16 +458,22 @@ export class GaiaSignalFsm {
           impulseChi >= 0.60 &&
           (deltaNetFlux6Bar > 0 || bullSmaOrVwap) &&
           barBody <= qm.maxSignalBarBody &&
-          leg2CallRoom >= qm.minWallRoom
+          leg2CallRoom >= Math.max(qm.minWallRoom, MIN_REWARD_RISK * leg2LongRisk) &&
+          leg2LongDest - bar.close >= MIN_REWARD_RISK * leg2LongRisk
         ) {
           return {
             nextState: "LONG",
             reason: "LEG2_PUT_WALL_BULL_RECLAIM_CALL",
-            targetWall: leg2CallTarget ?? Number((bar.close + Math.max(bar.close * 0.0027, 2.0 * dispersion.atr)).toFixed(2)),
-            stopPrice: Number((leg2TestLow - qm.stopWickBuffer).toFixed(2)),
+            targetWall: leg2LongDest,
+            stopPrice: leg2LongStop,
           };
         }
 
+        const leg2ShortStop = Number((leg2TestHigh + qm.stopWickBuffer).toFixed(2));
+        const leg2ShortRisk = Math.max(bar.close * 0.0012, leg2ShortStop - bar.close);
+        const leg2ShortDest =
+          leg2PutTarget ??
+          Number((bar.close - Math.max(bar.close * 0.0027, 2.0 * dispersion.atr, MIN_REWARD_RISK * leg2ShortRisk)).toFixed(2));
         if (
           allowShort &&
           testedCallWallOrSigma1 &&
@@ -462,13 +481,14 @@ export class GaiaSignalFsm {
           impulseChi <= 0.40 &&
           (deltaNetFlux6Bar < 0 || bearSmaOrVwap) &&
           -barBody <= qm.maxSignalBarBody &&
-          leg2PutRoom >= qm.minWallRoom
+          leg2PutRoom >= Math.max(qm.minWallRoom, MIN_REWARD_RISK * leg2ShortRisk) &&
+          bar.close - leg2ShortDest >= MIN_REWARD_RISK * leg2ShortRisk
         ) {
           return {
             nextState: "SHORT",
             reason: "LEG2_CALL_WALL_BEAR_REJECTION_PUT",
-            targetWall: leg2PutTarget ?? Number((bar.close - Math.max(bar.close * 0.0027, 2.0 * dispersion.atr)).toFixed(2)),
-            stopPrice: Number((leg2TestHigh + qm.stopWickBuffer).toFixed(2)),
+            targetWall: leg2ShortDest,
+            stopPrice: leg2ShortStop,
           };
         }
 
@@ -561,7 +581,7 @@ export class GaiaSignalFsm {
         }
 
         // Setup P-C (Pre-Market Upper Flux Field / Zero-Gamma Rejection + Bearish Opening Lean)
-      if (!putBlockedByWall && typeof etMins === "number" && etMins >= GAIA_ENTRY_START_MINS && etMins <= 630) {
+      if (!putBlockedByWall && typeof etMins === "number" && etMins >= ENTRY_START_MINS && etMins <= 630) {
         const rejectedOverhead = (zg !== undefined && bar.close < zg) &&
           (callWall !== undefined && bar.close < callWall);
         const bearishLean = (bar.flowVwap !== undefined && bar.close < bar.flowVwap) &&
@@ -660,17 +680,25 @@ export class GaiaSignalFsm {
         const vwapLevel = typeof bar.flowVwap === "number" && bar.flowVwap > 0 ? bar.flowVwap : 0;
         const reclaimedZeroGamma = zgLevel > 0 && bar.close > zgLevel && bar.close > vwapLevel && vwapLevel > 0;
         const fluxImpulseBull = (bar.chi >= 0.46 || eFlux >= 0.35) && bar.peclet >= 0.50 && vwapSlope >= 0;
+        const setup1cTarget =
+          callWall && callWall > bar.close
+            ? callWall
+            : Number((vwapLevel + 2.0 * Math.max(qm.minReversalInvalidation, 1.25 * dispersion.atr)).toFixed(2));
+        const setup1cStop = Number((vwapLevel - qm.stopWickBuffer).toFixed(2));
+        const setup1cRisk = Math.max(bar.close * 0.0012, bar.close - setup1cStop);
         if (
           allowLong &&
           reclaimedZeroGamma &&
           fluxImpulseBull &&
           isBullMacro &&
-          !callBlockedByWall
+          !callBlockedByWall &&
+          setup1cTarget - bar.close >= MIN_REWARD_RISK * setup1cRisk
         ) {
           return {
             nextState: "LONG",
             reason: "ZERO_GAMMA_FLUX_RECLAIM_CALL",
-            targetWall: callWall && callWall > bar.close + Math.max(0.15, bar.close * 0.0013) ? callWall : Number((vwapLevel + 2.0 * Math.max(qm.minReversalInvalidation, 1.25 * dispersion.atr)).toFixed(2))
+            targetWall: setup1cTarget,
+            stopPrice: setup1cStop,
           };
         }
 
@@ -726,13 +754,14 @@ export class GaiaSignalFsm {
         return { nextState: "STAND_ASIDE", reason: "UPPER_FLUX_FIELD_TARGET_OR_FLUX_FLIP", fillPrice: bar.close };
       }
       const targetW = targetWallRef || this.activeTargetWall;
+      const targetTouchBuf = Math.min(0.25, Math.max(0.03, bar.close * 0.0012));
 
-      // 1. Structural Target Hit: High reaches within $0.25 of targetWall
-      if (targetW > entryP && bar.high >= targetW - TARGET_TOUCH_DOLLARS) {
+      // 1. Structural Target Hit: High reaches within proportional buffer of targetWall
+      if (targetW > entryP && bar.high >= targetW - targetTouchBuf) {
         return {
           nextState: "STAND_ASIDE",
           reason: "STRUCTURAL_TARGET_HIT",
-          fillPrice: clampFill(targetW - TARGET_TOUCH_DOLLARS),
+          fillPrice: clampFill(targetW - targetTouchBuf),
         };
       }
 
@@ -806,13 +835,14 @@ export class GaiaSignalFsm {
         return { nextState: "STAND_ASIDE", reason: "LOWER_FLUX_FIELD_TARGET_OR_FLUX_FLIP", fillPrice: bar.close };
       }
       const targetW = targetWallRef || this.activeTargetWall;
+      const targetTouchBuf = Math.min(0.25, Math.max(0.03, bar.close * 0.0012));
 
-      // 1. Structural Target Hit: Low reaches within $0.25 of targetWall
-      if (targetW > 0 && targetW < entryP && bar.low <= targetW + TARGET_TOUCH_DOLLARS) {
+      // 1. Structural Target Hit: Low reaches within proportional buffer of targetWall
+      if (targetW > 0 && targetW < entryP && bar.low <= targetW + targetTouchBuf) {
         return {
           nextState: "STAND_ASIDE",
           reason: "STRUCTURAL_TARGET_HIT",
-          fillPrice: clampFill(targetW + TARGET_TOUCH_DOLLARS),
+          fillPrice: clampFill(targetW + targetTouchBuf),
         };
       }
 
@@ -887,12 +917,31 @@ export class GaiaSignalFsm {
     opts?: { isHistoricalBackfill: boolean }
   ): GaiaCommittedSignal | null {
     if (!bar.isClosed) return null;
+    if (this.committedBarTimestamps.has(bar.barTimestamp)) return null;
 
-    // RTH Gate: Pre-market (etMins < 570) and post-close (etMins >= 960) bars are strictly gated
+    // Daily counter reset on new ET trading date / session rollover
     const resolvedEtMins = resolveGaiaBarEtMinutes(bar);
+    const barEtDate =
+      typeof bar.barTimestamp === "number" && bar.barTimestamp > 1e9
+        ? getTodayEt(new Date(bar.barTimestamp > 1e11 ? bar.barTimestamp : bar.barTimestamp * 1000))
+        : "";
+    const isNewDay =
+      (barEtDate !== "" && this.currentSessionEtDate !== "" && barEtDate !== this.currentSessionEtDate) ||
+      (typeof resolvedEtMins === "number" && this.lastEtMinsSeen !== undefined && resolvedEtMins < this.lastEtMinsSeen);
+    if (isNewDay) {
+      this.closedTradesToday = 0;
+      this.lastClosedDirection = null;
+      this.lastExitBarTs = 0;
+      this.prevBarLow = 0;
+      this.prevBarHigh = 0;
+    }
+    if (barEtDate) this.currentSessionEtDate = barEtDate;
+    if (typeof resolvedEtMins === "number") this.lastEtMinsSeen = resolvedEtMins;
+
+    // RTH Gate: Pre-market (etMins < 570) and post-close (etMins >= 960 when flat) bars are strictly gated
     if (
       typeof resolvedEtMins === "number" &&
-      (resolvedEtMins < GAIA_RTH_OPEN_MINS || resolvedEtMins >= GAIA_RTH_CLOSE_MINS)
+      (resolvedEtMins < RTH_OPEN_MINS || (resolvedEtMins >= RTH_CLOSE_MINS && this.committedState === "STAND_ASIDE"))
     ) {
       return null;
     }
@@ -904,7 +953,6 @@ export class GaiaSignalFsm {
       atr: bar.close * 0.0015,
     };
 
-    if (this.committedBarTimestamps.has(bar.barTimestamp)) return null;
     this.committedBarTimestamps.add(bar.barTimestamp);
 
     // Update localized extreme price before transition check

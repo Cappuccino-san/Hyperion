@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { optionsMemoryCache } from "@/lib/marketCache";
 import { getTickerPreset } from "@/lib/tickerPresets";
+import { getTodayEt } from "@/lib/gaiaSessionGuards";
 
 export const dynamic = "force-dynamic";
 
@@ -94,9 +95,7 @@ function buildLiveScannerRows(
 }
 
 export async function GET() {
-  const todayEt = new Date().toLocaleDateString("en-CA", {
-    timeZone: "America/New_York",
-  });
+  const todayEt = getTodayEt();
   const nowIso = new Date().toISOString();
 
   // Pre-fetch live quotes for all scanner symbols dynamically in a single sub-second batch
@@ -109,6 +108,7 @@ export async function GET() {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
       },
       cache: "no-store",
+      signal: AbortSignal.timeout(3000),
     });
     if (res.ok) {
       const json = await res.json();

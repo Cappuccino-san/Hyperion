@@ -1,9 +1,8 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { PlaybookPayload, PlaybookPick } from "@/lib/types/playbook";
-import { DEFAULT_PLAYBOOK_PAYLOAD } from "@/lib/playbookData";
+import { PlaybookPayload } from "@/lib/types/playbook";
 import { PlaybookCard } from "./PlaybookCard";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { cn } from "@/lib/utils";
@@ -34,12 +33,13 @@ export function HyperionPlaybook({
   const setDashboardTicker = useDashboardStore((state) => state.setTicker);
   const setActiveView = useDashboardStore((state) => state.setActiveView);
 
-  const [localPayload, setLocalPayload] = useState<PlaybookPayload>(
-    initialPayload || DEFAULT_PLAYBOOK_PAYLOAD
+  const [localPayload] = useState<PlaybookPayload | null>(
+    initialPayload ?? null
   );
   const [filter, setFilter] = useState<"ALL" | "CALL" | "PUT">("ALL");
   const [showRules, setShowRules] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const payload = storePayload || localPayload;
 
@@ -58,25 +58,34 @@ export function HyperionPlaybook({
     setIsRefreshing(true);
     try {
       await fetchStorePlaybook();
-      const res = await fetch("/api/scanner/playbook", { cache: "no-store" });
-      if (res.ok) {
-        const data = await res.json();
-        setLocalPayload(data);
-      }
     } catch {
       // Fallback retained
     } finally {
-      setTimeout(() => setIsRefreshing(false), 500);
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = setTimeout(() => setIsRefreshing(false), 500);
     }
   };
 
   useEffect(() => {
     fetchStorePlaybook();
     const interval = setInterval(() => {
-      fetchStorePlaybook();
+      if (typeof document === "undefined" || document.visibilityState === "visible") {
+        fetchStorePlaybook();
+      }
     }, 45000);
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    };
   }, [fetchStorePlaybook]);
+
+  if (!payload) {
+    return (
+      <section className="w-full rounded-xl bg-[#101520] border border-[#1e2638] p-8 text-center text-xs font-mono text-slate-400">
+        Loading live 0DTE playbook...
+      </section>
+    );
+  }
 
   const calls = payload.topCalls && payload.topCalls.length > 0
     ? payload.topCalls

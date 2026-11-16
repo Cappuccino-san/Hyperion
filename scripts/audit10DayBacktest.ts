@@ -14,9 +14,6 @@
 import fs from "fs";
 import path from "path";
 import {
-  solveImpliedVol,
-  repriceOptionBS,
-  calibrateWalkForwardExpectancy,
   computeRemainingYearsToExpiration,
   priceOptionWithSkew,
   evaluateUnifiedSniperSetup,
@@ -139,82 +136,100 @@ async function run10DaySniperAudit() {
 
     let fallingKnifeCallsCount = 0;
     let morningFlushPutsCount = 0;
-    const testStore: DailyTradeStore = {
-      date: targetDateArg,
-      activePositions: {},
-      closedPositions: [],
-      alerts: [],
-      prevSpotPrices: { SPY: 766.74 },
-    };
-    saveTradeStore(testStore);
+    const targetStorePath = path.join(process.cwd(), ".cache", `active-trades-${targetDateArg}.json`);
+    const hadLiveStoreFile = fs.existsSync(targetStorePath);
+    const liveStoreBackupRaw = hadLiveStoreFile ? fs.readFileSync(targetStorePath, "utf-8") : null;
+    let openCheckFailed = false;
 
-    for (const tick of openTicks) {
-      const res = await evaluateTradeSignals({
-        ticker: "SPY",
-        spotPrice: tick.spot,
-        callWall: tick.callWall || 770,
-        putWall: tick.putWall || 760,
-        zeroGamma: tick.zeroGamma || 767.16,
-        priorClose: 766.74,
-        premarketFlowVwap: 766.74,
-        nowEt: new Date(tick.ts * 1000),
-        contracts: [
-          {
-            symbol: "SPY261105P00762000",
-            strike: 762,
-            expiration: targetDateArg,
-            optionType: "P",
-            bid: 0.63,
-            ask: 0.65,
-            last: 0.64,
-            openInterest: 15000,
-            volume: 24000,
-            delta: -0.32,
-            gamma: 0.04,
-            vega: 0.12,
-            iv: 0.18,
-            percentChange: 0,
-          },
-        ],
-      });
+    try {
+      const testStore: DailyTradeStore = {
+        date: targetDateArg,
+        activePositions: {},
+        closedPositions: [],
+        alerts: [],
+        prevSpotPrices: { SPY: 766.74 },
+      };
+      saveTradeStore(testStore);
 
-      const callEmitted =
-        res.emittedAlerts.some((a) => a.action === "BUY_TO_OPEN" && a.contractType === "CALL") ||
-        res.activePosition?.contractType === "CALL";
-      if (callEmitted) {
-        fallingKnifeCallsCount++;
+      for (const tick of openTicks) {
+        const res = await evaluateTradeSignals({
+          ticker: "SPY",
+          spotPrice: tick.spot,
+          callWall: tick.callWall || 770,
+          putWall: tick.putWall || 760,
+          zeroGamma: tick.zeroGamma || 767.16,
+          priorClose: 766.74,
+          premarketFlowVwap: 766.74,
+          nowEt: new Date(tick.ts * 1000),
+          contracts: [
+            {
+              symbol: "SPY261105P00762000",
+              strike: 762,
+              expiration: targetDateArg,
+              optionType: "P",
+              bid: 0.63,
+              ask: 0.65,
+              last: 0.64,
+              openInterest: 15000,
+              volume: 24000,
+              delta: -0.32,
+              gamma: 0.04,
+              vega: 0.12,
+              iv: 0.18,
+              percentChange: 0,
+            },
+          ],
+        });
+
+        const callEmitted =
+          res.emittedAlerts.some((a) => a.action === "BUY_TO_OPEN" && a.contractType === "CALL") ||
+          res.activePosition?.contractType === "CALL";
+        if (callEmitted) {
+          fallingKnifeCallsCount++;
+        }
+
+        const putEmitted =
+          res.emittedAlerts.some((a) => a.action === "BUY_TO_OPEN" && a.contractType === "PUT") ||
+          res.activePosition?.contractType === "PUT";
+        if (putEmitted) {
+          morningFlushPutsCount++;
+        }
       }
 
-      const putEmitted =
-        res.emittedAlerts.some((a) => a.action === "BUY_TO_OPEN" && a.contractType === "PUT") ||
-        res.activePosition?.contractType === "PUT";
-      if (putEmitted) {
-        morningFlushPutsCount++;
+      console.log(`  Falling-Knife Call Trades Emitted: ${fallingKnifeCallsCount} (Target: Exactly 0)`);
+      console.log(`  Bearish Zero-Gamma Flush Puts:     ${morningFlushPutsCount > 0 ? "1 ACTIVE POSITION (Single-Slot Automaton)" : "0"}`);
+      console.log(`  Zero Gamma Benchmark Level:        $767.16`);
+      console.log(`  Prior Day Close Benchmark Level:   $766.74`);
+      console.log(`  09:31 AM Spot ($764.77):           -$2.39 below Zero Gamma (Negative Gamma Regime -> BTO PUT Triggered)`);
+      console.log(`  09:34 AM Spot ($763.13):           -$4.03 below Zero Gamma (Negative Gamma Regime)`);
+
+      if (fallingKnifeCallsCount === 0 && morningFlushPutsCount >= 1) {
+        console.log(`>> [CONFIRMED] Zero falling-knife Calls & Bearish Zero-Gamma Flush [BTO PUT] fired at open on ${targetDateArg}. <<\n`);
+      } else {
+        console.error(`>> [FAILED] Session open verification failed (Calls=${fallingKnifeCallsCount}, Puts=${morningFlushPutsCount}). <<\n`);
+        openCheckFailed = true;
+      }
+    } finally {
+      if (hadLiveStoreFile && liveStoreBackupRaw !== null) {
+        const tmpRestorePath = `${targetStorePath}.tmp.${process.pid}.${Date.now()}`;
+        try {
+          fs.writeFileSync(tmpRestorePath, liveStoreBackupRaw, "utf-8");
+          fs.renameSync(tmpRestorePath, targetStorePath);
+        } finally {
+          try {
+            if (fs.existsSync(tmpRestorePath)) fs.unlinkSync(tmpRestorePath);
+          } catch {}
+        }
+      } else if (fs.existsSync(targetStorePath)) {
+        try {
+          fs.unlinkSync(targetStorePath);
+        } catch {}
       }
     }
 
-    console.log(`  Falling-Knife Call Trades Emitted: ${fallingKnifeCallsCount} (Target: Exactly 0)`);
-    console.log(`  Bearish Zero-Gamma Flush Puts:     ${morningFlushPutsCount > 0 ? "1 ACTIVE POSITION (Single-Slot Automaton)" : "0"}`);
-    console.log(`  Zero Gamma Benchmark Level:        $767.16`);
-    console.log(`  Prior Day Close Benchmark Level:   $766.74`);
-    console.log(`  09:31 AM Spot ($764.77):           -$2.39 below Zero Gamma (Negative Gamma Regime -> BTO PUT Triggered)`);
-    console.log(`  09:34 AM Spot ($763.13):           -$4.03 below Zero Gamma (Negative Gamma Regime)`);
-
-    if (fallingKnifeCallsCount === 0 && morningFlushPutsCount >= 1) {
-      console.log(`>> [CONFIRMED] Zero falling-knife Calls & Bearish Zero-Gamma Flush [BTO PUT] fired at open on ${targetDateArg}. <<\n`);
-    } else {
-      console.error(`>> [FAILED] Session open verification failed (Calls=${fallingKnifeCallsCount}, Puts=${morningFlushPutsCount}). <<\n`);
+    if (openCheckFailed) {
       process.exit(1);
     }
-
-    // Reset clean store after open tick verification
-    saveTradeStore({
-      date: targetDateArg,
-      activePositions: {},
-      closedPositions: [],
-      alerts: [],
-      prevSpotPrices: { SPY: 766.74 },
-    });
 
     // Convert history ticks into 5-minute bars
     const bucketMap = new Map<number, typeof historyTicks>();
@@ -312,6 +327,7 @@ async function run10DaySniperAudit() {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
           },
           cache: "no-store",
+          signal: AbortSignal.timeout(8_000),
         }
       );
 

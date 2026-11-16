@@ -44,41 +44,59 @@ export function MetricsRow() {
         ? netCharm
         : netVex;
 
-  const isLongGex = netGex >= 0;
-  const isLongSecond = secondValueM >= 0;
+  const safeNetGex = Number.isFinite(netGex) ? netGex : 0;
+  const safeSecondValueM = Number.isFinite(secondValueM) ? secondValueM : 0;
+  const isLongGex = safeNetGex >= 0;
+  const isLongSecond = safeSecondValueM >= 0;
 
-  const allExpKing = kingNode.allExpKing ?? allExpKingNode?.allExpKing ?? 760;
-  const weeklyKing = kingNode.weeklyKing ?? allExpKingNode?.weeklyKing ?? 765;
+  const rawAllExpKing = kingNode.allExpKing ?? allExpKingNode?.allExpKing ?? 0;
+  const rawWeeklyKing = kingNode.weeklyKing ?? allExpKingNode?.weeklyKing ?? 0;
+  const rawZeroDteKing = kingNode.zeroDteKing ?? allExpKingNode?.zeroDteKing ?? 0;
+
+  const allExpKing = Number.isFinite(rawAllExpKing) ? rawAllExpKing : 0;
+  const weeklyKing = Number.isFinite(rawWeeklyKing) ? rawWeeklyKing : 0;
+  const zeroDteKing = Number.isFinite(rawZeroDteKing) ? rawZeroDteKing : 0;
+
   const weeklyDate =
-    kingNode.weeklyDate ?? allExpKingNode?.weeklyDate ?? getFridayEtShort();
-  const zeroDteKing =
-    kingNode.zeroDteKing ?? allExpKingNode?.zeroDteKing ?? 760;
+    kingNode.weeklyDate || allExpKingNode?.weeklyDate || getFridayEtShort();
   const zeroDteDate =
-    kingNode.zeroDteDate ?? allExpKingNode?.zeroDteDate ?? getTodayEtShort();
+    kingNode.zeroDteDate || allExpKingNode?.zeroDteDate || getTodayEtShort();
 
   const firstTierLabel = hasZeroDte ? "0DTE King" : "Next exp King";
   const isContested = kingNode.isContested || allExpKingNode?.isContested;
+  const fmtStrike = (s: number) =>
+    Number.isFinite(s) && s > 0
+      ? s % 1 !== 0
+        ? Number(s.toFixed(2)).toString()
+        : s.toFixed(0)
+      : "—";
 
-  // TerraShade exact kingPhrase():
-  // When All exp: "All-exp King 760 · contested"
-  // When filtered: "{Filter} King {strike} ({MM-DD}) · All-exp King {allExpKing} · contested"
-  let kingPhrase = `All-exp King ${allExpKing.toFixed(0)}${
-    isContested ? " · contested" : ""
-  }`;
-  if (!isAllExp) {
+  let kingPhrase =
+    allExpKing > 0
+      ? `All-exp King ${fmtStrike(allExpKing)}${isContested ? " · contested" : ""}`
+      : "Awaiting live King Node...";
+  if (!isAllExp && allExpKing > 0) {
     if (isZeroDte) {
-      kingPhrase = `${firstTierLabel} ${zeroDteKing.toFixed(0)} (${zeroDteDate}) · All-exp King ${allExpKing.toFixed(0)}${
+      kingPhrase = `${firstTierLabel} ${fmtStrike(zeroDteKing)} (${zeroDteDate}) · All-exp King ${fmtStrike(allExpKing)}${
         isContested ? " · contested" : ""
       }`;
     } else if (isThisWeek) {
-      kingPhrase = `Week King ${weeklyKing.toFixed(0)} (${weeklyDate}) · All-exp King ${allExpKing.toFixed(0)}${
+      kingPhrase = `Week King ${fmtStrike(weeklyKing)} (${weeklyDate}) · All-exp King ${fmtStrike(allExpKing)}${
         isContested ? " · contested" : ""
       }`;
     } else {
-      const filtStrike = kingNode.filteredKing ?? allExpKing;
+      const rawFiltStrike = kingNode.filteredKing ?? allExpKing;
+      const filtStrike = Number.isFinite(rawFiltStrike) ? rawFiltStrike : 0;
       const dateMatch =
         kingNode.filteredLabel?.match(/\(([^)]+)\)/)?.[1] ?? expirationFilter;
-      kingPhrase = `${dateMatch} King ${filtStrike.toFixed(0)} (${dateMatch}) · All-exp King ${allExpKing.toFixed(0)}${
+      const labelPrefix =
+        expirationFilter === "OPEX"
+          ? "OPEX"
+          : expirationFilter === dateMatch
+            ? dateMatch
+            : expirationFilter;
+      const dateSuffix = labelPrefix === dateMatch ? "" : ` (${dateMatch})`;
+      kingPhrase = `${labelPrefix} King ${fmtStrike(filtStrike)}${dateSuffix} · All-exp King ${fmtStrike(allExpKing)}${
         isContested ? " · contested" : ""
       }`;
     }
@@ -115,7 +133,7 @@ export function MetricsRow() {
                 isLongGex ? "text-[#14b8a6]" : "text-[#c084fc]"
               )}
             >
-              {formatExposure(netGex * 1000)}
+              {formatExposure(safeNetGex * 1000)}
             </div>
           </div>
           <div className="text-[11px] font-mono text-slate-400">
@@ -149,7 +167,7 @@ export function MetricsRow() {
                 isLongSecond ? "text-emerald-400" : "text-amber-400"
               )}
             >
-              {formatExposure(secondValueM)}
+              {formatExposure(safeSecondValueM)}
             </div>
           </div>
           <div className="text-[11px] font-mono text-slate-400">
@@ -170,7 +188,7 @@ export function MetricsRow() {
               KING
             </span>
             <span className="rounded-full bg-amber-400/20 border border-amber-300/50 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 shrink-0">
-              Strength {kingNode.kingStrength}/100
+              Strength {Number.isFinite(kingNode.kingStrength) ? kingNode.kingStrength : 0}/100
               {isContested ? " · contested" : ""}
             </span>
           </div>
@@ -183,9 +201,15 @@ export function MetricsRow() {
 
           {/* 3-King Horizon Reference Row */}
           <div className="text-[11px] font-mono text-slate-400 truncate">
-            {firstTierLabel} {zeroDteKing.toFixed(0)} ({zeroDteDate}) · Week{" "}
-            {weeklyKing.toFixed(0)} ({weeklyDate}) · All-exp{" "}
-            {allExpKing.toFixed(0)}
+            {allExpKing > 0 ? (
+              <>
+                {firstTierLabel} {fmtStrike(zeroDteKing)} ({zeroDteDate}) · Week{" "}
+                {fmtStrike(weeklyKing)} ({weeklyDate}) · All-exp{" "}
+                {fmtStrike(allExpKing)}
+              </>
+            ) : (
+              "Syncing multi-horizon Kings..."
+            )}
           </div>
         </div>
       </div>

@@ -21,7 +21,6 @@ export type ActiveView =
   | "Charts";
 export * from "@/lib/tickerPresets";
 import {
-  type TickerSymbol,
   type NetMetrics,
   type GammaLevels,
   type KingNodeMetrics,
@@ -30,17 +29,6 @@ import {
   getTodayEtShort,
   getFridayEtShort,
   buildKingNodeMetrics,
-  WATCH_LIST,
-  WATCH_LEAD,
-  WATCH_REST,
-  ROW1_TICKERS,
-  ROW2_TICKERS,
-  ROW3_TICKERS,
-  ROW4_TICKERS,
-  ROW5_TICKERS,
-  TICKER_PILL_ROWS,
-  SUPPORTED_TICKERS,
-  TICKER_PRESETS,
   getTickerPreset,
 } from "@/lib/tickerPresets";
 
@@ -324,7 +312,7 @@ export function computeFilteredSummaryMetrics(params: {
             ? "OPEX King"
             : `${best.peakDateLabel} King`;
 
-    const spot = params.spotPrice ?? preset.spotPrice;
+    const spot = params.spotPrice && params.spotPrice > 0 ? params.spotPrice : preset.spotPrice;
 
     // Resolve precomputed gamma levels for the active filter if present
     let filteredGammaLevels: GammaLevels | null = null;
@@ -343,9 +331,9 @@ export function computeFilteredSummaryMetrics(params: {
 
     if (!filteredGammaLevels) {
       let cw = spot;
-      let maxCall = -1;
+      let maxCall = 0;
       let pw = spot;
-      let maxPut = -1;
+      let maxPut = 0;
 
       for (const row of strikes) {
         let callSum = 0;
@@ -447,6 +435,8 @@ export function computeFilteredSummaryMetrics(params: {
     netMetrics: {
       netGex: Number((allExpNetMetrics.netGex * scaleFactor).toFixed(2)),
       netVex: Number((allExpNetMetrics.netVex * scaleFactor).toFixed(1)),
+      netDex: Number(((allExpNetMetrics.netDex ?? 0) * scaleFactor).toFixed(1)),
+      netCharm: Number(((allExpNetMetrics.netCharm ?? 0) * scaleFactor).toFixed(1)),
     },
     kingNode: buildKingNodeMetrics(
       preset,
@@ -470,20 +460,13 @@ export function computeFilteredSummaryMetrics(params: {
 export interface DiscordConfig {
   webhookUrl: string;
   enabled: boolean;
-  notifyWalls: boolean;
-  notifyZeroGamma: boolean;
-  notifyKing: boolean;
 }
 
-export const DEFAULT_DISCORD_WEBHOOK_URL =
-  "https://discord.com/api/webhooks/1562857850676449411/Qza12VWuPoBlek12-6o7V6fc2EscYDjIQrKw7KJyfB8Y3i9VAMvU7OJH0m7joqUH5arx";
+export const DEFAULT_DISCORD_WEBHOOK_URL = "";
 
 export const DEFAULT_DISCORD_CONFIG: DiscordConfig = {
   webhookUrl: DEFAULT_DISCORD_WEBHOOK_URL,
-  enabled: true,
-  notifyWalls: false, // Silenced: Discord channel focuses exclusively on BTO/STC trade execution signals
-  notifyZeroGamma: false, // Silenced
-  notifyKing: false, // Silenced
+  enabled: false,
 };
 
 const DISCORD_STORAGE_KEY = "hyperion_discord_config";
@@ -497,18 +480,22 @@ function getInitialDiscordConfig(): DiscordConfig {
       localStorage.getItem(LEGACY_DISCORD_STORAGE_KEY);
     if (saved) {
       const parsed = JSON.parse(saved);
+      const savedUrl = typeof parsed.webhookUrl === "string" ? parsed.webhookUrl.trim() : "";
       return {
-        ...DEFAULT_DISCORD_CONFIG,
-        ...parsed,
-        webhookUrl: parsed.webhookUrl?.trim() || DEFAULT_DISCORD_WEBHOOK_URL,
-        enabled: parsed.enabled ?? true,
+        webhookUrl: savedUrl || DEFAULT_DISCORD_WEBHOOK_URL,
+        enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : Boolean(savedUrl),
       };
     }
   } catch {}
   return DEFAULT_DISCORD_CONFIG;
 }
 
-let lastDiscordPostTime = 0;
+let optionsAbortCtrl: AbortController | null = null;
+let optionsReqSeq = 0;
+let flowVwapAbortCtrl: AbortController | null = null;
+let flowVwapReqSeq = 0;
+let serverTradesAbortCtrl: AbortController | null = null;
+let serverTradesReqSeq = 0;
 
 export interface DashboardState {
   activeView: ActiveView;
@@ -585,14 +572,42 @@ export interface DashboardState {
   ) => Promise<void>;
 }
 
-const defaultPreset = TICKER_PRESETS.SPY;
-const defaultKing = buildKingNodeMetrics(defaultPreset, "0DTE");
+const EMPTY_NET_METRICS: NetMetrics = {
+  netGex: 0,
+  netVex: 0,
+  netDex: 0,
+  netCharm: 0,
+};
+
+const EMPTY_GAMMA_LEVELS: GammaLevels = {
+  putWall: 0,
+  callWall: 0,
+  zeroGamma: 0,
+  hasZeroGammaFlip: false,
+};
+
+const EMPTY_KING_NODE: KingNodeMetrics = {
+  allExpKing: 0,
+  filteredKing: 0,
+  filteredLabel: "Syncing...",
+  zeroDteKing: 0,
+  zeroDteDate: "",
+  hasZeroDte: false,
+  weeklyKing: 0,
+  weeklyDate: "",
+  kingValue: 0,
+  secondLargestStrike: 0,
+  secondLargestValue: 0,
+  totalBoardGamma: 0,
+  kingStrength: 0,
+  isContested: false,
+};
 
 export const useDashboardStore = create<DashboardState>((set, get) => ({
   activeView: "Heatmap",
-  activeTicker: defaultPreset.ticker,
+  activeTicker: "SPY",
   dataSource: "CBOE_MARKET_DATA",
-  connectionStatus: "LIVE",
+  connectionStatus: "SYNCING",
   isStaleSnapshot: false,
   isLoadingChain: true,
   liveTickPrice: null,
@@ -605,16 +620,16 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   spotPrice: 0,
   previousClose: 0,
   impliedVolatility: 0,
-  strikeStep: defaultPreset.strikeStep,
+  strikeStep: 1,
   extendedQuote: null,
   expectedMoves: null,
-  netMetrics: { ...defaultPreset.netMetrics },
-  allExpNetMetrics: { ...defaultPreset.netMetrics },
-  gammaLevels: { ...defaultPreset.gammaLevels },
-  allExpGammaLevels: { ...defaultPreset.gammaLevels },
-  gammaLevelsByFilter: defaultPreset.gammaLevelsByFilter ?? null,
-  kingNode: defaultKing,
-  allExpKingNode: defaultKing,
+  netMetrics: { ...EMPTY_NET_METRICS },
+  allExpNetMetrics: { ...EMPTY_NET_METRICS },
+  gammaLevels: { ...EMPTY_GAMMA_LEVELS },
+  allExpGammaLevels: { ...EMPTY_GAMMA_LEVELS },
+  gammaLevelsByFilter: null,
+  kingNode: { ...EMPTY_KING_NODE },
+  allExpKingNode: { ...EMPTY_KING_NODE },
   kingByFilter: null,
   chainExpirations: [],
   chainStrikes: [],
@@ -643,6 +658,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     }),
   fetchServerTrades: async (ticker, sessionDate) => {
     const targetTicker = (ticker || get().activeTicker || "SPY").toUpperCase();
+    serverTradesAbortCtrl?.abort();
+    const ctrl = new AbortController();
+    serverTradesAbortCtrl = ctrl;
+    const reqId = ++serverTradesReqSeq;
     const dateParam =
       sessionDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionDate)
         ? `&date=${encodeURIComponent(sessionDate)}`
@@ -650,10 +669,24 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     try {
       const res = await fetch(
         `/api/signals?ticker=${encodeURIComponent(targetTicker)}${dateParam}`,
-        { cache: "no-store", keepalive: true }
+        { cache: "no-store", keepalive: true, signal: ctrl.signal }
       );
+      if (
+        ctrl.signal.aborted ||
+        reqId !== serverTradesReqSeq ||
+        get().activeTicker.toUpperCase() !== targetTicker
+      ) {
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
+        if (
+          ctrl.signal.aborted ||
+          reqId !== serverTradesReqSeq ||
+          get().activeTicker.toUpperCase() !== targetTicker
+        ) {
+          return;
+        }
         set({
           serverActivePositions: data?.activePositions ?? {},
           serverClosedTrades: data?.closedPositions ?? [],
@@ -752,6 +785,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
   setTicker: (rawTicker) => {
     const preset = getTickerPreset(rawTicker);
+    if (preset.ticker === get().activeTicker) {
+      return;
+    }
+    optionsAbortCtrl?.abort();
+    flowVwapAbortCtrl?.abort();
+    serverTradesAbortCtrl?.abort();
     set((state) => {
       const isStandardFilter =
         state.gridFilters.expiration === "ALL" ||
@@ -762,38 +801,29 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         ? state.gridFilters.expiration
         : "ALL";
 
-      const baseKing = buildKingNodeMetrics(preset, safeExpFilter);
-      const filtered = computeFilteredSummaryMetrics({
-        expirationFilter: safeExpFilter,
-        preset,
-        expirations: [],
-        strikes: [],
-        allExpNetMetrics: preset.netMetrics,
-        allExpKingNode: baseKing,
-        allExpGammaLevels: preset.gammaLevels,
-        gammaLevelsByFilter: preset.gammaLevelsByFilter ?? null,
-        spotPrice: preset.spotPrice,
-      });
-
       return {
         activeTicker: preset.ticker,
         isLoadingChain: true,
-        spotPrice: preset.spotPrice,
+        connectionStatus: "SYNCING",
+        isStaleSnapshot: false,
+        lastUpdated: "--:-- ET",
+        bookTimestamp: null,
+        spotPrice: 0,
         liveTickPrice: null,
         liveTickTimestamp: 0,
         liveTickDirection: "flat",
-        previousClose: preset.previousClose,
-        impliedVolatility: preset.impliedVolatility,
+        previousClose: 0,
+        impliedVolatility: 0,
         strikeStep: preset.strikeStep,
         extendedQuote: null,
         expectedMoves: null,
-        netMetrics: filtered.netMetrics,
-        allExpNetMetrics: { ...preset.netMetrics },
-        gammaLevels: filtered.gammaLevels,
-        allExpGammaLevels: { ...preset.gammaLevels },
-        gammaLevelsByFilter: preset.gammaLevelsByFilter ?? null,
-        kingNode: filtered.kingNode,
-        allExpKingNode: baseKing,
+        netMetrics: { ...EMPTY_NET_METRICS },
+        allExpNetMetrics: { ...EMPTY_NET_METRICS },
+        gammaLevels: { ...EMPTY_GAMMA_LEVELS },
+        allExpGammaLevels: { ...EMPTY_GAMMA_LEVELS },
+        gammaLevelsByFilter: null,
+        kingNode: { ...EMPTY_KING_NODE },
+        allExpKingNode: { ...EMPTY_KING_NODE },
         kingByFilter: null,
         chainExpirations: [],
         chainStrikes: [],
@@ -802,13 +832,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
           expiration: safeExpFilter,
         },
         alerts: [],
+        serverClosedTrades: [],
+        serverTradeAlerts: [],
         intradayData: [],
         flowGammaVwapData: null,
       };
     });
-    get().fetchOptionsChain(preset.ticker, true).catch(() => {});
-    get().fetchServerTrades(preset.ticker).catch(() => {});
-    get().fetchFlowGammaVwap(preset.ticker).catch(() => {});
   },
 
   setLiveTick: (ticker, price, timestamp = Date.now()) =>
@@ -827,47 +856,11 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       };
     }),
 
-  updateSpot: (newSpot, timeLabel) => {
+  updateSpot: (newSpot) => {
+    if (!Number.isFinite(newSpot) || newSpot <= 0) return;
     const roundedSpot = Number(newSpot.toFixed(2));
-    const nowLabel =
-      timeLabel ??
-      new Date().toLocaleTimeString("en-US", {
-        hour12: false,
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      });
 
     set((state) => {
-      const spotDelta = roundedSpot - state.spotPrice;
-      const gexDrift = Number((state.netMetrics.netGex + spotDelta * 0.015).toFixed(2));
-      const vexDrift = Number((state.netMetrics.netVex + spotDelta * 2.1).toFixed(1));
-
-      const updatedKingValue = Math.max(
-        1,
-        Number((state.kingNode.kingValue + spotDelta * 0.6).toFixed(1))
-      );
-      const updatedStrength = calculateKingStrength(
-        updatedKingValue,
-        state.kingNode.secondLargestValue,
-        state.kingNode.totalBoardGamma
-      );
-      const isContested =
-        updatedKingValue > 0 &&
-        (updatedKingValue - state.kingNode.secondLargestValue) /
-          updatedKingValue <=
-          0.1;
-
-      const nextPoint: IntradayPoint = {
-        time: nowLabel,
-        spot: roundedSpot,
-        callWall: state.gammaLevels.callWall,
-        putWall: state.gammaLevels.putWall,
-        zeroGamma: state.gammaLevels.zeroGamma,
-      };
-
-      const nextIntraday = [...state.intradayData.slice(-59), nextPoint];
-
       let nextPlaybook = state.playbookPayload;
       if (nextPlaybook && nextPlaybook.picks.length > 0) {
         const updatePick = (p: PlaybookPick) => {
@@ -890,18 +883,6 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
       return {
         spotPrice: roundedSpot,
-        netMetrics: {
-          ...state.netMetrics,
-          netGex: gexDrift,
-          netVex: vexDrift,
-        },
-        kingNode: {
-          ...state.kingNode,
-          kingValue: updatedKingValue,
-          kingStrength: updatedStrength,
-          isContested,
-        },
-        intradayData: nextIntraday,
         playbookPayload: nextPlaybook,
       };
     });
@@ -980,37 +961,6 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         },
       ],
     }));
-
-    // Non-blocking throttled Discord Webhook notification (max 1 per 10s)
-    const config = get().discordConfig;
-    if (config?.enabled && config?.webhookUrl) {
-      const shouldNotify =
-        ((type === "call" || type === "put") && config.notifyWalls) ||
-        (type === "zero" && config.notifyZeroGamma) ||
-        (type === "king" && config.notifyKing);
-
-      if (shouldNotify) {
-        const now = Date.now();
-        if (now - lastDiscordPostTime >= 10000) {
-          lastDiscordPostTime = now;
-          fetch("/api/discord", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              webhookUrl: config.webhookUrl,
-              ticker: get().activeTicker,
-              spotPrice: get().spotPrice,
-              eventType: type,
-              message,
-              callWall: get().gammaLevels.callWall,
-              putWall: get().gammaLevels.putWall,
-              zeroGamma: get().gammaLevels.zeroGamma,
-              allExpKing: get().kingNode.allExpKing,
-            }),
-          }).catch(() => {});
-        }
-      }
-    }
   },
 
   setFilters: (filters) => {
@@ -1021,6 +971,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       };
 
       if (filters.expiration === undefined && filters.metric === undefined) {
+        return { gridFilters: nextFilters };
+      }
+
+      if (state.chainStrikes.length === 0) {
         return { gridFilters: nextFilters };
       }
 
@@ -1048,7 +1002,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
   hydrateFromMarketData: (payload) => {
     set((state) => {
-      if (payload.ticker !== state.activeTicker) {
+      if (payload.ticker.toUpperCase() !== state.activeTicker.toUpperCase()) {
         return state;
       }
 
@@ -1063,7 +1017,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
           payload.kingNode.zeroDteDate ??
           payload.kingByFilter?.["0DTE"]?.label?.match(/\(([^)]+)\)/)?.[1] ??
           getTodayEtShort(),
-        hasZeroDte: payload.kingNode.hasZeroDte ?? true,
+        hasZeroDte:
+          payload.kingNode.hasZeroDte ??
+          payload.expirations.some((c) => c.tag === "0DTE"),
         weeklyKing:
           payload.kingNode.weeklyKing ??
           payload.kingByFilter?.THIS_WEEK?.strike ??
@@ -1095,49 +1051,64 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         minute: "2-digit",
       });
 
+      const fmtStrike = (s: number) =>
+        s % 1 !== 0 ? Number(s.toFixed(2)).toString() : s.toFixed(0);
+
       if (!isInitialChainHydration) {
         if (
           filtered.kingNode.allExpKing !== state.allExpKingNode.allExpKing &&
-          state.allExpKingNode.allExpKing > 0
+          state.allExpKingNode.allExpKing > 0 &&
+          filtered.kingNode.allExpKing > 0
         ) {
           nextAlerts.push({
             id: `${payload.ticker}-king-${Date.now() - 1}`,
             timestamp: formattedTime,
             type: "king",
-            message: `${payload.ticker} King moved ${state.allExpKingNode.allExpKing.toFixed(0)} → ${filtered.kingNode.allExpKing.toFixed(0)}`,
+            message: `${payload.ticker} King moved ${fmtStrike(state.allExpKingNode.allExpKing)} → ${fmtStrike(filtered.kingNode.allExpKing)}`,
           });
         }
-        if (payload.gammaLevels.callWall !== state.gammaLevels.callWall) {
+        if (
+          filtered.gammaLevels.callWall !== state.gammaLevels.callWall &&
+          state.gammaLevels.callWall > 0 &&
+          filtered.gammaLevels.callWall > 0
+        ) {
           nextAlerts.push({
             id: `${payload.ticker}-cwall-${Date.now()}`,
             timestamp: formattedTime,
             type: "call",
-            message: `${payload.ticker} Call wall moved ${state.gammaLevels.callWall.toFixed(0)} → ${payload.gammaLevels.callWall.toFixed(0)}`,
+            message: `${payload.ticker} Call wall moved ${fmtStrike(state.gammaLevels.callWall)} → ${fmtStrike(filtered.gammaLevels.callWall)}`,
           });
         }
-        if (payload.gammaLevels.putWall !== state.gammaLevels.putWall) {
+        if (
+          filtered.gammaLevels.putWall !== state.gammaLevels.putWall &&
+          state.gammaLevels.putWall > 0 &&
+          filtered.gammaLevels.putWall > 0
+        ) {
           nextAlerts.push({
             id: `${payload.ticker}-pwall-${Date.now() + 1}`,
             timestamp: formattedTime,
             type: "put",
-            message: `${payload.ticker} Put wall moved ${state.gammaLevels.putWall.toFixed(0)} → ${payload.gammaLevels.putWall.toFixed(0)}`,
+            message: `${payload.ticker} Put wall moved ${fmtStrike(state.gammaLevels.putWall)} → ${fmtStrike(filtered.gammaLevels.putWall)}`,
           });
         }
         if (
-          (state.spotPrice < state.gammaLevels.zeroGamma &&
-            payload.spotPrice >= payload.gammaLevels.zeroGamma) ||
-          (state.spotPrice >= state.gammaLevels.zeroGamma &&
-            payload.spotPrice < payload.gammaLevels.zeroGamma)
+          state.spotPrice > 0 &&
+          state.gammaLevels.zeroGamma > 0 &&
+          filtered.gammaLevels.zeroGamma > 0 &&
+          ((state.spotPrice < state.gammaLevels.zeroGamma &&
+            payload.spotPrice >= filtered.gammaLevels.zeroGamma) ||
+            (state.spotPrice >= state.gammaLevels.zeroGamma &&
+              payload.spotPrice < filtered.gammaLevels.zeroGamma))
         ) {
           const dir =
-            payload.spotPrice >= payload.gammaLevels.zeroGamma
+            payload.spotPrice >= filtered.gammaLevels.zeroGamma
               ? "above"
               : "below";
           nextAlerts.push({
             id: `${payload.ticker}-zg-${Date.now() + 2}`,
             timestamp: formattedTime,
             type: "zero",
-            message: `${payload.ticker} crossed ${dir} zero γ ($${payload.gammaLevels.zeroGamma.toFixed(2)}) — spot $${payload.spotPrice.toFixed(2)}`,
+            message: `${payload.ticker} crossed ${dir} zero γ ($${filtered.gammaLevels.zeroGamma.toFixed(2)}) — spot $${payload.spotPrice.toFixed(2)}`,
           });
         }
       }
@@ -1250,27 +1221,60 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
   fetchFlowGammaVwap: async (ticker) => {
     const targetTicker = (ticker ?? get().activeTicker).trim().toUpperCase();
+    flowVwapAbortCtrl?.abort();
+    const ctrl = new AbortController();
+    flowVwapAbortCtrl = ctrl;
+    const reqId = ++flowVwapReqSeq;
     try {
       const res = await fetch(
         `/api/flow-vwap?ticker=${encodeURIComponent(targetTicker)}`,
-        { cache: "no-store" }
+        { cache: "no-store", signal: ctrl.signal }
       );
-      if (!res.ok) return;
+      if (
+        !res.ok ||
+        ctrl.signal.aborted ||
+        reqId !== flowVwapReqSeq ||
+        get().activeTicker.toUpperCase() !== targetTicker
+      ) {
+        return;
+      }
       const points = await res.json();
+      if (
+        ctrl.signal.aborted ||
+        reqId !== flowVwapReqSeq ||
+        get().activeTicker.toUpperCase() !== targetTicker
+      ) {
+        return;
+      }
       if (Array.isArray(points) && points.length > 0) {
         const latest = points[points.length - 1];
-        const sigma =
-          latest.sigma ?? Math.max(0.316, latest.upper1Sigma - latest.flowVwap);
-        set({
-          flowGammaVwapData: {
-            flowVwap: Number(latest.flowVwap.toFixed(2)),
-            upper1s: Number((latest.upper1s ?? latest.upper1Sigma).toFixed(2)),
-            lower1s: Number((latest.lower1s ?? latest.lower1Sigma).toFixed(2)),
-            upper2s: Number((latest.upper2s ?? latest.upper2Sigma).toFixed(2)),
-            lower2s: Number((latest.lower2s ?? latest.lower2Sigma).toFixed(2)),
-            sigma: Number(sigma.toFixed(3)),
-          },
-        });
+        const flowVwap = Number(latest?.flowVwap);
+        const u1 = Number(latest?.upper1s ?? latest?.upper1Sigma);
+        const l1 = Number(latest?.lower1s ?? latest?.lower1Sigma);
+        const u2 = Number(latest?.upper2s ?? latest?.upper2Sigma);
+        const l2 = Number(latest?.lower2s ?? latest?.lower2Sigma);
+        const rawSigma = Number(latest?.sigma ?? u1 - flowVwap);
+        if (Number.isFinite(flowVwap) && Number.isFinite(rawSigma)) {
+          const safeSigma = Math.max(0, rawSigma);
+          set({
+            flowGammaVwapData: {
+              flowVwap: Number(flowVwap.toFixed(2)),
+              upper1s: Number(
+                (Number.isFinite(u1) ? u1 : flowVwap + safeSigma).toFixed(2)
+              ),
+              lower1s: Number(
+                (Number.isFinite(l1) ? l1 : flowVwap - safeSigma).toFixed(2)
+              ),
+              upper2s: Number(
+                (Number.isFinite(u2) ? u2 : flowVwap + 2 * safeSigma).toFixed(2)
+              ),
+              lower2s: Number(
+                (Number.isFinite(l2) ? l2 : flowVwap - 2 * safeSigma).toFixed(2)
+              ),
+              sigma: Number(safeSigma.toFixed(3)),
+            },
+          });
+        }
       }
     } catch {
       // Non-fatal background fetch
@@ -1279,14 +1283,27 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
   fetchOptionsChain: async (ticker, force = false, showToastOnError = false) => {
     const targetTicker = (ticker ?? get().activeTicker).trim().toUpperCase();
+    if (targetTicker !== get().activeTicker.toUpperCase()) return;
+    optionsAbortCtrl?.abort();
+    const ctrl = new AbortController();
+    optionsAbortCtrl = ctrl;
+    const reqId = ++optionsReqSeq;
+
     // Seamlessly update Flow VWAP during the 5-second polling cycle
     get().fetchFlowGammaVwap(targetTicker).catch(() => {});
     set({ isLoadingChain: true });
     try {
       const res = await fetch(
         `/api/options?ticker=${encodeURIComponent(targetTicker)}${force ? "&force=true" : ""}`,
-        { cache: "no-store" }
+        { cache: "no-store", signal: ctrl.signal }
       );
+      if (
+        ctrl.signal.aborted ||
+        reqId !== optionsReqSeq ||
+        get().activeTicker.toUpperCase() !== targetTicker
+      ) {
+        return;
+      }
       if (!res.ok) {
         // If we already have live data for this ticker, retain the last verified valid snapshot!
         const state = get();
@@ -1312,6 +1329,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         return;
       }
       const payload: OptionsAnalyticsPayload = await res.json();
+      if (
+        ctrl.signal.aborted ||
+        reqId !== optionsReqSeq ||
+        get().activeTicker.toUpperCase() !== targetTicker
+      ) {
+        return;
+      }
       get().hydrateFromMarketData(payload);
 
       const status: "LIVE" | "SYNCING" | "RECONNECTING" =
@@ -1324,6 +1348,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         toastMessage: null,
       });
     } catch {
+      if (
+        ctrl.signal.aborted ||
+        reqId !== optionsReqSeq ||
+        get().activeTicker.toUpperCase() !== targetTicker
+      ) {
+        return;
+      }
       // Network fetch failure: if valid data exists, serve last verified valid snapshot with SYNCING indicator
       const state = get();
       if (state.activeTicker === targetTicker && state.chainStrikes.length > 0) {

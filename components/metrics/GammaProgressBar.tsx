@@ -24,9 +24,15 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
   const kingNode = useDashboardStore((state) => state.kingNode);
   const allExpKingNode = useDashboardStore((state) => state.allExpKingNode);
 
+  const hasLiveSpot = Number.isFinite(effectiveSpot) && effectiveSpot > 0;
   const lowBound = Math.min(putWall, callWall);
   const highBound = Math.max(putWall, callWall);
-  const hasValidWalls = lowBound > 0 && highBound > lowBound;
+  const hasValidWalls =
+    hasLiveSpot &&
+    Number.isFinite(lowBound) &&
+    Number.isFinite(highBound) &&
+    lowBound > 0 &&
+    highBound > lowBound;
   const span = hasValidWalls ? Math.max(0.01, highBound - lowBound) : 1;
 
   const rawPct = hasValidWalls ? ((effectiveSpot - lowBound) / span) * 100 : 50;
@@ -37,6 +43,8 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
   const showZgTick =
     hasValidWalls &&
     hasZeroGammaFlip &&
+    Number.isFinite(zeroGamma) &&
+    zeroGamma > 0 &&
     zeroGamma >= lowBound &&
     zeroGamma <= highBound;
   const activeKingStrike = kingNode.filteredKing ?? kingNode.allExpKing;
@@ -44,7 +52,11 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
     ? Math.min(100, Math.max(0, ((activeKingStrike - lowBound) / span) * 100))
     : 50;
   const showKingMarker =
-    hasValidWalls && activeKingStrike >= lowBound && activeKingStrike <= highBound;
+    hasValidWalls &&
+    Number.isFinite(activeKingStrike) &&
+    activeKingStrike > 0 &&
+    activeKingStrike >= lowBound &&
+    activeKingStrike <= highBound;
 
   const positionMessage = !hasValidWalls
     ? "awaiting structural walls"
@@ -57,9 +69,11 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
   const isContested = kingNode.isContested || allExpKingNode?.isContested;
   const displayKingPhrase =
     kingPhrase ??
-    `All-exp King ${kingNode.allExpKing.toFixed(0)}${
-      isContested ? " · contested" : ""
-    }`;
+    (kingNode.allExpKing > 0
+      ? `All-exp King ${kingNode.allExpKing.toFixed(kingNode.allExpKing % 1 !== 0 ? 1 : 0)}${
+          isContested ? " · contested" : ""
+        }`
+      : "Awaiting live King Node...");
 
   return (
     <div className="argon-card rounded-xl p-4 space-y-4">
@@ -71,10 +85,10 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
             CALL WALL
           </div>
           <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#22d3ee] tabular-nums">
-            {callWall > 0 ? callWall.toFixed(callWall % 1 !== 0 ? 2 : 0) : "—"}
+            {hasLiveSpot && callWall > 0 ? callWall.toFixed(callWall % 1 !== 0 ? 2 : 0) : "—"}
           </div>
           <div className="text-[11px] font-mono text-slate-400">
-            {callWallGex !== undefined && callWallGex !== 0
+            {hasLiveSpot && callWallGex !== undefined && callWallGex !== 0
               ? formatExposure(callWallGex, { showPlus: false })
               : "Highest +γ ≥ Spot"}
           </div>
@@ -86,10 +100,10 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
             PUT WALL
           </div>
           <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#e879f9] tabular-nums">
-            {putWall > 0 ? putWall.toFixed(putWall % 1 !== 0 ? 2 : 0) : "—"}
+            {hasLiveSpot && putWall > 0 ? putWall.toFixed(putWall % 1 !== 0 ? 2 : 0) : "—"}
           </div>
           <div className="text-[11px] font-mono text-slate-400">
-            {putWallGex !== undefined && putWallGex !== 0
+            {hasLiveSpot && putWallGex !== undefined && putWallGex !== 0
               ? formatExposure(putWallGex)
               : "Highest -γ ≤ Spot"}
           </div>
@@ -101,14 +115,16 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
             ZERO Γ
           </div>
           <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-white tabular-nums">
-            {hasZeroGammaFlip ? zeroGamma.toFixed(1) : "—"}
+            {hasLiveSpot && hasZeroGammaFlip && zeroGamma > 0 ? zeroGamma.toFixed(1) : "—"}
           </div>
           <div className="text-[11px] font-mono text-slate-400">
-            {hasZeroGammaFlip
+            {hasLiveSpot && hasZeroGammaFlip && zeroGamma > 0
               ? effectiveSpot >= zeroGamma
                 ? "spot above"
                 : "spot below"
-              : "no flip"}
+              : hasZeroGammaFlip
+                ? "awaiting spot"
+                : "no flip"}
           </div>
         </div>
       </div>
@@ -119,7 +135,7 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
           <span className="text-[#facc15] font-bold">
             ★ {displayKingPhrase}
           </span>
-          {hasZeroGammaFlip && (
+          {hasLiveSpot && hasZeroGammaFlip && zeroGamma > 0 && (
             <span className="text-slate-400">
               Zero γ: {zeroGamma.toFixed(1)}
             </span>
@@ -133,7 +149,7 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
             style={{ left: `${percentage}%` }}
           >
             <div className="rounded-md bg-[#1c223a] border border-[#5e72e4] px-2 py-0.5 text-[10px] font-mono font-bold text-white shadow-[0_0_12px_rgba(94,114,228,0.8)] whitespace-nowrap">
-              ${effectiveSpot.toFixed(2)}
+              {hasLiveSpot ? `$${effectiveSpot.toFixed(2)}` : "—"}
             </div>
           </div>
 
@@ -153,7 +169,7 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
               <div
                 className="absolute -top-1 -bottom-1 w-1 rounded-full bg-[#facc15] shadow-[0_0_10px_rgba(250,204,21,0.95)] z-10"
                 style={{ left: `${kingPct}%` }}
-                title={`King: $${activeKingStrike.toFixed(0)}`}
+                title={`King: $${activeKingStrike.toFixed(activeKingStrike % 1 !== 0 ? 1 : 0)}`}
               />
             )}
 
@@ -170,14 +186,14 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
           <span>
             Put wall{" "}
             <strong className="text-[#e879f9]">
-              {putWall.toFixed(putWall % 1 !== 0 ? 2 : 0)}
+              {hasLiveSpot && putWall > 0 ? putWall.toFixed(putWall % 1 !== 0 ? 2 : 0) : "—"}
             </strong>
           </span>
           <span className="text-slate-300">{positionMessage}</span>
           <span>
             Call wall{" "}
             <strong className="text-[#22d3ee]">
-              {callWall.toFixed(callWall % 1 !== 0 ? 2 : 0)}
+              {hasLiveSpot && callWall > 0 ? callWall.toFixed(callWall % 1 !== 0 ? 2 : 0) : "—"}
             </strong>
           </span>
         </div>

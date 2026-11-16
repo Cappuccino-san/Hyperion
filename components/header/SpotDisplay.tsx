@@ -25,13 +25,18 @@ export function SpotDisplay() {
     (state) => state.fetchOptionsChain
   );
 
-  const absChange = spotPrice - previousClose;
-  const pctChange = previousClose !== 0 ? (absChange / previousClose) * 100 : 0;
+  const hasValidSpot = Number.isFinite(spotPrice) && spotPrice > 0;
+  const hasValidPrevClose = Number.isFinite(previousClose) && previousClose > 0;
+  const absChange = hasValidSpot && hasValidPrevClose ? spotPrice - previousClose : 0;
+  const pctChange = hasValidSpot && hasValidPrevClose ? (absChange / previousClose) * 100 : 0;
   const isPositive = absChange >= 0;
   const isPositiveGamma = netGex >= 0;
   const preset = getTickerPreset(activeTicker);
   const showExtended =
-    extendedQuote && !NO_EXT.has(activeTicker.toUpperCase());
+    extendedQuote &&
+    Number.isFinite(extendedQuote.price) &&
+    extendedQuote.price > 0 &&
+    !NO_EXT.has(activeTicker.toUpperCase());
 
   const isSyncing =
     connectionStatus === "SYNCING" ||
@@ -72,23 +77,34 @@ export function SpotDisplay() {
               {activeTicker}
             </span>
             <span className="font-mono text-2xl sm:text-3xl font-extrabold tracking-tight text-white tabular-nums">
-              ${spotPrice.toLocaleString("en-US", {
-                minimumFractionDigits: 2,
-                maximumFractionDigits: 2,
-              })}
+              {hasValidSpot
+                ? `$${spotPrice.toLocaleString("en-US", {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  })}`
+                : "—"}
             </span>
-            <span
-              className={cn(
-                "font-mono text-sm font-bold tabular-nums",
-                isPositive ? "text-emerald-400" : "text-rose-400"
-              )}
-            >
-              {isPositive ? "+" : ""}
-              {absChange.toFixed(2)} ({isPositive ? "+" : ""}
-              {pctChange.toFixed(2)}%)
-            </span>
+            {hasValidSpot && hasValidPrevClose ? (
+              <span
+                className={cn(
+                  "font-mono text-sm font-bold tabular-nums",
+                  isPositive ? "text-emerald-400" : "text-rose-400"
+                )}
+              >
+                {isPositive ? "+" : ""}
+                {absChange.toFixed(2)} ({isPositive ? "+" : ""}
+                {pctChange.toFixed(2)}%)
+              </span>
+            ) : (
+              <span className="font-mono text-xs font-semibold text-slate-400">
+                Syncing live quote...
+              </span>
+            )}
             <span className="hidden md:inline text-xs font-mono text-slate-500">
-              {preset.name} · IV30 {(impliedVolatility * 100).toFixed(1)}%
+              {preset.name}
+              {hasValidSpot && Number.isFinite(impliedVolatility) && impliedVolatility > 0
+                ? ` · IV30 ${(impliedVolatility * 100).toFixed(1)}%`
+                : ""}
             </span>
           </div>
 
@@ -139,7 +155,7 @@ export function SpotDisplay() {
         {/* Right: Timestamp + Green LIVE Pill + Regime Pill + Data Source & Refresh */}
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-[11px] font-mono text-slate-400 tabular-nums">
-            {bookTimestamp ? `book ${bookTimestamp}` : `${lastUpdated} UTC`}
+            {bookTimestamp ? `book ${bookTimestamp}` : lastUpdated || "--:-- ET"}
           </span>
 
           {/* Green LIVE / Amber SYNCING / Connecting indicator */}

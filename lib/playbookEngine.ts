@@ -50,7 +50,7 @@ export function calculateExpectedMove(
   }
   // IV-based rule-of-16 daily move: Spot * IV / sqrt(252)
   const ruleOf16 = spotPrice * (iv / Math.sqrt(252));
-  return f2(Math.max(0.25, ruleOf16));
+  return f2(Math.max(spotPrice * 0.0005, ruleOf16));
 }
 
 /**
@@ -131,8 +131,8 @@ export function generateCallPick(telemetry: LiveTickerTelemetry): PlaybookPick {
   const kingBetween = gexKing >= entryPrice && gexKing <= target2;
 
   // Compute Flux Field Péclet number Pe = mu_delta * W / Gamma and Ceiling Share chi
-  const channelW = Math.max(0.5, edgeHigh - edgeLow);
-  const driftNorm = (spotPrice - previousClose) / Math.max(0.25, expectedMoveDaily);
+  const channelW = Math.max(spotPrice * 0.0005, edgeHigh - edgeLow);
+  const driftNorm = (spotPrice - previousClose) / Math.max(spotPrice * 0.0005, expectedMoveDaily);
   const pecletNumber = f2(Math.max(-12, Math.min(12, driftNorm * 2.4 + (netGex >= 0 ? 0.55 : -0.35))));
   const ceilingShareChi = computeCeilingShareChi(pecletNumber);
 
@@ -143,6 +143,7 @@ export function generateCallPick(telemetry: LiveTickerTelemetry): PlaybookPick {
   score += Math.min(15, Math.round(kingStrength * 0.15));
   if (spotPrice > previousClose) score += 10;
   if (ceilingShareChi >= 0.55) score += 8;
+  score = Math.min(100, score);
 
   let why = `Scanner top bull pick. Coiling within ${(
     ((entryPrice - spotPrice) / expectedMoveDaily) *
@@ -224,8 +225,8 @@ export function generatePutPick(telemetry: LiveTickerTelemetry): PlaybookPick {
   const kingBetween = gexKing <= entryPrice && gexKing >= target2;
 
   // Compute Flux Field Péclet number Pe and Ceiling Share chi
-  const channelW = Math.max(0.5, edgeHigh - edgeLow);
-  const driftNorm = (spotPrice - previousClose) / Math.max(0.25, expectedMoveDaily);
+  const channelW = Math.max(spotPrice * 0.0005, edgeHigh - edgeLow);
+  const driftNorm = (spotPrice - previousClose) / Math.max(spotPrice * 0.0005, expectedMoveDaily);
   const pecletNumber = f2(Math.max(-12, Math.min(12, driftNorm * 2.4 + (netGex < 0 ? -0.65 : 0.25))));
   const ceilingShareChi = computeCeilingShareChi(pecletNumber);
   const floorShare = f2(1 - ceilingShareChi);
@@ -237,6 +238,7 @@ export function generatePutPick(telemetry: LiveTickerTelemetry): PlaybookPick {
   score += Math.min(15, Math.round(kingStrength * 0.15));
   if (spotPrice < previousClose) score += 10;
   if (ceilingShareChi <= 0.45) score += 8;
+  score = Math.min(100, score);
 
   let why = `Deep breakdown setup coiling within ${(
     ((spotPrice - entryPrice) / expectedMoveDaily) *

@@ -42,7 +42,9 @@ export function PlaybookCard({ pick, rank, liveSpot, onSelectTicker }: PlaybookC
   // Determine current active spot: prop liveSpot > pick.currentSpot > priorClose
   const currentSpot = liveSpot ?? pick.currentSpot ?? pick.priorClose;
   const status: PlaybookExecutionStatus =
-    pick.status ?? evaluateExecutionStatus(pick, currentSpot);
+    liveSpot != null && liveSpot > 0
+      ? evaluateExecutionStatus(pick, currentSpot)
+      : (pick.status ?? evaluateExecutionStatus(pick, currentSpot));
   const progressPct = computeTargetProgress(pick, currentSpot);
 
   const handleCopy = (e: React.MouseEvent) => {
@@ -50,7 +52,7 @@ export function PlaybookCard({ pick, rank, liveSpot, onSelectTicker }: PlaybookC
     // Institutional Copy & Export format:
     // {TICKER} {SIDE} | Entry: {trigger} | Stop: {stop} | T1: {target1} | T2 (EM): {target2}
     const institutionalSpec = `${pick.ticker} ${pick.type} | Entry: ${pick.entryTrigger} | Stop: ${pick.stopLoss} | T1: $${f2(pick.target1)} | T2 (EM): $${f2(pick.target2)}`;
-    navigator.clipboard.writeText(institutionalSpec);
+    navigator.clipboard?.writeText(institutionalSpec).catch(() => {});
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };

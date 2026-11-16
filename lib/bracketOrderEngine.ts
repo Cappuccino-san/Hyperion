@@ -17,6 +17,7 @@
  */
 
 import { NbboQuote } from "@/lib/marketDataService";
+import { etSecondsOfDay, EOD_FORCE_FLAT_MINS } from "@/lib/gaiaSessionGuards";
 
 export interface OcoBracketConfig {
   entryPrice: number; // Executed Ask
@@ -80,11 +81,15 @@ export function initializeOcoBrackets(config: OcoBracketConfig): OcoBracketState
   const rawStop = Math.max(0.05, entryPrice * (1 - stopLossMaxLossPct / 100));
   const hardStopPrice = Number((Math.round((rawStop + Number.EPSILON) * 100) / 100).toFixed(2));
 
-  // Staged momentum time stop is active if position was opened before 10:15 AM
-  const openedBefore1015 =
-    openedAtEt.includes("9:") ||
-    openedAtEt.includes("09:") ||
-    (openedAtEt.includes("10:") && parseInt(openedAtEt.split(":")[1] || "99", 10) < 15);
+  // Staged momentum time stop is active if position was opened before 10:15 AM ET
+  const parsedSec = parseEtTimeSeconds(openedAtEt);
+  const openedSec =
+    parsedSec > 0
+      ? parsedSec
+      : Number.isFinite(config.openedTs) && config.openedTs > 0
+        ? etSecondsOfDay(config.openedTs)
+        : 0;
+  const openedBefore1015 = openedSec > 0 && openedSec < 10 * 3600 + 15 * 60;
 
   return {
     tp1LimitPrice,
@@ -100,15 +105,23 @@ export function initializeOcoBrackets(config: OcoBracketConfig): OcoBracketState
 }
 
 /**
- * Parses ET time strings ("HH:MM:SS" or "H:MM:SS") into integer seconds-since-midnight.
+ * Parses ET time strings ("HH:MM:SS", "H:MM:SS", or "H:MM AM/PM") into integer seconds-since-midnight.
  * Eliminates ASCII lexicographical comparison bugs (e.g. "9:45:00" > "15:55:00").
  */
 export function parseEtTimeSeconds(timeEt: string): number {
-  const parts = timeEt.trim().split(":").map(Number);
-  if (parts.length < 2 || parts.some((n) => !Number.isFinite(n))) {
+  const m = timeEt.trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+  if (!m) {
     return 0;
   }
-  const [hh, mm, ss = 0] = parts;
+  let hh = parseInt(m[1], 10);
+  const mm = parseInt(m[2], 10);
+  const ss = m[3] ? parseInt(m[3], 10) : 0;
+  const meridiem = m[4]?.toUpperCase();
+  if (!Number.isFinite(hh) || !Number.isFinite(mm) || !Number.isFinite(ss)) {
+    return 0;
+  }
+  if (meridiem === "PM" && hh < 12) hh += 12;
+  if (meridiem === "AM" && hh === 12) hh = 0;
   return (hh % 24) * 3600 + mm * 60 + ss;
 }
 
@@ -133,15 +146,8 @@ export function evaluateOcoBrackets(params: {
   const { bracket, config, currentNbbo, underlyingSpot, candle5m, nowEt, fluxContext } = params;
   const now = nowEt ?? new Date();
 
-  const etString = now.toLocaleTimeString("en-US", {
-    timeZone: "America/New_York",
-    hour12: false,
-    hourCycle: "h23",
-  });
-  const [rawHours, minutes, seconds = 0] = etString.split(":").map(Number);
-  const hours = rawHours % 24;
-  const totalMins = hours * 60 + minutes;
-  const totalSeconds = hours * 3600 + minutes * 60 + seconds;
+  const totalSeconds = etSecondsOfDay(now.getTime());
+  const totalMins = Math.floor(totalSeconds / 60);
 
   // Real-time PnL calculated from current BID (hitting the bid on exit) vs entry ASK
   const liveBid = Math.max(0.01, currentNbbo.bid);
@@ -166,13 +172,20 @@ export function evaluateOcoBrackets(params: {
   // 1. Arm Trailing Breakeven Stop if position gains >= 18%
   if (!updatedBracket.isTrailingBreakevenArmed && pnlPct >= 18) {
     updatedBracket.isTrailingBreakevenArmed = true;
-    updatedBracket.hardStopPrice = updatedBracket.breakevenStopPrice;
+    updatedBracket.hardStopPrice = Math.max(updatedBracket.hardStopPrice, updatedBracket.breakevenStopPrice);
+  }
+  if (updatedBracket.status === "PARTIAL_TP1_FILLED" && config.contractsQty === 1) {
+    const runnerFloor = Number((config.entryPrice * 1.10).toFixed(2));
+    if (liveBid > runnerFloor) {
+      updatedBracket.breakevenStopPrice = Math.max(updatedBracket.breakevenStopPrice, runnerFloor);
+      updatedBracket.hardStopPrice = Math.max(updatedBracket.hardStopPrice, runnerFloor);
+    }
   }
 
   // --------------------------------------------------------------------------
   // RULE 1: 15:55:00 ET Hard Market-On-Close Liquidation
   // --------------------------------------------------------------------------
-  if (totalSeconds >= 15 * 3600 + 55 * 60) {
+  if (totalSeconds >= EOD_FORCE_FLAT_MINS * 60) {
     updatedBracket.status = "CLOSED";
     const closingQty = updatedBracket.remainingContracts;
     updatedBracket.remainingContracts = 0;
@@ -292,6 +305,20 @@ export function evaluateOcoBrackets(params: {
         contractsToClose: 1,
         updatedBracket,
       };
+    } else {
+      // Aligned Boundary Flux runner: skip EXIT_TP1_FULL and ride toward TP2,
+      // ratcheting stop to BE + 10% (when liveBid clears it) so runner never turns into a full -25% loss.
+      const targetRunnerFloor = Number((config.entryPrice * 1.10).toFixed(2));
+      const safeRunnerFloor =
+        liveBid > targetRunnerFloor
+          ? targetRunnerFloor
+          : liveBid > config.entryPrice
+            ? config.entryPrice
+            : updatedBracket.hardStopPrice;
+      updatedBracket.status = "PARTIAL_TP1_FILLED";
+      updatedBracket.isTrailingBreakevenArmed = true;
+      updatedBracket.breakevenStopPrice = Math.max(updatedBracket.breakevenStopPrice, safeRunnerFloor);
+      updatedBracket.hardStopPrice = Math.max(updatedBracket.hardStopPrice, safeRunnerFloor);
     }
   }
 

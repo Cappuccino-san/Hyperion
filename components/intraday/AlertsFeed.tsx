@@ -46,27 +46,43 @@ export function AlertsFeed() {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
 
   // Tactical 0DTE / Next-Exp levels for intraday Pre-Trade Radar
-  // Anchors BTO Put triggers and Call triggers to 0DTE walls instead of distant all-expiration LEAPS outliers ($800)
+  // Anchors BTO Put triggers and Call triggers to 0DTE walls instead of distant all-expiration LEAPS outliers
   const zeroDteLevels = gammaLevelsByFilter?.["0DTE"] ?? gammaLevelsByFilter?.["THIS_WEEK"];
-  const currentSpot = spotPrice > 0 ? spotPrice : (getTickerPreset(activeTicker)?.spotPrice || 764);
+  const currentSpot = spotPrice > 0 ? spotPrice : (getTickerPreset(activeTicker)?.spotPrice || 0);
+  const strikeStep = useDashboardStore((state) => state.strikeStep) || 1;
+  const roundToStep = (v: number) =>
+    Number.isFinite(v) && strikeStep > 0
+      ? Number((Math.round(v / strikeStep) * strikeStep).toFixed(2))
+      : 0;
+  const fmtStrike = (v: number) =>
+    Number.isFinite(v) && v > 0
+      ? v % 1 !== 0
+        ? Number(v.toFixed(2)).toString()
+        : v.toFixed(0)
+      : "—";
 
   const tacticalCallWall =
     zeroDteLevels?.callWall && zeroDteLevels.callWall > 0
       ? zeroDteLevels.callWall
-      : gammaLevels?.callWall && spotPrice && Math.abs(gammaLevels.callWall - spotPrice) / spotPrice < 0.025
+      : gammaLevels?.callWall && spotPrice > 0 && Math.abs(gammaLevels.callWall - spotPrice) / spotPrice < 0.025
         ? gammaLevels.callWall
-        : Math.round(currentSpot * 1.008);
+        : currentSpot > 0
+          ? roundToStep(currentSpot * 1.008)
+          : 0;
 
   const rawTacticalPutWall =
     zeroDteLevels?.putWall && zeroDteLevels.putWall > 0
       ? zeroDteLevels.putWall
-      : gammaLevels?.putWall && spotPrice && Math.abs(spotPrice - gammaLevels.putWall) / spotPrice < 0.025
+      : gammaLevels?.putWall && spotPrice > 0 && Math.abs(spotPrice - gammaLevels.putWall) / spotPrice < 0.025
         ? gammaLevels.putWall
-        : Math.round(currentSpot * 0.992);
+        : currentSpot > 0
+          ? roundToStep(currentSpot * 0.992)
+          : 0;
 
-  // Sanitize distant multi-day Put Wall (> 0.95% below spot, e.g. $755 when SPY is $766) to nearest local negative-GEX node (e.g. $762)
+  // Sanitize distant multi-day Put Wall (> 0.95% below spot) to nearest local negative-GEX node
   const tacticalPutWall = React.useMemo(() => {
     if (
+      currentSpot > 0 &&
       rawTacticalPutWall > 0 &&
       (currentSpot - rawTacticalPutWall) / currentSpot > 0.0095 &&
       chainStrikes.length > 0 &&
@@ -75,8 +91,12 @@ export function AlertsFeed() {
       const nearExpId = chainExpirations[0].id;
       let bestStrike = 0;
       let minGex = 0;
+      const minStepOffset = Math.min(0.5, Math.max(0.05, currentSpot * 0.001));
       for (const row of chainStrikes) {
-        if (row.strike < currentSpot - 0.5 && (currentSpot - row.strike) / currentSpot <= 0.0095) {
+        if (
+          row.strike < currentSpot - minStepOffset &&
+          (currentSpot - row.strike) / currentSpot <= 0.0095
+        ) {
           const g = row.gex[nearExpId] ?? 0;
           if (g < minGex) {
             minGex = g;
@@ -94,10 +114,7 @@ export function AlertsFeed() {
       ? zeroDteLevels.zeroGamma
       : gammaLevels?.zeroGamma;
 
-  // Institutional 3-Tier Multi-Horizon Execution:
-  // Tier 1: Tactical Support & Resistance (0DTE Expected Move & Local Gamma Nodes: e.g. $762 & $767/$768)
-  // Tier 2: Midday Equilibrium Pivot (e.g. Strike $765 where gamma / VWAP sits)
-  // Tier 3: Macro Tail Boundaries (King / 0DTE Walls: e.g. $760 & $770)
+  // Institutional 3-Tier Multi-Horizon Execution
   const dailyEm = expectedMoves?.daily;
   const emLow = dailyEm && dailyEm.low > 0 ? dailyEm.low : 0;
   const emHigh = dailyEm && dailyEm.high > 0 ? dailyEm.high : 0;
@@ -116,37 +133,45 @@ export function AlertsFeed() {
     allExpKing;
   const hasZeroDte = kingNode?.hasZeroDte ?? allExpKingNode?.hasZeroDte ?? false;
 
-  const distToAllExpKing = allExpKing > 0 ? Math.abs(currentSpot - allExpKing) : 0;
+  const distToAllExpKing =
+    currentSpot > 0 && allExpKing > 0 ? Math.abs(currentSpot - allExpKing) : 0;
   const isDistantKingTrap =
+    currentSpot > 0 &&
     allExpKing > 0 &&
     tacticalKing > 0 &&
     allExpKing !== tacticalKing &&
     (distToAllExpKing > dailySigma * 0.85 || distToAllExpKing / currentSpot > 0.0095);
 
   const flowVwap = flowGammaVwapData?.flowVwap ?? 0;
-  const isAboveVwap = flowVwap > 0 ? currentSpot >= flowVwap : true;
+  const isAboveVwap = flowVwap > 0 && currentSpot > 0 ? currentSpot >= flowVwap : true;
 
   const tacticalSupport =
-    emLow > 0 && emLow > tacticalPutWall && Math.abs(currentSpot - emLow) / currentSpot < 0.02
-      ? Math.round(emLow)
-      : (currentSpot - tacticalPutWall) / currentSpot > 0.0095
-        ? Math.round(currentSpot * 0.9935)
-        : tacticalPutWall;
+    currentSpot <= 0
+      ? 0
+      : emLow > 0 && emLow > tacticalPutWall && Math.abs(currentSpot - emLow) / currentSpot < 0.02
+        ? roundToStep(emLow)
+        : (currentSpot - tacticalPutWall) / currentSpot > 0.0095
+          ? roundToStep(currentSpot * 0.9935)
+          : tacticalPutWall;
 
   const tacticalResistance =
-    tacticalKing > currentSpot && tacticalKing <= tacticalCallWall
-      ? tacticalKing
-      : emHigh > 0 && emHigh < tacticalCallWall && Math.abs(emHigh - currentSpot) / currentSpot < 0.02
-        ? Math.round(emHigh)
-        : tacticalCallWall;
+    currentSpot <= 0
+      ? 0
+      : tacticalKing > currentSpot && tacticalKing <= tacticalCallWall
+        ? tacticalKing
+        : emHigh > 0 && emHigh < tacticalCallWall && Math.abs(emHigh - currentSpot) / currentSpot < 0.02
+          ? roundToStep(emHigh)
+          : tacticalCallWall;
 
-  const pivotMid = Number(((tacticalSupport + tacticalResistance) / 2).toFixed(1));
+  const pivotMid = Number(((tacticalSupport + tacticalResistance) / 2).toFixed(2));
   const tacticalPivot =
-    tacticalZeroGamma && tacticalZeroGamma > tacticalSupport && tacticalZeroGamma < tacticalResistance
-      ? tacticalZeroGamma
-      : flowVwap > tacticalSupport && flowVwap < tacticalResistance
-        ? Number(flowVwap.toFixed(1))
-        : Math.round(pivotMid);
+    currentSpot <= 0
+      ? 0
+      : tacticalZeroGamma && tacticalZeroGamma > tacticalSupport && tacticalZeroGamma < tacticalResistance
+        ? tacticalZeroGamma
+        : flowVwap > tacticalSupport && flowVwap < tacticalResistance
+          ? Number(flowVwap.toFixed(2))
+          : roundToStep(pivotMid);
 
   // Directional Targets Invariant:
   // For CALL: entry at tacticalSupport, target 1 at tacticalPivot, target 2 at tacticalResistance.
@@ -162,8 +187,15 @@ export function AlertsFeed() {
   const serverTradeAlerts = useDashboardStore((state) => state.serverTradeAlerts);
   const fetchServerTrades = useDashboardStore((state) => state.fetchServerTrades);
 
-  const normalizedPosKey = activeTicker === "SPX" || activeTicker === "SPXW" ? "SPY" : activeTicker;
+  const upperTicker = activeTicker.toUpperCase();
+  const normalizedPosKey =
+    upperTicker === "SPX" || upperTicker === "SPXW"
+      ? "SPY"
+      : upperTicker === "NDX" || upperTicker === "NDXP"
+        ? "QQQ"
+        : upperTicker;
   const activePosition =
+    (serverActivePositions?.[upperTicker] as OptionTradePositionUI) ??
     (serverActivePositions?.[activeTicker] as OptionTradePositionUI) ??
     (serverActivePositions?.[normalizedPosKey] as OptionTradePositionUI) ??
     null;
@@ -176,7 +208,9 @@ export function AlertsFeed() {
       setRadarSending(true);
       const customUrl = discordConfig?.webhookUrl?.trim();
       const qs = customUrl ? `&webhookUrl=${encodeURIComponent(customUrl)}` : "";
-      await fetch(`/api/signals?action=send_radar${qs}`);
+      await fetch(
+        `/api/signals?action=send_radar&ticker=${encodeURIComponent(activeTicker)}${qs}`
+      );
       await fetchServerTrades(activeTicker);
     } catch {
       // ignore
@@ -219,6 +253,13 @@ export function AlertsFeed() {
       el.scrollTop = el.scrollHeight;
     }
   }, [combinedAlerts]);
+
+  const nearPinTolerance = Math.max(0.25, currentSpot * 0.002);
+  const bandOffset = roundToStep(Math.max(strikeStep, currentSpot * 0.0026));
+  const maxPutOtmOffset = roundToStep(
+    Math.max(strikeStep, Math.min(strikeStep * 3, currentSpot * 0.0045))
+  );
+  const roundedAtmStrike = roundToStep(currentSpot);
 
   return (
     <div className="argon-card rounded-xl p-4">
@@ -356,51 +397,57 @@ export function AlertsFeed() {
               <strong className="text-amber-400 uppercase tracking-wide">
                 ⚠️ Distant King Trap Guardrail:
               </strong>{" "}
-              All-Exp King <strong className="text-yellow-300">${allExpKing}</strong> is{" "}
+              All-Exp King <strong className="text-yellow-300">${fmtStrike(allExpKing)}</strong> is{" "}
               <strong>{distToAllExpKing.toFixed(1)} pts</strong> away on later expirations, while{" "}
               <strong className="text-cyan-300">
-                {hasZeroDte ? "0DTE" : "Next-Exp"} Tactical King is ${tacticalKing}
+                {hasZeroDte ? "0DTE" : "Next-Exp"} Tactical King is ${fmtStrike(tacticalKing)}
               </strong>
               .{" "}
-              {tacticalKing >= currentSpot - 1.5 && isAboveVwap
-                ? `Price is pinning toward $${tacticalKing} above VWAP — DO NOT short HOD or buy deep OTM $${allExpKing} Puts until 5m closes below SMA34 & $${tacticalPivot}!`
-                : `Trade local range ($${tacticalSupport}–$${tacticalResistance}) with ATM/1-OTM strikes ($${Math.round(currentSpot) - 2}–$${Math.round(currentSpot) + 2}); avoid deep OTM $${allExpKing} lottery strikes.`}
+              {tacticalKing >= currentSpot - nearPinTolerance && isAboveVwap
+                ? `Price is pinning toward $${fmtStrike(tacticalKing)} above VWAP — DO NOT short HOD or buy deep OTM $${fmtStrike(allExpKing)} Puts until 5m closes below SMA34 & $${fmtStrike(tacticalPivot)}!`
+                : `Trade local range ($${fmtStrike(tacticalSupport)}–$${fmtStrike(tacticalResistance)}) with ATM/1-OTM strikes ($${fmtStrike(roundedAtmStrike - bandOffset)}–$${fmtStrike(roundedAtmStrike + bandOffset)}); avoid deep OTM $${fmtStrike(allExpKing)} lottery strikes.`}
             </div>
           )}
 
-          <div className="mt-2 grid grid-cols-2 gap-2 text-[10.5px]">
-            <div className="rounded bg-black/25 p-2 border border-emerald-500/20">
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-emerald-400 font-bold text-[10px]">🟢 BTO CALL TRIGGER</span>
-                <span className="text-slate-400 text-[9px]">
-                  {tacticalKing >= currentSpot ? `Magnet Pull / Bounce` : `Bounce Setup`}
+          {currentSpot > 0 ? (
+            <div className="mt-2 grid grid-cols-2 gap-2 text-[10.5px]">
+              <div className="rounded bg-black/25 p-2 border border-emerald-500/20">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-emerald-400 font-bold text-[10px]">🟢 BTO CALL TRIGGER</span>
+                  <span className="text-slate-400 text-[9px]">
+                    {tacticalKing >= currentSpot ? "Magnet Pull / Bounce" : "Bounce Setup"}
+                  </span>
+                </div>
+                <span className="text-slate-200 block text-[11px] leading-tight">
+                  Support Bounce near <strong className="text-emerald-300">${fmtStrike(tacticalSupport)}</strong>{" "}
+                  or Hold above <strong className="text-emerald-300">${fmtStrike(tacticalPivot)}</strong>
+                </span>
+                <span className="text-slate-400 text-[9.5px] block mt-1">
+                  Target: ${callTarget1.toFixed(strikeStep < 1 ? 2 : 1)} / ${fmtStrike(callTarget2)} · Strike: ${fmtStrike(roundedAtmStrike)}C–${fmtStrike(roundToStep(callTarget2))}C
                 </span>
               </div>
-              <span className="text-slate-200 block text-[11px] leading-tight">
-                Support Bounce near <strong className="text-emerald-300">${tacticalSupport}</strong>{" "}
-                or Hold above <strong className="text-emerald-300">${tacticalPivot}</strong>
-              </span>
-              <span className="text-slate-400 text-[9.5px] block mt-1">
-                Target: ${callTarget1.toFixed(1)} / ${callTarget2} · Strike: ${Math.round(currentSpot)}C–${Math.round(callTarget2)}C
-              </span>
-            </div>
 
-            <div className="rounded bg-black/25 p-2 border border-purple-500/20">
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-purple-400 font-bold text-[10px]">🟣 BTO PUT TRIGGER</span>
-                <span className="text-slate-400 text-[9px]">
-                  {tacticalKing >= currentSpot - 1 && isAboveVwap ? "Wait for Breakdown" : "Rejection Setup"}
+              <div className="rounded bg-black/25 p-2 border border-purple-500/20">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-purple-400 font-bold text-[10px]">🟣 BTO PUT TRIGGER</span>
+                  <span className="text-slate-400 text-[9px]">
+                    {tacticalKing >= currentSpot - nearPinTolerance && isAboveVwap ? "Wait for Breakdown" : "Rejection Setup"}
+                  </span>
+                </div>
+                <span className="text-slate-200 block text-[11px] leading-tight">
+                  Rejection near <strong className="text-purple-300">${fmtStrike(tacticalResistance)}</strong>{" "}
+                  <span className="text-amber-300/90 text-[9.5px]">(Requires 5m &lt; SMA34)</span>
+                </span>
+                <span className="text-slate-400 text-[9.5px] block mt-1">
+                  Target: ${putTarget1.toFixed(strikeStep < 1 ? 2 : 1)} / ${fmtStrike(putTarget2)} · Max OTM: ${fmtStrike(Math.max(putTarget2, roundedAtmStrike - maxPutOtmOffset))}P
                 </span>
               </div>
-              <span className="text-slate-200 block text-[11px] leading-tight">
-                Rejection near <strong className="text-purple-300">${tacticalResistance}</strong>{" "}
-                <span className="text-amber-300/90 text-[9.5px]">(Requires 5m &lt; SMA34)</span>
-              </span>
-              <span className="text-slate-400 text-[9.5px] block mt-1">
-                Target: ${putTarget1.toFixed(1)} / ${putTarget2} · Max OTM: ${Math.max(putTarget2, Math.round(currentSpot) - 3)}P
-              </span>
             </div>
-          </div>
+          ) : (
+            <div className="mt-2 text-[10.5px] text-slate-400">
+              Syncing live quote &amp; tactical option structure...
+            </div>
+          )}
         </div>
       )}
 

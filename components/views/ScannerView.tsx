@@ -110,6 +110,8 @@ export function ScannerView() {
   const liveSpotPrice = useDashboardStore((state) => state.spotPrice);
   const liveKingNode = useDashboardStore((state) => state.kingNode);
   const liveNetGex = useDashboardStore((state) => state.netMetrics.netGex);
+  const isLoadingChain = useDashboardStore((state) => state.isLoadingChain);
+  const chainStrikesLen = useDashboardStore((state) => state.chainStrikes.length);
   const setTicker = useDashboardStore((state) => state.setTicker);
   const setActiveView = useDashboardStore((state) => state.setActiveView);
 
@@ -123,50 +125,66 @@ export function ScannerView() {
   const [searchQuery, setSearchQuery] = useState<string>("");
 
   useEffect(() => {
+    if (scannerMode !== "KING_NODES") return;
     let active = true;
-    const fetchScanner = async () => {
+    const controller = new AbortController();
+    const fetchScanner = async (isInitial = false) => {
+      if (!isInitial && typeof document !== "undefined" && document.visibilityState !== "visible") {
+        return;
+      }
       try {
-        const res = await fetch("/api/scanner", { cache: "no-store" });
+        const res = await fetch("/api/scanner", {
+          cache: "no-store",
+          signal: controller.signal,
+        });
         if (!res.ok) return;
         const j: ScannerData = await res.json();
-        if (active) {
+        if (active && !controller.signal.aborted) {
           setData(j);
           const slots = (j.scans || []).map((s) => s.slot);
-          if (slots.length > 0 && !slots.includes(curSlot)) {
-            setCurSlot(slots[slots.length - 1]);
+          if (slots.length > 0) {
+            setCurSlot((prev) => (slots.includes(prev) ? prev : slots[slots.length - 1]));
           }
           setIsLoading(false);
         }
       } catch {
-        if (active) setIsLoading(false);
+        if (active && !controller.signal.aborted) setIsLoading(false);
       }
     };
 
-    fetchScanner();
-    const interval = setInterval(fetchScanner, 15000);
+    void fetchScanner(true);
+    const interval = setInterval(() => {
+      void fetchScanner(false);
+    }, 15000);
     return () => {
       active = false;
+      controller.abort();
       clearInterval(interval);
     };
-  }, [curSlot]);
+  }, [scannerMode]);
 
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
     const fetchRadar = async () => {
       try {
-        const res = await fetch("/api/signals?radar=true", { cache: "no-store" });
+        const res = await fetch("/api/signals?radar=true", {
+          cache: "no-store",
+          signal: controller.signal,
+        });
         if (!res.ok) return;
         const j = await res.json();
-        if (active && Array.isArray(j?.radar?.setups)) {
+        if (active && !controller.signal.aborted && Array.isArray(j?.radar?.setups)) {
           setRadarSetups(j.radar.setups);
         }
       } catch {
         // Ignore transient radar fetch error
       }
     };
-    fetchRadar();
+    void fetchRadar();
     return () => {
       active = false;
+      controller.abort();
     };
   }, []);
 
@@ -175,6 +193,9 @@ export function ScannerView() {
 
   const rawRows = useMemo(() => {
     const base = activeScan?.rows ?? [];
+    if (isLoadingChain || chainStrikesLen === 0) {
+      return base;
+    }
     return base.map((r) => {
       if (r.t.toUpperCase() === activeTicker.toUpperCase() && liveSpotPrice > 0) {
         const king = liveKingNode.allExpKing;
@@ -194,7 +215,7 @@ export function ScannerView() {
       }
       return r;
     });
-  }, [activeScan, activeTicker, liveSpotPrice, liveKingNode, liveNetGex]);
+  }, [activeScan, activeTicker, liveSpotPrice, liveKingNode, liveNetGex, isLoadingChain, chainStrikesLen]);
 
   const filterCounts = useMemo(() => {
     return {

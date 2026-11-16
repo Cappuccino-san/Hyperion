@@ -12,7 +12,6 @@ import { recordIntradaySnapshot } from "@/lib/intradayHistory";
 import {
   evaluateTradeSignals,
   evaluateAllActivePositions,
-  getDailyTradeAlerts,
   loadTradeStore,
 } from "@/lib/tradeSignalEngine";
 import {
@@ -23,8 +22,17 @@ import {
   getEtClockNow,
 } from "@/lib/liveBotDaemon";
 import { globalTelemetry } from "@/lib/telemetry";
-
-import { optionsMemoryCache as memoryCache } from "@/lib/marketCache";
+import {
+  getTodayEt,
+  RTH_OPEN_MINS,
+  RTH_CLOSE_MINS,
+} from "@/lib/gaiaSessionGuards";
+import {
+  BoundedMap,
+  optionsMemoryCache as memoryCache,
+  sanitizeTickerSymbol,
+  setBoundedMapEntry,
+} from "@/lib/marketCache";
 
 export const dynamic = "force-dynamic";
 
@@ -33,26 +41,29 @@ const CACHE_TTL_MS = 10_000;
 
 const NO_EXT_SET = new Set(["SPX", "^SPX", "NDX", "^NDX", "SPXW", "NDXP"]);
 
-const openGexCache = new Map<
+const openGexCache = new BoundedMap<
   string,
   { day: string; map: Map<string, number> }
->();
+>(64);
 
 async function fetchOpenGexMap(
   ticker: string
 ): Promise<Map<string, number> | null> {
   const sym = ticker.toUpperCase();
-  const todayEt = new Date().toLocaleDateString("en-CA", {
-    timeZone: "America/New_York",
-  });
+  const todayEt = getTodayEt();
+  for (const [k, v] of Array.from(openGexCache.entries())) {
+    if (v.day !== todayEt) {
+      openGexCache.delete(k);
+    }
+  }
   const cached = openGexCache.get(sym);
   if (cached && cached.day === todayEt && cached.map.size > 0) {
     return cached.map;
   }
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2500);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 2500);
     const res = await fetch(
       `https://terrashade.onrender.com/api/gexhist?symbol=${encodeURIComponent(
         sym
@@ -63,7 +74,6 @@ async function fetchOpenGexMap(
         cache: "no-store",
       }
     );
-    clearTimeout(timeout);
     if (!res.ok) return null;
     const j = await res.json();
     const openObj = j?.open;
@@ -95,6 +105,8 @@ async function fetchOpenGexMap(
     return null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -120,6 +132,7 @@ async function fetchRealtimeSpotQuote(
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
         },
         cache: "no-store",
+        signal: AbortSignal.timeout(2200),
       }
     );
     if (rhRes.ok) {
@@ -147,9 +160,9 @@ async function fetchRealtimeSpotQuote(
         ? "^NDX"
         : sym;
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2200);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 2200);
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
       yahooSym
     )}?range=1d&interval=1m`;
@@ -161,7 +174,6 @@ async function fetchRealtimeSpotQuote(
       },
       cache: "no-store",
     });
-    clearTimeout(timeout);
     if (!res.ok) return null;
     const json = await res.json();
     const meta = json?.chart?.result?.[0]?.meta;
@@ -178,6 +190,8 @@ async function fetchRealtimeSpotQuote(
     return null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -187,13 +201,9 @@ async function fetchExtendedQuote(
 ): Promise<ExtendedQuoteInfo | null> {
   if (NO_EXT_SET.has(ticker.toUpperCase())) return null;
   try {
-    const nowEt = new Date(
-      new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
-    );
-    const mins = nowEt.getHours() * 60 + nowEt.getMinutes();
-    const wd = nowEt.getDay();
+    const { isWeekday, etMins: mins } = getEtClockNow();
     // During regular market hours (Mon-Fri 9:30 AM - 4:00 PM ET), no extended quote badge is shown
-    if (wd >= 1 && wd <= 5 && mins >= 570 && mins < 960) {
+    if (isWeekday && mins >= RTH_OPEN_MINS && mins < RTH_CLOSE_MINS) {
       return null;
     }
 
@@ -206,6 +216,7 @@ async function fetchExtendedQuote(
         "User-Agent": "Mozilla/5.0 (compatible; HyperionAnalytics/1.0)",
       },
       cache: "no-store",
+      signal: AbortSignal.timeout(2500),
     });
     if (!res.ok) return null;
     const json = await res.json();
@@ -214,7 +225,7 @@ async function fetchExtendedQuote(
     if (!meta) return null;
 
     const sessionType: "pre" | "after" =
-      wd >= 1 && wd <= 5 && mins >= 240 && mins < 570 ? "pre" : "after";
+      isWeekday && mins >= 240 && mins < RTH_OPEN_MINS ? "pre" : "after";
 
     let extPrice = Number(
       sessionType === "pre"
@@ -262,7 +273,7 @@ async function fetchTradierOptions(
 
   const quoteRes = await fetch(
     `https://api.tradier.com/v1/markets/quotes?symbols=${ticker}`,
-    { headers, cache: "no-store" }
+    { headers, cache: "no-store", signal: AbortSignal.timeout(5000) }
   );
   if (!quoteRes.ok) return null;
   const quoteJson = await quoteRes.json();
@@ -273,7 +284,7 @@ async function fetchTradierOptions(
 
   const expRes = await fetch(
     `https://api.tradier.com/v1/markets/options/expirations?symbol=${ticker}&includeAllRoots=true`,
-    { headers, cache: "no-store" }
+    { headers, cache: "no-store", signal: AbortSignal.timeout(5000) }
   );
   if (!expRes.ok) return null;
   const expJson = await expRes.json();
@@ -285,7 +296,7 @@ async function fetchTradierOptions(
       rawDates.map((exp) =>
         fetch(
           `https://api.tradier.com/v1/markets/options/chains?symbol=${ticker}&expiration=${exp}&greeks=true`,
-          { headers, cache: "no-store" }
+          { headers, cache: "no-store", signal: AbortSignal.timeout(5000) }
         ).then((r) => (r.ok ? r.json() : null))
       )
     ),
@@ -333,7 +344,7 @@ async function fetchTradierOptions(
 
   if (contracts.length === 0) return null;
 
-  contractsCache.set(ticker, contracts);
+  setBoundedMapEntry(contractsCache, ticker, contracts, 64);
   const impliedVolatility = ivCount > 0 ? ivSum / ivCount : 0.18;
 
   return computeOptionsAnalytics({
@@ -365,10 +376,11 @@ async function fetchCboeOptions(
   const startFetchTime = performance.now();
 
   const fetchWithTimeout = async (attempt = 1): Promise<Response | null> => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    let res: Response;
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
-      const res = await fetch(url, {
+      res = await fetch(url, {
         signal: controller.signal,
         headers: {
           Accept: "application/json",
@@ -377,14 +389,6 @@ async function fetchCboeOptions(
         },
         cache: "no-store",
       });
-      clearTimeout(timeout);
-      if (res.ok) return res;
-      if (attempt <= maxAttempts) {
-        const delay = backoffDelays[attempt - 1] ?? 4000;
-        await new Promise((r) => setTimeout(r, delay));
-        return fetchWithTimeout(attempt + 1);
-      }
-      return null;
     } catch {
       if (attempt <= maxAttempts) {
         const delay = backoffDelays[attempt - 1] ?? 4000;
@@ -392,7 +396,17 @@ async function fetchCboeOptions(
         return fetchWithTimeout(attempt + 1);
       }
       return null;
+    } finally {
+      clearTimeout(timeout);
     }
+
+    if (res.ok) return res;
+    if (attempt <= maxAttempts) {
+      const delay = backoffDelays[attempt - 1] ?? 4000;
+      await new Promise((r) => setTimeout(r, delay));
+      return fetchWithTimeout(attempt + 1);
+    }
+    return null;
   };
 
   const response = await fetchWithTimeout();
@@ -456,7 +470,7 @@ async function fetchCboeOptions(
 
   if (contracts.length === 0) return null;
 
-  contractsCache.set(ticker, contracts);
+  setBoundedMapEntry(contractsCache, ticker, contracts, 64);
   const extendedQuote = await fetchExtendedQuote(ticker, spotPrice);
 
   return computeOptionsAnalytics({
@@ -678,10 +692,8 @@ async function attachIntraday(
 export async function GET(request: NextRequest) {
   ensureLiveBotRunning();
   const { searchParams } = new URL(request.url);
-  const rawTicker = (searchParams.get("ticker") ?? "SPY").trim().toUpperCase();
+  const ticker = sanitizeTickerSymbol(searchParams.get("ticker"), "SPY");
   const forceRefresh = searchParams.get("force") === "true";
-
-  const ticker = /^[A-Z0-9._-]{1,10}$/.test(rawTicker) ? rawTicker : "SPY";
 
   if (!forceRefresh) {
     const cached = memoryCache.get(ticker);

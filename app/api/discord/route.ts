@@ -5,7 +5,7 @@ interface CachedEvent {
 }
 const dispatchedAlertsCache = new Map<string, CachedEvent>();
 
-export interface DiscordAlertRequestBody {
+interface DiscordAlertRequestBody {
   webhookUrl?: string;
   dryRun?: boolean;
   action?: "BUY_TO_OPEN" | "SELL_TO_CLOSE";
@@ -127,12 +127,11 @@ export async function POST(req: NextRequest) {
       const setupName = body.setupName || "System Setup";
       const btoSpot = body.btoSpotPrice ?? spot;
       const t1 = body.target1Spot ?? spot;
-      const t2 = body.target2Spot ?? spot;
       const sl = body.stopLossSpot ?? spot;
       const openedAt = body.openedAt || body.timestamp || "Now";
 
       const mid = body.btoOptionMid ?? 0.55;
-      const qty = body.contractsQty ?? (mid <= 0.5 ? 2 : 1);
+      const qty = body.contractsQty ?? 1;
       const totalRisk = body.totalOutlay ?? Number((mid * 100 * qty).toFixed(0));
 
       // Color: Emerald Green (0x10b981) for CALLS, Electric Violet (0x8b5cf6) for PUTS
@@ -164,7 +163,7 @@ export async function POST(req: NextRequest) {
         embeds: [
           {
             author: {
-              name: "Hyperion Sub-$1.00 Options Engine (1-2 Contracts Max)",
+              name: "Hyperion Sub-$1.00 Options Engine (1 Contract Max)",
             },
             title: `${emoji} BUY TO OPEN · ${ticker} ${contractType}S (${qty}x @ $${mid.toFixed(2)})`,
             description: `**Setup:** ${setupName}\n${
@@ -220,7 +219,7 @@ export async function POST(req: NextRequest) {
             ],
             timestamp: new Date().toISOString(),
             footer: {
-              text: "Hyperion · Sub-$1.00 Small Account Options Engine (1-2 Contracts Max)",
+              text: "Hyperion · Sub-$1.00 Small Account Options Engine (1 Contract Max)",
             },
           },
         ],
@@ -249,17 +248,14 @@ export async function POST(req: NextRequest) {
       const isWin = pnlOptionPct >= 0;
 
       let embedColor = isWin ? 0x10b981 : 0xef4444; // Green for win, Red for loss
-      let exitBadge = "🏁 POSITION CLOSED";
       let resultWord = isWin ? "CLOSED IN PROFIT" : "CLOSED AT LOSS";
       let resultEmoji = isWin ? "💰" : "🛑";
 
       if (reasonUpper.includes("TARGET 2") || reasonUpper.includes("FULL")) {
-        exitBadge = "🎯 TARGET 2 SMASHED";
         resultWord = "TAKE PROFIT HIT";
         resultEmoji = "💰";
         embedColor = 0x10b981;
       } else if (reasonUpper.includes("TARGET 1") || reasonUpper.includes("TP1") || reasonUpper.includes("TAKE PROFIT")) {
-        exitBadge = "🎯 TARGET 1 HIT";
         resultWord = "TAKE PROFIT HIT";
         resultEmoji = "💰";
         embedColor = 0x10b981;
@@ -269,12 +265,10 @@ export async function POST(req: NextRequest) {
         reasonUpper.includes("DIVERGENCE") ||
         reasonUpper.includes("SCRATCH")
       ) {
-        exitBadge = isWin ? "🔒 REVERSAL PROFIT LOCK" : "🔄 REGIME FLIP EXIT";
         resultWord = isWin ? "REVERSAL PROFIT LOCK" : "REGIME PROTECT EXIT";
         resultEmoji = isWin ? "🔒" : "🔄";
         embedColor = isWin ? 0x10b981 : 0x3b82f6;
       } else if (reasonUpper.includes("TRAIL") || reasonUpper.includes("PROFIT LOCK") || reasonUpper.includes("RATCHET") || reasonUpper.includes("LOCK PROFIT")) {
-        exitBadge = "🛡️ TRAILING PROFIT LOCKED";
         resultWord = "TRAILING PROFIT LOCKED";
         resultEmoji = "💰";
         embedColor = 0x10b981;
@@ -286,17 +280,14 @@ export async function POST(req: NextRequest) {
         reasonUpper.includes("CUTOFF") ||
         reasonUpper.includes("MARKET CLOSE")
       ) {
-        exitBadge = "⏰ 3:55 PM EOD MARKET CLOSE CUTOFF";
         resultWord = isWin ? "3:55 PM EOD PROFIT EXIT" : "3:55 PM EOD CUTOFF";
         resultEmoji = isWin ? "💰" : "⏰";
         embedColor = isWin ? 0x10b981 : 0xf59e0b;
       } else if (reasonUpper.includes("BREAKEVEN")) {
-        exitBadge = "⚪ BREAKEVEN STOP";
         resultWord = "BREAKEVEN STOP";
         resultEmoji = "⚪";
         embedColor = 0x94a3b8;
       } else {
-        exitBadge = "🛑 STOP LOSS HIT";
         resultWord = isWin ? "TRAILING STOP EXIT" : "STOP LOSS HIT";
         resultEmoji = isWin ? "💰" : "🛑";
         embedColor = isWin ? 0x10b981 : 0xef4444;
@@ -460,6 +451,7 @@ export async function POST(req: NextRequest) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8_000),
     });
 
     if (!discordRes.ok) {

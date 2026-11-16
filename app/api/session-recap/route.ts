@@ -61,6 +61,20 @@ export interface PortfolioRecapSummary {
   trades: PortfolioTradeRow[];
 }
 
+function firstPositiveNum(...vals: unknown[]): number | undefined {
+  for (const v of vals) {
+    if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
+  }
+  return undefined;
+}
+
+function firstFiniteNum(...vals: unknown[]): number | undefined {
+  for (const v of vals) {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+  }
+  return undefined;
+}
+
 function buildRollingPortfolioSummary(): PortfolioRecapSummary {
   const cacheDir = path.resolve(process.cwd(), ".cache");
   const trades: PortfolioTradeRow[] = [];
@@ -85,23 +99,36 @@ function buildRollingPortfolioSummary(): PortfolioRecapSummary {
 
         for (const p of closed) {
           const qty = Number(p.contractsQty) || 1;
-          const entryPx = Number(
-            p.btoOptionAsk ?? p.optionAsk ?? p.btoPrice ?? p.btoOptionMid ?? p.btoMid ?? 0.5
-          );
-          const exitPx = Number(p.closedOptionBid ?? p.stcPrice ?? p.closedOptionMid ?? 0);
-          const outlay = Number(p.totalOutlay ?? Math.round(entryPx * 100 * qty));
+          const entryPx =
+            firstPositiveNum(
+              p.btoOptionAsk,
+              p.optionAsk,
+              p.btoPrice,
+              p.btoOptionMid,
+              p.btoMid
+            ) ?? 0.5;
+          const exitPx =
+            firstFiniteNum(p.closedOptionBid, p.stcPrice, p.closedOptionMid) ?? 0;
+          const outlay =
+            entryPx > 0
+              ? Number((entryPx * 100 * qty).toFixed(2))
+              : Number(p.totalOutlay ?? 0);
           const realizedDollarPnl = Number(
-            (p.realizedPnlDollars ?? p.pnlDollars ?? (exitPx - entryPx) * 100 * qty).toFixed(2)
+            (
+              firstFiniteNum(p.realizedPnlDollars, p.pnlDollars) ??
+              (exitPx - entryPx) * 100 * qty
+            ).toFixed(2)
           );
           const pnlOptionPct = Number(
             (
-              p.pnlOptionPct ??
-              p.realizedPnlPct ??
+              firstFiniteNum(p.pnlOptionPct, p.realizedPnlPct) ??
               (entryPx > 0 ? ((exitPx - entryPx) / entryPx) * 100 : 0)
             ).toFixed(1)
           );
           const riskDollars = Math.max(10, outlay * 0.25);
-          const rMultiple = Number((p.realizedR ?? realizedDollarPnl / riskDollars).toFixed(2));
+          const rMultiple = Number(
+            (firstFiniteNum(p.realizedR) ?? realizedDollarPnl / riskDollars).toFixed(2)
+          );
 
           if (realizedDollarPnl > 0) dayWins++;
           else if (realizedDollarPnl < 0) dayLosses++;
@@ -222,8 +249,18 @@ function buildRollingPortfolioSummary(): PortfolioRecapSummary {
 
 export async function GET(req: Request) {
   try {
+    const { searchParams } = new URL(req.url);
+    const rawDay = searchParams.get("day")?.trim() || "";
+    const requestedDay = /^\d{4}-\d{2}-\d{2}$/.test(rawDay) ? rawDay : "";
+
     const portfolio = buildRollingPortfolioSummary();
     const possiblePaths = [
+      ...(requestedDay
+        ? [
+            path.resolve(process.cwd(), `scratch/terrashade/api_recap_${requestedDay}.json`),
+            path.resolve(process.cwd(), `.cache/terrashade/api_recap_${requestedDay}.json`),
+          ]
+        : []),
       path.resolve(process.cwd(), "scratch/terrashade/api_recap.json"),
       path.resolve(process.cwd(), ".cache/terrashade/api_recap.json"),
       ...(process.env.SESSION_RECAP_PATH ? [path.resolve(process.env.SESSION_RECAP_PATH)] : []),
@@ -232,14 +269,17 @@ export async function GET(req: Request) {
     for (const p of possiblePaths) {
       if (fs.existsSync(p)) {
         const parsed = JSON.parse(fs.readFileSync(p, "utf-8"));
-        return NextResponse.json(
-          { ...parsed, portfolio },
-          { headers: { "Cache-Control": "no-store" } }
-        );
+        if (!requestedDay || parsed?.day === requestedDay || parsed?.recap?.day === requestedDay) {
+          return NextResponse.json(
+            { ...parsed, portfolio },
+            { headers: { "Cache-Control": "no-store" } }
+          );
+        }
       }
     }
 
     const latestDay =
+      requestedDay ||
       portfolio.daysWithTrades[portfolio.daysWithTrades.length - 1] ||
       new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
 

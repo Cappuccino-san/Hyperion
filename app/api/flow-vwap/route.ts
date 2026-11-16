@@ -8,8 +8,7 @@ import {
   NormalizedOptionContract,
   parseOccSymbol,
 } from "@/lib/optionsExposure";
-import { optionsMemoryCache } from "@/lib/marketCache";
-import { getTickerPreset } from "@/lib/tickerPresets";
+import { sanitizeTickerSymbol, setBoundedMapEntry } from "@/lib/marketCache";
 
 export const dynamic = "force-dynamic";
 
@@ -50,6 +49,7 @@ async function fetchIntradayCandles(
         "User-Agent": "Mozilla/5.0 (compatible; HyperionAnalytics/1.0)",
       },
       cache: "no-store",
+      signal: AbortSignal.timeout(5000),
     });
 
     if (!res.ok) {
@@ -107,12 +107,13 @@ async function fetchIntradayCandles(
         const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
           headers: { "User-Agent": "Mozilla/5.0" },
           cache: "no-store",
+          signal: AbortSignal.timeout(2500),
         });
         if (rhRes.ok) {
           const rhJson = await rhRes.json();
           const p = Number(rhJson?.results?.[0]?.last_trade_price ?? rhJson?.results?.[0]?.bid_price ?? 0);
           if (p > 0 && Number.isFinite(p)) {
-            const mult = sym === "SPX" || sym === "SPXW" ? 10 : 1;
+            const mult = sym === "SPX" || sym === "SPXW" ? 10 : sym === "NDX" || sym === "NDXP" ? 40 : 1;
             const liveP = Number((p * mult).toFixed(2));
             const lastBar = bars[bars.length - 1];
             lastBar.close = liveP;
@@ -150,9 +151,9 @@ async function getOrFetchOptionContracts(
       ? "_NDX"
       : ticker.toUpperCase();
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
     const url = `https://cdn.cboe.com/api/global/delayed_quotes/options/${cboeSymbol}.json`;
 
     const res = await fetch(url, {
@@ -164,7 +165,6 @@ async function getOrFetchOptionContracts(
       },
       cache: "no-store",
     });
-    clearTimeout(timeout);
 
     if (res.ok) {
       const json = await res.json();
@@ -199,13 +199,15 @@ async function getOrFetchOptionContracts(
         }
 
         if (contracts.length > 0) {
-          globalContractsCache.set(ticker.toUpperCase(), contracts);
+          setBoundedMapEntry(globalContractsCache, ticker.toUpperCase(), contracts, 64);
           return contracts;
         }
       }
     }
   } catch {
     // Non-fatal, fallback to empty/simulated
+  } finally {
+    clearTimeout(timeout);
   }
 
   return [];
@@ -214,7 +216,7 @@ async function getOrFetchOptionContracts(
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
-    const ticker = (searchParams.get("ticker") || "SPY").trim().toUpperCase();
+    const ticker = sanitizeTickerSymbol(searchParams.get("ticker"), "SPY");
     const timeframe = (searchParams.get("timeframe") || "5m").trim().toLowerCase();
 
     const [candles, contracts] = await Promise.all([

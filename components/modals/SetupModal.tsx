@@ -21,12 +21,7 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
   const kingNode = useDashboardStore((state) => state.kingNode);
 
   const [url, setUrl] = useState(discordConfig.webhookUrl || "");
-  const [enabled, setEnabled] = useState(discordConfig.enabled ?? true);
-  const [notifyWalls, setNotifyWalls] = useState(discordConfig.notifyWalls ?? true);
-  const [notifyZeroGamma, setNotifyZeroGamma] = useState(
-    discordConfig.notifyZeroGamma ?? true
-  );
-  const [notifyKing, setNotifyKing] = useState(discordConfig.notifyKing ?? true);
+  const [enabled, setEnabled] = useState(discordConfig.enabled ?? false);
 
   const [testState, setTestState] = useState<"idle" | "sending" | "success" | "error">(
     "idle"
@@ -37,10 +32,7 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
   useEffect(() => {
     if (open) {
       setUrl(discordConfig.webhookUrl || "");
-      setEnabled(discordConfig.enabled ?? true);
-      setNotifyWalls(discordConfig.notifyWalls ?? true);
-      setNotifyZeroGamma(discordConfig.notifyZeroGamma ?? true);
-      setNotifyKing(discordConfig.notifyKing ?? true);
+      setEnabled(discordConfig.enabled ?? false);
       setTestState("idle");
       setTestMessage(null);
     }
@@ -50,9 +42,6 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
     updateDiscordConfig({
       webhookUrl: url.trim(),
       enabled,
-      notifyWalls,
-      notifyZeroGamma,
-      notifyKing,
     });
     onOpenChange(false);
   };

@@ -9,12 +9,11 @@ import {
 } from "@/lib/flowGammaVwap";
 import {
   drawFlowGammaVwapOverlay,
-  ConfluenceLevel,
 } from "@/components/chart/FlowGammaVwapOverlay";
 import {
   GaiaCallPutBiasHud,
-  type GaiaHudTradeSignal,
 } from "@/components/gaia/GaiaCallPutBiasHud";
+import { toEpochSec } from "@/lib/gaiaSessionGuards";
 import type {
   GaiaExpirationInfo,
   GaiaIntradayCandle,
@@ -180,30 +179,6 @@ function evaluateBucketExposureM(
   if (mode === "GEX") return netGexM;
   if (mode === "VEX") return netVexM;
   return netGexM + netVexM;
-}
-
-interface DivergenceSignal {
-  type: string;
-  p1: number;
-  p2: number;
-  t1: number;
-  t2: number;
-  near?: [string, number][];
-}
-
-interface DivergenceRow {
-  tf: string;
-  name: string;
-  state: string;
-  signal: DivergenceSignal | null;
-  building?: boolean;
-  intraday?: boolean;
-}
-
-interface DivergencePayload {
-  symbol: string;
-  rows: DivergenceRow[];
-  levels: { King: number; "Call wall": number; "Put wall": number };
 }
 
 function getCandleEtMinutes(c: { timestamp?: number; timeLabel?: string }): number | null {
@@ -553,7 +528,7 @@ function buildLiveGaiaDataset(
   ];
   const minPrice = Math.min(...allDomainPrices);
   const maxPrice = Math.max(...allDomainPrices);
-  const padPts = Math.max(1.5, (maxPrice - minPrice) * 0.06);
+  const padPts = Math.max(Math.max(0.05, priorClose * 0.002), (maxPrice - minPrice) * 0.06);
   const yMin = Number((minPrice - padPts).toFixed(2));
   const yMax = Number((maxPrice + padPts).toFixed(2));
 
@@ -585,14 +560,10 @@ function buildLiveGaiaDataset(
 
 export function GaiaView() {
   const storeTicker = useDashboardStore((state) => state.activeTicker);
-  const storeSpotPrice = useDashboardStore((state) => state.spotPrice);
   const gammaLevels = useDashboardStore((state) => state.gammaLevels);
   const setStoreTicker = useDashboardStore((state) => state.setTicker);
   const liveTickPrice = useDashboardStore((state) => state.liveTickPrice);
   const liveTickCount = useDashboardStore((state) => state.liveTickCount);
-  const fetchOptionsChain = useDashboardStore(
-    (state) => state.fetchOptionsChain
-  );
   const storeActivePositions = useDashboardStore(
     (state) => state.serverActivePositions
   );
@@ -601,9 +572,6 @@ export function GaiaView() {
   );
   const storeTradeAlerts = useDashboardStore(
     (state) => state.serverTradeAlerts
-  );
-  const setStoreServerTrades = useDashboardStore(
-    (state) => state.setServerTrades
   );
 
   const [serverTrades, setServerTrades] = useState<ServerTradesState>({
@@ -620,11 +588,11 @@ export function GaiaView() {
   const [loadedTicker, setLoadedTicker] = useState<string>(storeTicker || "SPY");
   const [guideExpanded, setGuideExpanded] = useState<boolean>(false);
   const [selectedSessionIso, setSelectedSessionIso] = useState<string>("");
-  const [hudTradeSignals, setHudTradeSignals] = useState<GaiaHudTradeSignal[]>([]);
   const [przmHudSignals, setPrzmHudSignals] = useState<any[]>([]);
 
   useEffect(() => {
     setPrzmHudSignals([]);
+    setServerTrades({ activePositions: {}, closedPositions: [], alerts: [] });
   }, [loadedTicker]);
 
   const [livePayload, setLivePayload] = useState<GaiaLivePayload | null>(
@@ -636,7 +604,6 @@ export function GaiaView() {
   const [exposureMode, setExposureMode] = useState<ExposureMode>("GEX");
   const [expFilter, setExpFilter] = useState<ExpFilterMode>("ALL");
   const [selectedDateExp, setSelectedDateExp] = useState<string>("");
-  const [pathToKing, setPathToKing] = useState<boolean>(true);
 
   // Chart Layout Metrics (Unified constants across canvas draw & pointer projection)
   const CHART_PAD_LEFT = 24;
@@ -651,7 +618,7 @@ export function GaiaView() {
   const [replaySpeed, setReplaySpeed] = useState<1 | 2 | 4>(1);
   const isHistoricalOrReplay = isReplaying || isReplayFrozen || Boolean(selectedSessionIso);
   const effectiveServerTrades: ServerTradesState = useMemo(() => {
-    if (isHistoricalOrReplay) {
+    if (selectedSessionIso) {
       return {
         activePositions: serverTrades.activePositions || {},
         closedPositions: serverTrades.closedPositions || [],
@@ -659,20 +626,11 @@ export function GaiaView() {
       };
     }
     return {
-      activePositions:
-        serverTrades.activePositions && Object.keys(serverTrades.activePositions).length > 0
-          ? serverTrades.activePositions
-          : storeActivePositions,
-      closedPositions:
-        serverTrades.closedPositions && serverTrades.closedPositions.length > 0
-          ? serverTrades.closedPositions
-          : storeClosedTrades,
-      alerts:
-        serverTrades.alerts && serverTrades.alerts.length > 0
-          ? serverTrades.alerts
-          : storeTradeAlerts,
+      activePositions: storeActivePositions,
+      closedPositions: storeClosedTrades,
+      alerts: storeTradeAlerts,
     };
-  }, [isHistoricalOrReplay, serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts]);
+  }, [selectedSessionIso, serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts]);
   const storeHeatmapKingNode = useDashboardStore((s) => s.kingNode);
   const storeHeatmapTicker = useDashboardStore((s) => s.activeTicker);
   const isReplayingRef = useRef<boolean>(false);
@@ -690,8 +648,6 @@ export function GaiaView() {
     url.searchParams.set("ticker", upper);
     window.history.replaceState(null, "", url.pathname + url.search + url.hash);
   }, []);
-  const [openDivTf, setOpenDivTf] = useState<string | null>(null);
-  const [divPayload, setDivPayload] = useState<DivergencePayload | null>(null);
 
   // Adjustable Chart Window States (Horizontal & Vertical)
   const [chartHeight, setChartHeight] = useState<number>(540); // 380 .. 950 px
@@ -746,9 +702,21 @@ export function GaiaView() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [canvasWidth, setCanvasWidth] = useState<number>(1016);
+  const gaiaAbortRef = useRef<AbortController | null>(null);
+  const gaiaReqSeqRef = useRef<number>(0);
+
+  useEffect(() => {
+    return () => {
+      gaiaAbortRef.current?.abort();
+    };
+  }, []);
 
   const fetchLiveGaia = useCallback(
     async (tickerSymbol: string, sessionIso?: string, sHour: number = startHour, silent: boolean = false) => {
+      gaiaAbortRef.current?.abort();
+      const controller = new AbortController();
+      gaiaAbortRef.current = controller;
+      const reqSeq = ++gaiaReqSeqRef.current;
       if (!silent) {
         setIsLoading(true);
       }
@@ -761,11 +729,13 @@ export function GaiaView() {
         if (sessionIso) qs.set("session", sessionIso);
         const res = await fetch(`/api/gaia?${qs.toString()}`, {
           cache: "no-store",
+          signal: controller.signal,
         });
         const data = await res.json();
         if (!res.ok || data?.error) {
           throw new Error(data?.error ?? `HTTP ${res.status}`);
         }
+        if (controller.signal.aborted || reqSeq !== gaiaReqSeqRef.current) return;
         const payload = data as GaiaLivePayload;
         setLivePayload(payload);
         if (!isReplayingRef.current && !isReplayFrozenRef.current) {
@@ -773,6 +743,7 @@ export function GaiaView() {
         }
         setHoverBarIndex(null);
       } catch (err) {
+        if (controller.signal.aborted || reqSeq !== gaiaReqSeqRef.current) return;
         if (!silent) {
           const msg =
             err instanceof Error
@@ -781,7 +752,7 @@ export function GaiaView() {
           setErrorMsg(msg);
         }
       } finally {
-        if (!silent) {
+        if (!silent && reqSeq === gaiaReqSeqRef.current) {
           setIsLoading(false);
         }
       }
@@ -801,7 +772,7 @@ export function GaiaView() {
         setTickerInput(urlTicker);
         setLoadedTicker(urlTicker);
         setStoreTicker(urlTicker);
-        fetchOptionsChain(urlTicker, true);
+        setLivePayload(null);
         isReplayingRef.current = false;
         setIsReplaying(false);
         isReplayFrozenRef.current = false;
@@ -812,7 +783,7 @@ export function GaiaView() {
     };
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
-  }, [loadedTicker, setStoreTicker, fetchOptionsChain, resetViewportTo24H]);
+  }, [loadedTicker, setStoreTicker, resetViewportTo24H]);
 
   // Initial load and sync when global store ticker changes externally
   useEffect(() => {
@@ -821,6 +792,7 @@ export function GaiaView() {
       if (storeTicker && storeTicker !== loadedTicker) {
         setTickerInput(storeTicker);
         setLoadedTicker(storeTicker);
+        setLivePayload(null);
         setSelectedSessionIso("");
         isReplayingRef.current = false;
         setIsReplaying(false);
@@ -844,13 +816,13 @@ export function GaiaView() {
         setTickerInput(urlTicker);
         setLoadedTicker(urlTicker);
         setStoreTicker(urlTicker);
-        fetchOptionsChain(urlTicker, true);
+        setLivePayload(null);
         return;
       }
       syncTickerUrlParam(loadedTicker);
     }
     fetchLiveGaia(loadedTicker, selectedSessionIso, startHour, false);
-  }, [loadedTicker, selectedSessionIso, startHour, fetchLiveGaia, setStoreTicker, fetchOptionsChain, syncTickerUrlParam]);
+  }, [loadedTicker, selectedSessionIso, startHour, fetchLiveGaia, setStoreTicker, syncTickerUrlParam]);
 
   useEffect(() => {
     if (!isReplaying && !isReplayFrozen && !selectedSessionIso) {
@@ -870,8 +842,16 @@ export function GaiaView() {
   // Instant 800ms tick reactivity for GaiaView livePayload spot & candle tip
   useEffect(() => {
     if (!liveTickPrice || liveTickPrice <= 0 || isReplaying || isReplayFrozen || Boolean(selectedSessionIso)) return;
+    if (storeTicker.toUpperCase() !== loadedTicker.toUpperCase()) return;
     setLivePayload((prev) => {
-      if (!prev || isReplayingRef.current || isReplayFrozenRef.current) return prev;
+      if (
+        !prev ||
+        prev.ticker.toUpperCase() !== loadedTicker.toUpperCase() ||
+        isReplayingRef.current ||
+        isReplayFrozenRef.current
+      ) {
+        return prev;
+      }
       const candles = prev.candles;
       if (!candles || candles.length === 0) return prev;
       const lastCandle = candles[candles.length - 1];
@@ -890,27 +870,7 @@ export function GaiaView() {
         candles: updatedCandles,
       };
     });
-  }, [liveTickPrice, liveTickCount, isReplaying, isReplayFrozen, selectedSessionIso]);
-
-  useEffect(() => {
-    const sym = loadedTicker.toUpperCase();
-    if (!DIVSYM.has(sym)) {
-      setDivPayload(null);
-      return;
-    }
-    let active = true;
-    fetch(`/api/divergence?symbol=${encodeURIComponent(sym)}`, { cache: "no-store" })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (active && data && Array.isArray(data.rows)) {
-          setDivPayload(data as DivergencePayload);
-        }
-      })
-      .catch(() => {});
-    return () => {
-      active = false;
-    };
-  }, [loadedTicker, DIVSYM]);
+  }, [liveTickPrice, liveTickCount, isReplaying, isReplayFrozen, selectedSessionIso, storeTicker, loadedTicker]);
 
   // Observe chart container width for responsive high-DPI canvas rendering
   useEffect(() => {
@@ -963,7 +923,7 @@ export function GaiaView() {
     if (candles && candles.length > 0) {
       const lastTs = candles[candles.length - 1]?.timestamp;
       if (typeof lastTs === "number" && Number.isFinite(lastTs) && lastTs > 0) {
-        const tsMs = lastTs > 1e11 ? lastTs : lastTs * 1000;
+        const tsMs = toEpochSec(lastTs) * 1000;
         return new Intl.DateTimeFormat("en-CA", {
           timeZone: "America/New_York",
           year: "numeric",
@@ -976,10 +936,15 @@ export function GaiaView() {
     return fallback && /^\d{4}-\d{2}-\d{2}$/.test(fallback) ? fallback : undefined;
   }, [dataset?.candles, dataset?.sessionDate, selectedSessionIso, livePayload?.sessionDate]);
 
-  // Dynamic Trade Signals Engine Hook for Gaia HUD & Canvas Execution Markers
+  // Historical Session Trade Signals Hook (live session uses GlobalMarketDataSync store state)
   useEffect(() => {
+    if (!selectedSessionIso) {
+      setServerTrades({ activePositions: {}, closedPositions: [], alerts: [] });
+      return;
+    }
     if (isReplaying || isReplayFrozen) return;
     let isMounted = true;
+    const controller = new AbortController();
     async function fetchSignals() {
       try {
         const dateParam = chartSessionDate ? `&date=${encodeURIComponent(chartSessionDate)}` : "";
@@ -987,51 +952,28 @@ export function GaiaView() {
           `/api/signals?ticker=${encodeURIComponent(loadedTicker)}${dateParam}`,
           {
             cache: "no-store",
+            signal: controller.signal,
           }
         );
         if (!res.ok) return;
         const data = await res.json();
-        if (isMounted && data) {
-          const payload: ServerTradesState = {
+        if (isMounted && !controller.signal.aborted && data) {
+          setServerTrades({
             activePositions: data.activePositions || {},
             closedPositions: data.closedPositions || [],
             alerts: data.alerts || [],
-          };
-          setServerTrades(payload);
-          if (!selectedSessionIso) {
-            setStoreServerTrades(payload);
-          }
-
-          if (Array.isArray(data.alerts)) {
-            const mapped: GaiaHudTradeSignal[] = data.alerts
-              .filter(
-                (a: any) =>
-                  a.action === "BUY_TO_OPEN" &&
-                  !a.setupName?.includes("Gaia Tactical HUD") &&
-                  !a.id?.startsWith("gaia-")
-              )
-              .map((a: any) => ({
-                timestamp: (a.ts || 0) * 1000,
-                action: a.action,
-                contractType: a.contractType,
-                spotPrice: a.btoSpotPrice || a.spotPrice,
-                setupName: a.setupName,
-                isWin: a.status === "TARGET_HIT" || (a.pnlOptionPct && a.pnlOptionPct > 0),
-              }));
-            setHudTradeSignals(mapped);
-          }
+          });
         }
       } catch {
         // Silent fallback
       }
     }
-    fetchSignals();
-    const interval = setInterval(fetchSignals, 5000);
+    void fetchSignals();
     return () => {
       isMounted = false;
-      clearInterval(interval);
+      controller.abort();
     };
-  }, [loadedTicker, chartSessionDate, selectedSessionIso, isReplaying, isReplayFrozen, setStoreServerTrades]);
+  }, [loadedTicker, chartSessionDate, selectedSessionIso, isReplaying, isReplayFrozen]);
 
   const flowVwapPoints = useMemo<FlowGammaVwapSnapshot[]>(() => {
     if (!dataset?.candles || dataset.candles.length === 0) return [];
@@ -1078,7 +1020,9 @@ export function GaiaView() {
           ? storeHeatmapKingNode.zeroDteKing
           : expFilter === "WEEK" && storeHeatmapKingNode.weeklyKing
             ? storeHeatmapKingNode.weeklyKing
-            : storeHeatmapKingNode.allExpKing || lastCol?.filteredKingStrike || 0
+            : expFilter === "ALL"
+              ? storeHeatmapKingNode.allExpKing || lastCol?.filteredKingStrike || 0
+              : lastCol?.filteredKingStrike ?? 0
         : (lastCol?.filteredKingStrike ?? 0);
     const activeKing = expFilter === "ALL" ? allExpKingStrike : (filteredKingStrike || allExpKingStrike);
     const apiCallWall = allowLiveStoreOverlay ? (gammaLevels?.callWall ?? 0) : 0;
@@ -1086,7 +1030,7 @@ export function GaiaView() {
     const apiZeroGamma = allowLiveStoreOverlay ? (gammaLevels?.zeroGamma ?? 0) : 0;
 
     // Include structural gamma walls/kings within ±1.75σ so key pins are never culled
-    const maxStructuralReach = Math.max(4.0, dataset.sigma1Move * 1.75);
+    const maxStructuralReach = Math.max(Math.max(0.05, spot * 0.005), dataset.sigma1Move * 1.75);
     const nearStructuralNodes = [
       allExpKingStrike,
       activeKing,
@@ -1136,9 +1080,9 @@ export function GaiaView() {
 
     const minP = Math.min(...anchorPrices);
     const maxP = Math.max(...anchorPrices);
-    const rawSpan = Math.max(2.0, maxP - minP);
+    const rawSpan = Math.max(Math.max(0.05, spot * 0.0025), maxP - minP);
     const pad = Math.max(
-      2.5,
+      Math.max(0.05, spot * 0.003),
       rawSpan * (scopePreset === "focus" ? 0.14 : 0.12)
     );
 
@@ -1153,7 +1097,7 @@ export function GaiaView() {
     const yAxisTicks = computeNicePriceTicks(yMin, yMax, 6);
 
     return { yMin, yMax, yAxisTicks };
-  }, [dataset, scopePreset, expFilter, gammaLevels, yScale, yPanOffset, isReplaying, storeHeatmapTicker, loadedTicker, storeHeatmapKingNode]);
+  }, [dataset, scopePreset, expFilter, gammaLevels, yScale, yPanOffset, isReplaying, isReplayFrozen, activeBarIndex, selectedSessionIso, storeHeatmapTicker, loadedTicker, storeHeatmapKingNode]);
 
   const handleLoadTicker = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -1161,7 +1105,6 @@ export function GaiaView() {
     prevStoreTickerRef.current = cleaned;
     setTickerInput(cleaned);
     setStoreTicker(cleaned);
-    fetchOptionsChain(cleaned, true);
     isReplayingRef.current = false;
     setIsReplaying(false);
     isReplayFrozenRef.current = false;
@@ -1170,6 +1113,7 @@ export function GaiaView() {
     resetViewportTo24H();
     syncTickerUrlParam(cleaned);
     if (cleaned !== loadedTicker) {
+      setLivePayload(null);
       setLoadedTicker(cleaned);
     } else {
       fetchLiveGaia(cleaned, "", startHour, false);
@@ -1196,7 +1140,6 @@ export function GaiaView() {
     setExposureMode("GEX");
     setExpFilter("ALL");
     setSelectedDateExp("");
-    setPathToKing(true);
     setStartHour(0);
     isReplayingRef.current = false;
     setIsReplaying(false);
@@ -1251,6 +1194,7 @@ export function GaiaView() {
     setIsReplaying(false);
     isReplayFrozenRef.current = false;
     setIsReplayFrozen(false);
+    setSelectedSessionIso("");
     setActiveBarIndex(maxBarIdx);
     setHoverBarIndex(null);
   };
@@ -1403,7 +1347,7 @@ export function GaiaView() {
     for (let i = 0; i <= safeActiveIdx; i++) {
       const c = dataset.candles[i];
       const etMins = c ? getCandleEtMinutes(c) : null;
-      const slotIdx = etMins !== null && etMins >= axisStartMins ? (etMins - axisStartMins) / 5 : i;
+      const slotIdx = etMins !== null ? (etMins - axisStartMins) / 5 : i;
       const cx = padLeft + xPanOffset + (slotIdx + 0.5) * stepX;
       const d = Math.abs(cx - mouseX);
       if (d < bestDist) {
@@ -1451,7 +1395,6 @@ export function GaiaView() {
 
   const handleCanvasKeyDown = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
     if (!dataset || dataset.candles.length === 0) return;
-    const maxIdx = dataset.candles.length - 1;
 
     if (e.key === "ArrowLeft") {
       e.preventDefault();
@@ -1544,7 +1487,7 @@ export function GaiaView() {
   const liveBarIdx = dataset && dataset.candles.length > 0 ? dataset.candles.length - 1 : 0;
   const structuralBarIdx = (isReplaying || isReplayFrozen) ? Math.min(safeActiveIdx, liveBarIdx) : liveBarIdx;
   const structuralBookCol = dataset?.columnsByBar[structuralBarIdx] ?? activeBookCol;
-  const isLiveHeatmapSynced = !(isReplaying || isReplayFrozen) && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
+  const isLiveHeatmapSynced = !(isReplaying || isReplayFrozen || Boolean(selectedSessionIso)) && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
   const liveAllExpKingStrike =
     isLiveHeatmapSynced && storeHeatmapKingNode && storeHeatmapKingNode.allExpKing > 0
       ? storeHeatmapKingNode.allExpKing
@@ -1555,15 +1498,10 @@ export function GaiaView() {
         ? storeHeatmapKingNode.zeroDteKing
         : expFilter === "WEEK" && storeHeatmapKingNode.weeklyKing
           ? storeHeatmapKingNode.weeklyKing
-          : storeHeatmapKingNode.allExpKing || structuralBookCol?.filteredKingStrike || 0
+          : expFilter === "ALL"
+            ? storeHeatmapKingNode.allExpKing || structuralBookCol?.filteredKingStrike || 0
+            : structuralBookCol?.filteredKingStrike ?? 0
       : structuralBookCol?.filteredKingStrike ?? 0;
-  const mtfDivergence = dataset?.mtfByBar[safeActiveIdx] ?? {
-    tf5m: "NO",
-    tf30m: "NO",
-    tf2h: "NO",
-    tfDaily: "NO",
-    tfWeekly: "NO",
-  };
 
   const sessionOptions: GaiaSessionOption[] = livePayload?.sessions ?? [];
   const expirationOptions: GaiaExpirationInfo[] =
@@ -1629,7 +1567,7 @@ export function GaiaView() {
 
     const candleSlotIndices = dataset.candles.map((c, idx) => {
       const etMins = getCandleEtMinutes(c);
-      if (etMins !== null && etMins >= axisStartMins) {
+      if (etMins !== null) {
         return (etMins - axisStartMins) / 5;
       }
       return idx;
@@ -1642,8 +1580,7 @@ export function GaiaView() {
     };
 
     const minsToX = (etMins: number): number => {
-      const clampedMins = Math.max(axisStartMins, Math.min(axisEndMins, etMins));
-      const rawRatio = (clampedMins - axisStartMins) / Math.max(5, axisEndMins - axisStartMins);
+      const rawRatio = (etMins - axisStartMins) / Math.max(5, axisEndMins - axisStartMins);
       return padLeft + xPanOffset + rawRatio * sessionWidth * xScale;
     };
 
@@ -1708,11 +1645,7 @@ export function GaiaView() {
 
     const colStepX = sessionWidth / totalSessionSlots;
     const allExpKingStrike = liveAllExpKingStrike || structuralBookCol?.allExpKingStrike || 0;
-    const yAllExpKing = priceToY(allExpKingStrike);
-    const isFiltered = expFilter !== "ALL";
     const filteredKingStrike = liveFilteredKingStrike || structuralBookCol?.filteredKingStrike || 0;
-    const yFilteredKing = priceToY(filteredKingStrike);
-    const outlookEndX = outlookRightX - 18;
 
     // Determine Call Wall (largest positive exposure) and Put Wall (largest negative exposure)
     // Prefer authoritative signed GEX walls from /api/options (gammaLevels), falling back to signed strike scan
@@ -1791,8 +1724,7 @@ export function GaiaView() {
       (livePayload as (GaiaLivePayload & { pdh?: number }) | null)?.pdh ??
       dataset.priorClose;
     const pdlPrice =
-      (livePayload as (GaiaLivePayload & { pdl?: number }) | null)?.pdl ??
-      (dataset.priorClose - dataset.sigma1Move * 0.65);
+      (livePayload as (GaiaLivePayload & { pdl?: number }) | null)?.pdl ?? 0;
 
     const structuralSpecs: StructuralLineSpec[] = [];
 
@@ -1952,7 +1884,7 @@ export function GaiaView() {
       const chosen = candidates.find(
         (c) =>
           c.centerY >= padTop + 8 &&
-          c.centerY <= height - padBottom - 8 &&
+          c.centerY <= height - padBottom - 22 &&
           !hasYCollision(occupiedLevelBoxes, c.centerY, 5)
       );
       if (chosen) {
@@ -1980,9 +1912,6 @@ export function GaiaView() {
     // LAYER 1B: Flow Gamma VWAP Flux Field Corridor (Rendered behind candlesticks)
     // =========================================================================
     if (flowVwapPoints.length > 0) {
-      const confluenceLevels: ConfluenceLevel[] =
-        allExpKingStrike > 0 ? [{ name: "King Node", strike: allExpKingStrike }] : [];
-
       drawFlowGammaVwapOverlay({
         ctx,
         points: flowVwapPoints,
@@ -1995,7 +1924,6 @@ export function GaiaView() {
         padBottom,
         chartHeight: height,
         rightAxisWidth,
-        confluenceLevels,
         showCenterline: true,
         showBands: true,
         showShading: true,
@@ -2003,52 +1931,8 @@ export function GaiaView() {
         showRightAxisBadge: false,
         strikeNodes: [],
         referenceBadges: [],
-        showBeadedStrikes: false,
         candles: dataset.candles,
       });
-    }
-
-    // Strike step and Proximity scale for moneyflow calculation
-    const strikeStep = dataset.visibleStrikes.length > 1
-      ? Math.abs(dataset.visibleStrikes[0] - dataset.visibleStrikes[1])
-      : 1;
-    const sigmaProx = Math.max(2.0, strikeStep * 2.5, dataset.sigma1Move * 0.25);
-    const sigmaProxSq2 = 2 * sigmaProx * sigmaProx;
-
-    // -------------------------------------------------------------------------
-    // Top-K Active Institutional Strike Filter (Strictly K <= 5 within active 1.5σ band)
-    // -------------------------------------------------------------------------
-    const curSpotPrice = dataset.candles[safeActiveIdx]?.close ?? dataset.priorClose;
-    const activeSigma1 = Math.max(1.0, dataset.sigma1Move);
-    const activeExpectedBand = activeSigma1 * 1.5;
-
-    const rankedCandidateStrikes = dataset.visibleStrikes.map((s) => {
-      const activeVal = (structuralBookCol ?? activeBookCol)!.strikeValues[s] ?? 0;
-      const isKing = s === allExpKingStrike || s === filteredKingStrike;
-      const isCallWall = s === callWallStrike;
-      const isPutWall = s === putWallStrike;
-      const isWall = isCallWall || isPutWall;
-
-      const dist = Math.abs(s - curSpotPrice);
-      const normDist = dist / activeExpectedBand;
-      const spotProxWeight = Math.exp(-1.2 * normDist * normDist);
-
-      const rawConc = Math.min(1.0, Math.abs(activeVal) / maxSessionExposure);
-      const structuralBoost = isKing ? 0.40 : isWall ? 0.22 : 0.0;
-      const score = (rawConc * 0.65 + structuralBoost) * (0.35 + 0.65 * spotProxWeight);
-
-      return { strike: s, score, isKing, isCallWall, isPutWall, val: activeVal, inBand: dist <= activeExpectedBand };
-    });
-
-    rankedCandidateStrikes.sort((a, b) => b.score - a.score);
-
-    const activeNodeMap = new Map<number, (typeof rankedCandidateStrikes)[0]>();
-    for (const item of rankedCandidateStrikes) {
-      if (!item.inBand && !item.isKing) continue;
-      if (activeNodeMap.size >= 5) break;
-      if (item.isKing || item.isCallWall || item.isPutWall || item.score >= 0.25) {
-        activeNodeMap.set(item.strike, item);
-      }
     }
 
     // Strike matrix and bead dots completely purged - zero dot clutter
@@ -2189,73 +2073,6 @@ export function GaiaView() {
       drawTriangle(x2, y2, sig.type === "BULL", isNear);
       ctx.restore();
     }
-
-    // =========================================================================
-    // LAYER 3B: Tactical Trade Signals Overlay (Aligned with Top HUD & Discord Engine)
-    // =========================================================================
-    if (hudTradeSignals && hudTradeSignals.length > 0 && dataset.candles.length > 0) {
-      hudTradeSignals.forEach((sig) => {
-        const sigTsSec = sig.timestamp > 1e11 ? Math.floor(sig.timestamp / 1000) : sig.timestamp;
-        let matchedBarIdx = -1;
-        let minDiff = Infinity;
-
-        dataset.candles.forEach((c, cIdx) => {
-          if (!c.timestamp) return;
-          const diff = Math.abs(c.timestamp - sigTsSec);
-          if (diff < minDiff) {
-            minDiff = diff;
-            matchedBarIdx = cIdx;
-          }
-        });
-
-        if (matchedBarIdx < 0 || matchedBarIdx > safeActiveIdx || minDiff > 15 * 60) return;
-
-        const candle = dataset.candles[matchedBarIdx];
-        const cx = barToX(matchedBarIdx);
-        const isCall = sig.contractType === "CALL";
-        const sigColor = isCall ? "#10b981" : "#f43f5e";
-        const candleY = isCall ? priceToY(candle.low) : priceToY(candle.high);
-        // Place Green (CALL) reticle circle BELOW candle low wick, Red (PUT) reticle circle ABOVE candle high wick
-        const entryY = isCall
-          ? Math.min(height - padBottom - 14, candleY + 8)
-          : Math.max(padTop + 14, candleY - 8);
-
-        ctx.save();
-        // 1. Entry price glowing core dot and reticle ring
-        ctx.shadowBlur = 8;
-        ctx.shadowColor = sigColor;
-        ctx.strokeStyle = isCall ? "#34d399" : "#fb7185";
-        ctx.lineWidth = 1.3;
-        ctx.setLineDash([2, 2]);
-        ctx.beginPath();
-        ctx.arc(cx, entryY, 7.5, 0, Math.PI * 2);
-        ctx.stroke();
-
-        ctx.setLineDash([]);
-        ctx.fillStyle = sigColor;
-        ctx.beginPath();
-        ctx.arc(cx, entryY, 3.2, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Layer 5.5 drawTradeExecutionMarkers renders the crisp BTO PUT / BTO CALL pill directly over this wick anchor
-
-        ctx.restore();
-      });
-    }
-
-    // =========================================================================
-    // LAYER 5: Outlook Zone (Expected-Move Cone, Plateau Fills & Path to King)
-    // =========================================================================
-    const yPriorClose = priceToY(dataset.priorClose);
-    const pPlus1 = dataset.priorClose + dataset.sigma1Move;
-    const pMinus1 = dataset.priorClose - dataset.sigma1Move;
-    const pPlus2 = dataset.priorClose + dataset.sigma2Move;
-    const pMinus2 = dataset.priorClose - dataset.sigma2Move;
-
-    const yPlus1 = priceToY(pPlus1);
-    const yMinus1 = priceToY(pMinus1);
-    const yPlus2 = priceToY(pPlus2);
-    const yMinus2 = priceToY(pMinus2);
 
     // Clean Minimalist Outlook: All heavy cone fills, diagonal ray fans, and floating pills purged.
     // Price levels are displayed in the right Y-axis gutter.
@@ -2541,7 +2358,7 @@ export function GaiaView() {
         let timeKey = "";
         if (c.timestamp && c.timestamp > 0) {
           try {
-            const d = new Date(c.timestamp * 1000);
+            const d = new Date(toEpochSec(c.timestamp) * 1000);
             const et = d.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour12: false });
             const [h, m] = et.split(":");
             if (m === "00" || (h === "09" && m === "30")) {
@@ -2793,7 +2610,6 @@ export function GaiaView() {
     dataset,
     safeActiveIdx,
     hoverBarIndex,
-    pathToKing,
     canvasWidth,
     chartWidth,
     dividerRatio,
@@ -2814,7 +2630,6 @@ export function GaiaView() {
     flowVwapPoints,
     hoverCursor,
     atlasPalette,
-    hudTradeSignals,
     effectiveServerTrades,
     przmHudSignals,
     precomputedChartTrades,
@@ -3037,21 +2852,7 @@ export function GaiaView() {
           </span>
         </div>
 
-        {/* 4. Path to King Pill */}
-        <button
-          type="button"
-          onClick={() => setPathToKing((prev) => !prev)}
-          className={cn(
-            "rounded-full px-3.5 py-1.5 text-xs transition cursor-pointer",
-            pathToKing
-              ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold"
-              : "bg-[#151b28] border border-[#232d42] text-slate-300 hover:text-white"
-          )}
-        >
-          Path to King
-        </button>
-
-        {/* 5. Session Start Time Filter: 7:00 AM Premkt (default) | 8:00 AM Premkt | 9:30 AM RTH */}
+        {/* 4. Session Start Time Filter: 7:00 AM Premkt (default) | 8:00 AM Premkt | 9:30 AM RTH */}
         <div className="bg-[#151b28] border border-[#232d42] rounded-full p-1 flex items-center gap-1 font-mono text-xs">
           <button
             type="button"
@@ -3452,10 +3253,6 @@ export function GaiaView() {
                 <span>Filter</span>
               </span>
             )}
-            <span className="inline-flex items-center gap-1.5">
-              <span className="w-4 border-b-2 border-dotted border-[#eab308] inline-block" />
-              <span>Path to King · projection</span>
-            </span>
           </div>
         </div>
         );
@@ -3465,7 +3262,7 @@ export function GaiaView() {
       {(() => {
         const replayBar = dataset?.candles?.[safeActiveIdx];
         const replayTsRaw = Number(replayBar?.timestamp ?? 0);
-        const replayBarTsSec = replayTsRaw > 1e11 ? Math.floor(replayTsRaw / 1000) : replayTsRaw;
+        const replayBarTsSec = replayTsRaw > 0 ? toEpochSec(replayTsRaw) : 0;
         return (
       <GaiaCallPutBiasHud
         symbol={loadedTicker}
@@ -3481,17 +3278,16 @@ export function GaiaView() {
         flowVwapPoints={flowVwapPoints.slice(0, safeActiveIdx + 1)}
         sigma1Move={dataset?.sigma1Move}
         liveSpot={activeCandle ? activeCandle.close : null}
-        tradeSignals={hudTradeSignals}
         serverTrades={effectiveServerTrades}
         sessionDate={chartSessionDate}
         dividerRatio={dividerRatio}
-        isReplayMode={isReplaying || isReplayFrozen}
+        isReplayMode={isHistoricalOrReplay}
         replayBarTsSec={replayBarTsSec > 0 ? replayBarTsSec : undefined}
         replayBarClose={replayBar?.close}
         startHour={startHour}
         xScale={xScale}
         xPanOffset={xPanOffset}
-        containerWidthPx={chartWidth === null ? canvasWidth : undefined}
+        containerWidthPx={canvasWidth}
         onXViewportChange={(s, p) => {
           setXScale(s);
           setXPanOffset(p);
@@ -3511,7 +3307,6 @@ export function GaiaView() {
           prevStoreTickerRef.current = cleaned;
           setTickerInput(cleaned);
           setStoreTicker(cleaned);
-          fetchOptionsChain(cleaned, true);
           isReplayingRef.current = false;
           setIsReplaying(false);
           isReplayFrozenRef.current = false;
@@ -3520,6 +3315,7 @@ export function GaiaView() {
           resetViewportTo24H();
           syncTickerUrlParam(cleaned);
           if (cleaned !== loadedTicker) {
+            setLivePayload(null);
             setLoadedTicker(cleaned);
           } else {
             void fetchLiveGaia(cleaned, "", startHour);

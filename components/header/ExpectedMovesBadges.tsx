@@ -17,9 +17,14 @@ export function ExpectedMovesBadges() {
   const chainExpirations = useDashboardStore((state) => state.chainExpirations);
   const expectedMoves = useDashboardStore((state) => state.expectedMoves);
 
-  const fallbackDailyEm = Number(
-    (spotPrice * (impliedVolatility / Math.sqrt(252))).toFixed(2)
-  );
+  const hasLiveSpot =
+    Number.isFinite(spotPrice) &&
+    spotPrice > 0 &&
+    Number.isFinite(impliedVolatility) &&
+    impliedVolatility > 0;
+  const fallbackDailyEm = hasLiveSpot
+    ? Number((spotPrice * (impliedVolatility / Math.sqrt(252))).toFixed(2))
+    : 0;
 
   const dailyDate =
     expectedMoves?.daily?.exp?.slice(5) ??
@@ -35,10 +40,12 @@ export function ExpectedMovesBadges() {
   const monthlyDate =
     expectedMoves?.monthly?.exp?.slice(5) ??
     chainExpirations.find((c) => c.filterGroup === "OPEX")?.dateLabel ??
-    "11-20";
+    "—";
 
-  const dailyEm =
-    expectedMoves?.daily?.em ?? (fallbackDailyEm > 0 ? fallbackDailyEm : 1.28);
+  const dailyEm = expectedMoves?.daily?.em ?? fallbackDailyEm;
+  if ((!expectedMoves && !hasLiveSpot) || !Number.isFinite(dailyEm) || dailyEm <= 0) {
+    return null;
+  }
   const dailyLow =
     expectedMoves?.daily?.low ?? Number((spotPrice - dailyEm).toFixed(2));
   const dailyHigh =

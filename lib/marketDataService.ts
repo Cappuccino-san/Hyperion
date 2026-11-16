@@ -10,7 +10,13 @@
  * 4. Market Hours Enforcement: Blocks all orders after 16:00:00 ET sharp
  */
 
-import { getNowEtTime } from "@/lib/tradeSignalEngine";
+import {
+  HOLIDAYS_2026,
+  RTH_OPEN_MINS,
+  RTH_CLOSE_MINS,
+  getTodayEt,
+  etMinutesOfDay,
+} from "@/lib/gaiaSessionGuards";
 
 export interface NbboQuote {
   symbol: string; // OCC symbol, e.g. "SPY261023C00768000"
@@ -52,41 +58,27 @@ export interface ExecutionFillResult {
   fillReceiptId: string;
 }
 
-const HOLIDAYS_2026 = new Set([
-  "2026-01-01",
-  "2026-01-19",
-  "2026-02-16",
-  "2026-04-03",
-  "2026-05-25",
-  "2026-06-19",
-  "2026-07-03",
-  "2026-09-07",
-  "2026-11-26",
-  "2026-12-25",
-]);
-
 /**
  * Validates whether the market is open for trading (9:30 AM to 4:00 PM ET, Mon-Fri, excluding US market holidays)
  */
 export function isMarketOpen(nowEt?: Date): { open: boolean; reason?: string } {
   const d = nowEt ?? new Date();
-  let dayOfWeek: number;
-  let dateIso: string;
+  let weekdayStr = "";
+  let dateIso = "";
   try {
-    const etString = d.toLocaleString("en-US", { timeZone: "America/New_York" });
-    const etDate = new Date(etString);
-    dayOfWeek = etDate.getDay();
-    const y = etDate.getFullYear();
-    const m = String(etDate.getMonth() + 1).padStart(2, "0");
-    const day = String(etDate.getDate()).padStart(2, "0");
-    dateIso = `${y}-${m}-${day}`;
+    weekdayStr = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      weekday: "short",
+    }).format(d);
+    dateIso = getTodayEt(d);
   } catch {
-    dayOfWeek = d.getDay();
+    const wd = d.getDay();
+    weekdayStr = wd === 0 ? "Sun" : wd === 6 ? "Sat" : "Mon";
     dateIso = "";
   }
 
-  // 1. Weekend check (0 = Sunday, 6 = Saturday)
-  if (dayOfWeek === 0 || dayOfWeek === 6) {
+  // 1. Weekend check (Sat / Sun)
+  if (weekdayStr === "Sat" || weekdayStr === "Sun") {
     return {
       open: false,
       reason: "MARKET_CLOSED: US equity options markets are closed on weekends.",
@@ -101,11 +93,10 @@ export function isMarketOpen(nowEt?: Date): { open: boolean; reason?: string } {
     };
   }
 
-  const { hours, minutes } = getNowEtTime(nowEt);
-  const totalMins = hours * 60 + minutes;
+  const totalMins = etMinutesOfDay(d.getTime());
 
   // 3. Premarket check (< 9:30 AM ET = 570 mins)
-  if (totalMins < 570) {
+  if (totalMins < RTH_OPEN_MINS) {
     return {
       open: false,
       reason: "MARKET_CLOSED: Regular options trading commences at 9:30 AM ET.",
@@ -113,7 +104,7 @@ export function isMarketOpen(nowEt?: Date): { open: boolean; reason?: string } {
   }
 
   // 4. Post-market check (>= 4:00 PM ET = 960 mins)
-  if (totalMins >= 960) {
+  if (totalMins >= RTH_CLOSE_MINS) {
     return {
       open: false,
       reason: "MARKET_CLOSED: Regular options trading halts strictly at 4:00 PM ET. No post-market fills allowed.",

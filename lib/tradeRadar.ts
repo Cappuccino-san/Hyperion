@@ -2,10 +2,6 @@ import {
   selectSmallAccountContract,
   fetchLiveCboeOptions,
   getCachedSpotPrice,
-  loadTradeStore,
-  saveTradeStore,
-  TradeLifecycleAlert,
-  getTodayEt,
 } from "./tradeSignalEngine";
 import { computeOptionsAnalytics } from "./optionsExposure";
 
@@ -53,15 +49,35 @@ export interface TradeRadarPayload {
 /**
  * Generates a clean dark-mode intraday chart URL using QuickChart.io
  */
-export async function generateIntradayChartUrl(params: {
-  ticker: string;
-  spotPrice: number;
-  callWall: number;
-  putWall: number;
-  zeroGamma?: number;
-}): Promise<string> {
+export async function generateIntradayChartUrl(
+  params: {
+    ticker: string;
+    spotPrice: number;
+    callWall: number;
+    putWall: number;
+    zeroGamma?: number;
+    signal?: AbortSignal;
+  },
+  options?: { signal?: AbortSignal }
+): Promise<string> {
   const { ticker, spotPrice, callWall, putWall, zeroGamma } = params;
-  const yahooSym = ticker === "SPX" || ticker === "SPXW" ? "^GSPC" : ticker === "QQQ" ? "QQQ" : "SPY";
+  const signal = params.signal ?? options?.signal;
+  if (signal?.aborted) return "";
+
+  const upperTicker = ticker.trim().toUpperCase();
+  const yahooSym =
+    upperTicker === "SPX" || upperTicker === "SPXW"
+      ? "^GSPC"
+      : upperTicker === "NDX" || upperTicker === "NDXP"
+        ? "^NDX"
+        : upperTicker === "VIX"
+          ? "^VIX"
+          : upperTicker;
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const timeoutId = setTimeout(() => controller.abort(), 8_000);
 
   try {
     const res = await fetch(
@@ -71,6 +87,7 @@ export async function generateIntradayChartUrl(params: {
       {
         headers: { "User-Agent": "Mozilla/5.0" },
         cache: "no-store",
+        signal: controller.signal,
       }
     );
 
@@ -202,6 +219,7 @@ export async function generateIntradayChartUrl(params: {
         height: 320,
         chart: chartConfig,
       }),
+      signal: controller.signal,
     });
 
     if (postRes.ok) {
@@ -214,31 +232,35 @@ export async function generateIntradayChartUrl(params: {
     )}`;
   } catch {
     return "";
+  } finally {
+    clearTimeout(timeoutId);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
 /**
  * Builds the complete multi-ticker pre-trade radar gameplan without internal HTTP deadlocks
  */
-export async function getPreTradeRadarData(): Promise<TradeRadarPayload> {
-  const defaultLevels: Record<string, { callWall: number; putWall: number; zeroGamma: number }> = {
-    SPY: { callWall: 770, putWall: 760, zeroGamma: 773.59 },
-    QQQ: { callWall: 740, putWall: 700, zeroGamma: 730.51 },
-  };
-
+export async function getPreTradeRadarData(options?: {
+  signal?: AbortSignal;
+}): Promise<TradeRadarPayload> {
+  const signal = options?.signal;
   const tickers = ["SPY", "QQQ"];
   const setups: PreTradeSetupIdea[] = [];
 
   for (const ticker of tickers) {
+    if (signal?.aborted) break;
     try {
       // 1. Fetch live CBOE contracts in-process directly
-      const contracts = await fetchLiveCboeOptions(ticker);
+      const contracts = await fetchLiveCboeOptions(ticker, signal);
+      if (signal?.aborted) break;
       let spot = getCachedSpotPrice(ticker);
 
       if (!spot || spot <= 0) {
         // Fallback to recent last trade price in contracts
         const atm = contracts.find((c) => c.last && c.last > 0);
-        spot = atm?.strike || (ticker === "SPY" ? 764 : 705);
+        spot = atm?.strike ?? 0;
+        if (!spot || spot <= 0) continue;
       }
 
       // Institutional 0DTE Options Exposure: extract real 0DTE / Next-Exp tactical walls
@@ -315,6 +337,7 @@ export async function getPreTradeRadarData(): Promise<TradeRadarPayload> {
         contracts,
         zeroDteCallWall: callWall,
         zeroDtePutWall: putWall,
+        signal,
       });
 
       // Pre-select candidate Put contract for Resistance Rejection (anchored to 0DTE walls)
@@ -328,6 +351,7 @@ export async function getPreTradeRadarData(): Promise<TradeRadarPayload> {
         contracts,
         zeroDteCallWall: callWall,
         zeroDtePutWall: putWall,
+        signal,
       });
 
       const distToSupportPct = Number((((spot - tacticalSupport) / spot) * 100).toFixed(2));
@@ -373,15 +397,20 @@ export async function getPreTradeRadarData(): Promise<TradeRadarPayload> {
 
   // Generate primary chart for SPY
   const primary = setups.find((s) => s.ticker === "SPY") || setups[0];
-  const chartUrl = primary
-    ? await generateIntradayChartUrl({
-        ticker: primary.ticker,
-        spotPrice: primary.spotPrice,
-        callWall: primary.callWall,
-        putWall: primary.putWall,
-        zeroGamma: primary.zeroGamma,
-      })
-    : "";
+  const chartUrl =
+    primary && !signal?.aborted
+      ? await generateIntradayChartUrl(
+          {
+            ticker: primary.ticker,
+            spotPrice: primary.spotPrice,
+            callWall: primary.callWall,
+            putWall: primary.putWall,
+            zeroGamma: primary.zeroGamma,
+            signal,
+          },
+          { signal }
+        )
+      : "";
 
   const timeStr = new Date().toLocaleTimeString("en-US", {
     timeZone: "America/New_York",
@@ -400,17 +429,37 @@ export async function getPreTradeRadarData(): Promise<TradeRadarPayload> {
 /**
  * Dispatches the Pre-Trade Radar Gameplan & Chart to Discord
  */
-export async function sendPreTradeRadarDiscordCard(customWebhookUrl?: string): Promise<boolean> {
+export async function sendPreTradeRadarDiscordCard(
+  customWebhookUrl?: string,
+  options?: { signal?: AbortSignal; isHistoricalBackfill?: boolean }
+): Promise<boolean> {
+  if (options?.isHistoricalBackfill) {
+    return false;
+  }
   const webhookUrl =
     (customWebhookUrl || process.env.DISCORD_WEBHOOK_URL)?.trim() || "";
   if (!webhookUrl) {
     console.warn("[TradeRadar] Skipping radar Discord dispatch: DISCORD_WEBHOOK_URL is not configured.");
     return false;
   }
+  if (!/^https:\/\//i.test(webhookUrl)) {
+    console.warn("[TradeRadar] Rejecting non-HTTPS Discord webhook URL.");
+    return false;
+  }
+  if (options?.signal?.aborted) {
+    return false;
+  }
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  options?.signal?.addEventListener("abort", onAbort, { once: true });
+  const timeoutId = setTimeout(() => controller.abort(), 8_000);
 
   try {
-    const radar = await getPreTradeRadarData();
-    const store = loadTradeStore();
+    const radar = await getPreTradeRadarData({ signal: options?.signal });
+    if (options?.signal?.aborted || radar.setups.length === 0) {
+      return false;
+    }
 
     const fields: { name: string; value: string; inline: boolean }[] = [];
 
@@ -439,10 +488,9 @@ export async function sendPreTradeRadarDiscordCard(customWebhookUrl?: string): P
     fields.push({
       name: "🛡️ Execution Discipline & Money-Making Rules",
       value: [
-        "• **Theta Protection:** Contracts locked on **Tomorrow, Fri Oct 23 (1 DTE)** near ATM (0.25-0.50 delta).",
-        "• **+18% Auto-BE Stop:** Once option reaches +18%, stop loss moves to Breakeven so green trades never lose.",
-        "• **+25% Target 1 Scaling:** Guaranteed profit locking at TP1.",
-        "• **-25% Option Hard Stop:** Strict risk containment.",
+        "• **Theta Protection:** Contracts locked on nearest liquid 0DTE/next-day expiration near ATM (0.25-0.50 delta).",
+        "• **Progressive Profit Ratchet:** +50% Target 1 progress moves stop to Breakeven; +75% locks +30% profit.",
+        "• **1-Contract Sniper Sizing:** Strict 1 contract max (<= $100 outlay) with -25% option hard stop.",
       ].join("\n"),
       inline: false,
     });
@@ -472,6 +520,7 @@ export async function sendPreTradeRadarDiscordCard(customWebhookUrl?: string): P
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
 
     console.log("[TradeRadar] Discord response status:", res.status);
@@ -479,42 +528,12 @@ export async function sendPreTradeRadarDiscordCard(customWebhookUrl?: string): P
       console.log("[TradeRadar] Discord error:", await res.text());
     }
 
-    // Also push a radar notification into daily alerts for terminal visibility
-    const radarAlert: TradeLifecycleAlert = {
-      id: `radar-${Date.now()}`,
-      timestamp: radar.timestamp,
-      ts: Math.floor(Date.now() / 1000),
-      ticker: "SPY",
-      action: "BUY_TO_OPEN",
-      contractType: "CALL",
-      contractLabel: "Intraday Gameplan Active",
-      strike: 760,
-      expiration: getTodayEt(),
-      setupName: "Intraday Radar Briefing",
-      reason: "Live Monitoring Active",
-      status: "OPEN",
-      spotPrice: radar.setups[0]?.spotPrice || 762,
-      btoSpotPrice: radar.setups[0]?.spotPrice || 762,
-      target1Spot: radar.setups[0]?.callWall || 770,
-      target2Spot: radar.setups[0]?.callWall || 770,
-      stopLossSpot: radar.setups[0]?.putWall || 760,
-      optionMid: 0.5,
-      btoOptionMid: 0.5,
-      contractsQty: 1,
-      remainingQty: 1,
-      totalOutlay: 0,
-      isHistoricalBackfill: true,
-      message: `📡 PRE-TRADE RADAR UPDATED: SPY $${radar.setups[0]?.spotPrice.toFixed(2)} testing toward Put Wall $${radar.setups[0]?.putWall}. Waiting for 5m confirmation.`,
-    };
-
-    store.dispatchedAlertIds = store.dispatchedAlertIds || {};
-    store.dispatchedAlertIds[radarAlert.id] = true;
-    store.alerts.push(radarAlert);
-    saveTradeStore(store);
-
     return res.ok;
   } catch (err) {
     console.error("[TradeRadar] Failed to send radar Discord card:", err);
     return false;
+  } finally {
+    clearTimeout(timeoutId);
+    options?.signal?.removeEventListener("abort", onAbort);
   }
 }

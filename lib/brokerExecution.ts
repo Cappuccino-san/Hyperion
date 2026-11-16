@@ -10,8 +10,66 @@
  * 3. Bid-Ask crossing enforcement on all live and simulated orders
  */
 
-import { NbboQuote, executeNbboOrder, ExecutionFillResult } from "@/lib/marketDataService";
+import { NbboQuote, executeNbboOrder, ExecutionFillResult, isMarketOpen } from "@/lib/marketDataService";
 import { calculateSmallAccountSize } from "@/lib/positionSizer";
+
+function validateLiveBrokerOrder(request: BrokerOrderRequest): string | null {
+  const mkt = isMarketOpen(request.nowEt);
+  if (!mkt.open) return mkt.reason || "MARKET_CLOSED";
+  if (
+    !Number.isFinite(request.quote.ask) ||
+    request.quote.ask <= 0 ||
+    !Number.isFinite(request.quote.bid) ||
+    request.quote.bid < 0 ||
+    request.quote.bid > request.quote.ask ||
+    !Number.isFinite(request.quote.spreadPct) ||
+    request.quote.spreadPct > 0.25
+  ) {
+    const spreadLabel = Number.isFinite(request.quote.spreadPct)
+      ? (request.quote.spreadPct * 100).toFixed(1)
+      : "NaN";
+    return `ILLIQUID_OR_INVALID_QUOTE: spread=${spreadLabel}%`;
+  }
+  if (request.action === "BUY_TO_OPEN") {
+    if (request.contractsQty !== 1) {
+      return `CONTRACT_QTY_VIOLATION: Attempted ${request.contractsQty} (strictly 1 allowed)`;
+    }
+    const sizing = calculateSmallAccountSize(request.quote.ask);
+    if (!sizing.allowed) return sizing.rejectionReason || "BUDGET_EXCEEDED";
+  }
+  return null;
+}
+
+function buildRejectedSlip(
+  request: BrokerOrderRequest,
+  broker: SupportedBroker,
+  reason: string,
+  brokerOrderId = "NONE",
+  ledgerSignature = "REJECTED_ORDER",
+  fillSlipIdPrefix = "SLIP-REJ"
+): BrokerFillSlip {
+  const nowTs = Math.floor(Date.now() / 1000);
+  return {
+    fillSlipId: `${fillSlipIdPrefix}-${nowTs}`,
+    broker,
+    brokerOrderId,
+    timestamp: nowTs,
+    timeEt: new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York" }),
+    ticker: request.ticker,
+    symbol: request.symbol,
+    action: request.action,
+    filledQty: request.contractsQty,
+    filledPrice: 0,
+    totalOutlayOrProceeds: 0,
+    nbboBid: request.quote.bid,
+    nbboAsk: request.quote.ask,
+    effectiveSpread: request.quote.spread,
+    slippage: 0,
+    status: "REJECTED",
+    rejectionReason: reason,
+    ledgerSignature,
+  };
+}
 
 export type SupportedBroker = "ROBINHOOD" | "TRADIER" | "INSTITUTIONAL_SIMULATOR";
 
@@ -134,27 +192,7 @@ class InstitutionalSimulatedBroker {
     broker: SupportedBroker,
     reason: string
   ): BrokerFillSlip {
-    const nowTs = Math.floor(Date.now() / 1000);
-    return {
-      fillSlipId: `SLIP-REJ-${nowTs}`,
-      broker,
-      brokerOrderId: "NONE",
-      timestamp: nowTs,
-      timeEt: new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York" }),
-      ticker: request.ticker,
-      symbol: request.symbol,
-      action: request.action,
-      filledQty: request.contractsQty,
-      filledPrice: 0,
-      totalOutlayOrProceeds: 0,
-      nbboBid: request.quote.bid,
-      nbboAsk: request.quote.ask,
-      effectiveSpread: request.quote.spread,
-      slippage: 0,
-      status: "REJECTED",
-      rejectionReason: reason,
-      ledgerSignature: "REJECTED_ORDER",
-    };
+    return buildRejectedSlip(request, broker, reason);
   }
 }
 
@@ -178,6 +216,11 @@ class RobinhoodApiClient {
       throw new Error("Robinhood API client is not configured with an authentication token.");
     }
 
+    const validationError = validateLiveBrokerOrder(request);
+    if (validationError) {
+      return buildRejectedSlip(request, "ROBINHOOD", validationError, "PRECHECK_REJECTED", "ROBINHOOD_PRECHECK_REJECTED", "RH-REJ");
+    }
+
     const isBuy = request.action === "BUY_TO_OPEN";
     const side = isBuy ? "buy" : "sell";
     const positionEffect = isBuy ? "open" : "close";
@@ -191,6 +234,7 @@ class RobinhoodApiClient {
           "Content-Type": "application/json",
           Accept: "application/json",
         },
+        signal: AbortSignal.timeout(10_000),
         body: JSON.stringify({
           account: process.env.ROBINHOOD_ACCOUNT_NUMBER,
           direction: isBuy ? "debit" : "credit",
@@ -217,26 +261,14 @@ class RobinhoodApiClient {
       const timeEt = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York" });
 
       if (!res.ok || json?.error) {
-        return {
-          fillSlipId: `RH-ERR-${nowTs}`,
-          broker: "ROBINHOOD",
-          brokerOrderId: json?.id || "ERROR",
-          timestamp: nowTs,
-          timeEt,
-          ticker: request.ticker,
-          symbol: request.symbol,
-          action: request.action,
-          filledQty: request.contractsQty,
-          filledPrice: 0,
-          totalOutlayOrProceeds: 0,
-          nbboBid: request.quote.bid,
-          nbboAsk: request.quote.ask,
-          effectiveSpread: request.quote.spread,
-          slippage: 0,
-          status: "REJECTED",
-          rejectionReason: json?.error || json?.detail || `Robinhood HTTP ${res.status}`,
-          ledgerSignature: "ROBINHOOD_REJECTED",
-        };
+        return buildRejectedSlip(
+          request,
+          "ROBINHOOD",
+          json?.error || json?.detail || `Robinhood HTTP ${res.status}`,
+          json?.id || "ERROR",
+          "ROBINHOOD_REJECTED",
+          "RH-ERR"
+        );
       }
 
       const filledPrice = Number(json.price || price);
@@ -309,6 +341,11 @@ class TradierApiClient {
       throw new Error("Tradier API client is not configured with an API key and account ID.");
     }
 
+    const validationError = validateLiveBrokerOrder(request);
+    if (validationError) {
+      return buildRejectedSlip(request, "TRADIER", validationError, "PRECHECK_REJECTED", "TRADIER_PRECHECK_REJECTED", "TRAD-REJ");
+    }
+
     const isBuy = request.action === "BUY_TO_OPEN";
     const side = isBuy ? "buy_to_open" : "sell_to_close";
     const price = isBuy ? request.quote.ask : request.quote.bid;
@@ -332,6 +369,7 @@ class TradierApiClient {
           Accept: "application/json",
           "Content-Type": "application/x-www-form-urlencoded",
         },
+        signal: AbortSignal.timeout(10_000),
         body: formData.toString(),
       });
 
@@ -340,27 +378,20 @@ class TradierApiClient {
       const timeEt = new Date().toLocaleTimeString("en-US", { timeZone: "America/New_York" });
 
       if (!res.ok || json?.errors) {
-        const errorMsg = json?.errors?.error?.join(", ") || `Tradier HTTP ${res.status}`;
-        return {
-          fillSlipId: `TRAD-ERR-${nowTs}`,
-          broker: "TRADIER",
-          brokerOrderId: "ERROR",
-          timestamp: nowTs,
-          timeEt,
-          ticker: request.ticker,
-          symbol: request.symbol,
-          action: request.action,
-          filledQty: request.contractsQty,
-          filledPrice: 0,
-          totalOutlayOrProceeds: 0,
-          nbboBid: request.quote.bid,
-          nbboAsk: request.quote.ask,
-          effectiveSpread: request.quote.spread,
-          slippage: 0,
-          status: "REJECTED",
-          rejectionReason: errorMsg,
-          ledgerSignature: "TRADIER_REJECTED",
-        };
+        const rawErr = json?.errors?.error;
+        const errorMsg = Array.isArray(rawErr)
+          ? rawErr.join(", ")
+          : typeof rawErr === "string"
+            ? rawErr
+            : `Tradier HTTP ${res.status}`;
+        return buildRejectedSlip(
+          request,
+          "TRADIER",
+          errorMsg,
+          "ERROR",
+          "TRADIER_REJECTED",
+          "TRAD-ERR"
+        );
       }
 
       const orderId = String(json?.order?.id || nowTs);

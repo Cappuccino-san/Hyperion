@@ -1,5 +1,12 @@
 import fs from "fs";
 import path from "path";
+import {
+  getTodayEt as getSessionTodayEt,
+  etMinutesOfDay,
+  toEpochSec,
+  RTH_OPEN_MINS,
+  RTH_CLOSE_MINS,
+} from "@/lib/gaiaSessionGuards";
 
 export interface IntradayHistoryPoint {
   t: string;
@@ -26,8 +33,6 @@ export interface IntradayAlert {
   type: "call" | "put" | "zero" | "king";
 }
 
-const RTH_START_MINS = 9 * 60 + 30; // 09:30 ET
-const RTH_END_MINS = 16 * 60;       // 16:00 ET (exclusive)
 const MAX_RTH_SNAPSHOTS = 1600;     // Covers full 6.5h RTH session at 15s cadence
 const MAX_EXT_SNAPSHOTS = 2400;     // Covers full extended-hours window across 00:00–24:00 ET
 
@@ -52,7 +57,13 @@ export interface DailyStore {
   tickers: Record<string, TickerIntradayData>;
 }
 
-let inMemoryStore: DailyStore | null = null;
+const globalForIntraday = globalThis as unknown as {
+  __hyperionIntradayStore?: DailyStore | null;
+  __hyperionIntradayMtimeMs?: number;
+  __hyperionTerraBackfillInFlight?: Map<string, Promise<void>>;
+  __hyperionIntradayWriteSeq?: number;
+};
+let inMemoryStore: DailyStore | null = globalForIntraday.__hyperionIntradayStore ?? null;
 
 function getCacheDir(): string {
   const dir = path.join(process.cwd(), ".cache");
@@ -68,16 +79,14 @@ function getCacheDir(): string {
 
 export function getTodayEt(): string {
   try {
-    return new Date().toLocaleDateString("en-CA", {
-      timeZone: "America/New_York",
-    });
+    return getSessionTodayEt();
   } catch {
     return new Date().toISOString().slice(0, 10);
   }
 }
 
 export function formatTimeEt(dateOrTs: Date | number): string {
-  const d = typeof dateOrTs === "number" ? new Date(dateOrTs * 1000) : dateOrTs;
+  const d = typeof dateOrTs === "number" ? new Date(toEpochSec(dateOrTs) * 1000) : dateOrTs;
   try {
     return d.toLocaleTimeString("en-US", {
       timeZone: "America/New_York",
@@ -91,24 +100,16 @@ export function formatTimeEt(dateOrTs: Date | number): string {
 
 export function getEtMinutesFromTs(tsSec: number): number {
   try {
-    const parts = new Intl.DateTimeFormat("en-US", {
-      timeZone: "America/New_York",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    }).formatToParts(new Date(tsSec * 1000));
-    const hour = Number(parts.find((p) => p.type === "hour")?.value ?? 0) % 24;
-    const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
-    return hour * 60 + minute;
+    return etMinutesOfDay(tsSec);
   } catch {
-    const d = new Date(tsSec * 1000);
+    const d = new Date(toEpochSec(tsSec) * 1000);
     return d.getHours() * 60 + d.getMinutes();
   }
 }
 
 export function isRthTimestampEt(tsSec: number): boolean {
   const etMins = getEtMinutesFromTs(tsSec);
-  return etMins >= RTH_START_MINS && etMins < RTH_END_MINS;
+  return etMins >= RTH_OPEN_MINS && etMins < RTH_CLOSE_MINS;
 }
 
 function ensurePartitionedHistory(tickerData: TickerIntradayData): {
@@ -134,14 +135,42 @@ function ensurePartitionedHistory(tickerData: TickerIntradayData): {
 
 function loadStore(): DailyStore {
   const today = getTodayEt();
+  const cacheDir = getCacheDir();
+  const filePath = path.join(cacheDir, `intraday-${today}.json`);
+
+  inMemoryStore = globalForIntraday.__hyperionIntradayStore ?? inMemoryStore;
   if (inMemoryStore && inMemoryStore.date === today) {
+    if (fs.existsSync(filePath)) {
+      try {
+        const stat = fs.statSync(filePath);
+        if (stat.mtimeMs > (globalForIntraday.__hyperionIntradayMtimeMs ?? 0)) {
+          const raw = fs.readFileSync(filePath, "utf-8");
+          const parsed = JSON.parse(raw) as DailyStore;
+          if (parsed && parsed.date === today && parsed.tickers) {
+            inMemoryStore = parsed;
+            globalForIntraday.__hyperionIntradayStore = parsed;
+            globalForIntraday.__hyperionIntradayMtimeMs = stat.mtimeMs;
+          }
+        }
+      } catch {
+        // Ignore transient read/parse race
+      }
+    }
+    globalForIntraday.__hyperionIntradayStore = inMemoryStore;
     return inMemoryStore;
   }
 
-  const cacheDir = getCacheDir();
   try {
     const files = fs.readdirSync(cacheDir);
+    const staleTmpCutoffMs = Date.now() - 5 * 60_000;
     for (const f of files) {
+      if (f.startsWith("intraday-") && f.includes(".json.tmp.")) {
+        try {
+          const full = path.join(cacheDir, f);
+          if (fs.statSync(full).mtimeMs < staleTmpCutoffMs) fs.unlinkSync(full);
+        } catch {}
+        continue;
+      }
       if (f.startsWith("intraday-") && !f.includes(today)) {
         try {
           fs.unlinkSync(path.join(cacheDir, f));
@@ -150,14 +179,15 @@ function loadStore(): DailyStore {
     }
   } catch {}
 
-  const filePath = path.join(cacheDir, `intraday-${today}.json`);
-
   if (fs.existsSync(filePath)) {
     try {
+      const stat = fs.statSync(filePath);
       const raw = fs.readFileSync(filePath, "utf-8");
       const parsed = JSON.parse(raw) as DailyStore;
       if (parsed && parsed.date === today && parsed.tickers) {
         inMemoryStore = parsed;
+        globalForIntraday.__hyperionIntradayStore = parsed;
+        globalForIntraday.__hyperionIntradayMtimeMs = stat.mtimeMs;
         return inMemoryStore;
       }
     } catch {
@@ -169,6 +199,7 @@ function loadStore(): DailyStore {
     date: today,
     tickers: {},
   };
+  globalForIntraday.__hyperionIntradayStore = inMemoryStore;
   return inMemoryStore;
 }
 
@@ -228,148 +259,207 @@ export function getMergedIntradayHistory(
 }
 
 function saveStore(store: DailyStore): void {
+  const cacheDir = getCacheDir();
+  const filePath = path.join(cacheDir, `intraday-${store.date}.json`);
+  const writeSeq = (globalForIntraday.__hyperionIntradayWriteSeq =
+    (globalForIntraday.__hyperionIntradayWriteSeq || 0) + 1);
+  const tmpPath = path.join(
+    cacheDir,
+    `intraday-${store.date}.json.tmp.${process.pid}.${Date.now()}.${writeSeq}`
+  );
   try {
-    const cacheDir = getCacheDir();
-    const filePath = path.join(cacheDir, `intraday-${store.date}.json`);
-    fs.writeFileSync(filePath, JSON.stringify(store, null, 2), "utf-8");
+    inMemoryStore = store;
+    globalForIntraday.__hyperionIntradayStore = store;
+    fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), "utf-8");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        fs.renameSync(tmpPath, filePath);
+        try {
+          globalForIntraday.__hyperionIntradayMtimeMs = fs.statSync(filePath).mtimeMs;
+        } catch {}
+        return;
+      } catch (renameErr: any) {
+        const code = renameErr?.code;
+        if (attempt < 2 && (code === "EPERM" || code === "EACCES" || code === "EBUSY")) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+          continue;
+        }
+        throw renameErr;
+      }
+    }
   } catch {
     // Non-fatal if filesystem write fails
+  } finally {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {}
   }
 }
 
 async function backfillFromTerraShade(
   ticker: string,
-  store: DailyStore
+  initialStore: DailyStore
 ): Promise<void> {
   const sym = ticker.trim().toUpperCase();
-  const tickerData = store.tickers[sym] ?? {
-    history: [],
-    alerts: [],
-    lastBackfillAttempt: 0,
-  };
+  const inFlightMap =
+    globalForIntraday.__hyperionTerraBackfillInFlight ??
+    (globalForIntraday.__hyperionTerraBackfillInFlight = new Map<string, Promise<void>>());
 
-  const now = Date.now();
-  if (now - (tickerData.lastBackfillAttempt ?? 0) < 60_000) {
+  const existingPromise = inFlightMap.get(sym);
+  if (existingPromise) {
+    await existingPromise;
     return;
   }
-  tickerData.lastBackfillAttempt = now;
 
-  try {
+  const runBackfill = (async () => {
+    const preData = initialStore.tickers[sym] ?? {
+      history: [],
+      alerts: [],
+      lastBackfillAttempt: 0,
+    };
+
+    const now = Date.now();
+    if (now - (preData.lastBackfillAttempt ?? 0) < 60_000) {
+      return;
+    }
+    preData.lastBackfillAttempt = now;
+    initialStore.tickers[sym] = preData;
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3500);
-
-    const res = await fetch(
-      `https://terrashade.onrender.com/api?symbol=${encodeURIComponent(sym)}`,
-      {
-        signal: controller.signal,
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-      }
-    );
-    clearTimeout(timeout);
-
-    if (!res.ok) return;
-    const data = await res.json();
-
-    if (Array.isArray(data.history) && data.history.length > 0) {
-      const backfilledHistory: IntradayHistoryPoint[] = data.history.map(
-        (h: any) => {
-          const ts =
-            typeof h.ts === "number" ? h.ts : Math.floor(Date.now() / 1000);
-          const time = formatTimeEt(ts);
-          const spot = Number(h.spot ?? 0);
-          const cw = Number(h.cw ?? h.call_wall ?? 0);
-          const pw = Number(h.pw ?? h.put_wall ?? 0);
-          const zg = Number(h.zg ?? h.zero_gamma ?? 0);
-          return {
-            t:
-              h.t ??
-              new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 16) +
-                " UTC",
-            ts,
-            time,
-            spot,
-            cw,
-            pw,
-            zg,
-            callWall: cw,
-            putWall: pw,
-            zeroGamma: zg,
-          };
+    try {
+      const res = await fetch(
+        `https://terrashade.onrender.com/api?symbol=${encodeURIComponent(sym)}`,
+        {
+          signal: controller.signal,
+          headers: { Accept: "application/json" },
+          cache: "no-store",
         }
       );
 
-      // Merge avoiding duplicate timestamps into partitioned RTH vs Extended-Hours arrays
-      const { rth, ext } = ensurePartitionedHistory(tickerData);
-      const existingTs = new Set([...rth, ...ext].map((item) => item.ts));
-      for (const item of backfilledHistory) {
-        if (!existingTs.has(item.ts)) {
-          if (isRthTimestampEt(item.ts)) rth.push(item);
-          else ext.push(item);
-          existingTs.add(item.ts);
-        }
-      }
-      rth.sort((a, b) => a.ts - b.ts);
-      ext.sort((a, b) => a.ts - b.ts);
-      tickerData.rthHistory = rth.slice(-MAX_RTH_SNAPSHOTS);
-      tickerData.extHistory = ext.slice(-MAX_EXT_SNAPSHOTS);
-      tickerData.history = [
-        ...tickerData.rthHistory,
-        ...tickerData.extHistory,
-      ].sort((a, b) => a.ts - b.ts);
-    }
+      if (!res.ok) return;
+      const data = await res.json();
 
-    if (Array.isArray(data.alerts) && data.alerts.length > 0) {
-      const existingMsgs = new Set(tickerData.alerts.map((a) => a.message));
-      data.alerts.forEach((a: any, idx: number) => {
-        const ts =
-          typeof a.ts === "number" ? a.ts : Math.floor(Date.now() / 1000);
-        const time = formatTimeEt(ts);
-        const msg = String(a.msg ?? a.message ?? "");
-        if (!msg || existingMsgs.has(msg)) return;
-
-        const type: "call" | "put" | "zero" | "king" = msg.includes("Call wall")
-          ? "call"
-          : msg.includes("Put wall")
-            ? "put"
-            : msg.includes("zero gamma")
-              ? "zero"
-              : "king";
-
-        tickerData.alerts.push({
-          id: `${sym}-${ts}-${idx}`,
-          ts,
-          timestamp: time,
-          time,
-          symbol: sym,
-          message: msg,
-          msg,
-          type,
-        });
-        existingMsgs.add(msg);
-      });
-      tickerData.alerts.sort((a, b) => a.ts - b.ts);
-    }
-
-    if (data.levels) {
-      tickerData.officialLevels = {
-        callWall: Number(data.levels.call_wall?.strike ?? 0),
-        callWallGex: Number(
-          ((data.levels.call_wall?.gex ?? 0) / 1e6).toFixed(2)
-        ),
-        putWall: Number(data.levels.put_wall?.strike ?? 0),
-        putWallGex: Number(
-          ((data.levels.put_wall?.gex ?? 0) / 1e6).toFixed(2)
-        ),
-        zeroGamma: Number((data.levels.zero_gamma ?? 0).toFixed(2)),
-        hasZeroGammaFlip: true,
+      // Reload latest store after await so concurrent snapshot writes for other tickers aren't clobbered
+      const latestStore = loadStore();
+      const tickerData = latestStore.tickers[sym] ?? {
+        history: [],
+        alerts: [],
+        lastBackfillAttempt: now,
       };
-    }
+      tickerData.lastBackfillAttempt = now;
 
-    store.tickers[sym] = tickerData;
-    saveStore(store);
-  } catch {
-    // Non-fatal if TerraShade API is unreachable or times out
+      if (Array.isArray(data.history) && data.history.length > 0) {
+        const backfilledHistory: IntradayHistoryPoint[] = data.history.map(
+          (h: any) => {
+            const ts =
+              typeof h.ts === "number" ? toEpochSec(h.ts) : Math.floor(Date.now() / 1000);
+            const time = formatTimeEt(ts);
+            const spot = Number(h.spot ?? 0);
+            const cw = Number(h.cw ?? h.call_wall ?? 0);
+            const pw = Number(h.pw ?? h.put_wall ?? 0);
+            const zg = Number(h.zg ?? h.zero_gamma ?? 0);
+            return {
+              t:
+                h.t ??
+                new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 16) +
+                  " UTC",
+              ts,
+              time,
+              spot,
+              cw,
+              pw,
+              zg,
+              callWall: cw,
+              putWall: pw,
+              zeroGamma: zg,
+            };
+          }
+        );
+
+        // Merge avoiding duplicate timestamps into partitioned RTH vs Extended-Hours arrays
+        const { rth, ext } = ensurePartitionedHistory(tickerData);
+        const existingTs = new Set([...rth, ...ext].map((item) => item.ts));
+        for (const item of backfilledHistory) {
+          if (!existingTs.has(item.ts)) {
+            if (isRthTimestampEt(item.ts)) rth.push(item);
+            else ext.push(item);
+            existingTs.add(item.ts);
+          }
+        }
+        rth.sort((a, b) => a.ts - b.ts);
+        ext.sort((a, b) => a.ts - b.ts);
+        tickerData.rthHistory = rth.slice(-MAX_RTH_SNAPSHOTS);
+        tickerData.extHistory = ext.slice(-MAX_EXT_SNAPSHOTS);
+        tickerData.history = [
+          ...tickerData.rthHistory,
+          ...tickerData.extHistory,
+        ].sort((a, b) => a.ts - b.ts);
+      }
+
+      if (Array.isArray(data.alerts) && data.alerts.length > 0) {
+        const existingMsgs = new Set(tickerData.alerts.map((a) => a.message));
+        data.alerts.forEach((a: any, idx: number) => {
+          const ts =
+            typeof a.ts === "number" ? toEpochSec(a.ts) : Math.floor(Date.now() / 1000);
+          const time = formatTimeEt(ts);
+          const msg = String(a.msg ?? a.message ?? "");
+          if (!msg || existingMsgs.has(msg)) return;
+
+          const type: "call" | "put" | "zero" | "king" = msg.includes("Call wall")
+            ? "call"
+            : msg.includes("Put wall")
+              ? "put"
+              : msg.includes("zero gamma")
+                ? "zero"
+                : "king";
+
+          tickerData.alerts.push({
+            id: `${sym}-${ts}-${idx}`,
+            ts,
+            timestamp: time,
+            time,
+            symbol: sym,
+            message: msg,
+            msg,
+            type,
+          });
+          existingMsgs.add(msg);
+        });
+        tickerData.alerts.sort((a, b) => a.ts - b.ts);
+      }
+
+      if (data.levels) {
+        tickerData.officialLevels = {
+          callWall: Number(data.levels.call_wall?.strike ?? 0),
+          callWallGex: Number(
+            ((data.levels.call_wall?.gex ?? 0) / 1e6).toFixed(2)
+          ),
+          putWall: Number(data.levels.put_wall?.strike ?? 0),
+          putWallGex: Number(
+            ((data.levels.put_wall?.gex ?? 0) / 1e6).toFixed(2)
+          ),
+          zeroGamma: Number((data.levels.zero_gamma ?? 0).toFixed(2)),
+          hasZeroGammaFlip: true,
+        };
+      }
+
+      latestStore.tickers[sym] = tickerData;
+      saveStore(latestStore);
+    } catch {
+      // Non-fatal if TerraShade API is unreachable or times out
+    } finally {
+      clearTimeout(timeout);
+    }
+  })();
+
+  inFlightMap.set(sym, runBackfill);
+  try {
+    await runBackfill;
+  } finally {
+    if (inFlightMap.get(sym) === runBackfill) {
+      inFlightMap.delete(sym);
+    }
   }
 }
 
@@ -397,7 +487,7 @@ export async function recordIntradaySnapshot(params: {
 }> {
   const { ticker, spotPrice, callWall, putWall, zeroGamma, allExpKing } = params;
   const sym = ticker.trim().toUpperCase();
-  const store = loadStore();
+  let store = loadStore();
 
   if (
     !store.tickers[sym] ||
@@ -405,6 +495,7 @@ export async function recordIntradaySnapshot(params: {
     Date.now() - (store.tickers[sym].lastBackfillAttempt ?? 0) > 300_000
   ) {
     await backfillFromTerraShade(sym, store);
+    store = loadStore();
   }
 
   const tickerData = store.tickers[sym] ?? {

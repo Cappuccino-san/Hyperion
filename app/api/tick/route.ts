@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { BoundedMap, VALID_TICKER_REGEX } from "@/lib/marketCache";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -17,7 +18,7 @@ export interface LiveTickResponse {
   isLive: true;
 }
 
-const TICK_CACHE = new Map<string, { data: LiveTickResponse; ts: number }>();
+const TICK_CACHE = new BoundedMap<string, { data: LiveTickResponse; ts: number }>(128);
 const TICK_CACHE_TTL_MS = 400; // 400ms micro-coalescing
 
 const YAHOO_SYMBOL_MAP: Record<string, string> = {
@@ -186,10 +187,13 @@ async function fetchYahooTick(ticker: string): Promise<LiveTickResponse> {
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
-  const ticker = (searchParams.get("ticker") || "SPY").trim().toUpperCase();
+  const rawTicker = (searchParams.get("ticker") || "SPY").trim().toUpperCase();
+  if (!VALID_TICKER_REGEX.test(rawTicker)) {
+    return NextResponse.json({ error: "Invalid ticker symbol" }, { status: 400 });
+  }
 
   try {
-    const clean = ticker.trim().toUpperCase();
+    const clean = rawTicker;
     const now = Date.now();
     const cached = TICK_CACHE.get(clean);
     if (cached && now - cached.ts < TICK_CACHE_TTL_MS) {

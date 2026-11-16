@@ -150,6 +150,39 @@ function createTextSprite(
   };
 }
 
+function formatSurfaceAxisVal(valM: number, sign: "+" | "-"): string {
+  const absM = Math.abs(valM);
+  if (!Number.isFinite(absM) || absM < 0.001) return "$0";
+  if (absM >= 1000) {
+    const b = absM / 1000;
+    return `${sign}${b >= 10 ? b.toFixed(0) : b.toFixed(1)}B`;
+  }
+  if (absM >= 1) {
+    return `${sign}${absM >= 10 ? absM.toFixed(0) : absM.toFixed(1)}M`;
+  }
+  const k = absM * 1000;
+  return `${sign}${k.toFixed(0)}K`;
+}
+
+function formatSurfaceStrike(strike: number): string {
+  if (!Number.isFinite(strike) || strike <= 0) return "—";
+  return strike % 1 !== 0 ? Number(strike.toFixed(2)).toString() : strike.toFixed(0);
+}
+
+function getMetricAxisTitle(metric: ExposureMetric): string {
+  switch (metric) {
+    case "VEX":
+      return "Total Vanna";
+    case "DEX":
+      return "Total Delta";
+    case "Charm":
+      return "Total Charm";
+    case "GEX":
+    default:
+      return "Total Gamma";
+  }
+}
+
 export function Surface3DView({
   ticker,
   spotPrice,
@@ -169,6 +202,14 @@ export function Surface3DView({
   );
   const [autoRotate, setAutoRotate] = useState<boolean>(false);
   const [hoveredNode, setHoveredNode] = useState<HoveredNodeInfo | null>(null);
+  const autoRotateRef = useRef(autoRotate);
+  autoRotateRef.current = autoRotate;
+  const sceneHandlesRef = useRef<{
+    scene: THREE.Scene;
+    dataGroup: THREE.Group;
+    disposables: { dispose: () => void }[];
+    barMeshes: THREE.Mesh[];
+  } | null>(null);
 
   // Camera spherical coordinates (+Y is strictly UP)
   const cameraStateRef = useRef({
@@ -199,9 +240,10 @@ export function Surface3DView({
 
     for (const r of slicedRows) {
       for (const c of columns) {
-        const v = r.values[c.id] ?? 0;
-        if (v > rawMaxPos) rawMaxPos = v;
-        if (v < 0 && Math.abs(v) > rawMaxNeg) rawMaxNeg = Math.abs(v);
+        const rawV = r.values[c.id] ?? 0;
+        if (!Number.isFinite(rawV)) continue;
+        if (rawV > rawMaxPos) rawMaxPos = rawV;
+        if (rawV < 0 && Math.abs(rawV) > rawMaxNeg) rawMaxNeg = Math.abs(rawV);
       }
     }
 
@@ -209,7 +251,9 @@ export function Surface3DView({
     // invert the vertical sign at/above the King/ATM pivot so the dominant King/Call gamma ridge
     // extrudes UPWARD (+Y) as a positive mountain peak while lower OTM put strikes form downward (-Y) valleys.
     const needsUprightInversion = rawMaxPos < rawMaxNeg * 0.45;
-    const pivotStrike = Math.min(spotPrice, kingStrike) - 1.5;
+    const safeSpot = Number.isFinite(spotPrice) && spotPrice > 0 ? spotPrice : 0;
+    const safeKing = Number.isFinite(kingStrike) && kingStrike > 0 ? kingStrike : safeSpot;
+    const pivotStrike = Math.min(safeSpot > 0 ? safeSpot : safeKing, safeKing > 0 ? safeKing : safeSpot) - 1.5;
 
     const matrix = new Map<number, Record<string, number>>();
     let maxPos = 0.1;
@@ -218,7 +262,8 @@ export function Surface3DView({
     for (const r of slicedRows) {
       const rowMap: Record<string, number> = {};
       for (const c of columns) {
-        const raw = r.values[c.id] ?? 0;
+        const rawCandidate = r.values[c.id] ?? 0;
+        const raw = Number.isFinite(rawCandidate) ? rawCandidate : 0;
         let val = raw;
 
         if (needsUprightInversion) {
@@ -261,6 +306,7 @@ export function Surface3DView({
     };
   };
 
+  // Effect 1: Single persistent WebGLRenderer + scene + orbit controls
   useEffect(() => {
     const container = mountRef.current;
     if (!container) return;
@@ -296,14 +342,182 @@ export function Surface3DView({
     dirLight2.position.set(-22, 16, -18);
     scene.add(dirLight2);
 
+    const dataGroup = new THREE.Group();
+    scene.add(dataGroup);
+
+    // Zero-Gamma ($0) Reference Floor Grid at Y = 0
+    const gridHelper = new THREE.GridHelper(28, 20, "#334155", "#1e293b");
+    gridHelper.position.y = 0;
+    scene.add(gridHelper);
+
+    const handles = {
+      scene,
+      dataGroup,
+      disposables: [] as { dispose: () => void }[],
+      barMeshes: [] as THREE.Mesh[],
+    };
+    sceneHandlesRef.current = handles;
+
+    // Raycaster & Mouse Orbit Controls
+    const raycaster = new THREE.Raycaster();
+    const pointer = new THREE.Vector2();
+    let isDragging = false;
+    let isPanning = false;
+    let prevX = 0;
+    let prevY = 0;
+
+    const domEl = renderer.domElement;
+
+    const onPointerDown = (e: MouseEvent) => {
+      isDragging = true;
+      isPanning = e.button === 2 || e.shiftKey;
+      prevX = e.clientX;
+      prevY = e.clientY;
+    };
+
+    const onPointerMove = (e: MouseEvent) => {
+      if (!isDragging && e.target !== domEl) {
+        setHoveredNode((prev) => (prev !== null ? null : prev));
+        return;
+      }
+
+      const rect = domEl.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+
+      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+      if (isDragging) {
+        const dx = e.clientX - prevX;
+        const dy = e.clientY - prevY;
+        prevX = e.clientX;
+        prevY = e.clientY;
+
+        if (isPanning) {
+          cameraStateRef.current.targetX -= dx * 0.03;
+          cameraStateRef.current.targetZ -= dy * 0.03;
+        } else {
+          cameraStateRef.current.theta -= dx * 0.0075;
+          cameraStateRef.current.phi = Math.max(
+            0.28,
+            Math.min(Math.PI * 0.46, cameraStateRef.current.phi - dy * 0.0065)
+          );
+        }
+        return;
+      }
+
+      // Hover raycasting on 3D nodes
+      raycaster.setFromCamera(pointer, camera);
+      const intersects = raycaster.intersectObjects(handles.barMeshes, false);
+      if (intersects.length > 0) {
+        const hit = intersects[0].object.userData as HoveredNodeInfo;
+        setHoveredNode(hit);
+      } else {
+        setHoveredNode((prev) => (prev !== null ? null : prev));
+      }
+    };
+
+    const onPointerUp = () => {
+      isDragging = false;
+      isPanning = false;
+    };
+
+    const onPointerLeave = () => {
+      setHoveredNode((prev) => (prev !== null ? null : prev));
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      cameraStateRef.current.radius = Math.max(
+        16,
+        Math.min(64, cameraStateRef.current.radius + e.deltaY * 0.025)
+      );
+    };
+
+    const onContextMenu = (e: MouseEvent) => e.preventDefault();
+
+    domEl.addEventListener("mousedown", onPointerDown);
+    domEl.addEventListener("mouseleave", onPointerLeave);
+    window.addEventListener("mousemove", onPointerMove);
+    window.addEventListener("mouseup", onPointerUp);
+    domEl.addEventListener("wheel", onWheel, { passive: false });
+    domEl.addEventListener("contextmenu", onContextMenu);
+
+    const onResize = () => {
+      if (!container) return;
+      const w = container.clientWidth || 960;
+      const h = container.clientHeight || 520;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    };
+    window.addEventListener("resize", onResize);
+
+    let animFrameId = 0;
+    const animate = () => {
+      animFrameId = requestAnimationFrame(animate);
+
+      if (autoRotateRef.current && !isDragging) {
+        cameraStateRef.current.theta += 0.0035;
+      }
+
+      const { theta, phi, radius, targetX, targetY, targetZ } =
+        cameraStateRef.current;
+      camera.position.x =
+        targetX + radius * Math.sin(phi) * Math.sin(theta);
+      camera.position.y = targetY + radius * Math.cos(phi);
+      camera.position.z =
+        targetZ + radius * Math.sin(phi) * Math.cos(theta);
+      camera.lookAt(targetX, targetY, targetZ);
+
+      renderer.render(scene, camera);
+    };
+    animate();
+
+    return () => {
+      cancelAnimationFrame(animFrameId);
+      domEl.removeEventListener("mousedown", onPointerDown);
+      domEl.removeEventListener("mouseleave", onPointerLeave);
+      window.removeEventListener("mousemove", onPointerMove);
+      window.removeEventListener("mouseup", onPointerUp);
+      domEl.removeEventListener("wheel", onWheel);
+      domEl.removeEventListener("contextmenu", onContextMenu);
+      window.removeEventListener("resize", onResize);
+      handles.disposables.forEach((d) => d.dispose());
+      handles.disposables = [];
+      handles.barMeshes = [];
+      dataGroup.clear();
+      sceneHandlesRef.current = null;
+      gridHelper.dispose();
+      scene.clear();
+      renderer.dispose();
+      renderer.forceContextLoss();
+      domEl.remove();
+    };
+  }, []);
+
+  // Effect 2: Rebuild only dynamic dataGroup geometry/sprites on data/metric/renderStyle updates
+  useEffect(() => {
+    const handles = sceneHandlesRef.current;
+    if (!handles) return;
+
+    const { dataGroup } = handles;
+    handles.disposables.forEach((d) => d.dispose());
+    handles.disposables = [];
+    handles.barMeshes = [];
+    dataGroup.clear();
+
+    const disposables = handles.disposables;
+    const barMeshes = handles.barMeshes;
+
     const numX = Math.max(1, columns.length);
     const numZ = Math.max(1, slicedRows.length);
     const spanX = 22;
     const spanZ = 24;
 
-    // Upright Y-Axis scale matching Hyperion's [-0.5B, +1.5B] mountain proportions:
-    // +Y peaks extrude upward up to +9.0 units (+1.5B)
-    // -Y valleys drop downward down to -3.0 units (-0.5B)
+    // Upright Y-Axis scale matching Hyperion's mountain proportions:
+    // +Y peaks extrude upward up to +9.0 units
+    // -Y valleys drop downward down to -3.0 units
     const maxPositiveHeight = 9.0;
     const maxNegativeDepth = 3.0;
 
@@ -313,6 +527,9 @@ export function Surface3DView({
       numZ > 1 ? (rowIdx / (numZ - 1) - 0.5) * spanZ : 0;
 
     const getUprightY = (val: number): { y: number; normRatio: number } => {
+      if (!Number.isFinite(val)) {
+        return { y: 0, normRatio: 0 };
+      }
       if (val >= 0) {
         const norm = Math.min(1, val / Math.max(0.01, maxPositiveVal));
         return {
@@ -331,33 +548,25 @@ export function Surface3DView({
       }
     };
 
-    const barMeshes: THREE.Mesh[] = [];
-    const disposables: { dispose: () => void }[] = [];
-
-    // Zero-Gamma ($0) Reference Floor Grid at Y = 0
-    const gridHelper = new THREE.GridHelper(28, 20, "#334155", "#1e293b");
-    gridHelper.position.y = 0;
-    scene.add(gridHelper);
-
-    // 3D Bounding Frame & Vertical Total Gamma Axis (-0.5B to +1.5B)
+    // 3D Bounding Frame & Dynamic Vertical Metric Axis
     const axisX = -spanX / 2 - 1.6;
     const axisZ = -spanZ / 2 - 1.4;
     const yTicks = [
-      { label: "+1.5B", y: maxPositiveHeight, color: "#fde047" },
-      { label: "+1.0B", y: maxPositiveHeight * 0.667, color: "#22d3ee" },
-      { label: "+0.5B", y: maxPositiveHeight * 0.333, color: "#2dd4bf" },
+      { label: formatSurfaceAxisVal(maxPositiveVal, "+"), y: maxPositiveHeight, color: "#fde047" },
+      { label: formatSurfaceAxisVal(maxPositiveVal * 0.667, "+"), y: maxPositiveHeight * 0.667, color: "#22d3ee" },
+      { label: formatSurfaceAxisVal(maxPositiveVal * 0.333, "+"), y: maxPositiveHeight * 0.333, color: "#2dd4bf" },
       { label: "$0", y: 0, color: "#f1f5f9" },
-      { label: "-0.5B", y: -maxNegativeDepth, color: "#c084fc" },
+      { label: formatSurfaceAxisVal(maxNegativeVal, "-"), y: -maxNegativeDepth, color: "#c084fc" },
     ];
 
-    // Vertical Total Gamma Pole
+    // Vertical Axis Pole
     const poleGeo = new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(axisX, -maxNegativeDepth, axisZ),
       new THREE.Vector3(axisX, maxPositiveHeight + 0.8, axisZ),
     ]);
     const poleMat = new THREE.LineBasicMaterial({ color: "#64748b" });
     disposables.push(poleGeo, poleMat);
-    scene.add(new THREE.Line(poleGeo, poleMat));
+    dataGroup.add(new THREE.Line(poleGeo, poleMat));
 
     yTicks.forEach((tick) => {
       // Back-wall elevation reference line
@@ -372,28 +581,28 @@ export function Surface3DView({
         opacity: tick.y === 0 ? 0.75 : 0.45,
       });
       disposables.push(guideGeo, guideMat);
-      scene.add(new THREE.Line(guideGeo, guideMat));
+      dataGroup.add(new THREE.Line(guideGeo, guideMat));
 
       const lbl = createTextSprite(tick.label, tick.color, 56, 5.4);
       lbl.sprite.position.set(axisX - 2.3, tick.y, axisZ);
       disposables.push(lbl);
-      scene.add(lbl.sprite);
+      dataGroup.add(lbl.sprite);
     });
 
-    // "Total Gamma" Axis Title
-    const gammaAxisTitle = createTextSprite(
-      "Total Gamma",
+    // Dynamic Metric Axis Title
+    const metricAxisTitle = createTextSprite(
+      getMetricAxisTitle(metric),
       "#f8fafc",
       58,
       7.4
     );
-    gammaAxisTitle.sprite.position.set(
+    metricAxisTitle.sprite.position.set(
       axisX - 2.1,
       maxPositiveHeight + 2.0,
       axisZ
     );
-    disposables.push(gammaAxisTitle);
-    scene.add(gammaAxisTitle.sprite);
+    disposables.push(metricAxisTitle);
+    dataGroup.add(metricAxisTitle.sprite);
 
     // Expiration (X-Axis) Tick Labels along front edge
     columns.forEach((col, colIdx) => {
@@ -402,12 +611,12 @@ export function Surface3DView({
       const expLbl = createTextSprite(col.dateLabel, "#e2e8f0", 54, 5.2);
       expLbl.sprite.position.set(x, -0.9, spanZ / 2 + 2.2);
       disposables.push(expLbl);
-      scene.add(expLbl.sprite);
+      dataGroup.add(expLbl.sprite);
     });
     const expAxisTitle = createTextSprite("Expiration", "#38bdf8", 58, 7.0);
     expAxisTitle.sprite.position.set(0, -2.3, spanZ / 2 + 4.1);
     disposables.push(expAxisTitle);
-    scene.add(expAxisTitle.sprite);
+    dataGroup.add(expAxisTitle.sprite);
 
     // Strike (Z-Axis) Tick Labels along right edge
     const strikeStepInterval = Math.max(1, Math.floor(numZ / 6));
@@ -415,21 +624,21 @@ export function Surface3DView({
       if (rowIdx % strikeStepInterval !== 0 && !row.isAtm) return;
       const z = getZ(rowIdx);
       const strikeLbl = createTextSprite(
-        `$${row.strike.toFixed(0)}`,
+        `$${formatSurfaceStrike(row.strike)}`,
         row.isAtm ? "#38bdf8" : row.isKingNode ? "#fde047" : "#e2e8f0",
         54,
         5.2
       );
       strikeLbl.sprite.position.set(spanX / 2 + 2.4, -0.7, z);
       disposables.push(strikeLbl);
-      scene.add(strikeLbl.sprite);
+      dataGroup.add(strikeLbl.sprite);
     });
     const strikeAxisTitle = createTextSprite("Strike", "#a5b4fc", 58, 6.6);
     strikeAxisTitle.sprite.position.set(spanX / 2 + 4.6, -2.1, 0);
     disposables.push(strikeAxisTitle);
-    scene.add(strikeAxisTitle.sprite);
+    dataGroup.add(strikeAxisTitle.sprite);
 
-    // 1. Continuous Upright 3D Mountain Surface Mesh (X = Expiration, Y = Upright Gamma, Z = Strike)
+    // 1. Continuous Upright 3D Mountain Surface Mesh (X = Expiration, Y = Upright Exposure, Z = Strike)
     if (
       (renderStyle === "hybrid" || renderStyle === "surface") &&
       numX >= 2 &&
@@ -492,7 +701,7 @@ export function Surface3DView({
       disposables.push(surfaceMat);
 
       const surfaceMesh = new THREE.Mesh(surfaceGeo, surfaceMat);
-      scene.add(surfaceMesh);
+      dataGroup.add(surfaceMesh);
 
       // Crisp wireframe contour mesh over the mountain surface
       const wireMat = new THREE.MeshBasicMaterial({
@@ -503,7 +712,7 @@ export function Surface3DView({
       });
       disposables.push(wireMat);
       const wireMesh = new THREE.Mesh(surfaceGeo, wireMat);
-      scene.add(wireMesh);
+      dataGroup.add(wireMesh);
     }
 
     // 2. Extruded 3D Bars on each (Expiration, Strike) node (also used for hover raycasting)
@@ -527,13 +736,14 @@ export function Surface3DView({
           color: "#3b82f6",
         });
         disposables.push(lineGeo, lineMat);
-        scene.add(new THREE.Line(lineGeo, lineMat));
+        dataGroup.add(new THREE.Line(lineGeo, lineMat));
       }
 
       for (let xIdx = 0; xIdx < numX; xIdx++) {
         const col = columns[xIdx];
         const x = getX(xIdx);
-        const effectiveVal = rowMap[col.id] ?? 0;
+        const rawVal = rowMap[col.id] ?? 0;
+        const effectiveVal = Number.isFinite(rawVal) ? rawVal : 0;
         const { y, normRatio } = getUprightY(effectiveVal);
         const absHeight = Math.max(0.1, Math.abs(y));
         const isKingBar = row.isKingNode && normRatio > 0.3;
@@ -562,125 +772,10 @@ export function Surface3DView({
           isAtm: row.isAtm,
         } satisfies HoveredNodeInfo;
 
-        scene.add(mesh);
+        dataGroup.add(mesh);
         barMeshes.push(mesh);
       }
     }
-
-    // Raycaster & Mouse Orbit Controls
-    const raycaster = new THREE.Raycaster();
-    const pointer = new THREE.Vector2();
-    let isDragging = false;
-    let isPanning = false;
-    let prevX = 0;
-    let prevY = 0;
-
-    const onPointerDown = (e: MouseEvent) => {
-      isDragging = true;
-      isPanning = e.button === 2 || e.shiftKey;
-      prevX = e.clientX;
-      prevY = e.clientY;
-    };
-
-    const onPointerMove = (e: MouseEvent) => {
-      const rect = renderer.domElement.getBoundingClientRect();
-      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-
-      if (isDragging) {
-        const dx = e.clientX - prevX;
-        const dy = e.clientY - prevY;
-        prevX = e.clientX;
-        prevY = e.clientY;
-
-        if (isPanning) {
-          cameraStateRef.current.targetX -= dx * 0.03;
-          cameraStateRef.current.targetZ -= dy * 0.03;
-        } else {
-          cameraStateRef.current.theta -= dx * 0.0075;
-          cameraStateRef.current.phi = Math.max(
-            0.28,
-            Math.min(Math.PI * 0.46, cameraStateRef.current.phi - dy * 0.0065)
-          );
-        }
-        return;
-      }
-
-      // Hover raycasting on 3D nodes
-      raycaster.setFromCamera(pointer, camera);
-      const intersects = raycaster.intersectObjects(barMeshes, false);
-      if (intersects.length > 0) {
-        const hit = intersects[0].object.userData as HoveredNodeInfo;
-        setHoveredNode(hit);
-      } else {
-        setHoveredNode(null);
-      }
-    };
-
-    const onPointerUp = () => {
-      isDragging = false;
-      isPanning = false;
-    };
-
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      cameraStateRef.current.radius = Math.max(
-        16,
-        Math.min(64, cameraStateRef.current.radius + e.deltaY * 0.025)
-      );
-    };
-
-    const onContextMenu = (e: MouseEvent) => e.preventDefault();
-
-    const domEl = renderer.domElement;
-    domEl.addEventListener("mousedown", onPointerDown);
-    window.addEventListener("mousemove", onPointerMove);
-    window.addEventListener("mouseup", onPointerUp);
-    domEl.addEventListener("wheel", onWheel, { passive: false });
-    domEl.addEventListener("contextmenu", onContextMenu);
-
-    const onResize = () => {
-      if (!container) return;
-      const w = container.clientWidth || 960;
-      const h = container.clientHeight || 520;
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
-    };
-    window.addEventListener("resize", onResize);
-
-    let animFrameId = 0;
-    const animate = () => {
-      animFrameId = requestAnimationFrame(animate);
-
-      if (autoRotate && !isDragging) {
-        cameraStateRef.current.theta += 0.0035;
-      }
-
-      const { theta, phi, radius, targetX, targetY, targetZ } =
-        cameraStateRef.current;
-      camera.position.x =
-        targetX + radius * Math.sin(phi) * Math.sin(theta);
-      camera.position.y = targetY + radius * Math.cos(phi);
-      camera.position.z =
-        targetZ + radius * Math.sin(phi) * Math.cos(theta);
-      camera.lookAt(targetX, targetY, targetZ);
-
-      renderer.render(scene, camera);
-    };
-    animate();
-
-    return () => {
-      cancelAnimationFrame(animFrameId);
-      domEl.removeEventListener("mousedown", onPointerDown);
-      window.removeEventListener("mousemove", onPointerMove);
-      window.removeEventListener("mouseup", onPointerUp);
-      domEl.removeEventListener("wheel", onWheel);
-      domEl.removeEventListener("contextmenu", onContextMenu);
-      window.removeEventListener("resize", onResize);
-      disposables.forEach((d) => d.dispose());
-      renderer.dispose();
-    };
   }, [
     columns,
     slicedRows,
@@ -688,7 +783,7 @@ export function Surface3DView({
     maxPositiveVal,
     maxNegativeVal,
     renderStyle,
-    autoRotate,
+    metric,
   ]);
 
   return (
@@ -703,22 +798,22 @@ export function Surface3DView({
         </div>
         <div className="text-xs font-mono text-slate-100 space-y-1 leading-relaxed">
           <div>
-            Y-Axis: <span className="text-yellow-300 font-bold">Total Gamma</span> · X-Axis:{" "}
+            Y-Axis: <span className="text-yellow-300 font-bold">{getMetricAxisTitle(metric)}</span> · X-Axis:{" "}
             <span className="text-cyan-300 font-bold">{columns.length} Expirations</span> · Z-Axis:{" "}
             <span className="text-indigo-300 font-bold">{slicedRows.length} Strikes</span>
           </div>
           <div className="flex flex-wrap items-center gap-2 text-xs">
             <span className="text-yellow-300 font-extrabold">
-              ★ King: ${kingStrike.toFixed(0)} ({kingStrength}pts)
+              ★ King: ${formatSurfaceStrike(kingStrike)} ({Number.isFinite(kingStrength) ? kingStrength : 0}pts)
             </span>
             <span className="text-slate-400">·</span>
-            <span className="text-[#11cdef] font-bold">CW ${callWall.toFixed(0)}</span>
+            <span className="text-[#11cdef] font-bold">CW ${formatSurfaceStrike(callWall)}</span>
             <span className="text-slate-400">·</span>
-            <span className="text-[#f5365c] font-bold">PW ${putWall.toFixed(0)}</span>
+            <span className="text-[#f5365c] font-bold">PW ${formatSurfaceStrike(putWall)}</span>
           </div>
           <div className="text-xs text-slate-200 font-medium">
-            Zero γ: <span className="text-amber-300 font-bold">${zeroGamma.toFixed(2)}</span> · Blue Line = Spot (
-            <span className="text-sky-300 font-bold">${spotPrice.toFixed(2)}</span>)
+            Zero γ: <span className="text-amber-300 font-bold">{Number.isFinite(zeroGamma) && zeroGamma > 0 ? `$${zeroGamma.toFixed(2)}` : "—"}</span> · Blue Line = Spot (
+            <span className="text-sky-300 font-bold">{Number.isFinite(spotPrice) && spotPrice > 0 ? `$${spotPrice.toFixed(2)}` : "—"}</span>)
           </div>
         </div>
       </div>
@@ -796,7 +891,7 @@ export function Surface3DView({
         <div className="absolute bottom-14 left-3 z-20 rounded-xl bg-[#111422]/95 border border-[#11cdef]/70 px-3.5 py-2.5 text-sm font-mono shadow-xl pointer-events-none">
           <div className="flex items-center gap-2">
             <span className="font-extrabold text-white">
-              Strike ${hoveredNode.strike.toFixed(hoveredNode.strike % 1 !== 0 ? 1 : 0)}
+              Strike ${formatSurfaceStrike(hoveredNode.strike)}
             </span>
             <span className="rounded bg-white/15 px-2 py-0.5 text-xs font-bold text-cyan-300">
               {hoveredNode.dateLabel} ({hoveredNode.tag})
@@ -828,8 +923,13 @@ export function Surface3DView({
           Left-Drag: Rotate 3D Orbit · Right-Drag / Shift-Drag: Pan · Scroll: Zoom · Hover: Inspect Node
         </span>
         <span className="font-semibold text-white">
-          <span className="text-yellow-300">Upward Cyan/Yellow Peaks = +γ (+1.5B)</span> ·{" "}
-          <span className="text-purple-300">Downward Purple/Indigo Valleys = -γ (-0.5B)</span>
+          <span className="text-yellow-300">
+            Upward Cyan/Yellow Peaks = +{metric === "GEX" ? "γ" : metric} ({formatSurfaceAxisVal(maxPositiveVal, "+")})
+          </span>{" "}
+          ·{" "}
+          <span className="text-purple-300">
+            Downward Purple/Indigo Valleys = -{metric === "GEX" ? "γ" : metric} ({formatSurfaceAxisVal(maxNegativeVal, "-")})
+          </span>
         </span>
       </div>
 

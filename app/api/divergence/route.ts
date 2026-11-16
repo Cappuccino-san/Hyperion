@@ -19,10 +19,9 @@ export async function GET(request: NextRequest) {
   // Map SPX to SPXW if needed
   const querySym = symbol === "SPX" ? "SPXW" : symbol;
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
-
     const res = await fetch(`https://terrashade.onrender.com/api/divergence?symbol=${encodeURIComponent(querySym)}`, {
       signal: controller.signal,
       headers: {
@@ -32,14 +31,14 @@ export async function GET(request: NextRequest) {
       cache: "no-store",
     });
 
-    clearTimeout(timeout);
-
     if (res.ok) {
       const data = await res.json();
       return NextResponse.json(data);
     }
-  } catch (err) {
+  } catch {
     // Fallback: If external API call times out or fails, return empty schema
+  } finally {
+    clearTimeout(timeout);
   }
 
   return NextResponse.json({

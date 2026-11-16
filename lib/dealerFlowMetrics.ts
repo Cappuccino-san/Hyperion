@@ -64,23 +64,24 @@ export function computeDealerFlowSummary(params: {
   strikes?: StrikeExposureSummary[];
 }): DealerFlowSummary {
   const { spot, netGexM, zeroGammaFlip, kingStrike, allExpKingStrike, strikes = [] } = params;
-  const safeSpot = spot > 0 ? spot : 1;
+  const safeSpot = Number.isFinite(spot) && spot > 0 ? spot : 1;
+  const safeNetGexM = Number.isFinite(netGexM) ? netGexM : 0;
 
   // Since netGexM is scaled per 1% move (0.01 * S), per-$1.00 move flow is:
   // Flow_per_pt = NetGEX_1pct / (0.01 * S) = (NetGEX_1pct * 100) / S
-  const hedgingFlowPerPtM = (netGexM * 100) / safeSpot;
+  const hedgingFlowPerPtM = (safeNetGexM * 100) / safeSpot;
 
-  const absFlow = Math.abs(hedgingFlowPerPtM);
+  const absNetGex1PctM = Math.abs(safeNetGexM);
   const hedgingBehavior: DealerFlowSummary['hedgingBehavior'] =
-    absFlow < 2.0
+    absNetGex1PctM < 15
       ? 'NEUTRAL'
-      : hedgingFlowPerPtM > 0
+      : safeNetGexM > 0
       ? 'COUNTER_TREND_ABSORB'
       : 'PRO_TREND_AMPLIFY';
 
   const cushionIndex = Math.max(
     -100,
-    Math.min(100, Math.round(Math.tanh(hedgingFlowPerPtM / 120) * 100))
+    Math.min(100, Math.round(Math.tanh(safeNetGexM / 900) * 100))
   );
 
   // Center of Gamma Mass (CoGM)
@@ -118,11 +119,12 @@ export function computeDealerFlowSummary(params: {
         : `Momentum regime — ride directional trend toward ${kingStr}.`;
   }
 
-  // Pin Conviction Score [0..100]
+  // Pin Conviction Score [0..100] (spot-normalized to 1% units anchored at SPY $750)
   const macroSplitPts = allExpKingStrike && kingStrike ? Math.abs(allExpKingStrike - kingStrike) : 0;
+  const macroSplitPctPts = (macroSplitPts / safeSpot) * 750;
   const pinConvictionScore = Math.max(
     10,
-    Math.min(98, Math.round(50 + cushionIndex * 0.4 - macroSplitPts * 1.5))
+    Math.min(98, Math.round(50 + cushionIndex * 0.4 - macroSplitPctPts * 1.5))
   );
 
   return {
@@ -211,6 +213,8 @@ export function formatInstitutionalDeskBrief(params: {
   return lines.join("\n");
 }
 
+let sharedTerminalAudioCtx: AudioContext | null = null;
+
 /**
  * Zero-dependency Web Audio API acoustic synthesizer for institutional regime alerts.
  */
@@ -221,13 +225,27 @@ export function playTerminalAlertTone(type: "KING_SHIFT" | "GAMMA_FLIP" | "WALL_
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     if (!AudioCtx) return;
-    const ctx = new AudioCtx();
+    if (!sharedTerminalAudioCtx || sharedTerminalAudioCtx.state === "closed") {
+      sharedTerminalAudioCtx = new AudioCtx();
+    }
+    const ctx = sharedTerminalAudioCtx;
+    if (ctx.state === "suspended") {
+      void ctx.resume().catch(() => {});
+    }
     const now = ctx.currentTime;
 
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.connect(gain);
     gain.connect(ctx.destination);
+    osc.onended = () => {
+      try {
+        osc.disconnect();
+        gain.disconnect();
+      } catch {
+        // ignore disconnect failures
+      }
+    };
 
     if (type === "CONFIRM") {
       osc.type = "sine";

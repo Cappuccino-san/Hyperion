@@ -9,6 +9,7 @@ import { CheatCodesModal } from "@/components/modals/CheatCodesModal";
 import { SetupModal } from "@/components/modals/SetupModal";
 import { CommandPalette } from "@/components/CommandPalette";
 import { ExpectedMovesBadges } from "@/components/header/ExpectedMovesBadges";
+import { HOLIDAYS_2026 } from "@/lib/gaiaSessionGuards";
 import { cn } from "@/lib/utils";
 
 const VIEW_TABS: ActiveView[] = ["Heatmap", "Quad", "Gaia", "Scanner", "Recap"];
@@ -23,19 +24,6 @@ const TAB_ROUTES: Record<ActiveView, string> = {
   Charts: "/",
   Recap: "/recap",
 };
-
-const HOLIDAYS_2026 = new Set([
-  "2026-01-01",
-  "2026-01-19",
-  "2026-02-16",
-  "2026-04-03",
-  "2026-05-25",
-  "2026-06-19",
-  "2026-07-03",
-  "2026-09-07",
-  "2026-11-26",
-  "2026-12-25",
-]);
 
 const EARLY_CLOSE_2026 = new Set(["2026-11-27", "2026-12-24"]);
 
@@ -177,17 +165,22 @@ export function TopNavBar() {
   useEffect(() => {
     let isCancelled = false;
     let timerId: ReturnType<typeof setTimeout> | null = null;
+    let activeController: AbortController | null = null;
 
     const pollTick = async () => {
       if (isCancelled) return;
       try {
         if (typeof document === "undefined" || document.visibilityState === "visible") {
+          activeController?.abort();
+          activeController = new AbortController();
+          const signal = activeController.signal;
           const res = await fetch(`/api/tick?ticker=${encodeURIComponent(activeTicker)}`, {
             cache: "no-store",
+            signal,
           });
-          if (res.ok && !isCancelled) {
+          if (res.ok && !isCancelled && !signal.aborted) {
             const data = await res.json();
-            if (typeof data.spot === "number" && data.spot > 0) {
+            if (!isCancelled && !signal.aborted && typeof data.spot === "number" && data.spot > 0) {
               setLiveTick(activeTicker, data.spot, data.timestamp || Date.now());
             }
           }
@@ -204,6 +197,7 @@ export function TopNavBar() {
     pollTick();
     return () => {
       isCancelled = true;
+      activeController?.abort();
       if (timerId) clearTimeout(timerId);
     };
   }, [activeTicker, setLiveTick]);
@@ -431,7 +425,9 @@ export function TopNavBar() {
                         : "text-cyan-300"
                   }`}
                 >
-                  ${(liveTickPrice ?? spotPrice).toFixed(2)}
+                  {(liveTickPrice ?? spotPrice) > 0
+                    ? `$${(liveTickPrice ?? spotPrice).toFixed(2)}`
+                    : "—"}
                 </span>
               </div>
 
@@ -480,6 +476,7 @@ export function TopNavBar() {
               className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#111520] border border-[#1e2638] text-xs font-mono text-slate-400"
             >
               <span
+                suppressHydrationWarning
                 className={cn(
                   "w-2 h-2 rounded-full shrink-0",
                   mktStatus.state === "open"
@@ -489,7 +486,9 @@ export function TopNavBar() {
                       : "bg-[#64748b]"
                 )}
               />
-              <b className="text-slate-200 font-semibold">{mktStatus.label}</b>
+              <b suppressHydrationWarning className="text-slate-200 font-semibold">
+                {mktStatus.label}
+              </b>
               <span suppressHydrationWarning>{mounted ? `· ${mktStatus.countdown}` : ""}</span>
             </div>
 
@@ -509,7 +508,7 @@ export function TopNavBar() {
             </div>
           </div>
 
-          {activeView !== "Heatmap" && (
+          {(pathname !== "/" || activeView !== "Heatmap") && (
             <div className="pt-1 border-t border-white/5">
               <ExpectedMovesBadges />
             </div>

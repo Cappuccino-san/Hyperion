@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { useRouter, usePathname } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import {
   computeDealerFlowSummary,
@@ -41,7 +41,6 @@ export function CommandPalette({
   onExternalClose?: () => void;
 }) {
   const router = useRouter();
-  const pathname = usePathname();
   const activeTicker = useDashboardStore((state) => state.activeTicker);
   const setTicker = useDashboardStore((state) => state.setTicker);
   const activeMetric = useDashboardStore((state) => state.gridFilters.metric);
@@ -64,6 +63,24 @@ export function CommandPalette({
   const inputRef = useRef<HTMLInputElement>(null);
   const prevKingRef = useRef<number | null>(null);
   const prevZeroGammaRef = useRef<number | null>(null);
+  const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showToast = (msg: string, durationMs = 3500) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastMsg(msg);
+    toastTimerRef.current = setTimeout(() => {
+      toastTimerRef.current = null;
+      setToastMsg(null);
+    }, durationMs);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (focusTimerRef.current) clearTimeout(focusTimerRef.current);
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    };
+  }, []);
 
   const openPalette = () => {
     setIsOpen(true);
@@ -103,9 +120,22 @@ export function CommandPalette({
   }, [isOpen]);
 
   useEffect(() => {
-    if (isOpen) {
-      setTimeout(() => inputRef.current?.focus(), 20);
+    if (focusTimerRef.current) {
+      clearTimeout(focusTimerRef.current);
+      focusTimerRef.current = null;
     }
+    if (isOpen) {
+      focusTimerRef.current = setTimeout(() => {
+        focusTimerRef.current = null;
+        inputRef.current?.focus();
+      }, 20);
+    }
+    return () => {
+      if (focusTimerRef.current) {
+        clearTimeout(focusTimerRef.current);
+        focusTimerRef.current = null;
+      }
+    };
   }, [isOpen]);
 
   // Acoustic monitoring for live King Node migration & Zero-Gamma Flips
@@ -121,8 +151,7 @@ export function CommandPalette({
       prevKingRef.current !== currentKing
     ) {
       playTerminalAlertTone("KING_SHIFT");
-      setToastMsg(`⚡ King Node Migrated: ${prevKingRef.current} → ${currentKing}`);
-      setTimeout(() => setToastMsg(null), 4000);
+      showToast(`⚡ King Node Migrated: ${prevKingRef.current} → ${currentKing}`, 4000);
     } else if (
       prevZeroGammaRef.current !== null &&
       prevZeroGammaRef.current > 0 &&
@@ -130,8 +159,7 @@ export function CommandPalette({
       Math.abs(prevZeroGammaRef.current - currentZg) >= 1
     ) {
       playTerminalAlertTone("GAMMA_FLIP");
-      setToastMsg(`⚠️ Zero Gamma Level Shift: ${currentZg.toFixed(1)}`);
-      setTimeout(() => setToastMsg(null), 4000);
+      showToast(`⚠️ Zero Gamma Level Shift: ${currentZg.toFixed(1)}`, 4000);
     }
 
     prevKingRef.current = currentKing;
@@ -176,12 +204,21 @@ export function CommandPalette({
       flow: liveFlowSnapshot ?? undefined,
     });
 
-    navigator.clipboard.writeText(brief).then(() => {
-      playTerminalAlertTone("CONFIRM");
-      setToastMsg(`Copied ${activeTicker} Institutional Desk Brief to Clipboard`);
-      setTimeout(() => setToastMsg(null), 3200);
-      closePalette();
-    });
+    if (!navigator?.clipboard?.writeText) {
+      showToast("Clipboard unavailable in this browser context", 3200);
+      return;
+    }
+
+    navigator.clipboard.writeText(brief).then(
+      () => {
+        playTerminalAlertTone("CONFIRM");
+        showToast(`Copied ${activeTicker} Institutional Desk Brief to Clipboard`, 3200);
+        closePalette();
+      },
+      () => {
+        showToast("Clipboard permission denied", 3200);
+      }
+    );
   };
 
   const commands = useMemo<CommandItem[]>(() => {

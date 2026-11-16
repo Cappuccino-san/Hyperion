@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ExposureMetric,
@@ -8,6 +8,7 @@ import {
   useDashboardStore,
 } from "@/store/useDashboardStore";
 import { OptionsAnalyticsPayload } from "@/lib/optionsExposure";
+import { getTodayEt } from "@/lib/gaiaSessionGuards";
 import { cn } from "@/lib/utils";
 
 const QUAD_TICKERS = ["SPY", "QQQ", "SPXW", "IWM"] as const;
@@ -51,6 +52,7 @@ function isAliveExpiration(isoDate: string): boolean {
 
 export function QuadView() {
   const router = useRouter();
+  const activeTicker = useDashboardStore((state) => state.activeTicker);
   const metric = useDashboardStore((state) => state.gridFilters.metric);
   const globalExpFilter = useDashboardStore(
     (state) => state.gridFilters.expiration
@@ -75,35 +77,46 @@ export function QuadView() {
   const scrollContainers = useRef<Record<string, HTMLDivElement | null>>({});
   const hasCentered = useRef<Record<string, boolean>>({});
 
-  const fetchQuadData = useCallback(() => {
+  useEffect(() => {
     let active = true;
-    QUAD_TICKERS.forEach(async (sym) => {
-      try {
-        const res = await fetch(`/api/options?ticker=${sym}`, {
-          cache: "no-store",
-        });
-        if (!res.ok) return;
-        const data: OptionsAnalyticsPayload = await res.json();
-        if (active) {
-          setQuadPayloads((prev) => ({ ...prev, [sym]: data }));
-        }
-      } catch {
-        // Fallback handled gracefully
+    let controller: AbortController | null = null;
+
+    const runFetch = () => {
+      if (
+        !active ||
+        (typeof document !== "undefined" && document.visibilityState !== "visible")
+      ) {
+        return;
       }
-    });
+      controller?.abort();
+      controller = new AbortController();
+      const signal = controller.signal;
+
+      QUAD_TICKERS.forEach(async (sym) => {
+        try {
+          const res = await fetch(`/api/options?ticker=${sym}`, {
+            cache: "no-store",
+            signal,
+          });
+          if (!res.ok || !active || signal.aborted) return;
+          const data: OptionsAnalyticsPayload = await res.json();
+          if (active && !signal.aborted) {
+            setQuadPayloads((prev) => ({ ...prev, [sym]: data }));
+          }
+        } catch {
+          // Fallback handled gracefully
+        }
+      });
+    };
+
+    runFetch();
+    const interval = setInterval(runFetch, 5000);
     return () => {
       active = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    const cleanup = fetchQuadData();
-    const interval = setInterval(fetchQuadData, 5000);
-    return () => {
-      cleanup();
+      controller?.abort();
       clearInterval(interval);
     };
-  }, [fetchQuadData]);
+  }, []);
 
   // Auto-center spot row in each ladder
   useEffect(() => {
@@ -132,14 +145,18 @@ export function QuadView() {
     if (!payload || !payload.expirations.length) return "0DTE";
     const alive = payload.expirations.filter((e) => isAliveExpiration(e.isoDate));
     const first = alive.length > 0 ? alive[0] : payload.expirations[0];
-    const todayEt = new Date().toLocaleDateString("en-CA", {
-      timeZone: "America/New_York",
-    });
+    const todayEt = getTodayEt();
     return first.isoDate.slice(0, 10) === todayEt ? "0DTE" : "Next exp";
   };
 
-  const spyPayload = quadPayloads["SPY"];
-  const nearExpBadge = getNearExpLabel(spyPayload);
+  const activeQuadSym = (QUAD_TICKERS as readonly string[]).includes(
+    activeTicker.toUpperCase()
+  )
+    ? activeTicker.toUpperCase()
+    : "SPY";
+  const nearExpBadge = getNearExpLabel(
+    quadPayloads[activeQuadSym] ?? quadPayloads["SPY"]
+  );
 
   return (
     <div className="space-y-3 max-w-[1200px] mx-auto">
@@ -244,65 +261,72 @@ export function QuadView() {
           let maxActiveAbs = -1;
           let peakActiveExpIso = colsToSum[0]?.isoDate ?? "";
 
-          const rows = strikesData.map((sRow) => {
-            const map =
-              metric === "GEX"
-                ? sRow.gex
-                : metric === "VEX"
-                  ? sRow.vex
-                  : metric === "DEX"
-                    ? sRow.dex
-                    : sRow.charm;
+          const rows = strikesData
+            .map((sRow) => {
+              if (!Number.isFinite(sRow.strike)) return null;
+              const map =
+                metric === "GEX"
+                  ? sRow.gex
+                  : metric === "VEX"
+                    ? sRow.vex
+                    : metric === "DEX"
+                      ? sRow.dex
+                      : sRow.charm;
 
-            const allVal = allExps.reduce(
-              (acc, c) => acc + (map[c.id] ?? 0),
-              0
-            );
-            if (Math.abs(allVal) > maxAllAbs) {
-              maxAllAbs = Math.abs(allVal);
-              computedAllKing = sRow.strike;
-            }
-
-            let sumVal = 0;
-            let rowPeakColAbs = -1;
-            let rowPeakIso = colsToSum[0]?.isoDate ?? "";
-            for (const c of colsToSum) {
-              const v = map[c.id] ?? 0;
-              sumVal += v;
-              if (Math.abs(v) > rowPeakColAbs) {
-                rowPeakColAbs = Math.abs(v);
-                rowPeakIso = c.isoDate;
+              const allVal = allExps.reduce((acc, c) => {
+                const raw = map?.[c.id] ?? 0;
+                return acc + (Number.isFinite(raw) ? raw : 0);
+              }, 0);
+              if (Math.abs(allVal) > maxAllAbs) {
+                maxAllAbs = Math.abs(allVal);
+                computedAllKing = sRow.strike;
               }
-            }
-            if (Math.abs(sumVal) > maxActiveAbs) {
-              maxActiveAbs = Math.abs(sumVal);
-              computedActiveKing = sRow.strike;
-              peakActiveExpIso = rowPeakIso;
-            }
 
-            // Compute open pct
-            let pct: number | null = null;
-            if (metric === "GEX" && sRow.openPctChange) {
-              let sumPct = 0;
-              let count = 0;
-              colsToSum.forEach((c) => {
-                const o = sRow.openPctChange[c.id];
-                if (o != null && o !== 0) {
-                  sumPct += o;
-                  count++;
+              let sumVal = 0;
+              let rowPeakColAbs = -1;
+              let rowPeakIso = colsToSum[0]?.isoDate ?? "";
+              for (const c of colsToSum) {
+                const raw = map?.[c.id] ?? 0;
+                const v = Number.isFinite(raw) ? raw : 0;
+                sumVal += v;
+                if (Math.abs(v) > rowPeakColAbs) {
+                  rowPeakColAbs = Math.abs(v);
+                  rowPeakIso = c.isoDate;
                 }
-              });
-              if (count > 0) {
-                pct = sumPct / count;
               }
-            }
+              if (Math.abs(sumVal) > maxActiveAbs) {
+                maxActiveAbs = Math.abs(sumVal);
+                computedActiveKing = sRow.strike;
+                peakActiveExpIso = rowPeakIso;
+              }
 
-            return {
-              strike: sRow.strike,
-              val: sumVal,
-              pct,
-            };
-          });
+              // Compute open pct
+              let pct: number | null = null;
+              if (metric === "GEX" && sRow.openPctChange) {
+                let sumPct = 0;
+                let count = 0;
+                colsToSum.forEach((c) => {
+                  const o = sRow.openPctChange[c.id];
+                  if (o != null && Number.isFinite(o) && o !== 0) {
+                    sumPct += o;
+                    count++;
+                  }
+                });
+                if (count > 0) {
+                  pct = sumPct / count;
+                }
+              }
+
+              return {
+                strike: sRow.strike,
+                val: sumVal,
+                pct,
+              };
+            })
+            .filter(
+              (r): r is { strike: number; val: number; pct: number | null } =>
+                r !== null && Number.isFinite(r.strike) && Number.isFinite(r.val)
+            );
 
           const allExpKing = maxAllAbs > 0 ? computedAllKing : fallbackAllExpKing;
           let activeKing = maxActiveAbs > 0 ? computedActiveKing : allExpKing;
@@ -362,7 +386,7 @@ export function QuadView() {
 
           // Pre-market / After-hours quote
           const ext = payload?.extendedQuote;
-          const isIndex = sym === "SPXW";
+          const isIndex = new Set<string>(["SPXW", "SPX", "NDX", "NDXP"]).has(sym);
           const hasExt = !isIndex && !!ext && ext.price > 0;
           const extDiff = hasExt && ext ? ext.price - spot : 0;
           const extPct = hasExt && spot > 0 && ext ? (extDiff / spot) * 100 : 0;
@@ -469,7 +493,7 @@ export function QuadView() {
                       ? "All exp"
                       : globalExpFilter === "THIS_WEEK"
                         ? "This week"
-                        : nearExpBadge}
+                        : nearLabel}
                     )
                   </option>
                   <option value="ALL">All expirations</option>
@@ -506,7 +530,7 @@ export function QuadView() {
                   rows.map((r) => {
                     const isKing = r.strike === activeKing;
                     const isSpot = r.strike === spotStrike;
-                    const tone = (r.val / maxVal + 1) / 2;
+                    const tone = maxVal > 0 ? (r.val / maxVal + 1) / 2 : 0.5;
                     const rgb = vir(tone);
                     const textColor = tone > 0.62 ? "#0b1220" : "#e6edf6";
 

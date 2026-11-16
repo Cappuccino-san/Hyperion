@@ -42,8 +42,11 @@ export function TickerNav() {
     }
 
     setToastMessage(null);
-    setTicker(cleaned);
-    void fetchOptionsChain(cleaned, true, true);
+    if (cleaned === activeTicker) {
+      void fetchOptionsChain(cleaned, true, true);
+    } else {
+      setTicker(cleaned);
+    }
     setSearchInput("");
   };
 
@@ -54,8 +57,11 @@ export function TickerNav() {
 
   const handlePresetTickerClick = (ticker: string) => {
     setToastMessage(null);
-    setTicker(ticker);
-    void fetchOptionsChain(ticker, false, false);
+    if (ticker === activeTicker) {
+      void fetchOptionsChain(ticker, false, false);
+    } else {
+      setTicker(ticker);
+    }
   };
 
   const isPresetTicker = (SUPPORTED_TICKERS as readonly string[]).includes(
