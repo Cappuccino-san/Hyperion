@@ -445,7 +445,8 @@ export async function GET(req: NextRequest) {
       (globalForSignals.__hyperionLastGetEvalAtMs != null &&
         nowMs - globalForSignals.__hyperionLastGetEvalAtMs < 5_000);
     const getLockToken = shouldThrottleEval ? 0 : acquireBarEvaluationLock();
-    if (getLockToken) {
+    const getClock = getEtClockNow();
+    if (getLockToken && getClock.isWeekday) {
       globalForSignals.__hyperionLastGetEvalAtMs = nowMs;
       const evalController = new AbortController();
       const evalTimeout = setTimeout(() => evalController.abort(), 12_000);
@@ -459,6 +460,8 @@ export async function GET(req: NextRequest) {
         clearTimeout(evalTimeout);
         releaseBarEvaluationLock(getLockToken);
       }
+    } else if (getLockToken) {
+      releaseBarEvaluationLock(getLockToken);
     }
 
     const activePositions = getActivePositions();
@@ -514,6 +517,10 @@ export async function POST(req: NextRequest) {
       }
       if (!backfill && typeof body.ticker === "string" && body.ticker.trim()) {
         registerActiveTrackedTicker(body.ticker);
+      }
+      const syncClock = getEtClockNow();
+      if (!backfill && !syncClock.isWeekday) {
+        return NextResponse.json({ success: true, skipped: true, reason: "Market closed (weekend)" });
       }
       const lockToken = await acquireBarEvaluationLockWithWait(2500, req.signal);
       if (!lockToken) {
@@ -634,6 +641,10 @@ export async function POST(req: NextRequest) {
         nowEt: body.nowEt,
         candleTimestamp: body.latest5mCandle?.timestamp,
       });
+      const postClock = getEtClockNow();
+      if (!backfill && !postClock.isWeekday) {
+        return NextResponse.json({ skipped: true, reason: "Market closed (weekend)", emittedAlerts: [] });
+      }
       if (!backfill && typeof body.ticker === "string" && body.ticker.trim()) {
         registerActiveTrackedTicker(body.ticker);
       }
