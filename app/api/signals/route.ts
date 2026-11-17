@@ -30,9 +30,10 @@ import {
 } from "@/lib/liveBotDaemon";
 import { sanitizeTickerSymbol } from "@/lib/marketCache";
 import {
-  loadShadowParityReport,
-  runPostMarketAttribution,
-} from "@/lib/agenticSupervisor";
+  readAlphaPriors,
+  readPostMarketAttribution,
+  readSupervisorPolicy,
+} from "@/lib/persistenceStore";
 
 export const dynamic = "force-dynamic";
 
@@ -360,17 +361,6 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ success: true, report });
     }
 
-    if (
-      searchParams.get("attribution") === "true" ||
-      searchParams.get("action") === "post_market_attribution"
-    ) {
-      const shadowParityReport = runPostMarketAttribution({
-        date: requestedDate,
-        ticker: ticker || "SPY",
-      });
-      return NextResponse.json({ success: true, shadowParityReport });
-    }
-
     if (searchParams.get("radar") === "true") {
       const radarController = new AbortController();
       const radarTimeout = setTimeout(() => radarController.abort(), 12_000);
@@ -440,12 +430,20 @@ export async function GET(req: NextRequest) {
 
     // Continuously evaluate all open positions across all tickers against live CBOE quotes
     const todayEt = getTodayEt();
+    const policyTicker = ticker || "SPY";
     if (requestedDate && requestedDate !== todayEt) {
+      const [supervisorPolicy, postMarketAttribution, alphaPriors] = await Promise.all([
+        readSupervisorPolicy(requestedDate, policyTicker).catch(() => null),
+        readPostMarketAttribution(requestedDate, policyTicker).catch(() => null),
+        readAlphaPriors().catch(() => null),
+      ]);
       return NextResponse.json({
         activePositions: getActivePositions(requestedDate),
         closedPositions: getClosedPositions(ticker, requestedDate),
         alerts: getDailyTradeAlerts(ticker, requestedDate),
-        shadowParityReport: loadShadowParityReport(requestedDate),
+        supervisorPolicy,
+        postMarketAttribution,
+        alphaPriors,
         sessionDate: requestedDate,
         timestamp: new Date().toISOString(),
       });
@@ -483,13 +481,19 @@ export async function GET(req: NextRequest) {
     const activePositions = getActivePositions();
     const closedPositions = getClosedPositions(ticker);
     const alerts = getDailyTradeAlerts(ticker);
-    const shadowParityReport = loadShadowParityReport(todayEt);
+    const [supervisorPolicy, postMarketAttribution, alphaPriors] = await Promise.all([
+      readSupervisorPolicy(todayEt, policyTicker).catch(() => null),
+      readPostMarketAttribution(todayEt, policyTicker).catch(() => null),
+      readAlphaPriors().catch(() => null),
+    ]);
 
     return NextResponse.json({
       activePositions,
       closedPositions,
       alerts,
-      shadowParityReport,
+      supervisorPolicy,
+      postMarketAttribution,
+      alphaPriors,
       sessionDate: todayEt,
       timestamp: new Date().toISOString(),
     });
@@ -514,14 +518,6 @@ export async function POST(req: NextRequest) {
     if (body.action === "REGISTER_TRACKED_TICKER") {
       const trackedTickers = registerActiveTrackedTicker(body.ticker);
       return NextResponse.json({ success: true, trackedTickers });
-    }
-
-    if (body.action === "RUN_POST_MARKET_ATTRIBUTION") {
-      const shadowParityReport = runPostMarketAttribution({
-        date: parseIsoDateParam(body.date ?? body.sessionDate),
-        ticker: typeof body.ticker === "string" && body.ticker.trim() ? body.ticker : "SPY",
-      });
-      return NextResponse.json({ success: true, shadowParityReport });
     }
 
     if (body.action === "SYNC_GAIA_TICKER_SIGNALS" || body.action === "SYNC_GAIA_SPY_SIGNALS") {

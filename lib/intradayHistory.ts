@@ -1,5 +1,3 @@
-import fs from "fs";
-import path from "path";
 import {
   getTodayEt as getSessionTodayEt,
   etMinutesOfDay,
@@ -7,6 +5,10 @@ import {
   RTH_OPEN_MINS,
   RTH_CLOSE_MINS,
 } from "@/lib/gaiaSessionGuards";
+import {
+  readIntradayStoreSync,
+  appendIntradaySnapshotSync,
+} from "@/lib/persistenceStore";
 
 export interface IntradayHistoryPoint {
   t: string;
@@ -58,24 +60,8 @@ export interface DailyStore {
 }
 
 const globalForIntraday = globalThis as unknown as {
-  __hyperionIntradayStore?: DailyStore | null;
-  __hyperionIntradayMtimeMs?: number;
   __hyperionTerraBackfillInFlight?: Map<string, Promise<void>>;
-  __hyperionIntradayWriteSeq?: number;
 };
-let inMemoryStore: DailyStore | null = globalForIntraday.__hyperionIntradayStore ?? null;
-
-function getCacheDir(): string {
-  const dir = path.join(process.cwd(), ".cache");
-  if (!fs.existsSync(dir)) {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-    } catch {
-      // In read-only or serverless environments
-    }
-  }
-  return dir;
-}
 
 export function getTodayEt(): string {
   try {
@@ -133,74 +119,8 @@ function ensurePartitionedHistory(tickerData: TickerIntradayData): {
   return { rth: tickerData.rthHistory, ext: tickerData.extHistory };
 }
 
-function loadStore(): DailyStore {
-  const today = getTodayEt();
-  const cacheDir = getCacheDir();
-  const filePath = path.join(cacheDir, `intraday-${today}.json`);
-
-  inMemoryStore = globalForIntraday.__hyperionIntradayStore ?? inMemoryStore;
-  if (inMemoryStore && inMemoryStore.date === today) {
-    if (fs.existsSync(filePath)) {
-      try {
-        const stat = fs.statSync(filePath);
-        if (stat.mtimeMs > (globalForIntraday.__hyperionIntradayMtimeMs ?? 0)) {
-          const raw = fs.readFileSync(filePath, "utf-8");
-          const parsed = JSON.parse(raw) as DailyStore;
-          if (parsed && parsed.date === today && parsed.tickers) {
-            inMemoryStore = parsed;
-            globalForIntraday.__hyperionIntradayStore = parsed;
-            globalForIntraday.__hyperionIntradayMtimeMs = stat.mtimeMs;
-          }
-        }
-      } catch {
-        // Ignore transient read/parse race
-      }
-    }
-    globalForIntraday.__hyperionIntradayStore = inMemoryStore;
-    return inMemoryStore;
-  }
-
-  try {
-    const files = fs.readdirSync(cacheDir);
-    const staleTmpCutoffMs = Date.now() - 5 * 60_000;
-    for (const f of files) {
-      if (f.startsWith("intraday-") && f.includes(".json.tmp.")) {
-        try {
-          const full = path.join(cacheDir, f);
-          if (fs.statSync(full).mtimeMs < staleTmpCutoffMs) fs.unlinkSync(full);
-        } catch {}
-        continue;
-      }
-      if (f.startsWith("intraday-") && !f.includes(today)) {
-        try {
-          fs.unlinkSync(path.join(cacheDir, f));
-        } catch {}
-      }
-    }
-  } catch {}
-
-  if (fs.existsSync(filePath)) {
-    try {
-      const stat = fs.statSync(filePath);
-      const raw = fs.readFileSync(filePath, "utf-8");
-      const parsed = JSON.parse(raw) as DailyStore;
-      if (parsed && parsed.date === today && parsed.tickers) {
-        inMemoryStore = parsed;
-        globalForIntraday.__hyperionIntradayStore = parsed;
-        globalForIntraday.__hyperionIntradayMtimeMs = stat.mtimeMs;
-        return inMemoryStore;
-      }
-    } catch {
-      // Failed to parse, initialize new
-    }
-  }
-
-  inMemoryStore = {
-    date: today,
-    tickers: {},
-  };
-  globalForIntraday.__hyperionIntradayStore = inMemoryStore;
-  return inMemoryStore;
+function loadStore(sessionDate?: string): DailyStore {
+  return readIntradayStoreSync(sessionDate);
 }
 
 /**
@@ -213,25 +133,7 @@ export function getMergedIntradayHistory(
 ): IntradayHistoryPoint[] {
   const sym = ticker.trim().toUpperCase();
   const targetDate = sessionDate?.trim() || getTodayEt();
-  const today = getTodayEt();
-
-  let store: DailyStore | null = null;
-  if (targetDate === today) {
-    store = loadStore();
-  } else {
-    const filePath = path.join(getCacheDir(), `intraday-${targetDate}.json`);
-    if (fs.existsSync(filePath)) {
-      try {
-        const raw = fs.readFileSync(filePath, "utf-8");
-        const parsed = JSON.parse(raw) as DailyStore;
-        if (parsed && parsed.tickers) {
-          store = parsed;
-        }
-      } catch {
-        store = null;
-      }
-    }
-  }
+  const store = readIntradayStoreSync(targetDate);
 
   const tickerData = store?.tickers?.[sym];
   if (!tickerData) return [];
@@ -259,41 +161,7 @@ export function getMergedIntradayHistory(
 }
 
 function saveStore(store: DailyStore): void {
-  const cacheDir = getCacheDir();
-  const filePath = path.join(cacheDir, `intraday-${store.date}.json`);
-  const writeSeq = (globalForIntraday.__hyperionIntradayWriteSeq =
-    (globalForIntraday.__hyperionIntradayWriteSeq || 0) + 1);
-  const tmpPath = path.join(
-    cacheDir,
-    `intraday-${store.date}.json.tmp.${process.pid}.${Date.now()}.${writeSeq}`
-  );
-  try {
-    inMemoryStore = store;
-    globalForIntraday.__hyperionIntradayStore = store;
-    fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), "utf-8");
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        fs.renameSync(tmpPath, filePath);
-        try {
-          globalForIntraday.__hyperionIntradayMtimeMs = fs.statSync(filePath).mtimeMs;
-        } catch {}
-        return;
-      } catch (renameErr: any) {
-        const code = renameErr?.code;
-        if (attempt < 2 && (code === "EPERM" || code === "EACCES" || code === "EBUSY")) {
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
-          continue;
-        }
-        throw renameErr;
-      }
-    }
-  } catch {
-    // Non-fatal if filesystem write fails
-  } finally {
-    try {
-      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-    } catch {}
-  }
+  appendIntradaySnapshotSync(store.date, store);
 }
 
 async function backfillFromTerraShade(

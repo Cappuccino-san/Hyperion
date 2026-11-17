@@ -1,5 +1,3 @@
-import fs from "fs";
-import path from "path";
 import {
   NormalizedOptionContract,
   computeBlackScholesGreeks,
@@ -13,15 +11,6 @@ import {
 } from "@/lib/flowGammaVwap";
 import { WATCH_LIST } from "@/lib/tickerPresets";
 import { computeAdaptiveQuantMetrics } from "@/lib/gaiaSignalFsm";
-import { fetchLiveTickQuote } from "@/lib/liveTick";
-import {
-  resolveMinOptionDelta,
-  computeBoundedExpectedMove,
-  scoreContractTaylorPayoff,
-  getMaxOtmDistance,
-  classifyMicrostructuralRegime,
-  type MicrostructuralRegime,
-} from "@/lib/alphaScorer";
 import {
   RTH_OPEN_MINS,
   ENTRY_START_MINS,
@@ -31,6 +20,26 @@ import {
   getTodayEt,
   etMinutesOfDay,
 } from "@/lib/gaiaSessionGuards";
+import {
+  readSessionLedgerSync,
+  writeSessionLedgerSync,
+  readAlphaPriorsSync,
+} from "@/lib/persistenceStore";
+import {
+  classifyMarketRegime,
+  evaluateLeg2StructuralGate,
+  evaluateOpeningHorizonAlignment,
+  LEG1_MIN_EXPECTANCY_R,
+  LEG2_MIN_EXPECTANCY_R,
+  scoreSetupExpectancy,
+  selectOptimalSmallAccountContract,
+  type ContractCandidateInput,
+} from "@/lib/alphaScorer";
+import {
+  DEFAULT_HARD_OPTION_STOP_LOSS_PCT,
+  evaluateOptionRiskStop,
+} from "@/lib/bracketOrderEngine";
+import { MAX_OPTION_DELTA, resolveMinOptionDelta } from "@/lib/positionSizer";
 
 export { getTodayEt };
 
@@ -132,6 +141,7 @@ export interface OptionTradePosition {
   flowVwap?: number;
   ceilingShareChi?: number;
   pecletNumber?: number;
+  peakOptionPnlPct?: number;
 }
 
 export interface TradeLifecycleAlert {
@@ -183,40 +193,6 @@ export interface TradeLifecycleAlert {
   pecletNumber?: number;
 }
 
-export interface ShadowParityTradeDelta {
-  ticker: string;
-  direction: ContractType;
-  replayTimeEt: string;
-  replayTs: number;
-  replayStrike: number;
-  replayEntryAsk: number;
-  replayExitPrice: number;
-  liveTradeId?: string;
-  liveTimeEt?: string;
-  liveTs?: number;
-  liveStrike?: number;
-  liveEntryAsk?: number;
-  liveExitPrice?: number;
-  matched: boolean;
-  entrySlippageDollars: number;
-  totalSlippageDollars: number;
-}
-
-export interface ShadowParityReport {
-  date: string;
-  ticker: string;
-  generatedAt: string;
-  replayTradeCount: number;
-  liveTradeCount: number;
-  matchedTrades: number;
-  missedLiveTrades: number;
-  extraLiveTrades: number;
-  slippageDriftDollars: number;
-  parityScorePct: number;
-  status: "PASS" | "DRIFT_WARNING" | "NO_SNAPSHOT";
-  details: ShadowParityTradeDelta[];
-}
-
 export interface DailyTradeStore {
   date: string; // YYYY-MM-DD (ET)
   version?: number;
@@ -228,7 +204,6 @@ export interface DailyTradeStore {
   backfilledTickers?: Record<string, boolean>;
   dispatchedAlertIds?: Record<string, boolean>;
   dailyRecapSent?: boolean;
-  shadowParityReport?: ShadowParityReport;
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
   macroRegime?: "CALL" | "PUT";
   chiPct?: number;
@@ -242,6 +217,8 @@ export interface DailyTradeStore {
       zeroGamma?: number;
     }
   >;
+  bookCenterHistoryByTicker?: Record<string, number[]>;
+  bookCenterLastTsByTicker?: Record<string, number>;
 }
 
 export interface SelectedOptionContract {
@@ -307,7 +284,6 @@ export interface TradeEvaluationParams {
   priorClose?: number;
   premarketFlowVwap?: number;
   netGex?: number;
-  dataSource?: string;
   signal?: AbortSignal;
 }
 
@@ -576,24 +552,6 @@ export function isSupportedTradeTicker(rawTicker: string): boolean {
   return SUPPORTED_TRADE_TICKERS.has(sym) || /^[A-Z0-9._-]{1,10}$/.test(sym);
 }
 
-const globalForTradeStore = globalThis as unknown as {
-  __hyperionInMemoryTradeStore?: DailyTradeStore | null;
-  __hyperionTradeStoreMtimeMs?: number;
-};
-let inMemoryTradeStore: DailyTradeStore | null = globalForTradeStore.__hyperionInMemoryTradeStore ?? null;
-
-function getCacheDir(): string {
-  const dir = path.join(process.cwd(), ".cache");
-  if (!fs.existsSync(dir)) {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-    } catch {
-      // Serverless/read-only filesystem fallback
-    }
-  }
-  return dir;
-}
-
 export function formatEtIsoDate(d: Date): string {
   try {
     return d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
@@ -640,205 +598,12 @@ export function getNowEtTime(date?: Date): { hours: number; minutes: number; tot
   return { hours, minutes, totalMinutes: hours * 60 + minutes };
 }
 
-function resolveActiveTradeFilePath(cacheDir: string, date: string): string {
-  const isTestRunner =
-    typeof process !== "undefined" &&
-    (process.env.NODE_ENV === "test" ||
-      (Array.isArray(process.argv) &&
-        process.argv.some((arg) =>
-          /verifyExecutionInvariants|testDiscordSignalDispatch|\.(test|spec)\./.test(arg)
-        )));
-  if (isTestRunner && date === getTodayEt()) {
-    const isolatedPath = path.join(cacheDir, `active-trades-${date}.test-${process.pid}.tmp.json`);
-    if (!(globalThis as any).__hyperionIsolatedCleanupRegistered) {
-      (globalThis as any).__hyperionIsolatedCleanupRegistered = true;
-      process.once("exit", () => {
-        try {
-          if (fs.existsSync(isolatedPath)) fs.unlinkSync(isolatedPath);
-        } catch {}
-      });
-    }
-    return isolatedPath;
-  }
-  return path.join(cacheDir, `active-trades-${date}.json`);
-}
-
 export function loadTradeStore(requestedDate?: string): DailyTradeStore {
-  const today = getTodayEt();
-  const cacheDir = getCacheDir();
-  inMemoryTradeStore = globalForTradeStore.__hyperionInMemoryTradeStore ?? inMemoryTradeStore;
-
-  if (requestedDate && /^\d{4}-\d{2}-\d{2}$/.test(requestedDate) && requestedDate !== today) {
-    const histPath = path.join(cacheDir, `active-trades-${requestedDate}.json`);
-    if (fs.existsSync(histPath)) {
-      try {
-        const raw = fs.readFileSync(histPath, "utf-8");
-        const parsed = JSON.parse(raw) as DailyTradeStore;
-        if (parsed && parsed.activePositions) {
-          return parsed;
-        }
-      } catch {
-        // ignore malformed historical file
-      }
-    }
-    return {
-      date: requestedDate,
-      version: 1,
-      updatedAtMs: Date.now(),
-      activePositions: {},
-      closedPositions: [],
-      alerts: [],
-      prevSpotPrices: {},
-    };
-  }
-
-  const filePath = resolveActiveTradeFilePath(cacheDir, today);
-
-  if (inMemoryTradeStore && inMemoryTradeStore.date === today) {
-    if (fs.existsSync(filePath)) {
-      try {
-        const stat = fs.statSync(filePath);
-        const raw = fs.readFileSync(filePath, "utf-8");
-        const parsed = JSON.parse(raw) as DailyTradeStore;
-        if (
-          parsed &&
-          parsed.date === today &&
-          (stat.mtimeMs > (globalForTradeStore.__hyperionTradeStoreMtimeMs ?? 0) ||
-            (parsed.version ?? 0) > (inMemoryTradeStore.version ?? 0) ||
-            (Array.isArray(parsed.alerts) && parsed.alerts.length > inMemoryTradeStore.alerts.length))
-        ) {
-          inMemoryTradeStore = parsed;
-          globalForTradeStore.__hyperionInMemoryTradeStore = parsed;
-          globalForTradeStore.__hyperionTradeStoreMtimeMs = stat.mtimeMs;
-        }
-      } catch {
-        // ignore
-      }
-    }
-    return inMemoryTradeStore;
-  }
-
-  // Retain the last 7 calendar days of active-trades-*.json and reap stale .tmp.* files (> 5 min old)
-  try {
-    const files = fs.readdirSync(cacheDir);
-    const validDates = new Set<string>();
-    for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
-      const dt = new Date();
-      dt.setDate(dt.getDate() - dayOffset);
-      const dtStr = dt.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-      validDates.add(dtStr);
-    }
-    const staleTmpCutoffMs = Date.now() - 5 * 60_000;
-    for (const f of files) {
-      if (f.startsWith("active-trades-") && f.includes(".json.tmp.")) {
-        try {
-          const full = path.join(cacheDir, f);
-          if (fs.statSync(full).mtimeMs < staleTmpCutoffMs) fs.unlinkSync(full);
-        } catch {
-          // ignore cleanup failures
-        }
-        continue;
-      }
-      if (f.startsWith("active-trades-") && f.endsWith(".json")) {
-        const matchesCurrentWindow = Array.from(validDates).some((d) => f.includes(d));
-        if (!matchesCurrentWindow) {
-          try {
-            fs.unlinkSync(path.join(cacheDir, f));
-          } catch {
-            // ignore cleanup failures
-          }
-        }
-      }
-    }
-  } catch {
-    // ignore directory read errors
-  }
-
-  if (fs.existsSync(filePath)) {
-    try {
-      const stat = fs.statSync(filePath);
-      const raw = fs.readFileSync(filePath, "utf-8");
-      const parsed = JSON.parse(raw) as DailyTradeStore;
-      if (parsed && parsed.date === today && parsed.activePositions) {
-        inMemoryTradeStore = parsed;
-        globalForTradeStore.__hyperionInMemoryTradeStore = parsed;
-        globalForTradeStore.__hyperionTradeStoreMtimeMs = stat.mtimeMs;
-        return inMemoryTradeStore;
-      }
-    } catch {
-      // Failed to parse, initialize new
-    }
-  }
-
-  inMemoryTradeStore = {
-    date: today,
-    version: 1,
-    updatedAtMs: Date.now(),
-    activePositions: {},
-    closedPositions: [],
-    alerts: [],
-    prevSpotPrices: {},
-  };
-  globalForTradeStore.__hyperionInMemoryTradeStore = inMemoryTradeStore;
-  globalForTradeStore.__hyperionTradeStoreMtimeMs = 0;
-  return inMemoryTradeStore;
+  return readSessionLedgerSync(requestedDate);
 }
 
 export function saveTradeStore(store: DailyTradeStore): void {
-  const cacheDir = getCacheDir();
-  const filePath = resolveActiveTradeFilePath(cacheDir, store.date);
-  const writeSeq = ((globalThis as any).__tradeWriteSeq = ((globalThis as any).__tradeWriteSeq || 0) + 1);
-  const tmpPath = path.join(cacheDir, `active-trades-${store.date}.json.tmp.${process.pid}.${Date.now()}.${writeSeq}`);
-  const prevVersion =
-    inMemoryTradeStore && inMemoryTradeStore.date === store.date
-      ? (inMemoryTradeStore.version ?? 0)
-      : 0;
-  try {
-    store.version = Math.max(store.version ?? 0, prevVersion) + 1;
-    store.updatedAtMs = Date.now();
-    const serialized = JSON.stringify(store, null, 2);
-    inMemoryTradeStore = store;
-    globalForTradeStore.__hyperionInMemoryTradeStore = store;
-    fs.writeFileSync(tmpPath, serialized, "utf-8");
-    for (let attempt = 0; attempt < 6; attempt++) {
-      try {
-        fs.renameSync(tmpPath, filePath);
-        if (store.date === getTodayEt()) {
-          try {
-            globalForTradeStore.__hyperionTradeStoreMtimeMs = fs.statSync(filePath).mtimeMs;
-          } catch {
-            // ignore stat failures
-          }
-        }
-        return;
-      } catch (renameErr: any) {
-        const code = renameErr?.code;
-        if (attempt < 5 && (code === "EPERM" || code === "EACCES" || code === "EBUSY")) {
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15 * (attempt + 1));
-          continue;
-        }
-        if (code === "EPERM" || code === "EACCES" || code === "EBUSY") {
-          // Windows AV/indexer fallback: overwrite target directly so memory and disk never diverge
-          fs.writeFileSync(filePath, serialized, "utf-8");
-          if (store.date === getTodayEt()) {
-            try {
-              globalForTradeStore.__hyperionTradeStoreMtimeMs = fs.statSync(filePath).mtimeMs;
-            } catch {}
-          }
-          return;
-        }
-        throw renameErr;
-      }
-    }
-  } catch {
-    // Non-fatal if filesystem write fails (e.g. read-only environment)
-  } finally {
-    try {
-      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-    } catch {
-      // ignore tmp cleanup failure
-    }
-  }
+  writeSessionLedgerSync(store);
 }
 
 export function getActivePositions(date?: string): Record<string, OptionTradePosition> {
@@ -869,11 +634,11 @@ export function getDailyTradeAlerts(ticker?: string, date?: string): TradeLifecy
 
 export function clearDailyTrades(): void {
   const today = getTodayEt();
-  const currentMem = globalForTradeStore.__hyperionInMemoryTradeStore ?? inMemoryTradeStore;
-  const prevVersion = currentMem?.date === today ? (currentMem.version ?? 0) : 0;
+  const prev = loadTradeStore(today);
+  const prevVersion = prev?.date === today ? (prev.version ?? 0) : 0;
   globalForGaiaDiscord.__hyperionDispatchedGaiaKeys?.clear();
   delete (globalForGaiaDiscord as { __hyperionDispatchedDate?: string }).__hyperionDispatchedDate;
-  inMemoryTradeStore = {
+  saveTradeStore({
     date: today,
     version: prevVersion,
     activePositions: {},
@@ -881,9 +646,7 @@ export function clearDailyTrades(): void {
     alerts: [],
     prevSpotPrices: {},
     dailyRecapSent: false,
-  };
-  globalForTradeStore.__hyperionInMemoryTradeStore = inMemoryTradeStore;
-  saveTradeStore(inMemoryTradeStore);
+  });
 }
 
 /**
@@ -911,100 +674,6 @@ export function getCachedSpotPrice(ticker: string): number | null {
   const cboeSymbol =
     sym === "SPX" || sym === "SPXW" ? "_SPX" : sym === "NDX" || sym === "NDXP" ? "_NDX" : sym;
   return spotPriceCache.get(cboeSymbol) ?? spotPriceCache.get(sym) ?? null;
-}
-
-export function isTradierDataSource(dataSource?: string | null): boolean {
-  if (!dataSource) return false;
-  const norm = dataSource.trim().toLowerCase();
-  return norm === "tradier" || norm === "tradier_live";
-}
-
-/**
- * Re-anchors delayed (non-Tradier) option quotes (mid, bid, ask, Greeks) against live
- * underlying spotPrice and chain implied volatility using Black-Scholes with skew.
- */
-export function reanchorDelayedOptionContract(params: {
-  contract: NormalizedOptionContract;
-  liveSpotPrice: number;
-  dataSource?: string | null;
-  todayEt?: string;
-  nowMs?: number;
-  fallbackAtmIv?: number;
-}): NormalizedOptionContract {
-  const { contract, liveSpotPrice, dataSource, todayEt, nowMs, fallbackAtmIv } = params;
-  if (isTradierDataSource(dataSource)) return contract;
-  if (!Number.isFinite(liveSpotPrice) || liveSpotPrice <= 0) return contract;
-  if (typeof contract.expiration !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(contract.expiration)) {
-    return contract;
-  }
-
-  const rawBid = typeof contract.bid === "number" && Number.isFinite(contract.bid) ? contract.bid : undefined;
-  const rawAsk = typeof contract.ask === "number" && Number.isFinite(contract.ask) ? contract.ask : undefined;
-  // Preserve crossed or dead quotes so downstream spread/ask firewalls reject them cleanly
-  if (rawBid !== undefined && rawAsk !== undefined && rawBid > rawAsk) return contract;
-  if (rawAsk !== undefined && rawAsk <= 0) return contract;
-
-  const refDate = todayEt || getTodayEt();
-  if (contract.expiration < refDate) return contract;
-  const { dte } = formatExpirationHuman(contract.expiration, refDate);
-  if (!Number.isFinite(dte) || dte < 0) return contract;
-
-  const rawIv =
-    typeof contract.iv === "number" && Number.isFinite(contract.iv) && contract.iv > 0
-      ? contract.iv > 4
-        ? contract.iv / 100
-        : contract.iv
-      : 0;
-  const hasChainIv = rawIv >= 0.04 && rawIv <= 2.5;
-  const fallbackIv =
-    typeof fallbackAtmIv === "number" && Number.isFinite(fallbackAtmIv) && fallbackAtmIv >= 0.04
-      ? Math.min(2.5, fallbackAtmIv)
-      : 0;
-  if (!hasChainIv && fallbackIv <= 0) return contract;
-
-  const rawMid =
-    rawBid !== undefined && rawAsk !== undefined && rawBid > 0 && rawAsk >= rawBid
-      ? (rawBid + rawAsk) / 2
-      : getContractMidPrice(contract);
-  const rawHalfSpreadPct =
-    rawBid !== undefined && rawAsk !== undefined && rawBid > 0 && rawAsk >= rawBid && rawMid > 0
-      ? (rawAsk - rawBid) / (2 * rawMid)
-      : 0.012;
-  const halfSpreadPct = Math.max(0.012, rawHalfSpreadPct);
-
-  const remainingYears = computeRemainingYearsToExpiration(nowMs ?? Date.now(), Math.max(0, dte));
-  const bsQuote = priceOptionWithSkew({
-    spot: liveSpotPrice,
-    strike: contract.strike,
-    direction: contract.optionType === "C" ? "LONG" : "SHORT",
-    remainingYears,
-    atmIv: hasChainIv ? rawIv : fallbackIv,
-    skewSlope: hasChainIv ? 0 : -3.5,
-    smileConvexity: hasChainIv ? 0 : 12.0,
-    halfSpreadPct,
-  });
-
-  // Preserve wide-spread rejection signal if raw chain spread exceeded 24%
-  let reanchoredBid = bsQuote.bid;
-  let reanchoredAsk = bsQuote.ask;
-  if (rawHalfSpreadPct > 0.14) {
-    reanchoredBid = Math.max(0.01, Number((bsQuote.mid * (1 - rawHalfSpreadPct)).toFixed(2)));
-    reanchoredAsk = Math.max(reanchoredBid + 0.01, Number((bsQuote.mid * (1 + rawHalfSpreadPct)).toFixed(2)));
-  }
-  if (rawBid !== undefined && rawBid <= 0) {
-    reanchoredBid = rawBid;
-  }
-
-  return {
-    ...contract,
-    bid: reanchoredBid,
-    ask: reanchoredAsk,
-    last: bsQuote.mid,
-    delta: Number(bsQuote.delta.toFixed(4)),
-    gamma: Number(bsQuote.gamma.toFixed(4)),
-    theta: Number(bsQuote.thetaPerDay.toFixed(4)),
-    iv: hasChainIv ? rawIv : bsQuote.iv,
-  };
 }
 
 export async function fetchLiveCboeOptions(
@@ -1039,17 +708,10 @@ export async function fetchLiveCboeOptions(
 
     const spot = Number(data.current_price ?? data.close ?? 0);
 
-    // Fetch sub-second live spot via /api/tick multi-source race (CNBC, Robinhood, Yahoo)
-    const tickSym = sym === "SPXW" ? "SPX" : sym === "NDXP" ? "NDX" : sym;
+    // Fetch live real-time spot price directly from Robinhood (sub-second OPRA/NLS feed; skip index NDX/NDXP)
+    const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym;
     let realTimeSpot = spot;
-    const tickQuote = await fetchLiveTickQuote(tickSym, signal);
-    if (tickQuote && tickQuote.spot > 0 && Number.isFinite(tickQuote.spot)) {
-      realTimeSpot = tickQuote.spot;
-    }
-
-    // Fallback: Robinhood direct OPRA/NLS quote
-    if ((realTimeSpot <= 0 || realTimeSpot === spot) && sym !== "NDX" && sym !== "NDXP") {
-      const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym;
+    if (sym !== "NDX" && sym !== "NDXP") {
       try {
         const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
           headers: {
@@ -1115,9 +777,8 @@ export async function fetchLiveCboeOptions(
       }
     }
 
+    // Difference between real-time market spot and 15-minute delayed CBOE spot
     const deltaSpot = realTimeSpot > 0 && spot > 0 ? realTimeSpot - spot : 0;
-    const todayEt = getTodayEt();
-    const nowMs = Date.now();
 
     const rawOptions = data.options;
     if (!Array.isArray(rawOptions)) return cached?.contracts ?? [];
@@ -1135,14 +796,28 @@ export async function fetchLiveCboeOptions(
 
       const openInterest = Number(raw.open_interest ?? 0);
       const volume = Number(raw.volume ?? 0);
-      const bid = Number(raw.bid ?? 0);
-      const ask = Number(raw.ask ?? 0);
-      const last = Number(raw.last_trade_price ?? 0);
+      let bid = Number(raw.bid ?? 0);
+      let ask = Number(raw.ask ?? 0);
+      let last = Number(raw.last_trade_price ?? 0);
 
       // Filter out totally dead contracts with zero quote & zero interest
       if (bid <= 0 && ask <= 0 && last <= 0 && openInterest <= 0 && volume <= 0) continue;
 
-      const rawContract: NormalizedOptionContract = {
+      const delta = Number(raw.delta ?? 0);
+      const gamma = Math.max(0, Number(raw.gamma ?? 0.05));
+      const isCall = typeChar === "C";
+      const signedDelta = isCall ? Math.abs(delta || 0.45) : -Math.abs(delta || 0.45);
+
+      // Real-time Greek synchronization: adjust delayed CBOE option pricing to current live spot
+      if (Math.abs(deltaSpot) > 0.05 && Math.abs(delta) > 0.02) {
+        // First-order Taylor delta adjustment + second-order gamma convexity
+        const priceAdj = deltaSpot * signedDelta + 0.5 * gamma * deltaSpot * deltaSpot;
+        if (bid > 0) bid = Number(Math.max(0.01, bid + priceAdj).toFixed(2));
+        if (ask > 0) ask = Number(Math.max(0.02, ask + priceAdj).toFixed(2));
+        if (last > 0) last = Number(Math.max(0.01, last + priceAdj).toFixed(2));
+      }
+
+      contracts.push({
         symbol: occ,
         expiration,
         optionType: typeChar as "C" | "P",
@@ -1150,29 +825,14 @@ export async function fetchLiveCboeOptions(
         openInterest,
         volume,
         iv: Number(raw.iv ?? 0),
-        delta: Number(raw.delta ?? 0),
+        delta,
         gamma: Number(raw.gamma ?? 0),
         vega: Number(raw.vega ?? 0),
-        theta: typeof raw.theta === "number" && Number.isFinite(raw.theta) ? raw.theta : undefined,
         percentChange: Number(raw.percent_change ?? 0),
         bid,
         ask,
         last,
-      };
-
-      // Live-Spot Black-Scholes Re-Anchoring for delayed CBOE feed using priceOptionWithSkew
-      const syncedContract =
-        Math.abs(deltaSpot) > 0.02 && effectiveSpot > 0
-          ? reanchorDelayedOptionContract({
-              contract: rawContract,
-              liveSpotPrice: effectiveSpot,
-              dataSource: "CBOE_MARKET_DATA",
-              todayEt,
-              nowMs,
-            })
-          : rawContract;
-
-      contracts.push(syncedContract);
+      });
     }
 
     if (contracts.length > 0) {
@@ -1257,14 +917,7 @@ export async function selectSmallAccountContract(params: {
   nowEt?: Date;
   zeroDteCallWall?: number;
   zeroDtePutWall?: number;
-  dailyExpectedMove?: { low: number; high: number } | null;
-  dataSource?: string;
-  regime?: MicrostructuralRegime;
-  impulsePeclet?: number;
-  pecletNumber?: number;
-  gammaRegime?: "POSITIVE_GAMMA" | "NEGATIVE_GAMMA";
-  netGex?: number;
-  zeroGamma?: number;
+  preferredDte?: "0DTE" | "1-2DTE" | "NONE";
   signal?: AbortSignal;
 }): Promise<SelectedOptionContract | null> {
   const {
@@ -1277,14 +930,7 @@ export async function selectSmallAccountContract(params: {
     nowEt,
     zeroDteCallWall,
     zeroDtePutWall,
-    dailyExpectedMove,
-    dataSource,
-    regime,
-    impulsePeclet,
-    pecletNumber,
-    gammaRegime,
-    netGex,
-    zeroGamma,
+    preferredDte,
     signal,
   } = params;
 
@@ -1320,135 +966,34 @@ export async function selectSmallAccountContract(params: {
     Array.isArray(contracts) &&
     contracts.length > 0 &&
     contracts.some((c) => c.strike > effectiveSpot * 3);
-  let resolvedDataSource = dataSource;
   if (!contracts || contracts.length === 0 || hasSpxScaleChain) {
     contracts = await fetchLiveCboeOptions(effectiveSym, signal);
-    if (!resolvedDataSource) resolvedDataSource = "CBOE_MARKET_DATA";
     if (signal?.aborted) return null;
   }
 
-  // 2. Filter from real chain (with live-spot BS re-anchoring for delayed non-Tradier chains)
+  // 2. Filter hard execution invariants from real CBOE chain, then rank with Greeks-aware optimizer
   if (contracts && contracts.length > 0) {
-    interface Candidate {
-      contract: NormalizedOptionContract;
-      mid: number;
-      bid: number;
-      ask: number;
-      dte: number;
-      expHuman: string;
-      robinhoodExp: string;
-      robinhoodTab: string;
-      absDelta: number;
-      score: number;
-    }
-
-    const stage1Candidates: Candidate[] = []; // Preferred DTEs
-    const stage2Candidates: Candidate[] = []; // Fallback DTEs
-    const stage3Candidates: Candidate[] = []; // Secondary long-dated fallback
-
+    const validCandidates: ContractCandidateInput[] = [];
     const isAfternoon = etTime.hours > 11 || (etTime.hours === 11 && etTime.minutes >= 30);
     const hasFutureExpirations = contracts.some(
       (item) => typeof item.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(item.expiration) && item.expiration > todayEt
     );
 
-    // Estimate ATM IV from chain for BS re-anchoring and remaining IV expected move
-    const chainIvSamples = contracts
-      .filter((item) => {
-        const ivVal = typeof item.iv === "number" && Number.isFinite(item.iv) ? (item.iv > 4 ? item.iv / 100 : item.iv) : 0;
-        return ivVal >= 0.04 && ivVal <= 2.5 && Math.abs(item.strike - effectiveSpot) <= effectiveSpot * 0.03;
-      })
-      .map((item) => (item.iv > 4 ? item.iv / 100 : item.iv));
-    const fallbackAtmIv =
-      chainIvSamples.length > 0
-        ? chainIvSamples.reduce((acc, v) => acc + v, 0) / chainIvSamples.length
-        : 0.16;
-
-    const shouldReanchorDelayed = Boolean(resolvedDataSource && !isTradierDataSource(resolvedDataSource));
-    const nowMs = (nowEt ?? new Date()).getTime();
-
-    const normZeroGamma =
-      typeof zeroGamma === "number" && zeroGamma > 0
-        ? (isSpxw ? zeroGamma / 10 : zeroGamma)
-        : undefined;
-    const hasRegimeContext =
-      regime !== undefined ||
-      impulsePeclet !== undefined ||
-      pecletNumber !== undefined ||
-      normZeroGamma !== undefined ||
-      netGex !== undefined ||
-      gammaRegime !== undefined;
-
-    const deltaRoute = hasRegimeContext
-      ? resolveMinOptionDelta({
-          regime,
-          spotPrice: effectiveSpot,
-          zeroGamma: normZeroGamma,
-          netGex,
-          impulsePeclet,
-          pecletNumber,
-          gammaRegime,
-        })
-      : {
-          regime: "POS_GAMMA_PIN" as MicrostructuralRegime,
-          minDelta: 0.25,
-          maxDelta: 0.50,
-          preferZeroDte: !isAfternoon,
-          fallbackOneToTwoDte: true,
-        };
-
-    const normZeroDteCw =
-      typeof zeroDteCallWall === "number" && zeroDteCallWall > 0
-        ? isSpxw
-          ? zeroDteCallWall / 10
-          : zeroDteCallWall
-        : 0;
-    const normZeroDtePw =
-      typeof zeroDtePutWall === "number" && zeroDtePutWall > 0
-        ? isSpxw
-          ? zeroDtePutWall / 10
-          : zeroDtePutWall
-        : 0;
-    const normDailyEm = dailyExpectedMove
-      ? isSpxw
-        ? { low: dailyExpectedMove.low / 10, high: dailyExpectedMove.high / 10 }
-        : dailyExpectedMove
-      : null;
-    const remainingRthMins = Math.max(15, Math.min(390, RTH_CLOSE_MINS - etTime.totalMinutes));
-    const boundedExpectedMove = computeBoundedExpectedMove({
-      spotPrice: effectiveSpot,
-      isCall,
-      target1Spot: effectiveTarget1,
-      target2Spot: effectiveTarget2,
-      zeroDteCallWall: normZeroDteCw,
-      zeroDtePutWall: normZeroDtePw,
-      dailyExpectedMove: normDailyEm,
-      atmIv: fallbackAtmIv,
-      remainingRthMinutes: remainingRthMins,
-    });
-    const maxOtmDistance = getMaxOtmDistance(effectiveSpot);
-
-    for (const rawContract of contracts) {
-      if (rawContract.optionType !== typeLetter) continue;
-      if (typeof rawContract.expiration !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(rawContract.expiration)) continue;
-
-      const c = shouldReanchorDelayed
-        ? reanchorDelayedOptionContract({
-            contract: rawContract,
-            liveSpotPrice: effectiveSpot,
-            dataSource: resolvedDataSource,
-            todayEt,
-            nowMs,
-            fallbackAtmIv,
-          })
-        : rawContract;
-
+    const minOptionDelta = resolveMinOptionDelta(etTime.totalMinutes);
+    for (const c of contracts) {
+      if (c.optionType !== typeLetter) continue;
+      if (typeof c.expiration !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(c.expiration)) continue;
       const mid = getContractMidPrice(c);
+
       const rawBid = typeof c.bid === "number" && Number.isFinite(c.bid) ? c.bid : undefined;
       const rawAsk = typeof c.ask === "number" && Number.isFinite(c.ask) ? c.ask : undefined;
       const askPrice = rawAsk !== undefined ? rawAsk : mid;
-
       // Strict Sub-$1.00 Ask Cap: retail buys at ASK ($0.15 <= ask <= $0.99)
       if (askPrice < 0.15 || askPrice > 0.99) continue;
+
+      // Time-of-Day Adaptive Delta Floor: 0.24 in [09:35-10:29 ET], 0.35 in [>=10:30 ET], cap 0.50
+      const absDelta = typeof c.delta === "number" && Number.isFinite(c.delta) ? Math.abs(c.delta) : 0;
+      if (absDelta < minOptionDelta || absDelta > MAX_OPTION_DELTA) continue;
 
       // Reject crossed/invalid quotes & wide-spread contracts (> 24% spread); never skip spread check when bid is missing
       const effectiveBid = rawBid ?? (askPrice > 0 ? 0 : -1);
@@ -1456,15 +1001,12 @@ export async function selectSmallAccountContract(params: {
       const spreadPct = (askPrice - effectiveBid) / askPrice;
       if (spreadPct > 0.24) continue;
 
-      // Regime-conditioned |delta| bounds (0.24..0.50 in NEG_GAMMA_TREND/ZERO_GAMMA_FLIP, 0.35..0.50 in POS_GAMMA_PIN)
-      const absDelta = typeof c.delta === "number" && Number.isFinite(c.delta) ? Math.abs(c.delta) : 0;
-      if (absDelta < deltaRoute.minDelta || absDelta > deltaRoute.maxDelta) continue;
-
       // Strike direction filter: OTM / near ATM in direction of move
       if (isCall && c.strike < effectiveSpot * 0.998) continue;
       if (!isCall && c.strike > effectiveSpot * 1.002) continue;
 
       // Hard Near-ATM / 1-3 Strike OTM Ceiling: never select deep-OTM lottos (> min($3.50, 0.45%) from spot)
+      const maxOtmDistance = Math.min(3.50, effectiveSpot * 0.0045);
       if (Math.abs(c.strike - effectiveSpot) > maxOtmDistance) continue;
 
       const { expHuman, robinhoodExp, robinhoodTab, dte } = formatExpirationHuman(c.expiration, todayEt);
@@ -1479,6 +1021,10 @@ export async function selectSmallAccountContract(params: {
       }
 
       // Structural Wall Strike Ceiling: Never buy OTM Calls above an active overhead 0DTE Call Wall
+      const normZeroDteCw = typeof zeroDteCallWall === "number" && zeroDteCallWall > 0
+        ? (isSpxw ? zeroDteCallWall / 10 : zeroDteCallWall) : 0;
+      const normZeroDtePw = typeof zeroDtePutWall === "number" && zeroDtePutWall > 0
+        ? (isSpxw ? zeroDtePutWall / 10 : zeroDtePutWall) : 0;
       const overheadCeiling = normZeroDteCw > effectiveSpot ? normZeroDteCw : 0;
       if (contractType === "CALL" && overheadCeiling > 0 && c.strike > overheadCeiling) {
         continue;
@@ -1490,43 +1036,7 @@ export async function selectSmallAccountContract(params: {
         continue;
       }
 
-      // Second-order Taylor net payoff efficiency + 22% spread-to-expected-payoff friction guard
-      const rawContractIv =
-        typeof c.iv === "number" && Number.isFinite(c.iv) && c.iv > 0
-          ? c.iv > 4
-            ? c.iv / 100
-            : c.iv
-          : fallbackAtmIv;
-      const effectiveContractIv = rawContractIv >= 0.04 && rawContractIv <= 2.5 ? rawContractIv : fallbackAtmIv;
-      const contractTYears = computeRemainingYearsToExpiration(nowMs, Math.max(0, dte));
-      const absTheta =
-        typeof c.theta === "number" && Number.isFinite(c.theta) && c.theta !== 0
-          ? Math.abs(c.theta)
-          : Math.abs(
-              priceOptionWithSkew({
-                spot: effectiveSpot,
-                strike: c.strike,
-                direction: isCall ? "LONG" : "SHORT",
-                remainingYears: contractTYears,
-                atmIv: effectiveContractIv,
-                skewSlope: 0,
-                smileConvexity: 0,
-              }).thetaPerDay
-            );
-      const holdDays = dte === 0 ? Math.max(0.15, remainingRthMins / 390) : 0.35;
-      const spreadDollars = Math.max(0, askPrice - effectiveBid);
-      const taylor = scoreContractTaylorPayoff({
-        absDelta,
-        gamma: Math.max(0, c.gamma || 0),
-        absTheta,
-        holdDays,
-        spread: spreadDollars,
-        ask: askPrice,
-        expectedMove: boundedExpectedMove,
-      });
-      if (!taylor.eligible) continue;
-
-      const candidateObj: Candidate = {
+      validCandidates.push({
         contract: c,
         mid,
         bid: effectiveBid,
@@ -1536,48 +1046,25 @@ export async function selectSmallAccountContract(params: {
         robinhoodExp,
         robinhoodTab,
         absDelta,
-        score: taylor.score,
-      };
-
-      if (hasRegimeContext) {
-        const isAdvectiveTrend =
-          deltaRoute.regime === "NEG_GAMMA_TREND" || deltaRoute.minDelta <= 0.24;
-        if (isAdvectiveTrend) {
-          // Trend / Gamma-Flip advection: 0DTE preferred at any RTH hour when <= $0.99 & near-ATM; 1-2 DTE fallback
-          if (dte === 0) stage1Candidates.push(candidateObj);
-          else if (dte >= 1 && dte <= 2) stage2Candidates.push(candidateObj);
-          else stage3Candidates.push(candidateObj);
-        } else {
-          // POS_GAMMA_PIN mean-reversion: 0DTE when <= $0.99, with 1-2 DTE fallback when 0DTE exceeds $0.99
-          if (dte === 0) stage1Candidates.push(candidateObj);
-          else if (dte >= 1 && dte <= 2) stage2Candidates.push(candidateObj);
-          else stage3Candidates.push(candidateObj);
-        }
-      } else if (isAfternoon) {
-        // Legacy fallback when no microstructural context is supplied: 1-2 DTE -> 3+ DTE -> 0DTE
-        if (dte >= 1 && dte <= 2) {
-          stage1Candidates.push(candidateObj);
-        } else if (dte >= 3) {
-          stage2Candidates.push(candidateObj);
-        } else if (dte === 0) {
-          candidateObj.score -= 25;
-          stage2Candidates.push(candidateObj);
-        }
-      } else {
-        if (dte >= 0 && dte <= 2) {
-          stage1Candidates.push(candidateObj);
-        } else if (dte > 2) {
-          stage2Candidates.push(candidateObj);
-        }
-      }
+        theta: typeof (c as { theta?: number }).theta === "number" ? (c as { theta?: number }).theta : undefined,
+      });
     }
 
-    // Pick top Taylor-scored candidate from preferred stage, falling back cleanly
-    stage1Candidates.sort((a, b) => b.score - a.score);
-    stage2Candidates.sort((a, b) => b.score - a.score);
-    stage3Candidates.sort((a, b) => b.score - a.score);
-
-    const chosen = stage1Candidates[0] ?? stage2Candidates[0] ?? stage3Candidates[0];
+    const selection = selectOptimalSmallAccountContract({
+      candidates: validCandidates,
+      spotPrice: effectiveSpot,
+      target1Spot: effectiveTarget1,
+      target2Spot: effectiveTarget2,
+      isCall,
+      isSpxw,
+      zeroDteCallWall,
+      zeroDtePutWall,
+      isAfternoon,
+      preferredDte,
+      etMins: etTime.totalMinutes,
+      nowMs: (nowEt ?? new Date()).getTime(),
+    });
+    const chosen = selection?.chosen;
 
     if (chosen) {
       const c = chosen.contract;
@@ -1628,8 +1115,9 @@ export async function selectSmallAccountContract(params: {
       // Guard against non-monotonic or negative moves
       const estTp1Mid = Number(Math.max(entryAsk + 0.05, bsTp1Mid).toFixed(2));
       const estTp2Mid = Number(Math.max(estTp1Mid + 0.05, bsTp2Mid).toFixed(2));
-      // Max -25% loss stop floor: stop price cannot fall below entryAsk * 0.75
-      const estStopMid = Number(Math.max(entryAsk * 0.75, Math.min(entryAsk - 0.01, bsStopMid)).toFixed(2));
+      // Max -45% option hard stop floor: stop price cannot fall below entryAsk * 0.55
+      const hardStopMult = 1 - DEFAULT_HARD_OPTION_STOP_LOSS_PCT / 100;
+      const estStopMid = Number(Math.max(entryAsk * hardStopMult, Math.min(entryAsk - 0.01, bsStopMid)).toFixed(2));
 
       const tp1Pct = Number((((estTp1Mid - entryAsk) / entryAsk) * 100).toFixed(0));
       const tp2Pct = Number((((estTp2Mid - entryAsk) / entryAsk) * 100).toFixed(0));
@@ -2696,7 +2184,6 @@ export async function evaluateTradeSignals(
   // Ensure real-time live CBOE option contracts are available before computing Flow VWAP & structural walls
   if (!params.contracts || params.contracts.length === 0) {
     params.contracts = await fetchLiveCboeOptions(normalizedTicker, params.signal);
-    if (!params.dataSource) params.dataSource = "CBOE_MARKET_DATA";
     if (params.signal?.aborted) {
       return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadTradeStore().alerts };
     }
@@ -2940,6 +2427,13 @@ export async function evaluateTradeSignals(
     const pnlOptionPct = Number(
       (((exitFillPrice - entryFillPrice) / Math.max(0.01, entryFillPrice)) * 100).toFixed(2)
     );
+    activePos.peakOptionPnlPct = Math.max(activePos.peakOptionPnlPct ?? 0, pnlOptionPct);
+    const optStopEval = evaluateOptionRiskStop({
+      entryPrice: entryFillPrice,
+      currentPrice: exitFillPrice,
+      heldMinutes: rawHeldMin,
+      peakPnlPct: activePos.peakOptionPnlPct,
+    });
 
     // Helper to close position (clamps spotPrice to [candle.low, candle.high] for ALL tickers including SPXW->SPY)
     const closePosition = (reason: string) => {
@@ -3205,12 +2699,11 @@ export async function evaluateTradeSignals(
       // Strict 1-Contract Sniper Automaton: 1 BTO -> 1 STC (No multi-contract partial scaling)
       closePosition("TARGET 1 HIT · FULL PROFIT EXIT (1 CONTRACT)");
     }
-    // 5. STC (STOP LOSS / LEVEL INVALIDATION / OPTION HARD STOP HIT)
+    // 5. STC (STOP LOSS / LEVEL INVALIDATION / OPTION -45% HARD STOP OR 20M -25% STALL STOP)
     else if (
       (isCall && posSpotPrice <= activePos.stopLossSpot) ||
       (!isCall && posSpotPrice >= activePos.stopLossSpot) ||
-      (activePos.status === "OPEN" && activePos.estStopMid != null && currentOptionMid <= activePos.estStopMid && pnlOptionPct <= -20) ||
-      (pnlOptionPct <= -25)
+      optStopEval.triggered
     ) {
       const isBreakeven =
         activePos.status === "PARTIAL_TP1" ||
@@ -3220,13 +2713,15 @@ export async function evaluateTradeSignals(
         pnlOptionPct > 0 &&
         ((isCall && activePos.stopLossSpot > activePos.btoSpotPrice + 0.01 && posSpotPrice > activePos.btoSpotPrice) ||
          (!isCall && activePos.stopLossSpot < activePos.btoSpotPrice - 0.01 && posSpotPrice < activePos.btoSpotPrice));
-      const isOptionHardStop = !isBreakeven && !isTrailingProfit && pnlOptionPct <= -22;
+      const isOptionHardStop = !isBreakeven && !isTrailingProfit && optStopEval.triggered;
       const reason = isTrailingProfit
         ? "TRAILING PROFIT LOCKED"
         : isBreakeven
           ? "BREAKEVEN STOP HIT"
           : isOptionHardStop
-            ? "OPTION HARD STOP HIT (-25% MAX LOSS)"
+            ? optStopEval.reason === "OPTION_STALL_STOP_25"
+              ? "OPTION STALL STOP HIT (-25% 20M THETA CAP)"
+              : "OPTION HARD STOP HIT (-45% MAX LOSS)"
             : "STOP LOSS / LEVEL INVALIDATION";
       closePosition(reason);
     }
@@ -3266,7 +2761,7 @@ export async function evaluateTradeSignals(
     Object.keys(store.activePositions || {}).length > 0
   );
 
-  const isWithinRthEntryWindow = etTime.totalMinutes >= ENTRY_START_MINS && etTime.totalMinutes <= Math.min(ENTRY_CUTOFF_MINS, 825);
+  const isWithinRthEntryWindow = etTime.totalMinutes >= ENTRY_START_MINS && etTime.totalMinutes <= ENTRY_CUTOFF_MINS;
   if (!hasActiveTrade && !hasCompletedTradeToday && !isEodCutoff && isWithinRthEntryWindow) {
     const {
       callWall,
@@ -3526,6 +3021,25 @@ export async function evaluateTradeSignals(
       : (tacticalPw > 0 && tacticalCw > tacticalPw)
         ? Number(((tacticalCw + tacticalPw) / 2).toFixed(2))
         : effectiveSma34;
+    const observedBookCenter =
+      typeof bookCenter === "number" && Number.isFinite(bookCenter) && bookCenter > 0
+        ? bookCenter
+        : tacticalBookCenter;
+    if (observedBookCenter > 0) {
+      const histMap = { ...(store.bookCenterHistoryByTicker || {}) };
+      const tsMap = { ...(store.bookCenterLastTsByTicker || {}) };
+      const prevHist = [...(histMap[normalizedTicker] || [])];
+      const barTsVal = latest5mCandle?.timestamp ?? 0;
+      if (barTsVal > 0 && tsMap[normalizedTicker] === barTsVal && prevHist.length > 0) {
+        prevHist[prevHist.length - 1] = observedBookCenter;
+      } else {
+        prevHist.push(observedBookCenter);
+        if (barTsVal > 0) tsMap[normalizedTicker] = barTsVal;
+      }
+      histMap[normalizedTicker] = prevHist.slice(-6);
+      store.bookCenterHistoryByTicker = histMap;
+      store.bookCenterLastTsByTicker = tsMap;
+    }
     const recent5mLow = latest5mCandle ? Math.min(latest5mCandle.low, latest5mCandle.prevLow ?? latest5mCandle.low, spotPrice) : spotPrice;
     const recent5mHigh = latest5mCandle ? Math.max(latest5mCandle.high, latest5mCandle.prevHigh ?? latest5mCandle.high, spotPrice) : spotPrice;
     const testedPutWallOrKingOrFlux =
@@ -3541,14 +3055,11 @@ export async function evaluateTradeSignals(
       : (activeKingNode > spotPrice + entryMetrics.minWallRoom ? activeKingNode : Number((spotPrice + Math.max(Math.max(entryMetrics.minWallRoom, spotPrice * 0.0033), fluxSigma * 2.2)).toFixed(2)));
     const callRoomToWall = callMagnetTarget - spotPrice;
 
-    const hasCallChiOrSustainedFlux =
-      currentChi >= 0.35 || (currentNetFlux > 0 && currentPe >= 0.40);
     if (
       !candidateBto &&
       isMiddayReclaimWindow &&
       testedPutWallOrKingOrFlux &&
       reclaimedKingOrSma &&
-      hasCallChiOrSustainedFlux &&
       hasAdequateCallRoomToWall &&
       callRoomToWall >= entryMetrics.minWallRoom &&
       Math.abs(barBody) <= maxSignalBarBody
@@ -3581,9 +3092,7 @@ export async function evaluateTradeSignals(
         spotPrice > effectiveFlowVwap &&
         spotPrice > effectiveSma34;
       const hasPositiveFluxImpulse =
-        currentChi >= 0.48 ||
-        store.macroRegime === "CALL" ||
-        (currentChi >= 0.35 && (currentNetFlux > 0 || currentPe >= 0.40));
+        currentChi >= 0.48 || currentNetFlux > 0 || currentPe >= 0.40 || store.macroRegime === "CALL";
       if (
         !candidateBto &&
         isMiddayReclaimWindow &&
@@ -3795,7 +3304,6 @@ export async function evaluateTradeSignals(
           : Number((spotPrice * 0.992).toFixed(2));
 
     const isTestingPutBounce =
-      etTime.totalMinutes >= 585 &&
       putBounceRef > 0 &&
       spotPrice >= putBounceRef * 0.998 &&
       spotPrice <= putBounceRef * 1.0025 &&
@@ -4283,7 +3791,6 @@ export async function evaluateTradeSignals(
     if (
       !candidateBto &&
       hasBullImpulseReclaim &&
-      !(currentChi < 0.35 && store.macroRegime === "PUT") &&
       hasAdequateCallRoomToWall &&
       (tacticalPw > 0 ? spotPrice >= tacticalPw * 0.9965 : true)
     ) {
@@ -4344,24 +3851,68 @@ export async function evaluateTradeSignals(
       }
     }
 
-    // Phase-2 Gate: Second trade today must be an opposite-direction structural rotation (>= 10:30 ET, >= 30m cooldown)
-    if (candidateBto && isPhase2ReclaimWindow) {
-      const isOppositeDir = candidateBto.contractType !== lastClosed?.contractType;
-      const isLeg2CallValid =
-        candidateBto.contractType === "CALL" &&
-        testedPutWallOrMinus1Sigma &&
-        (divergence5m === "BULL" || divergence30m === "BULL" || reclaimedSmaAndVwapOrCenter) &&
-        impChi >= 0.60 &&
-        (deltaFlux6 > 0 || spotPrice >= effectiveSma34 || spotPrice >= effectiveFlowVwap) &&
-        leg2CallRoom >= entryMetrics.minWallRoom;
-      const isLeg2PutValid =
-        candidateBto.contractType === "PUT" &&
-        testedCallWallOrPlus1Sigma &&
-        (divergence5m === "BEAR" || divergence30m === "BEAR" || lostSmaAndVwapOrCenter) &&
-        impChi <= 0.40 &&
-        (deltaFlux6 < 0 || spotPrice <= effectiveSma34 || spotPrice <= effectiveFlowVwap) &&
-        leg2PutRoom >= entryMetrics.minWallRoom;
-      if (!isOppositeDir || !(isLeg2CallValid || isLeg2PutValid)) {
+    // Opening Horizon Alignment (09:35-10:00 ET): require 0DTE King pull & Book Center 3-bar slope agreement
+    if (candidateBto && etTime.totalMinutes < 600) {
+      const pre1000Check = evaluateOpeningHorizonAlignment({
+        etMins: etTime.totalMinutes,
+        direction: candidateBto.contractType,
+        spotPrice,
+        zeroDteKing:
+          filteredKing && filteredKing > 0
+            ? filteredKing
+            : (kingNode as { zeroDteKing?: number } | undefined)?.zeroDteKing,
+        allExpKing:
+          kingNode?.allExpKing && kingNode.allExpKing > 0
+            ? kingNode.allExpKing
+            : kingNode?.strike,
+        bookCenterHistory: store.bookCenterHistoryByTicker?.[normalizedTicker] ?? [],
+      });
+      if (!pre1000Check.allowed) {
+        candidateBto = null;
+      }
+    }
+
+    // Asymmetric Leg-2 Structural Gating & Anti-Whipsaw Firewall (10:30-14:30 ET, >= 30m cooldown, opposite dir)
+    if (candidateBto && isPhase2ReclaimWindow && lastClosed) {
+      const effectiveDeltaChi6 =
+        deltaChi6 !== 0
+          ? deltaChi6
+          : deltaImpulseChi6 !== 0
+            ? deltaImpulseChi6
+            : deltaFlux6 > 0
+              ? 0.04
+              : deltaFlux6 < 0
+                ? -0.04
+                : 0;
+      const leg2Gate = evaluateLeg2StructuralGate({
+        direction: candidateBto.contractType,
+        etMins: etTime.totalMinutes,
+        nowTsSec: nowTs,
+        spotPrice,
+        prevSpotPrice,
+        zeroGamma: effectiveZeroGamma,
+        flowVwap: effectiveFlowVwap,
+        sma34: effectiveSma34,
+        leg1Trade: {
+          contractType: lastClosed.contractType,
+          closedTs: lastClosed.closedTs,
+          btoSpotPrice: lastClosed.btoSpotPrice,
+          closedSpotPrice: lastClosed.closedSpotPrice,
+          pnlOptionPct: lastClosed.pnlOptionPct,
+        },
+        testedPutWallOrMinus1Sigma,
+        testedCallWallOrPlus1Sigma,
+        has5mBullDiv: divergence5m === "BULL",
+        has5mBearDiv: divergence5m === "BEAR",
+        impulseChi: impChi,
+        deltaChi6Bar: effectiveDeltaChi6,
+        impulsePeclet: impPe,
+      });
+      const minLeg2RoomOk =
+        candidateBto.contractType === "CALL"
+          ? leg2CallRoom >= entryMetrics.minWallRoom
+          : leg2PutRoom >= entryMetrics.minWallRoom;
+      if (!leg2Gate.allowed || !minLeg2RoomOk) {
         candidateBto = null;
       }
     }
@@ -4378,13 +3929,53 @@ export async function evaluateTradeSignals(
       const rrRatio = hasValidBounds && risk > 0 ? Number((reward1 / risk).toFixed(2)) : 0;
 
       if (rrRatio >= 1.5 && !params.signal?.aborted) {
-        // Data-Driven Walk-Forward Gate (Empirical Bayes Shrinkage on 10-day prior sessions)
+        // Regime Classification + Causal Additive Empirical Expectancy Gate
+        const regimeClassification = classifyMarketRegime({
+          spotPrice: entryClampedSpot,
+          callWall: tacticalCw,
+          putWall: tacticalPw,
+          zeroGamma: effectiveZeroGamma,
+          zeroDteKing: filteredKing ?? (kingNode as any)?.zeroDteKing,
+          bookCenter: tacticalBookCenter,
+          flowVwap: effectiveFlowVwap,
+          netGex: resolvedNetGex,
+          flowSnapshot: flowSnap,
+          directionHint: candidateBto.contractType,
+        });
+
+        const alphaScore = scoreSetupExpectancy({
+          direction: candidateBto.contractType,
+          setupName: candidateBto.setupName,
+          spotPrice: entryClampedSpot,
+          stopLossSpot: candidateBto.stopLossSpot,
+          target1Spot: candidateBto.target1Spot,
+          target2Spot: candidateBto.target2Spot,
+          callWall: tacticalCw,
+          putWall: tacticalPw,
+          zeroGamma: effectiveZeroGamma,
+          zeroDteKing: filteredKing ?? (kingNode as any)?.zeroDteKing,
+          bookCenter: tacticalBookCenter,
+          divergence5m: divergence5m ?? "NO",
+          divergence30m: divergence30m ?? "NO",
+          flowSnapshot: flowSnap,
+          regimeClassification,
+          priors: readAlphaPriorsSync(),
+          minExpectancyR: isPhase2ReclaimWindow ? LEG2_MIN_EXPECTANCY_R : LEG1_MIN_EXPECTANCY_R,
+        });
+
+        // Data-Driven Walk-Forward Gate (Empirical Bayes Shrinkage on 10-day prior sessions + Regime Expectancy)
         const sessionDate = new Date(nowTs * 1000).toLocaleDateString("en-CA", {
           timeZone: "America/New_York",
         });
         const calibration = await calibrateWalkForwardExpectancy(normalizedTicker, sessionDate, params.signal);
-        if (params.signal?.aborted || !calibration.passesGate) {
+        const passesExpectancy = calibration.passesGate && alphaScore.passesGate;
+        if (params.signal?.aborted || !passesExpectancy) {
           const freshAbortStore = loadTradeStore();
+          if (store.bookCenterHistoryByTicker) {
+            freshAbortStore.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
+            freshAbortStore.bookCenterLastTsByTicker = store.bookCenterLastTsByTicker;
+            saveTradeStore(freshAbortStore);
+          }
           return {
             ticker: normalizedTicker,
             activePosition:
@@ -4396,15 +3987,7 @@ export async function evaluateTradeSignals(
           };
         }
 
-        // Select optimal Sub-$1.00 contract with regime-conditioned delta & Taylor payoff ranking
-        const entryRegime = classifyMicrostructuralRegime({
-          spotPrice: entryClampedSpot,
-          zeroGamma: effectiveZeroGamma,
-          netGex: resolvedNetGex,
-          impulsePeclet: impPe,
-          pecletNumber: currentPe,
-          gammaRegime: flowSnap?.gammaRegime,
-        });
+        // Select optimal Sub-$1.00 contract with Gamma-to-Theta ranking & Regime DTE preference
         const optimalContract = await selectSmallAccountContract({
           ticker: normalizedTicker,
           contractType: candidateBto.contractType,
@@ -4413,18 +3996,11 @@ export async function evaluateTradeSignals(
           target2Spot: candidateBto.target2Spot,
           stopLossSpot: candidateBto.stopLossSpot,
           contracts: params.contracts,
-          conviction,
+          conviction: Math.max(conviction, alphaScore.dataConvictionScore),
           nowEt: now,
           zeroDteCallWall: params.zeroDteCallWall || tacticalCw,
           zeroDtePutWall: params.zeroDtePutWall || tacticalPw,
-          dailyExpectedMove: params.dailyExpectedMove ?? null,
-          dataSource: params.dataSource,
-          regime: entryRegime,
-          impulsePeclet: impPe,
-          pecletNumber: currentPe,
-          gammaRegime: flowSnap?.gammaRegime,
-          netGex: resolvedNetGex,
-          zeroGamma: effectiveZeroGamma,
+          preferredDte: flowSnap ? regimeClassification.preferredDte : undefined,
           signal: params.signal,
         });
 
@@ -4584,6 +4160,10 @@ export async function evaluateTradeSignals(
 
         const latestStoreBeforeCommit = loadTradeStore();
         latestStoreBeforeCommit.prevSpotPrices[normalizedTicker] = spotPrice;
+        if (store.bookCenterHistoryByTicker) {
+          latestStoreBeforeCommit.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
+          latestStoreBeforeCommit.bookCenterLastTsByTicker = store.bookCenterLastTsByTicker;
+        }
         if (Object.keys(latestStoreBeforeCommit.activePositions || {}).length > 0) {
           console.warn(
             `[evaluateTradeSignals] Aborted ${positionTicker} BTO commit: global slot already occupied (${Object.keys(latestStoreBeforeCommit.activePositions).join(", ")}).`
@@ -4602,11 +4182,18 @@ export async function evaluateTradeSignals(
     }
   }
 
-  // Persist prevSpotPrices onto latest store when no commit/STEP-A write occurred after any await
+  // Persist prevSpotPrices & pre-10:00 Book Center history onto latest store when no commit/STEP-A write occurred
   if (emittedAlerts.length === 0 && !hadActivePositionAtStart) {
     const latestIdleStore = loadTradeStore();
-    if (latestIdleStore.prevSpotPrices[normalizedTicker] !== spotPrice) {
+    if (
+      latestIdleStore.prevSpotPrices[normalizedTicker] !== spotPrice ||
+      Boolean(store.bookCenterHistoryByTicker?.[normalizedTicker]?.length)
+    ) {
       latestIdleStore.prevSpotPrices[normalizedTicker] = spotPrice;
+      if (store.bookCenterHistoryByTicker) {
+        latestIdleStore.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
+        latestIdleStore.bookCenterLastTsByTicker = store.bookCenterLastTsByTicker;
+      }
       saveTradeStore(latestIdleStore);
     }
     store = latestIdleStore;
@@ -5167,8 +4754,8 @@ export function evaluateUnifiedSniperSetup(
   const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
   const etMins = hour * 60 + minute;
 
-  // Mandatory RTH Entry Window: 09:35 ET (575) through 13:45 ET (825)
-  if (etMins < ENTRY_START_MINS || etMins > Math.min(ENTRY_CUTOFF_MINS, 825)) return null;
+  // Mandatory RTH Entry Window: 09:35 ET (575) through 14:30 ET (870)
+  if (etMins < ENTRY_START_MINS || etMins > ENTRY_CUTOFF_MINS) return null;
 
   const features = computeUnifiedSniperFeatures(bars, idx, explicitKingStrike, referenceChainIv);
   const spot = bar.close;
@@ -5231,22 +4818,16 @@ export function evaluateUnifiedSniperSetup(
     spot < vwap &&
     spot < sma34 &&
     features.gammaRegime < 0 &&
-    features.trendVwap < 0 &&
-    vwapSlope < -minVwapSlope &&
-    isLowerLows &&
-    bar.close < bar.open &&
-    bar.close < prevBar.low
+    (bar.close < bar.open || bar.close < prevBar.close)
   ) {
     direction = "SHORT";
     setupName = "Bearish Zero-Gamma Flush [BTO PUT]";
   }
-  // 3. Support Bounce (Blocked if locked in Bearish Regime or before 09:45 ET)
+  // 3. Support Bounce (Blocked if locked in Bearish Regime)
   else if (
-    etMins >= 585 &&
     !isBearishRegimeLocked &&
-    spot >= vwap &&
     ((bar.low <= openingLow && bar.close > bar.open && bar.close >= sma34 && prevBar.close <= sma34) ||
-      (distSupport >= -Math.max(0.05, spot * 0.0005) && distSupport <= Math.max(0.15, spot * 0.0011) && bar.close > bar.open && features.trendVwap >= 0))
+      (distSupport >= -Math.max(0.05, spot * 0.0005) && distSupport <= Math.max(0.15, spot * 0.0011) && bar.close > bar.open && features.trendVwap >= -0.25))
   ) {
     direction = "LONG";
     setupName = "Support Bounce";
@@ -5265,15 +4846,11 @@ export function evaluateUnifiedSniperSetup(
     direction = "SHORT";
     setupName = "King Magnet Breakdown";
   }
-  // 5. Resistance Rejection (Strictly Blocked when Bullish Regime Locked or before 09:45 ET!)
+  // 5. Resistance Rejection (Strictly Blocked when Bullish Regime Locked!)
   else if (
-    etMins >= 585 &&
     !isBullishRegimeLocked &&
-    spot <= vwap &&
-    vwapSlope < -minVwapSlope &&
-    isLowerLows &&
     ((bar.high >= openingHigh && bar.close < bar.open && bar.close <= sma34 && prevBar.close >= sma34) ||
-      (distResist >= -Math.max(0.05, spot * 0.0005) && distResist <= Math.max(0.15, spot * 0.0011) && bar.close < bar.open && features.trendVwap <= 0))
+      (distResist >= -Math.max(0.05, spot * 0.0005) && distResist <= Math.max(0.15, spot * 0.0011) && bar.close < bar.open && features.trendVwap <= 0.25))
   ) {
     direction = "SHORT";
     setupName = "Resistance Rejection";
@@ -5758,8 +5335,6 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         stopLossSpot: contractSl,
         conviction: 92,
         nowEt: sigDate,
-        zeroGamma: typeof params.zeroGamma === "number" ? params.zeroGamma : undefined,
-        dataSource: "CBOE_MARKET_DATA",
         signal: params.signal,
       }).catch(() => null);
 
@@ -5781,8 +5356,8 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
       }
       const estTp1 = optimal.estTp1Mid;
       const estTp2 = optimal.estTp2Mid;
-      // Hard stop loss floor: strictly clamp to max -25% loss (entryAsk * 0.75)
-      const maxStopLossFloor = Number((entryAsk * 0.75).toFixed(2));
+      // Hard stop loss floor: strictly clamp to max -45% loss (entryAsk * 0.55)
+      const maxStopLossFloor = Number((entryAsk * (1 - DEFAULT_HARD_OPTION_STOP_LOSS_PCT / 100)).toFixed(2));
       const estStop = Math.max(maxStopLossFloor, optimal.estStopMid);
       const tp1Pct = Math.round(((estTp1 - entryAsk) / Math.max(0.01, entryAsk)) * 100);
       const tp2Pct = Math.round(((estTp2 - entryAsk) / Math.max(0.01, entryAsk)) * 100);

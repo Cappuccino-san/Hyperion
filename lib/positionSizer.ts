@@ -23,6 +23,24 @@ export interface PositionSizingResult {
 
 export const MAX_SMALL_ACCOUNT_BUDGET = 100.0; // Hard dollar ceiling: strictly <= $100.00
 const MAX_OUTLAY_CENTS = 10000; // $100.00 in cents
+export const MORNING_MIN_OPTION_DELTA = 0.24; // 09:35-10:29 ET (etMins < 630)
+export const INTRADAY_MIN_OPTION_DELTA = 0.35; // >= 10:30 ET (etMins >= 630)
+export const MIN_OPTION_DELTA = INTRADAY_MIN_OPTION_DELTA;
+export const MAX_OPTION_DELTA = 0.50;
+
+export function resolveMinOptionDelta(etMins?: number): number {
+  if (typeof etMins === "number" && Number.isFinite(etMins) && etMins < 630) {
+    return MORNING_MIN_OPTION_DELTA;
+  }
+  return INTRADAY_MIN_OPTION_DELTA;
+}
+
+export function isDeltaInTargetBand(delta: number, etMins?: number): boolean {
+  if (!Number.isFinite(delta)) return false;
+  const absDelta = Math.abs(delta);
+  const minDelta = resolveMinOptionDelta(etMins);
+  return absDelta >= minDelta && absDelta <= MAX_OPTION_DELTA;
+}
 
 export interface SizingResult {
   allowed: boolean;

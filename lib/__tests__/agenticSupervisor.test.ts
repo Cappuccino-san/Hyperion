@@ -1,231 +1,361 @@
-import { describe, it } from "node:test";
+import test, { after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import fs from "fs";
-import path from "path";
-import { NextRequest } from "next/server";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
-  loadShadowParityReport,
-  runDeterministicSnapshotReplay,
+  AttributionBar,
+  cloneDefaultAlphaPriors,
+  computeFeatureInformationCoefficients,
+  evaluateSessionPlaybook,
   runPostMarketAttribution,
-  type IntradaySnapshotFile,
-  type ReplayShadowTrade,
+  shouldRefreshSupervisorCheckpoint,
 } from "../agenticSupervisor";
-import { loadTradeStore, saveTradeStore, type OptionTradePosition } from "../tradeSignalEngine";
-import { GET as getSignalsRoute } from "../../app/api/signals/route";
+import { computeBarFlowGammaVwapSeries, type FlowGammaVwapSnapshot } from "../flowGammaVwap";
+import {
+  createEmptySessionLedger,
+  resetPersistenceMemCachesForTests,
+} from "../persistenceStore";
+import type { DailyTradeStore } from "../tradeSignalEngine";
 
-function buildBearishFlushSnapshot(dateIso: string): IntradaySnapshotFile {
-  const startSec = Math.floor(new Date(`${dateIso}T09:30:00-05:00`).getTime() / 1000);
-  const points: Array<{
-    ts: number;
-    spot: number;
-    callWall: number;
-    putWall: number;
-    zeroGamma: number;
-  }> = [];
-
-  // 24 x 5-minute bars (09:30 AM - 11:25 AM ET) forming a clean negative-gamma breakdown & bounce
-  const closes = [
-    755.2, 754.8, 754.2, 753.4, 752.7, 751.9, 751.1, 750.3,
-    749.6, 749.0, 748.5, 748.2, 748.4, 748.9, 749.5, 750.2,
-    750.9, 751.6, 752.1, 752.5, 752.8, 753.1, 753.4, 753.7,
-  ];
-
-  closes.forEach((spot, idx) => {
-    const barTs = startSec + idx * 300;
-    points.push({ ts: barTs + 10, spot: Number((spot + 0.15).toFixed(2)), callWall: 758, putWall: 747, zeroGamma: 756 });
-    points.push({ ts: barTs + 150, spot: Number((spot - 0.15).toFixed(2)), callWall: 758, putWall: 747, zeroGamma: 756 });
-    points.push({ ts: barTs + 280, spot, callWall: 758, putWall: 747, zeroGamma: 756 });
-  });
-
+function makeFlowSnap(overrides: Partial<FlowGammaVwapSnapshot> = {}): FlowGammaVwapSnapshot {
   return {
-    date: dateIso,
-    tickers: {
-      SPY: {
-        rthHistory: points,
-        history: points,
-      },
-    },
+    timestamp: 1794580500,
+    spot: 751,
+    flowVwap: 754,
+    upper1s: 756,
+    lower1s: 752,
+    upper2s: 758,
+    lower2s: 750,
+    upper1Sigma: 756,
+    lower1Sigma: 752,
+    upper2Sigma: 758,
+    lower2Sigma: 750,
+    sigma: 2.0,
+    variance: 4.0,
+    cumGammaWeight: 100,
+    totalWeight: 100,
+    signedGammaAcceleration: 0,
+    count: 10,
+    ceilingShareChi: 0.5,
+    netFluxJ: 0,
+    pecletNumber: 0.6,
+    gammaRegime: "POSITIVE_GAMMA",
+    bandSignal: null,
+    impulseChi: 0.5,
+    impulsePeclet: 0.6,
+    deltaChi6Bar: 0,
+    deltaImpulseChi6Bar: 0,
+    deltaNetFlux6Bar: 0,
+    ...overrides,
   };
 }
 
-describe("AgenticSupervisor: 16:05 ET Post-Market Attribution & Live-vs-Replay Shadow Parity", () => {
-  it("runDeterministicSnapshotReplay produces deterministic signals from intraday snapshot", () => {
-    const snap = buildBearishFlushSnapshot("2026-11-16");
-    const run1 = runDeterministicSnapshotReplay({ ticker: "SPY", snapshot: snap });
-    const run2 = runDeterministicSnapshotReplay({ ticker: "SPY", snapshot: snap });
-    assert.deepEqual(run1, run2, "Bar replay on intraday snapshot must be strictly deterministic");
-    assert.ok(run1.length >= 1, `Expected at least 1 deterministic replay trade, got ${run1.length}`);
-    assert.equal(run1[0].direction, "PUT");
-  });
+const tempCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "hyperion-supervisor-test-"));
+const prevCacheEnv = process.env.HYPERION_CACHE_DIR;
+process.env.HYPERION_CACHE_DIR = tempCacheDir;
 
-  it("runPostMarketAttribution computes matchedTrades, missedLiveTrades, and slippageDriftDollars accurately", () => {
-    const testDate = "2099-01-15";
-    const replayTrades: ReplayShadowTrade[] = [
-      {
-        ticker: "SPY",
-        direction: "PUT",
-        setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
-        strike: 752,
-        openedTs: 4072172100,
-        openedTimeEt: "09:35 AM",
-        closedTs: 4072175700,
-        closedTimeEt: "10:35 AM",
-        entrySpot: 754.0,
-        exitSpot: 749.5,
-        entryAsk: 0.72,
-        exitBid: 1.45,
-        exitReason: "TARGET 1 PROFIT SECURED",
-      },
-      {
-        ticker: "SPY",
-        direction: "CALL",
-        setupName: "Leg-2 Put Wall / -1σ Bullish Reclaim",
-        strike: 751,
-        openedTs: 4072181100,
-        openedTimeEt: "12:05 PM",
-        closedTs: 4072186500,
-        closedTimeEt: "01:35 PM",
-        entrySpot: 750.2,
-        exitSpot: 752.8,
-        entryAsk: 0.68,
-        exitBid: 1.12,
-        exitReason: "TARGET 1 PROFIT SECURED",
-      },
-    ];
+beforeEach(() => {
+  resetPersistenceMemCachesForTests();
+});
 
-    // Live session matched Trade #1 with +$0.05 entry slippage and -$0.04 exit slippage (+$9.00 drift), missed Trade #2
-    const liveTrades: OptionTradePosition[] = [
-      {
-        id: "live-shadow-put-1",
+after(() => {
+  resetPersistenceMemCachesForTests();
+  if (prevCacheEnv === undefined) delete process.env.HYPERION_CACHE_DIR;
+  else process.env.HYPERION_CACHE_DIR = prevCacheEnv;
+  try {
+    fs.rmSync(tempCacheDir, { recursive: true, force: true });
+  } catch {}
+});
+
+test("supervisor tightens thresholds on trailing 5d drawdown >= $150 and vetoes conflicting King levels in chop", () => {
+  const losingSessions: DailyTradeStore[] = ["2026-11-10", "2026-11-11", "2026-11-12"].map(
+    (date) => {
+      const ledger = createEmptySessionLedger(date);
+      ledger.closedPositions.push({
+        id: `${date}-loss`,
         ticker: "SPY",
         contractType: "PUT",
-        contractLabel: "SPY 752P",
-        strike: 752,
-        expiration: testDate,
-        setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
+        contractLabel: "SPY 750P",
+        strike: 750,
+        expiration: date,
+        setupName: "Test Setup",
         status: "CLOSED",
-        btoSpotPrice: 753.9,
-        btoOptionMid: 0.75,
-        optionAsk: 0.77, // +$5.00 worse entry fill vs $0.72 replay
-        closedOptionMid: 1.41, // +$4.00 worse exit fill vs $1.45 replay
+        btoSpotPrice: 752,
+        btoOptionMid: 0.8,
+        optionAsk: 0.8,
         contractsQty: 1,
         remainingQty: 0,
-        totalOutlay: 77,
-        target1Spot: 750.0,
-        target2Spot: 748.0,
-        stopLossSpot: 755.5,
-        openedAt: "09:35 AM",
-        openedTs: 4072172160, // 60s difference -> matched
-        closedAt: "10:35 AM",
-        closedTs: 4072175700,
-        exitReason: "TARGET 1 PROFIT SECURED",
-      },
-    ];
-
-    const report = runPostMarketAttribution({
-      date: testDate,
-      ticker: "SPY",
-      liveTrades,
-      replayTradesOverride: replayTrades,
-      persist: false,
-    });
-
-    assert.equal(report.matchedTrades, 1);
-    assert.equal(report.missedLiveTrades, 1);
-    assert.equal(report.slippageDriftDollars, 9.0);
-    assert.equal(report.parityScorePct, 50.0);
-    assert.equal(report.status, "DRIFT_WARNING");
-    assert.equal(report.details.length, 2);
-  });
-
-  it("persists shadowParityReport to .cache and exposes it via GET /api/signals", async () => {
-    const testDate = "2099-01-16";
-    const cacheDir = path.join(process.cwd(), ".cache");
-    const parityFile = path.join(cacheDir, `shadow-parity-${testDate}.json`);
-    const tradeFile = path.join(cacheDir, `active-trades-${testDate}.json`);
-    const snapFile = path.join(cacheDir, `intraday-${testDate}.json`);
-    const storeBackup = loadTradeStore();
-
-    try {
-      const snapshot = buildBearishFlushSnapshot(testDate);
-      fs.mkdirSync(cacheDir, { recursive: true });
-      fs.writeFileSync(snapFile, JSON.stringify(snapshot, null, 2), "utf-8");
-
-      const replayTrades = runDeterministicSnapshotReplay({ ticker: "SPY", snapshot });
-      assert.ok(replayTrades.length >= 1, "Snapshot must yield at least one replay trade");
-
-      const matchingLiveTrades: OptionTradePosition[] = replayTrades.map((rt, idx) => ({
-        id: `live-parity-${idx}`,
-        ticker: "SPY",
-        contractType: rt.direction,
-        contractLabel: `SPY ${rt.strike}${rt.direction === "CALL" ? "C" : "P"}`,
-        strike: rt.strike,
-        expiration: testDate,
-        setupName: rt.setupName,
-        status: "CLOSED",
-        btoSpotPrice: rt.entrySpot,
-        btoOptionMid: rt.entryAsk,
-        optionAsk: rt.entryAsk,
-        closedOptionMid: rt.exitBid,
-        contractsQty: 1,
-        remainingQty: 0,
-        totalOutlay: Number((rt.entryAsk * 100).toFixed(2)),
-        target1Spot: rt.exitSpot,
-        target2Spot: rt.exitSpot,
-        stopLossSpot: rt.entrySpot,
-        openedAt: rt.openedTimeEt,
-        openedTs: rt.openedTs,
-        closedAt: rt.closedTimeEt,
-        closedTs: rt.closedTs,
-        exitReason: rt.exitReason,
-      }));
-
-      fs.writeFileSync(
-        tradeFile,
-        JSON.stringify(
-          {
-            date: testDate,
-            version: 1,
-            activePositions: {},
-            closedPositions: matchingLiveTrades,
-            alerts: [],
-            prevSpotPrices: {},
-          },
-          null,
-          2
-        ),
-        "utf-8"
-      );
-
-      const report = runPostMarketAttribution({
-        date: testDate,
-        ticker: "SPY",
-        persist: true,
+        totalOutlay: 80,
+        target1Spot: 749,
+        target2Spot: 747,
+        stopLossSpot: 753.5,
+        openedAt: "9:40 AM",
+        openedTs: 1794580800,
+        closedAt: "10:00 AM",
+        closedTs: 1794582000,
+        closedSpotPrice: 753.6,
+        closedOptionMid: 0.25, // -$55 per trade => 3 * -$55 = -$165 DD (>= $150)
+        exitReason: "STOP LOSS HIT",
+        pnlSpotPct: -0.21,
+        pnlOptionPct: -68.8,
+        rrRatio: 2.0,
       });
-
-      assert.equal(report.matchedTrades, replayTrades.length);
-      assert.equal(report.missedLiveTrades, 0);
-      assert.equal(report.slippageDriftDollars, 0);
-      assert.equal(report.status, "PASS");
-      assert.ok(fs.existsSync(parityFile), "shadow-parity JSON file must be persisted in .cache");
-
-      const loaded = loadShadowParityReport(testDate);
-      assert.deepEqual(loaded?.matchedTrades, report.matchedTrades);
-
-      const req = new NextRequest(`http://localhost:3000/api/signals?ticker=SPY&date=${testDate}`);
-      const res = await getSignalsRoute(req);
-      assert.equal(res.status, 200);
-      const body = await res.json();
-      assert.equal(body.shadowParityReport?.matchedTrades, report.matchedTrades);
-      assert.equal(body.shadowParityReport?.missedLiveTrades, 0);
-      assert.equal(body.shadowParityReport?.slippageDriftDollars, 0);
-    } finally {
-      saveTradeStore(storeBackup);
-      for (const f of [parityFile, tradeFile, snapFile]) {
-        try {
-          if (fs.existsSync(f)) fs.unlinkSync(f);
-        } catch {}
-      }
+      return ledger;
     }
+  );
+
+  // 10:30 AM ET = 10*60+30 = 630 mins
+  const ts1030Ms = Date.parse("2026-11-13T15:30:00Z"); // 10:30 AM EST
+  const policyWithDrawdown = evaluateSessionPlaybook({
+    sessionDate: "2026-11-13",
+    ticker: "SPY",
+    nowMs: ts1030Ms,
+    spotPrice: 751,
+    prevSpotPrice: 752,
+    callWall: 760,
+    putWall: 742,
+    zeroGamma: 754,
+    zeroDteKing: 755,
+    allExpKing: 755,
+    netGex: -18,
+    flowSnapshot: makeFlowSnap({
+      timestamp: Math.floor(ts1030Ms / 1000),
+      spot: 751,
+      flowVwap: 754,
+      upper1s: 756,
+      lower1s: 752,
+      upper2s: 758,
+      lower2s: 750,
+      upper1Sigma: 756,
+      lower1Sigma: 752,
+      upper2Sigma: 758,
+      lower2Sigma: 750,
+      ceilingShareChi: 0.22,
+      netFluxJ: -3.5,
+      pecletNumber: -2.4,
+      gammaRegime: "NEGATIVE_GAMMA",
+      bandSignal: null,
+      impulseChi: 0.22,
+      impulsePeclet: -2.4,
+      deltaChi6Bar: -0.1,
+      deltaImpulseChi6Bar: -0.12,
+      deltaNetFlux6Bar: -5.0,
+    }),
+    historicalSessions: losingSessions,
   });
+
+  assert.equal(policyWithDrawdown.checkpoint, "MID_MORNING_1030");
+  assert.ok(policyWithDrawdown.trailing5dDrawdownDollars >= 150);
+  assert.equal(policyWithDrawdown.minExpectancyR, 0.5);
+  assert.equal(policyWithDrawdown.minWinRatePct, 62.0);
+  assert.equal(policyWithDrawdown.standAsideVetoReason, null);
+
+  // 0DTE vs All-Exp King divergence >= 0.8% with weak advection (|Pe| < 1.2) -> stand-aside veto
+  const kingConflictPolicy = evaluateSessionPlaybook({
+    sessionDate: "2026-11-13",
+    ticker: "SPY",
+    nowMs: ts1030Ms,
+    spotPrice: 750,
+    prevSpotPrice: 750,
+    callWall: 758,
+    putWall: 742,
+    zeroGamma: 746,
+    zeroDteKing: 750,
+    allExpKing: 760, // 1.33% divergence
+    netGex: 20,
+    flowSnapshot: makeFlowSnap({
+      timestamp: Math.floor(ts1030Ms / 1000),
+      spot: 750,
+      flowVwap: 750,
+      upper1s: 752,
+      lower1s: 748,
+      upper2s: 754,
+      lower2s: 746,
+      upper1Sigma: 752,
+      lower1Sigma: 748,
+      upper2Sigma: 754,
+      lower2Sigma: 746,
+      ceilingShareChi: 0.5,
+      netFluxJ: 0.1,
+      pecletNumber: 0.6,
+      gammaRegime: "POSITIVE_GAMMA",
+      bandSignal: "LOWER_2S_BOUNCE",
+      impulseChi: 0.5,
+      impulsePeclet: 0.6,
+      deltaChi6Bar: 0,
+      deltaImpulseChi6Bar: 0,
+      deltaNetFlux6Bar: 0,
+    }),
+  });
+  assert.ok(kingConflictPolicy.standAsideVetoReason?.includes("King conflict"));
+  assert.equal(kingConflictPolicy.preferredDte, "NONE");
+
+  // Checkpoint transition + stand-aside wakeup when |Pe| >= 1.2
+  assert.equal(shouldRefreshSupervisorCheckpoint(kingConflictPolicy, 635, false, 0.5), false);
+  assert.equal(shouldRefreshSupervisorCheckpoint(kingConflictPolicy, 635, false, 1.5), true);
+  assert.equal(shouldRefreshSupervisorCheckpoint(policyWithDrawdown, 780, false, 0.5), true); // 13:00 ET
+  assert.equal(shouldRefreshSupervisorCheckpoint(policyWithDrawdown, 635, true, 0.5), true); // Zero-Gamma flip
 });
+
+test("runPostMarketAttribution runs counterfactual simulation and updates priors within [0.6, 1.6] bounds", async () => {
+  const baseTs = Math.floor(Date.parse("2026-11-13T14:30:00Z") / 1000);
+  const bars: AttributionBar[] = [];
+  for (let i = 0; i < 20; i++) {
+    const close = Number((758 - i * 0.45).toFixed(2));
+    bars.push({
+      ts: baseTs + i * 300,
+      open: close + 0.25,
+      high: close + 0.4,
+      low: close - 0.5,
+      close,
+    });
+  }
+  const flowSeries = computeBarFlowGammaVwapSeries(
+    bars.map((b) => ({ timestamp: b.ts, open: b.open, high: b.high, low: b.low, close: b.close }))
+  );
+
+  const priorsStart = cloneDefaultAlphaPriors();
+  const report = await runPostMarketAttribution({
+    sessionDate: "2026-11-13",
+    ticker: "SPY",
+    bars,
+    flowSeries,
+    callWall: 762,
+    putWall: 745,
+    zeroGamma: 757,
+    executedTrades: [
+      {
+        id: "exec-1",
+        ticker: "SPY",
+        contractType: "PUT",
+        contractLabel: "SPY 755P",
+        strike: 755,
+        expiration: "2026-11-13",
+        setupName: "Bearish Zero-Gamma Flush",
+        status: "CLOSED",
+        btoSpotPrice: 756.5,
+        btoOptionMid: 0.7,
+        optionAsk: 0.7,
+        contractsQty: 1,
+        remainingQty: 0,
+        totalOutlay: 70,
+        target1Spot: 752,
+        target2Spot: 749,
+        stopLossSpot: 758.5,
+        openedAt: "9:40 AM",
+        openedTs: bars[2].ts,
+        closedAt: "10:25 AM",
+        closedTs: bars[11].ts,
+        closedSpotPrice: 751.8,
+        closedOptionMid: 2.4,
+        exitReason: "TARGET 1 PROFIT SECURED",
+        pnlSpotPct: -0.62,
+        pnlOptionPct: 242.9,
+        rrRatio: 2.25,
+      },
+    ],
+    candidateSetups: [
+      {
+        timestamp: bars[4].ts,
+        direction: "CALL",
+        setupName: "Skipped Counter-Flux Bounce",
+        regime: "LOW_EDGE_CHOP",
+        entrySpot: bars[4].close,
+        target1Spot: bars[4].close + 2.0,
+        stopLossSpot: bars[4].close - 1.0,
+        wasExecuted: false,
+        skipReason: "Weak advection",
+      },
+    ],
+    persist: true,
+    priorsOverride: priorsStart,
+  });
+
+  assert.equal(report.executedCount, 1);
+  assert.equal(report.skippedCount, 1);
+  assert.ok(report.executedAvgR > 1.0);
+  assert.equal(report.savedChopCount, 1);
+
+  const persistedPriors = JSON.parse(
+    fs.readFileSync(path.join(tempCacheDir, "alpha-priors.json"), "utf-8")
+  );
+  assert.equal(persistedPriors.lastAttributionDate, "2026-11-13");
+  for (const val of Object.values(persistedPriors.featureWeights) as number[]) {
+    assert.ok(val >= 0.6 && val <= 1.6);
+  }
+});
+
+test("computeFeatureInformationCoefficients and runPostMarketAttribution compute rolling IC and decay negative-IC weights toward 0.60", async () => {
+  const samples = [
+    // kingMagnet strongly negatively correlated with net forward payoff (mfeR - maeR),
+    // fluxAlignment strongly positively correlated.
+    {
+      features: { fluxAlignment: 0.9, flowVwapBand: 0.7, wallRoom: 0.6, kingMagnet: 0.2, mtfDivergence: 0.5, regimeFit: 0.8 },
+      mfeR: 2.4,
+      maeR: 0.2, // net +2.2
+    },
+    {
+      features: { fluxAlignment: 0.75, flowVwapBand: 0.65, wallRoom: 0.6, kingMagnet: 0.4, mtfDivergence: 0.5, regimeFit: 0.75 },
+      mfeR: 1.6,
+      maeR: 0.4, // net +1.2
+    },
+    {
+      features: { fluxAlignment: 0.45, flowVwapBand: 0.55, wallRoom: 0.6, kingMagnet: 0.7, mtfDivergence: 0.5, regimeFit: 0.55 },
+      mfeR: 0.5,
+      maeR: 0.8, // net -0.3
+    },
+    {
+      features: { fluxAlignment: 0.25, flowVwapBand: 0.4, wallRoom: 0.6, kingMagnet: 0.95, mtfDivergence: 0.5, regimeFit: 0.35 },
+      mfeR: 0.2,
+      maeR: 1.4, // net -1.2
+    },
+  ];
+
+  const ic = computeFeatureInformationCoefficients({ samples });
+  assert.ok(ic.fluxAlignment > 0.9, `Expected strong positive flux IC (got ${ic.fluxAlignment})`);
+  assert.ok(ic.kingMagnet < -0.9, `Expected strong negative kingMagnet IC (got ${ic.kingMagnet})`);
+  assert.equal(ic.wallRoom, 0);
+
+  const priors = cloneDefaultAlphaPriors();
+  const initialKingWeight = priors.featureWeights.kingMagnet;
+  const initialFluxWeight = priors.featureWeights.fluxAlignment;
+
+  const baseTs = Math.floor(Date.parse("2026-11-16T14:30:00Z") / 1000);
+  const bars: AttributionBar[] = Array.from({ length: 12 }, (_, i) => ({
+    ts: baseTs + i * 300,
+    open: 750 + i * 0.1,
+    high: 750.3 + i * 0.1,
+    low: 749.8 + i * 0.1,
+    close: 750.1 + i * 0.1,
+  }));
+
+  const report = await runPostMarketAttribution({
+    sessionDate: "2026-11-16",
+    ticker: "SPY",
+    bars,
+    flowSeries: [],
+    featureSamples: samples,
+    persist: true,
+    force: true,
+    priorsOverride: priors,
+  });
+
+  assert.ok(report.featureIc);
+  assert.ok((report.featureIc?.kingMagnet ?? 0) < -0.9);
+
+  const updatedPriors = JSON.parse(
+    fs.readFileSync(path.join(tempCacheDir, "alpha-priors.json"), "utf-8")
+  );
+  assert.ok(
+    updatedPriors.featureWeights.kingMagnet < initialKingWeight,
+    `Expected negative-IC kingMagnet weight (${updatedPriors.featureWeights.kingMagnet}) to decay below ${initialKingWeight}`
+  );
+  assert.ok(updatedPriors.featureWeights.kingMagnet >= 0.6);
+  assert.ok(
+    updatedPriors.featureWeights.fluxAlignment >= initialFluxWeight,
+    `Expected positive-IC fluxAlignment weight (${updatedPriors.featureWeights.fluxAlignment}) >= ${initialFluxWeight}`
+  );
+  assert.ok((updatedPriors.rollingFeatureIc?.kingMagnet ?? 0) < -0.2);
+});
+

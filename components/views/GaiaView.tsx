@@ -14,7 +14,7 @@ import {
   GaiaCallPutBiasHud,
 } from "@/components/gaia/GaiaCallPutBiasHud";
 import { toEpochSec } from "@/lib/gaiaSessionGuards";
-import { GAIA_TICKER_ROWS } from "@/lib/tickerPresets";
+import type { SessionPlaybookPolicy } from "@/lib/persistenceStore";
 import type {
   GaiaExpirationInfo,
   GaiaIntradayCandle,
@@ -563,8 +563,6 @@ export function GaiaView() {
   const storeTicker = useDashboardStore((state) => state.activeTicker);
   const gammaLevels = useDashboardStore((state) => state.gammaLevels);
   const setStoreTicker = useDashboardStore((state) => state.setTicker);
-  const fetchOptionsChain = useDashboardStore((state) => state.fetchOptionsChain);
-  const fetchServerTrades = useDashboardStore((state) => state.fetchServerTrades);
   const liveTickPrice = useDashboardStore((state) => state.liveTickPrice);
   const liveTickCount = useDashboardStore((state) => state.liveTickCount);
   const storeActivePositions = useDashboardStore(
@@ -576,12 +574,17 @@ export function GaiaView() {
   const storeTradeAlerts = useDashboardStore(
     (state) => state.serverTradeAlerts
   );
+  const storeSupervisorPolicy = useDashboardStore(
+    (state) => state.supervisorPolicy
+  );
 
   const [serverTrades, setServerTrades] = useState<ServerTradesState>({
     activePositions: storeActivePositions,
     closedPositions: storeClosedTrades,
     alerts: storeTradeAlerts,
   });
+  const [historicalSupervisorPolicy, setHistoricalSupervisorPolicy] =
+    useState<SessionPlaybookPolicy | null>(null);
 
   const [atlasPalette, setAtlasPalette] = useState<"ice" | "polarity">("polarity");
 
@@ -596,6 +599,7 @@ export function GaiaView() {
   useEffect(() => {
     setPrzmHudSignals([]);
     setServerTrades({ activePositions: {}, closedPositions: [], alerts: [] });
+    setHistoricalSupervisorPolicy(null);
   }, [loadedTicker]);
 
   const [livePayload, setLivePayload] = useState<GaiaLivePayload | null>(
@@ -939,13 +943,11 @@ export function GaiaView() {
     return fallback && /^\d{4}-\d{2}-\d{2}$/.test(fallback) ? fallback : undefined;
   }, [dataset?.candles, dataset?.sessionDate, selectedSessionIso, livePayload?.sessionDate]);
 
-  // Historical & Live Session Trade Signals Sync (/api/signals?ticker=...&date=...)
+  // Historical Session Trade Signals Hook (live session uses GlobalMarketDataSync store state)
   useEffect(() => {
     if (!selectedSessionIso) {
       setServerTrades({ activePositions: {}, closedPositions: [], alerts: [] });
-      if (!isReplaying && !isReplayFrozen) {
-        void fetchServerTrades(loadedTicker, chartSessionDate);
-      }
+      setHistoricalSupervisorPolicy(null);
       return;
     }
     if (isReplaying || isReplayFrozen) return;
@@ -969,6 +971,7 @@ export function GaiaView() {
             closedPositions: data.closedPositions || [],
             alerts: data.alerts || [],
           });
+          setHistoricalSupervisorPolicy(data.supervisorPolicy ?? null);
         }
       } catch {
         // Silent fallback
@@ -979,7 +982,7 @@ export function GaiaView() {
       isMounted = false;
       controller.abort();
     };
-  }, [loadedTicker, chartSessionDate, selectedSessionIso, isReplaying, isReplayFrozen, fetchServerTrades]);
+  }, [loadedTicker, chartSessionDate, selectedSessionIso, isReplaying, isReplayFrozen]);
 
   const flowVwapPoints = useMemo<FlowGammaVwapSnapshot[]>(() => {
     if (!dataset?.candles || dataset.candles.length === 0) return [];
@@ -1105,43 +1108,25 @@ export function GaiaView() {
     return { yMin, yMax, yAxisTicks };
   }, [dataset, scopePreset, expFilter, gammaLevels, yScale, yPanOffset, isReplaying, isReplayFrozen, activeBarIndex, selectedSessionIso, storeHeatmapTicker, loadedTicker, storeHeatmapKingNode]);
 
-  const selectTickerSymbol = useCallback(
-    (rawSym: string, forceOptionsRefresh: boolean = false) => {
-      const cleaned = rawSym.trim().toUpperCase() || "SPY";
-      prevStoreTickerRef.current = cleaned;
-      setTickerInput(cleaned);
-      setStoreTicker(cleaned);
-      void fetchOptionsChain(cleaned, forceOptionsRefresh, forceOptionsRefresh);
-      void fetchServerTrades(cleaned, undefined);
-      isReplayingRef.current = false;
-      setIsReplaying(false);
-      isReplayFrozenRef.current = false;
-      setIsReplayFrozen(false);
-      setSelectedSessionIso("");
-      resetViewportTo24H();
-      syncTickerUrlParam(cleaned);
-      if (cleaned !== loadedTicker) {
-        setLivePayload(null);
-        setLoadedTicker(cleaned);
-      } else {
-        void fetchLiveGaia(cleaned, "", startHour, false);
-      }
-    },
-    [
-      setStoreTicker,
-      fetchOptionsChain,
-      fetchServerTrades,
-      resetViewportTo24H,
-      syncTickerUrlParam,
-      loadedTicker,
-      fetchLiveGaia,
-      startHour,
-    ]
-  );
-
   const handleLoadTicker = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    selectTickerSymbol(tickerInput, true);
+    const cleaned = tickerInput.trim().toUpperCase() || "SPY";
+    prevStoreTickerRef.current = cleaned;
+    setTickerInput(cleaned);
+    setStoreTicker(cleaned);
+    isReplayingRef.current = false;
+    setIsReplaying(false);
+    isReplayFrozenRef.current = false;
+    setIsReplayFrozen(false);
+    setSelectedSessionIso("");
+    resetViewportTo24H();
+    syncTickerUrlParam(cleaned);
+    if (cleaned !== loadedTicker) {
+      setLivePayload(null);
+      setLoadedTicker(cleaned);
+    } else {
+      fetchLiveGaia(cleaned, "", startHour, false);
+    }
   };
 
   const handleSessionChange = (newSessionIso: string) => {
@@ -2770,16 +2755,15 @@ export function GaiaView() {
 
         <form
           onSubmit={handleLoadTicker}
-          className="bg-[#101520] border border-[#1e2638] rounded-xl p-1.5 flex items-center justify-between gap-2"
+          className="bg-[#101520] border border-[#1e2638] rounded-xl p-1.5 flex items-center justify-between"
         >
           <input
-            id="gaia-ticker-search-input"
             type="text"
             value={tickerInput}
             onChange={(e) => setTickerInput(e.target.value.toUpperCase())}
-            placeholder="Search ticker — SPY, QQQ, SPXW, IWM... (Press / to focus)"
+            placeholder="SPY"
             aria-label="Ticker symbol"
-            className="bg-transparent text-white font-bold text-sm px-3 py-1 focus:outline-none flex-1 uppercase font-sans placeholder:text-slate-500 placeholder:font-normal placeholder:normal-case"
+            className="bg-transparent text-white font-bold text-sm px-3 py-1 focus:outline-none flex-1 uppercase font-sans"
           />
           <button
             type="submit"
@@ -2789,36 +2773,6 @@ export function GaiaView() {
             {isLoading ? "Loading..." : "Load"}
           </button>
         </form>
-
-        {/* Quick-Select 51-Ticker Bar */}
-        <div
-          className="bg-[#0c111b] border border-[#1a2234] rounded-xl p-2 space-y-1.5"
-          aria-label="Gaia quick-select tickers"
-        >
-          {GAIA_TICKER_ROWS.map((row, rowIdx) => (
-            <div key={rowIdx} className="flex flex-wrap items-center gap-1.5">
-              {row.map((sym) => {
-                const isActive = loadedTicker.toUpperCase() === sym;
-                return (
-                  <button
-                    key={sym}
-                    type="button"
-                    onClick={() => selectTickerSymbol(sym, false)}
-                    aria-pressed={isActive}
-                    className={cn(
-                      "px-2.5 py-1 rounded-full text-[11px] font-mono font-semibold transition cursor-pointer border",
-                      isActive
-                        ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-extrabold border-[#818cf8]/80 shadow-[0_0_14px_rgba(99,102,241,0.45)]"
-                        : "bg-[#121826] border-[#1e2638] text-slate-300 hover:text-white hover:border-[#38bdf8]/50 hover:bg-[#172033]"
-                    )}
-                  >
-                    {sym}
-                  </button>
-                );
-              })}
-            </div>
-          ))}
-        </div>
       </div>
 
       {/* 2C. Horizontal Pill Filter Toolbar */}
@@ -3334,6 +3288,13 @@ export function GaiaView() {
         sigma1Move={dataset?.sigma1Move}
         liveSpot={activeCandle ? activeCandle.close : null}
         serverTrades={effectiveServerTrades}
+        supervisorPolicy={
+          selectedSessionIso
+            ? historicalSupervisorPolicy
+            : loadedTicker.toUpperCase() === storeTicker.toUpperCase()
+              ? storeSupervisorPolicy
+              : null
+        }
         sessionDate={chartSessionDate}
         dividerRatio={dividerRatio}
         isReplayMode={isHistoricalOrReplay}
@@ -3357,7 +3318,25 @@ export function GaiaView() {
           setScopePreset("cone");
         }}
         onSignalsEvaluated={setPrzmHudSignals}
-        onSymbolChange={(sym) => selectTickerSymbol(sym, false)}
+        onSymbolChange={(sym) => {
+          const cleaned = sym.trim().toUpperCase() || "SPY";
+          prevStoreTickerRef.current = cleaned;
+          setTickerInput(cleaned);
+          setStoreTicker(cleaned);
+          isReplayingRef.current = false;
+          setIsReplaying(false);
+          isReplayFrozenRef.current = false;
+          setIsReplayFrozen(false);
+          setSelectedSessionIso("");
+          resetViewportTo24H();
+          syncTickerUrlParam(cleaned);
+          if (cleaned !== loadedTicker) {
+            setLivePayload(null);
+            setLoadedTicker(cleaned);
+          } else {
+            void fetchLiveGaia(cleaned, "", startHour);
+          }
+        }}
       />
         );
       })()}

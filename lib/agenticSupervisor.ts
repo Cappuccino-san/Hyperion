@@ -1,871 +1,814 @@
-/**
- * Agentic Supervisor — Post-Market (16:05 ET) Attribution & Live-vs-Replay Shadow Parity Audit
- *
- * Compares live shadow trades recorded during the RTH session against deterministic
- * 5-minute bar-replay signals on that day's .cache/intraday-YYYY-MM-DD.json snapshot,
- * logging and persisting a ShadowParityReport into /api/signals and .cache/.
- */
-
-import fs from "fs";
-import path from "path";
 import {
-  computeRemainingYearsToExpiration,
-  estimateDynamicAtmIv,
-  evaluateUnifiedSniperSetup,
-  getTodayEt,
-  loadTradeStore,
-  priceOptionWithSkew,
-  saveTradeStore,
-  type DailyTradeStore,
-  type OptionTradePosition,
-  type ShadowParityReport,
-  type ShadowParityTradeDelta,
-} from "@/lib/tradeSignalEngine";
-import {
-  computeBoundedExpectedMove,
-  getMaxOtmDistance,
-  resolveMinOptionDelta,
-  scoreContractTaylorPayoff,
-  type MicrostructuralRegime,
+  classifyMarketRegime,
+  computeDailyOptionTheta,
+  estimateRemainingYears,
+  MarketRegimeClassification,
+  scoreSetupExpectancy,
 } from "@/lib/alphaScorer";
+import { FlowGammaVwapSnapshot } from "@/lib/flowGammaVwap";
+import { etMinutesOfDay, getTodayEt } from "@/lib/gaiaSessionGuards";
 import {
-  computeBarFlowGammaVwapSeries,
-  type StructuralFlowNodes,
-} from "@/lib/flowGammaVwap";
-import { etMinutesOfDay, RTH_CLOSE_MINS, RTH_OPEN_MINS } from "@/lib/gaiaSessionGuards";
+  AlphaFeatureWeights,
+  AlphaPriorsState,
+  CounterfactualEvalRecord,
+  FeatureIcMap,
+  MarketRegimeId,
+  PostMarketAttributionReport,
+  SessionPlaybookPolicy,
+  cloneDefaultAlphaPriors,
+  readAlphaPriorsSync,
+  readPostMarketAttribution,
+  readSupervisorPolicySync,
+  writeAlphaPriors,
+  writeAlphaPriorsSync,
+  writePostMarketAttribution,
+  writeSupervisorPolicy,
+  writeSupervisorPolicySync,
+} from "@/lib/persistenceStore";
+import type { DailyTradeStore } from "@/lib/tradeSignalEngine";
 
-export type { ShadowParityReport, ShadowParityTradeDelta };
-
-export interface IntradaySnapshotPoint {
-  ts: number;
-  time?: string;
-  spot: number;
-  callWall?: number;
-  putWall?: number;
-  zeroGamma?: number;
-  cw?: number;
-  pw?: number;
-  zg?: number;
-}
-
-export interface IntradaySnapshotFile {
-  date: string;
-  tickers: Record<
-    string,
-    {
-      history?: IntradaySnapshotPoint[];
-      rthHistory?: IntradaySnapshotPoint[];
-    }
-  >;
-}
-
-export interface ReplayShadowTrade {
+export interface SessionPlaybookInput {
+  sessionDate: string;
   ticker: string;
-  direction: "CALL" | "PUT";
-  setupName: string;
-  strike: number;
-  openedTs: number;
-  openedTimeEt: string;
-  closedTs: number;
-  closedTimeEt: string;
-  entrySpot: number;
-  exitSpot: number;
-  entryAsk: number;
-  exitBid: number;
-  exitReason: string;
+  nowMs?: number;
+  spotPrice: number;
+  prevSpotPrice?: number;
+  callWall: number;
+  putWall: number;
+  zeroGamma: number;
+  zeroDteKing?: number;
+  allExpKing?: number;
+  bookCenter?: number;
+  netGex?: number;
+  flowSnapshot?: FlowGammaVwapSnapshot | null;
+  historicalSessions?: DailyTradeStore[];
+  directionHint?: "CALL" | "PUT";
 }
 
-export interface PostMarketAttributionParams {
-  date?: string;
-  ticker?: string;
-  intradaySnapshot?: IntradaySnapshotFile | null;
-  liveTrades?: OptionTradePosition[];
-  replayTradesOverride?: ReplayShadowTrade[];
-  persist?: boolean;
-  matchWindowSec?: number;
-}
-
-interface ReplayBar5m {
+export interface AttributionBar {
   ts: number;
-  timeEt: string;
-  totalMinutes: number;
   open: number;
   high: number;
   low: number;
   close: number;
-  sma34: number;
-  callWall: number;
-  putWall: number;
-  zeroGamma: number;
+  sma34?: number;
 }
 
-function getCacheDir(): string {
-  const dir = path.join(process.cwd(), ".cache");
-  if (!fs.existsSync(dir)) {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-    } catch {
-      // ignore read-only runtime
-    }
-  }
-  return dir;
-}
-
-function formatTimeEtFromSec(tsSec: number): string {
-  return new Date(tsSec * 1000).toLocaleTimeString("en-US", {
-    timeZone: "America/New_York",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function normalizePosTicker(raw: string): string {
-  const clean = raw.trim().toUpperCase().replace(/^\$/, "");
-  return clean === "SPXW" || clean === "SPX" ? "SPY" : clean;
-}
-
-function inferStrikeStep(spot: number): number {
-  if (spot >= 15000) return 25;
-  if (spot >= 1500) return 5;
-  if (spot >= 250) return 1;
-  return 0.5;
-}
-
-function selectDeterministicReplayContract(params: {
-  spot: number;
-  direction: "LONG" | "SHORT";
-  barTsSec: number;
-  etMins: number;
-  atmIv: number;
+export interface AttributionCandidateSetup {
+  timestamp: number;
+  direction: "CALL" | "PUT";
+  setupName: string;
+  regime: MarketRegimeId;
+  entrySpot: number;
   target1Spot: number;
-  callWall: number;
-  putWall: number;
-  zeroGamma: number;
-  impulsePeclet?: number;
-}) {
-  const {
-    spot,
-    direction,
-    barTsSec,
-    etMins,
-    atmIv,
-    target1Spot,
-    callWall,
-    putWall,
-    zeroGamma,
-    impulsePeclet,
-  } = params;
-  const isCall = direction === "LONG";
-  const maxOtmDist = getMaxOtmDistance(spot);
-  const strikeStep = inferStrikeStep(spot);
+  stopLossSpot: number;
+  wasExecuted: boolean;
+  skipReason?: string;
+  realizedOptionR?: number;
+}
 
-  const deltaRoute = resolveMinOptionDelta({
-    spotPrice: spot,
-    zeroGamma,
-    impulsePeclet,
-  });
-  const dteCandidates =
-    deltaRoute.regime === "POS_GAMMA_PIN" ? [0, 1, 2] : [0, 1, 2];
-  const remainingRthMins = Math.max(15, Math.min(390, RTH_CLOSE_MINS - etMins));
-  const expectedMove = computeBoundedExpectedMove({
-    spotPrice: spot,
-    isCall,
-    target1Spot,
-    zeroDteCallWall: callWall > 0 ? callWall : undefined,
-    zeroDtePutWall: putWall > 0 ? putWall : undefined,
-    atmIv,
-    remainingRthMinutes: remainingRthMins,
-  });
+export interface FeatureIcSample {
+  features: FeatureIcMap;
+  mfeR: number;
+  maeR: number;
+}
 
-  const stage1: Array<{
-    strike: number;
-    quote: ReturnType<typeof priceOptionWithSkew>;
-    dteDays: number;
-    remainingYears: number;
-    score: number;
-  }> = [];
-  const stage2: typeof stage1 = [];
+export interface RunPostMarketAttributionInput {
+  sessionDate: string;
+  ticker: string;
+  bars: AttributionBar[];
+  flowSeries?: FlowGammaVwapSnapshot[];
+  callWall?: number;
+  putWall?: number;
+  zeroGamma?: number;
+  zeroDteKing?: number;
+  executedTrades?: DailyTradeStore["closedPositions"];
+  candidateSetups?: AttributionCandidateSetup[];
+  featureSamples?: FeatureIcSample[];
+  atmIv?: number;
+  force?: boolean;
+  persist?: boolean;
+  priorsOverride?: AlphaPriorsState;
+}
 
-  for (const dteDays of dteCandidates) {
-    const remainingYears = computeRemainingYearsToExpiration(barTsSec * 1000, dteDays);
-    const holdDays = dteDays === 0 ? Math.max(0.15, remainingRthMins / 390) : 0.35;
-    for (let step = 0; step <= 12; step++) {
-      const baseStrike = isCall
-        ? Math.ceil(spot / strikeStep) * strikeStep + step * strikeStep
-        : Math.floor(spot / strikeStep) * strikeStep - step * strikeStep;
-      const strike = Number(baseStrike.toFixed(2));
-      if (Math.abs(strike - spot) > maxOtmDist) break;
-
-      const quote = priceOptionWithSkew({
-        spot,
-        strike,
-        direction,
-        remainingYears,
-        atmIv,
-      });
-      const absDelta = Math.abs(quote.delta);
-      const spread = Math.max(0, quote.ask - quote.bid);
-      const spreadPct = quote.ask > 0 ? spread / quote.ask : 1;
-      if (
-        quote.ask < 0.15 ||
-        quote.ask > 0.99 ||
-        spreadPct > 0.24 ||
-        absDelta < deltaRoute.minDelta ||
-        absDelta > deltaRoute.maxDelta
-      ) {
-        continue;
-      }
-
-      const taylor = scoreContractTaylorPayoff({
-        absDelta,
-        gamma: Math.max(0, quote.gamma),
-        absTheta: Math.abs(quote.thetaPerDay),
-        holdDays,
-        spread,
-        ask: quote.ask,
-        expectedMove,
-      });
-      if (!taylor.eligible) continue;
-
-      const cand = {
-        strike,
-        quote,
-        dteDays,
-        remainingYears,
-        score: taylor.score,
-      };
-      if (dteDays === 0) stage1.push(cand);
-      else stage2.push(cand);
-    }
+function formatEtTimeShort(tsSec: number): string {
+  try {
+    return new Date(tsSec * 1000).toLocaleTimeString("en-US", {
+      timeZone: "America/New_York",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  } catch {
+    return "16:05 ET";
   }
+}
 
-  stage1.sort((a, b) => b.score - a.score);
-  stage2.sort((a, b) => b.score - a.score);
-  return stage1[0] ?? stage2[0] ?? null;
+export function resolveSupervisorCheckpoint(
+  etMins: number,
+  zeroGammaFlipped: boolean
+): SessionPlaybookPolicy["checkpoint"] {
+  if (zeroGammaFlipped) return "ZERO_GAMMA_FLIP";
+  if (etMins >= 780) return "AFTERNOON_1300";
+  if (etMins >= 630) return "MID_MORNING_1030";
+  if (etMins >= 575 && etMins < 600) return "OPEN_0935";
+  return "INTRADAY";
 }
 
 /**
- * Reconstructs deterministic 5-minute RTH bars and replays signals from an intraday snapshot.
+ * Computes trailing 5-day equity drawdown & net dollar P&L from durable session ledgers.
  */
-export function runDeterministicSnapshotReplay(params: {
-  ticker: string;
-  snapshot: IntradaySnapshotFile;
-}): ReplayShadowTrade[] {
-  const sym = params.ticker.trim().toUpperCase();
-  const tickerBucket =
-    params.snapshot.tickers?.[sym] ??
-    params.snapshot.tickers?.[normalizePosTicker(sym)];
-  if (!tickerBucket) return [];
+export function computeTrailing5dEquityStats(
+  sessions: DailyTradeStore[],
+  excludeSessionDate?: string
+): { trailing5dDrawdownDollars: number; trailing5dPnlDollars: number } {
+  const prior = sessions
+    .filter((s) => s && s.date && (!excludeSessionDate || s.date < excludeSessionDate))
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(-5);
 
-  const rawPoints =
-    Array.isArray(tickerBucket.rthHistory) && tickerBucket.rthHistory.length > 0
-      ? tickerBucket.rthHistory
-      : Array.isArray(tickerBucket.history)
-        ? tickerBucket.history
-        : [];
-  if (rawPoints.length === 0) return [];
+  let equity = 0;
+  let peak = 0;
+  let maxDd = 0;
 
-  const bucketMap = new Map<number, IntradaySnapshotPoint[]>();
-  for (const pt of rawPoints) {
-    if (!pt || typeof pt.ts !== "number" || typeof pt.spot !== "number" || pt.spot <= 0) continue;
-    const etMins = etMinutesOfDay(pt.ts);
-    if (etMins < RTH_OPEN_MINS || etMins > 955) continue;
-    const bucket = Math.floor(pt.ts / 300) * 300;
-    if (!bucketMap.has(bucket)) bucketMap.set(bucket, []);
-    bucketMap.get(bucket)!.push(pt);
+  for (const s of prior) {
+    for (const p of s.closedPositions || []) {
+      const entry = p.optionAsk || p.btoOptionMid || 0.5;
+      const exit = p.closedOptionMid ?? entry;
+      const qty = p.contractsQty || 1;
+      const pnl = Number(((exit - entry) * 100 * qty).toFixed(2));
+      equity += pnl;
+      if (equity > peak) peak = equity;
+      maxDd = Math.max(maxDd, peak - equity);
+    }
   }
 
-  const bars: ReplayBar5m[] = [];
-  for (const [bucketTs, ticks] of Array.from(bucketMap.entries()).sort((a, b) => a[0] - b[0])) {
-    ticks.sort((a, b) => a.ts - b.ts);
-    const lastPt = ticks[ticks.length - 1];
-    const cw = lastPt.callWall ?? lastPt.cw ?? 0;
-    const pw = lastPt.putWall ?? lastPt.pw ?? 0;
-    const zg = lastPt.zeroGamma ?? lastPt.zg ?? 0;
-    bars.push({
-      ts: bucketTs,
-      timeEt: formatTimeEtFromSec(bucketTs),
-      totalMinutes: etMinutesOfDay(bucketTs),
-      open: Number(ticks[0].spot.toFixed(2)),
-      high: Number(Math.max(...ticks.map((t) => t.spot)).toFixed(2)),
-      low: Number(Math.min(...ticks.map((t) => t.spot)).toFixed(2)),
-      close: Number(lastPt.spot.toFixed(2)),
-      sma34: Number(lastPt.spot.toFixed(2)),
-      callWall: cw,
-      putWall: pw,
-      zeroGamma: zg,
+  return {
+    trailing5dDrawdownDollars: Number(maxDd.toFixed(2)),
+    trailing5dPnlDollars: Number(equity.toFixed(2)),
+  };
+}
+
+/**
+ * Evaluates and updates the intraday SessionPlaybookPolicy at scheduled checkpoints
+ * (09:35, 10:30, 13:00 ET) or whenever Zero Gamma flips.
+ */
+export function evaluateSessionPlaybook(
+  input: SessionPlaybookInput
+): SessionPlaybookPolicy {
+  const nowMs = input.nowMs ?? Date.now();
+  const nowSec = Math.floor(nowMs / 1000);
+  const etMins = etMinutesOfDay(nowSec);
+  const sym = input.ticker.trim().toUpperCase();
+  const sessionDate = input.sessionDate || getTodayEt(new Date(nowSec * 1000));
+
+  const zeroGammaFlipped = Boolean(
+    input.zeroGamma > 0 &&
+      typeof input.prevSpotPrice === "number" &&
+      input.prevSpotPrice > 0 &&
+      ((input.prevSpotPrice <= input.zeroGamma && input.spotPrice > input.zeroGamma) ||
+        (input.prevSpotPrice >= input.zeroGamma && input.spotPrice < input.zeroGamma))
+  );
+
+  const regimeInfo: MarketRegimeClassification = classifyMarketRegime({
+    spotPrice: input.spotPrice,
+    callWall: input.callWall,
+    putWall: input.putWall,
+    zeroGamma: input.zeroGamma,
+    zeroDteKing: input.zeroDteKing,
+    bookCenter: input.bookCenter,
+    flowVwap: input.flowSnapshot?.flowVwap,
+    netGex: input.netGex,
+    flowSnapshot: input.flowSnapshot,
+    directionHint: input.directionHint,
+  });
+
+  const kingDivPct =
+    input.zeroDteKing &&
+    input.allExpKing &&
+    input.zeroDteKing > 0 &&
+    input.allExpKing > 0
+      ? Number(
+          (
+            (Math.abs(input.zeroDteKing - input.allExpKing) / Math.max(0.01, input.spotPrice)) *
+            100
+          ).toFixed(2)
+        )
+      : 0;
+
+  const { trailing5dDrawdownDollars, trailing5dPnlDollars } = computeTrailing5dEquityStats(
+    input.historicalSessions ?? [],
+    sessionDate
+  );
+
+  let minExpectancyR = 0.35;
+  let minWinRatePct = 58.0;
+  let allowedRegimes: MarketRegimeId[] =
+    regimeInfo.regime === "POS_GAMMA_PIN"
+      ? ["POS_GAMMA_PIN", "ZERO_GAMMA_FLIP"]
+      : regimeInfo.regime === "LOW_EDGE_CHOP"
+        ? []
+        : ["NEG_GAMMA_TREND", "ZERO_GAMMA_FLIP", "POS_GAMMA_PIN"];
+  let preferredDte: SessionPlaybookPolicy["preferredDte"] = regimeInfo.preferredDte;
+  let standAsideVetoReason: string | null = null;
+
+  if (regimeInfo.shouldStandAside || regimeInfo.regime === "LOW_EDGE_CHOP") {
+    standAsideVetoReason = regimeInfo.reason;
+    allowedRegimes = [];
+    preferredDte = "NONE";
+  } else if (kingDivPct >= 0.8 && regimeInfo.absPeclet < 1.2) {
+    standAsideVetoReason = `0DTE/All-Exp King conflict (${kingDivPct.toFixed(2)}%) with weak advection (|Pe|=${regimeInfo.absPeclet.toFixed(2)})`;
+    allowedRegimes = [];
+    preferredDte = "NONE";
+  }
+
+  // Drawdown protection governor: if 5d drawdown exceeds $150, raise required E[R] & win rate
+  if (trailing5dDrawdownDollars >= 150 && !standAsideVetoReason) {
+    minExpectancyR = 0.5;
+    minWinRatePct = 62.0;
+    allowedRegimes = allowedRegimes.filter((r) => r === regimeInfo.regime);
+  }
+
+  const zeroGammaSide: SessionPlaybookPolicy["zeroGammaSide"] =
+    input.zeroGamma <= 0
+      ? "AT"
+      : input.spotPrice > input.zeroGamma * 1.0005
+        ? "ABOVE"
+        : input.spotPrice < input.zeroGamma * 0.9995
+          ? "BELOW"
+          : "AT";
+
+  const checkpoint = resolveSupervisorCheckpoint(etMins, zeroGammaFlipped);
+  const evaluatedAtEt = formatEtTimeShort(nowSec);
+  const summary = standAsideVetoReason
+    ? `STAND ASIDE · ${standAsideVetoReason}`
+    : `${regimeInfo.regime} · Pref ${preferredDte} · Min E[R] +${minExpectancyR.toFixed(2)}R (${minWinRatePct.toFixed(0)}% WR)`;
+
+  return {
+    sessionDate,
+    ticker: sym,
+    checkpoint,
+    evaluatedAtEt,
+    evaluatedAtTs: nowSec,
+    regime: regimeInfo.regime,
+    allowedRegimes,
+    preferredDte,
+    minExpectancyR,
+    minWinRatePct,
+    standAsideVetoReason,
+    kingDivergencePct: kingDivPct,
+    trailing5dDrawdownDollars,
+    trailing5dPnlDollars,
+    zeroGammaSide,
+    wallCorridorPct: regimeInfo.wallCorridorPct,
+    absPeclet: regimeInfo.absPeclet,
+    summary,
+  };
+}
+
+export function shouldRefreshSupervisorCheckpoint(
+  existing: SessionPlaybookPolicy | null,
+  etMins: number,
+  zeroGammaFlipped: boolean,
+  currentAbsPeclet?: number
+): boolean {
+  if (!existing) return true;
+  if (zeroGammaFlipped) return true;
+  if (
+    existing.standAsideVetoReason &&
+    typeof currentAbsPeclet === "number" &&
+    Math.abs(currentAbsPeclet) >= 1.2
+  ) {
+    return true;
+  }
+  const targetCheckpoint = resolveSupervisorCheckpoint(etMins, false);
+  if (existing.checkpoint !== targetCheckpoint) return true;
+  return false;
+}
+
+export function evaluateAndPersistSessionPlaybookSync(
+  input: SessionPlaybookInput
+): SessionPlaybookPolicy {
+  const policy = evaluateSessionPlaybook(input);
+  writeSupervisorPolicySync(policy);
+  return policy;
+}
+
+export async function evaluateAndPersistSessionPlaybook(
+  input: SessionPlaybookInput
+): Promise<SessionPlaybookPolicy> {
+  const policy = evaluateSessionPlaybook(input);
+  await writeSupervisorPolicy(policy);
+  return policy;
+}
+
+export function getLatestSupervisorPolicy(
+  sessionDate: string,
+  ticker: string = "SPY"
+): SessionPlaybookPolicy | null {
+  return readSupervisorPolicySync(sessionDate, ticker);
+}
+
+/**
+ * Evaluates MFE/MAE & Black-Scholes theta-adjusted counterfactual R-multiple
+ * with pessimistic adverse-wick-first ordering across up to `maxHorizonBars` future 5m bars.
+ */
+function simulateCounterfactualSetup(params: {
+  bars: AttributionBar[];
+  startIdx: number;
+  direction: "CALL" | "PUT";
+  entrySpot: number;
+  target1Spot: number;
+  stopLossSpot: number;
+  atmIv: number;
+  maxHorizonBars?: number;
+}): { outcomeR: number; mfeR: number; maeR: number; thetaAdjustedPnlPct: number } {
+  const {
+    bars,
+    startIdx,
+    direction,
+    entrySpot,
+    target1Spot,
+    stopLossSpot,
+    atmIv,
+    maxHorizonBars = 12,
+  } = params;
+
+  const isCall = direction === "CALL";
+  const risk = Math.max(0.1, Math.abs(entrySpot - stopLossSpot));
+  const targetDist = Math.abs(target1Spot - entrySpot);
+  const targetR = Number((targetDist / risk).toFixed(2));
+
+  let mfe = 0;
+  let mae = 0;
+  let realizedR = 0;
+  let hitTerminal = false;
+  let exitSpot = bars[startIdx]?.close ?? entrySpot;
+  let exitIdx = startIdx;
+
+  const endIdx = Math.min(bars.length - 1, startIdx + maxHorizonBars);
+  for (let j = startIdx + 1; j <= endIdx; j++) {
+    const b = bars[j];
+    const barFav = isCall ? b.high - entrySpot : entrySpot - b.low;
+    const barAdv = isCall ? entrySpot - b.low : b.high - entrySpot;
+    mfe = Math.max(mfe, barFav);
+    mae = Math.max(mae, barAdv);
+
+    // Pessimistic intrabar ordering: check stop-loss adverse extreme first
+    if ((isCall && b.low <= stopLossSpot) || (!isCall && b.high >= stopLossSpot)) {
+      realizedR = -1.0;
+      exitSpot = stopLossSpot;
+      exitIdx = j;
+      hitTerminal = true;
+      break;
+    }
+    if ((isCall && b.high >= target1Spot) || (!isCall && b.low <= target1Spot)) {
+      realizedR = targetR;
+      exitSpot = target1Spot;
+      exitIdx = j;
+      hitTerminal = true;
+      break;
+    }
+    exitSpot = b.close;
+    exitIdx = j;
+  }
+
+  if (!hitTerminal) {
+    const dirMove = isCall ? exitSpot - entrySpot : entrySpot - exitSpot;
+    realizedR = Number((dirMove / risk).toFixed(2));
+  }
+
+  // Approximate Black-Scholes theta-adjusted option % return assuming ~0.40 delta sub-$1 contract
+  const entryTsMs = (bars[startIdx]?.ts ?? 0) * 1000;
+  const heldDays = Math.max(1 / 78, (exitIdx - startIdx) / 78);
+  const tYears = estimateRemainingYears(entryTsMs || Date.now(), 0);
+  const dailyTheta = Math.abs(
+    computeDailyOptionTheta(entrySpot, Math.round(entrySpot), tYears, atmIv, isCall)
+  );
+  const estOptionBase = 0.65;
+  const deltaGain = (isCall ? exitSpot - entrySpot : entrySpot - exitSpot) * 0.4;
+  const thetaDecay = dailyTheta * heldDays;
+  const thetaAdjustedPnlPct = Number(
+    (Math.max(-25, ((deltaGain - thetaDecay) / estOptionBase) * 100)).toFixed(1)
+  );
+
+  // If directional move didn't cover theta decay on a flat horizon hold, adjust R downward
+  const adjustedR =
+    !hitTerminal && thetaAdjustedPnlPct < 0 && realizedR >= 0
+      ? Number((realizedR - 0.15).toFixed(2))
+      : realizedR;
+
+  return {
+    outcomeR: adjustedR,
+    mfeR: Number((mfe / risk).toFixed(2)),
+    maeR: Number((mae / risk).toFixed(2)),
+    thetaAdjustedPnlPct,
+  };
+}
+
+const FEATURE_KEYS: Array<keyof AlphaFeatureWeights> = [
+  "fluxAlignment",
+  "flowVwapBand",
+  "wallRoom",
+  "kingMagnet",
+  "mtfDivergence",
+  "regimeFit",
+];
+
+function zeroFeatureIc(): FeatureIcMap {
+  return {
+    fluxAlignment: 0,
+    flowVwapBand: 0,
+    wallRoom: 0,
+    kingMagnet: 0,
+    mtfDivergence: 0,
+    regimeFit: 0,
+  };
+}
+
+function pearsonCorrelation(xs: number[], ys: number[]): number {
+  const n = Math.min(xs.length, ys.length);
+  if (n < 3) return 0;
+  let sumX = 0;
+  let sumY = 0;
+  for (let i = 0; i < n; i++) {
+    sumX += xs[i];
+    sumY += ys[i];
+  }
+  const meanX = sumX / n;
+  const meanY = sumY / n;
+  let cov = 0;
+  let varX = 0;
+  let varY = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - meanX;
+    const dy = ys[i] - meanY;
+    cov += dx * dy;
+    varX += dx * dx;
+    varY += dy * dy;
+  }
+  if (varX <= 1e-9 || varY <= 1e-9) return 0;
+  const r = cov / Math.sqrt(varX * varY);
+  if (!Number.isFinite(r)) return 0;
+  return Number(Math.max(-1, Math.min(1, r)).toFixed(4));
+}
+
+/**
+ * Computes out-of-sample Information Coefficient (IC) for each alpha feature against
+ * forward 6-bar directional payoff asymmetry (mfeR - maeR).
+ */
+export function computeFeatureInformationCoefficients(input: {
+  bars?: AttributionBar[];
+  flowSeries?: FlowGammaVwapSnapshot[];
+  callWall?: number;
+  putWall?: number;
+  zeroGamma?: number;
+  zeroDteKing?: number;
+  priors?: AlphaPriorsState;
+  samples?: FeatureIcSample[];
+}): FeatureIcMap {
+  let samples: FeatureIcSample[] = input.samples ? [...input.samples] : [];
+
+  if (samples.length === 0 && Array.isArray(input.bars) && input.bars.length >= 13) {
+    const bars = [...input.bars].sort((a, b) => a.ts - b.ts);
+    const flowSeries = input.flowSeries ?? [];
+    for (let i = 6; i < bars.length - 6; i++) {
+      const b = bars[i];
+      const flow = flowSeries[i];
+      const priorSlice = bars.slice(0, i + 1);
+      const cw =
+        input.callWall && input.callWall > 0
+          ? input.callWall
+          : Math.ceil(Math.max(...priorSlice.map((x) => x.high)));
+      const pw =
+        input.putWall && input.putWall > 0
+          ? input.putWall
+          : Math.floor(Math.min(...priorSlice.map((x) => x.low)));
+      const zg = input.zeroGamma && input.zeroGamma > 0 ? input.zeroGamma : flow?.flowVwap ?? b.close;
+      const direction: "CALL" | "PUT" =
+        (flow?.netFluxJ ?? (b.close - b.open)) >= 0 ? "CALL" : "PUT";
+      const isCall = direction === "CALL";
+      const risk = Math.max(0.2, b.close * 0.0014);
+      const stopLossSpot = isCall ? b.close - risk : b.close + risk;
+      const target1Spot = isCall ? b.close + risk * 1.5 : b.close - risk * 1.5;
+      const target2Spot = isCall ? b.close + risk * 2.5 : b.close - risk * 2.5;
+
+      const regimeInfo = classifyMarketRegime({
+        spotPrice: b.close,
+        callWall: cw,
+        putWall: pw,
+        zeroGamma: zg,
+        zeroDteKing: input.zeroDteKing,
+        flowSnapshot: flow,
+        directionHint: direction,
+      });
+      const scored = scoreSetupExpectancy({
+        direction,
+        setupName: isCall ? "Impulse Flux Reclaim" : "Bearish Zero-Gamma Flush",
+        spotPrice: b.close,
+        stopLossSpot,
+        target1Spot,
+        target2Spot,
+        callWall: cw,
+        putWall: pw,
+        zeroGamma: zg,
+        zeroDteKing: input.zeroDteKing,
+        flowSnapshot: flow,
+        regimeClassification: regimeInfo,
+        priors: input.priors,
+      });
+
+      let mfe = 0;
+      let mae = 0;
+      const endIdx = Math.min(bars.length - 1, i + 6);
+      for (let j = i + 1; j <= endIdx; j++) {
+        const fb = bars[j];
+        const fav = isCall ? fb.high - b.close : b.close - fb.low;
+        const adv = isCall ? b.close - fb.low : fb.high - b.close;
+        mfe = Math.max(mfe, fav);
+        mae = Math.max(mae, adv);
+      }
+
+      samples.push({
+        features: scored.featureBreakdown,
+        mfeR: mfe / risk,
+        maeR: mae / risk,
+      });
+    }
+  }
+
+  if (samples.length < 3) {
+    return zeroFeatureIc();
+  }
+
+  const netR = samples.map((s) => s.mfeR - s.maeR);
+  const out = zeroFeatureIc();
+  for (const key of FEATURE_KEYS) {
+    out[key] = pearsonCorrelation(
+      samples.map((s) => s.features[key]),
+      netR
+    );
+  }
+  return out;
+}
+
+/**
+ * Post-Market Counterfactual Attribution Engine (16:05 ET)
+ * Replays the day's 5m bars, evaluates executed + skipped setups with pessimistic fills
+ * and theta decay, computes rolling Feature ICs, and adapts Empirical Bayes priors for [D+1].
+ */
+export async function runPostMarketAttribution(
+  input: RunPostMarketAttributionInput
+): Promise<PostMarketAttributionReport> {
+  const sym = input.ticker.trim().toUpperCase();
+  const priors: AlphaPriorsState = input.priorsOverride
+    ? JSON.parse(JSON.stringify(input.priorsOverride))
+    : JSON.parse(JSON.stringify(readAlphaPriorsSync()));
+
+  if (!input.force && priors.lastAttributionDate === input.sessionDate) {
+    const existing = await readPostMarketAttribution(input.sessionDate, sym);
+    if (existing) return existing;
+  }
+
+  const bars = [...input.bars].sort((a, b) => a.ts - b.ts);
+  const flowSeries = input.flowSeries ?? [];
+  const atmIv = input.atmIv ?? 0.18;
+  const records: CounterfactualEvalRecord[] = [];
+
+  // 1. Score executed closed trades
+  for (const pos of input.executedTrades ?? []) {
+    const entryAsk = pos.optionAsk || pos.btoOptionMid || 0.5;
+    const exitBid = pos.closedOptionMid ?? entryAsk;
+    const pnlPct =
+      typeof pos.pnlOptionPct === "number"
+        ? pos.pnlOptionPct
+        : Number((((exitBid - entryAsk) / Math.max(0.01, entryAsk)) * 100).toFixed(1));
+    const realizedR = Number((pnlPct / 25).toFixed(2));
+    const idx = bars.findIndex((b) => b.ts >= (pos.openedTs || 0));
+    const flow = idx >= 0 ? flowSeries[idx] : undefined;
+    const regimeInfo = classifyMarketRegime({
+      spotPrice: pos.btoSpotPrice,
+      callWall: input.callWall ?? pos.target2Spot,
+      putWall: input.putWall ?? pos.stopLossSpot,
+      zeroGamma: input.zeroGamma ?? pos.btoSpotPrice,
+      zeroDteKing: input.zeroDteKing,
+      flowSnapshot: flow,
+      directionHint: pos.contractType,
+    });
+    const sim =
+      idx >= 0
+        ? simulateCounterfactualSetup({
+            bars,
+            startIdx: idx,
+            direction: pos.contractType,
+            entrySpot: pos.btoSpotPrice,
+            target1Spot: pos.target1Spot,
+            stopLossSpot: pos.stopLossSpot,
+            atmIv,
+          })
+        : { outcomeR: realizedR, mfeR: Math.max(0, realizedR), maeR: realizedR < 0 ? 1 : 0, thetaAdjustedPnlPct: pnlPct };
+
+    records.push({
+      timestamp: pos.openedTs || 0,
+      timeEt: pos.openedAt || formatEtTimeShort(pos.openedTs || 0),
+      direction: pos.contractType,
+      setupName: pos.setupName,
+      regime: regimeInfo.regime,
+      wasExecuted: true,
+      entrySpot: pos.btoSpotPrice,
+      target1Spot: pos.target1Spot,
+      stopLossSpot: pos.stopLossSpot,
+      realizedOptionR: realizedR,
+      mfeR: sim.mfeR,
+      maeR: sim.maeR,
+      thetaAdjustedPnlPct: pnlPct,
     });
   }
 
-  if (bars.length < 5) return [];
-
-  for (let i = 0; i < bars.length; i++) {
-    const startIdx = Math.max(0, i - 33);
-    let sum = 0;
-    for (let k = startIdx; k <= i; k++) sum += bars[k].close;
-    bars[i].sma34 = Number((sum / (i - startIdx + 1)).toFixed(2));
-  }
-
-  const unifiedBars = bars.map((b) => ({
-    timestampMs: b.ts * 1000,
-    open: b.open,
-    high: b.high,
-    low: b.low,
-    close: b.close,
-    volume: 10000,
-  }));
-
-  const refBar = bars[0];
-  const structuralNodes: StructuralFlowNodes | undefined =
-    refBar.callWall > 0 && refBar.putWall > 0
-      ? {
-          floorNode: refBar.putWall,
-          ceilingNode: refBar.callWall,
-          zeroGamma: refBar.zeroGamma > 0 ? refBar.zeroGamma : undefined,
-        }
-      : undefined;
-
-  const sessionFlow = computeBarFlowGammaVwapSeries(
-    bars.map((b) => ({
-      timestamp: b.ts,
-      open: b.open,
-      high: b.high,
-      low: b.low,
-      close: b.close,
-    })),
-    undefined,
-    structuralNodes
-  );
-
-  const replayTrades: ReplayShadowTrade[] = [];
-  const openingSlice = bars.slice(0, Math.min(3, bars.length));
-  const openingLow = Math.min(...openingSlice.map((b) => b.low));
-  const openingHigh = Math.max(...openingSlice.map((b) => b.high));
-
-  let activePosition: {
-    type: "CALL" | "PUT";
-    setupName: string;
-    strike: number;
-    entrySpot: number;
-    target1Spot: number;
-    target2Spot: number;
-    stopLossSpot: number;
-    entryAsk: number;
-    iv: number;
-    dteDays: number;
-    seenSmaSide: boolean;
-    openedTimeEt: string;
-    openedTs: number;
-  } | null = null;
-
-  let tradeCountToday = 0;
-  let firstTradeType: "CALL" | "PUT" | null = null;
-  let lastExitTs: number | null = null;
-
-  for (let idx = 1; idx < bars.length; idx++) {
-    const bar = bars[idx];
-
-    if (activePosition) {
-      const isCall = activePosition.type === "CALL";
-      const isZeroGammaFlush = activePosition.setupName.includes("Bearish Zero-Gamma Flush");
-      const heldMinutes = Math.round((bar.ts - activePosition.openedTs) / 60);
-      if (isCall && bar.close >= bar.sma34) activePosition.seenSmaSide = true;
-      if (!isCall && bar.close <= bar.sma34) activePosition.seenSmaSide = true;
-
-      let exitTriggered = false;
-      let exitReason = "";
-      let exitSpot = bar.close;
-
-      if (bar.totalMinutes >= 955 || idx === bars.length - 1) {
-        exitTriggered = true;
-        exitSpot = bar.close;
-        exitReason = "3:55 PM EOD MARKET CLOSE CUTOFF";
-      } else if (
-        (isCall && bar.low <= activePosition.stopLossSpot) ||
-        (!isCall && bar.high >= activePosition.stopLossSpot)
-      ) {
-        exitTriggered = true;
-        exitSpot = activePosition.stopLossSpot;
-        exitReason = "STOP LOSS HIT";
-      } else if (
-        heldMinutes >= 10 &&
-        activePosition.seenSmaSide &&
-        ((!isCall && bar.close > bar.sma34 && bar.close < activePosition.entrySpot) ||
-          (isCall && bar.close < bar.sma34 && bar.close > activePosition.entrySpot))
-      ) {
-        exitTriggered = true;
-        exitSpot = bar.close;
-        exitReason = "MOMENTUM REVERSAL / DIVERGENCE COVER";
-      } else if (
-        (!isZeroGammaFlush &&
-          ((isCall && bar.high >= activePosition.target1Spot) ||
-            (!isCall && bar.low <= activePosition.target1Spot))) ||
-        (isZeroGammaFlush && !isCall && bar.low <= activePosition.target2Spot && bar.close > bar.open)
-      ) {
-        exitTriggered = true;
-        exitSpot = isZeroGammaFlush ? bar.close : activePosition.target1Spot;
-        exitReason = isZeroGammaFlush
-          ? "MOMENTUM REVERSAL / DIVERGENCE COVER"
-          : "TARGET 1 PROFIT SECURED";
-      }
-
-      if (exitTriggered) {
-        const remYears = computeRemainingYearsToExpiration(bar.ts * 1000, activePosition.dteDays);
-        const exitQuote = priceOptionWithSkew({
-          spot: exitSpot,
-          strike: activePosition.strike,
-          direction: isCall ? "LONG" : "SHORT",
-          remainingYears: remYears,
-          atmIv: activePosition.iv,
+  // 2. Evaluate explicit or automatically discovered skipped candidate setups
+  const candidates: AttributionCandidateSetup[] = [...(input.candidateSetups ?? [])];
+  if (candidates.length === 0 && bars.length >= 12) {
+    for (let i = 6; i < bars.length - 4; i += 6) {
+      const b = bars[i];
+      const flow = flowSeries[i];
+      const regimeInfo = classifyMarketRegime({
+        spotPrice: b.close,
+        callWall: input.callWall ?? Math.ceil(b.high + 2),
+        putWall: input.putWall ?? Math.floor(b.low - 2),
+        zeroGamma: input.zeroGamma ?? flow?.flowVwap ?? b.close,
+        zeroDteKing: input.zeroDteKing,
+        flowSnapshot: flow,
+      });
+      if (regimeInfo.shouldStandAside || (flow && Math.abs(flow.pecletNumber ?? 0) < 1.2)) {
+        const dir: "CALL" | "PUT" = b.close >= b.open ? "CALL" : "PUT";
+        const risk = Math.max(0.5, b.close * 0.0014);
+        candidates.push({
+          timestamp: b.ts,
+          direction: dir,
+          setupName: "Skipped Chop Setup",
+          regime: regimeInfo.regime,
+          entrySpot: b.close,
+          target1Spot: dir === "CALL" ? b.close + risk * 1.5 : b.close - risk * 1.5,
+          stopLossSpot: dir === "CALL" ? b.close - risk : b.close + risk,
+          wasExecuted: false,
+          skipReason: regimeInfo.reason,
         });
-        const stopFloor = Number((activePosition.entryAsk * 0.75).toFixed(2));
-        let exitBid = Number(Math.max(0.05, exitQuote.bid).toFixed(2));
-        if (exitReason.includes("STOP LOSS") && exitBid < stopFloor) {
-          exitBid = stopFloor;
-        }
-
-        replayTrades.push({
-          ticker: normalizePosTicker(sym),
-          direction: activePosition.type,
-          setupName: activePosition.setupName,
-          strike: activePosition.strike,
-          openedTs: activePosition.openedTs,
-          openedTimeEt: activePosition.openedTimeEt,
-          closedTs: bar.ts,
-          closedTimeEt: bar.timeEt,
-          entrySpot: activePosition.entrySpot,
-          exitSpot,
-          entryAsk: activePosition.entryAsk,
-          exitBid,
-          exitReason,
-        });
-
-        lastExitTs = bar.ts;
-        activePosition = null;
-      }
-      continue;
-    }
-
-    const cooldownMet = lastExitTs !== null && bar.ts - lastExitTs >= 1800;
-    const canLeg2Call =
-      tradeCountToday === 1 &&
-      firstTradeType === "PUT" &&
-      cooldownMet &&
-      bar.totalMinutes >= 630 &&
-      bar.totalMinutes <= 870;
-    const canLeg2Put =
-      tradeCountToday === 1 &&
-      firstTradeType === "CALL" &&
-      cooldownMet &&
-      bar.totalMinutes >= 630 &&
-      bar.totalMinutes <= 870;
-
-    if (
-      (tradeCountToday === 0 || canLeg2Call || canLeg2Put) &&
-      bar.totalMinutes >= 575 &&
-      bar.totalMinutes <= 870
-    ) {
-      const flowSnap = sessionFlow[idx];
-      if (tradeCountToday === 0) {
-        const candidate = evaluateUnifiedSniperSetup(unifiedBars, idx);
-        if (!candidate) continue;
-
-        const isCall = candidate.direction === "LONG";
-        const entrySpot = bar.close;
-        const atmIv = candidate.features.atmIv;
-        const rawStopSpot = isCall
-          ? Math.min(bar.low, openingLow) * 0.9985
-          : Math.max(bar.high, openingHigh) * 1.0015;
-        const stopLossSpot = Number(rawStopSpot.toFixed(2));
-        const risk = Math.max(0.65, Math.abs(entrySpot - stopLossSpot));
-        const target1Spot = isCall
-          ? Number((entrySpot + risk * 1.5).toFixed(2))
-          : Number((entrySpot - risk * 1.5).toFixed(2));
-        const target2Spot = isCall
-          ? Number((entrySpot + risk * 2.5).toFixed(2))
-          : Number((entrySpot - risk * 2.5).toFixed(2));
-
-        const picked = selectDeterministicReplayContract({
-          spot: entrySpot,
-          direction: candidate.direction,
-          barTsSec: bar.ts,
-          etMins: bar.totalMinutes,
-          atmIv,
-          target1Spot,
-          callWall: bar.callWall,
-          putWall: bar.putWall,
-          zeroGamma: bar.zeroGamma,
-          impulsePeclet: flowSnap?.impulsePeclet,
-        });
-        if (!picked) continue;
-
-        activePosition = {
-          type: isCall ? "CALL" : "PUT",
-          setupName: candidate.setupName,
-          strike: picked.strike,
-          entrySpot,
-          target1Spot,
-          target2Spot,
-          stopLossSpot,
-          entryAsk: picked.quote.ask,
-          iv: atmIv,
-          dteDays: picked.dteDays,
-          seenSmaSide: isCall ? entrySpot >= bar.sma34 : entrySpot <= bar.sma34,
-          openedTimeEt: bar.timeEt,
-          openedTs: bar.ts,
-        };
-        firstTradeType = activePosition.type;
-        tradeCountToday++;
-      } else {
-        const impChi = flowSnap?.impulseChi ?? 0.5;
-        const dChi6 = flowSnap?.deltaChi6Bar ?? 0;
-        const dImpChi6 = flowSnap?.deltaImpulseChi6Bar ?? 0;
-        const dFlux6 = flowSnap?.deltaNetFlux6Bar ?? 0;
-        const fvwap = flowSnap?.flowVwap ?? bar.close;
-        const sigma = flowSnap?.sigma ?? Math.max(bar.close * 0.0015, 0.35);
-        const lower1S = flowSnap?.lower1Sigma ?? 0;
-        const upper1S = flowSnap?.upper1Sigma ?? 0;
-        const recent4 = bars.slice(Math.max(0, idx - 3), idx + 1);
-        const recentLow4 = Math.min(...recent4.map((b) => b.low));
-        const recentHigh4 = Math.max(...recent4.map((b) => b.high));
-        const priorBars = bars.slice(0, idx + 1);
-        const causalPw = Math.floor(Math.min(...priorBars.map((b) => b.low)));
-        const causalCw = Math.ceil(Math.max(...priorBars.map((b) => b.high)));
-        const barBody = bar.close - bar.open;
-        const maxBody = Math.max(0.45, bar.close * 0.003);
-        const minRoom = Math.max(0.5, bar.close * 0.002);
-
-        const testedPutWallOrMinus1S =
-          (causalPw > 0 && Math.abs(recentLow4 - causalPw) / causalPw <= 0.0035) ||
-          (lower1S > 0 && (Math.abs(recentLow4 - lower1S) / lower1S <= 0.0035 || recentLow4 <= lower1S));
-        const testedCallWallOrPlus1S =
-          (causalCw > 0 && Math.abs(recentHigh4 - causalCw) / causalCw <= 0.0035) ||
-          (upper1S > 0 && (Math.abs(recentHigh4 - upper1S) / upper1S <= 0.0035 || recentHigh4 >= upper1S));
-
-        let leg2Dir: "CALL" | "PUT" | null = null;
-        let leg2Setup = "";
-        let leg2Stop = 0;
-
-        if (
-          canLeg2Call &&
-          testedPutWallOrMinus1S &&
-          impChi >= 0.60 &&
-          dFlux6 > 0 &&
-          (dChi6 >= 0.03 || dImpChi6 >= 0.06) &&
-          barBody <= maxBody &&
-          causalCw - bar.close >= minRoom &&
-          bar.close > bar.open &&
-          bar.close >= fvwap &&
-          bar.close >= bar.sma34
-        ) {
-          leg2Dir = "CALL";
-          leg2Setup = "Leg-2 Put Wall / -1σ Bullish Reclaim";
-          leg2Stop = Number(Math.min(recentLow4 - sigma * 0.15, bar.close - Math.max(0.4, bar.close * 0.0011)).toFixed(2));
-        } else if (
-          canLeg2Put &&
-          testedCallWallOrPlus1S &&
-          impChi <= 0.40 &&
-          dFlux6 < 0 &&
-          (dChi6 <= -0.03 || dImpChi6 <= -0.06) &&
-          -barBody <= maxBody &&
-          bar.close - causalPw >= minRoom &&
-          bar.close < bar.open &&
-          bar.close <= fvwap &&
-          bar.close <= bar.sma34
-        ) {
-          leg2Dir = "PUT";
-          leg2Setup = "Leg-2 Call Wall / +1σ Bearish Rejection";
-          leg2Stop = Number(Math.max(recentHigh4 + sigma * 0.15, bar.close + Math.max(0.4, bar.close * 0.0011)).toFixed(2));
-        }
-
-        if (!leg2Dir) continue;
-        const isCall = leg2Dir === "CALL";
-        const entrySpot = bar.close;
-        const atmIv = estimateDynamicAtmIv(unifiedBars, idx);
-        const risk = Math.max(0.5, Math.abs(entrySpot - leg2Stop));
-        const target1Spot = isCall
-          ? Number((entrySpot + Math.max(bar.close * 0.0016, risk * 1.5)).toFixed(2))
-          : Number((entrySpot - Math.max(bar.close * 0.0016, risk * 1.5)).toFixed(2));
-        const target2Spot = isCall
-          ? Number((target1Spot + risk).toFixed(2))
-          : Number((target1Spot - risk).toFixed(2));
-
-        const picked = selectDeterministicReplayContract({
-          spot: entrySpot,
-          direction: isCall ? "LONG" : "SHORT",
-          barTsSec: bar.ts,
-          etMins: bar.totalMinutes,
-          atmIv,
-          target1Spot,
-          callWall: bar.callWall || causalCw,
-          putWall: bar.putWall || causalPw,
-          zeroGamma: bar.zeroGamma,
-          impulsePeclet: flowSnap?.impulsePeclet,
-        });
-        if (!picked) continue;
-
-        activePosition = {
-          type: leg2Dir,
-          setupName: leg2Setup,
-          strike: picked.strike,
-          entrySpot,
-          target1Spot,
-          target2Spot,
-          stopLossSpot: leg2Stop,
-          entryAsk: picked.quote.ask,
-          iv: atmIv,
-          dteDays: picked.dteDays,
-          seenSmaSide: isCall ? entrySpot >= bar.sma34 : entrySpot <= bar.sma34,
-          openedTimeEt: bar.timeEt,
-          openedTs: bar.ts,
-        };
-        tradeCountToday++;
       }
     }
   }
 
-  return replayTrades;
-}
-
-function saveShadowParityToDisk(report: ShadowParityReport): void {
-  const dir = getCacheDir();
-  const parityPath = path.join(dir, `shadow-parity-${report.date}.json`);
-  const tmpPath = `${parityPath}.tmp.${process.pid}.${Date.now()}`;
-  try {
-    fs.writeFileSync(tmpPath, JSON.stringify(report, null, 2), "utf-8");
-    fs.renameSync(tmpPath, parityPath);
-  } catch {
-    // ignore read-only runtime errors
-  } finally {
-    try {
-      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
-    } catch {}
-  }
-
-  const todayEt = getTodayEt();
-  if (report.date === todayEt) {
-    const store = loadTradeStore();
-    store.shadowParityReport = report;
-    saveTradeStore(store);
-    return;
-  }
-
-  const histStorePath = path.join(dir, `active-trades-${report.date}.json`);
-  if (fs.existsSync(histStorePath)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(histStorePath, "utf-8")) as DailyTradeStore;
-      if (parsed && parsed.date === report.date) {
-        parsed.shadowParityReport = report;
-        const histTmp = `${histStorePath}.tmp.${process.pid}.${Date.now()}`;
-        fs.writeFileSync(histTmp, JSON.stringify(parsed, null, 2), "utf-8");
-        fs.renameSync(histTmp, histStorePath);
-      }
-    } catch {
-      // non-fatal
-    }
-  }
-}
-
-/**
- * Loads the persisted ShadowParityReport for a given date if available.
- */
-export function loadShadowParityReport(date?: string): ShadowParityReport | null {
-  const targetDate = date || getTodayEt();
-  const store = loadTradeStore(targetDate);
-  if (store.shadowParityReport && store.shadowParityReport.date === targetDate) {
-    return store.shadowParityReport;
-  }
-  const parityPath = path.join(getCacheDir(), `shadow-parity-${targetDate}.json`);
-  if (fs.existsSync(parityPath)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(parityPath, "utf-8")) as ShadowParityReport;
-      if (parsed && parsed.date === targetDate) return parsed;
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
-/**
- * 16:05 ET Post-Market Attribution & Live-vs-Replay Shadow Parity Audit.
- *
- * Compares live shadow trades recorded during the session against deterministic
- * bar-replay signals on that day's .cache/intraday-YYYY-MM-DD.json snapshot.
- */
-export function runPostMarketAttribution(
-  params?: PostMarketAttributionParams
-): ShadowParityReport {
-  const targetDate = params?.date || getTodayEt();
-  const targetTicker = normalizePosTicker(params?.ticker || "SPY");
-  const matchWindowSec = params?.matchWindowSec ?? 900;
-  const shouldPersist = params?.persist !== false;
-
-  let snapshot: IntradaySnapshotFile | null = params?.intradaySnapshot ?? null;
-  if (!snapshot) {
-    const snapshotPath = path.join(getCacheDir(), `intraday-${targetDate}.json`);
-    if (fs.existsSync(snapshotPath)) {
-      try {
-        snapshot = JSON.parse(fs.readFileSync(snapshotPath, "utf-8")) as IntradaySnapshotFile;
-      } catch {
-        snapshot = null;
-      }
-    }
-  }
-
-  let liveTrades: OptionTradePosition[];
-  if (Array.isArray(params?.liveTrades)) {
-    liveTrades = params.liveTrades;
-  } else {
-    const store = loadTradeStore(targetDate);
-    const mergedMap = new Map<string, OptionTradePosition>();
-    for (const p of store.closedPositions || []) {
-      if (p) mergedMap.set(p.id, p);
-    }
-    for (const p of Object.values(store.activePositions || {})) {
-      if (p) mergedMap.set(p.id, p);
-    }
-    liveTrades = Array.from(mergedMap.values()).filter(
-      (p) => !params?.ticker || normalizePosTicker(p.ticker) === targetTicker
+  for (const cand of candidates) {
+    if (cand.wasExecuted) continue;
+    const idx = Math.max(
+      0,
+      bars.findIndex((b) => b.ts >= cand.timestamp)
     );
+    const sim = simulateCounterfactualSetup({
+      bars,
+      startIdx: idx,
+      direction: cand.direction,
+      entrySpot: cand.entrySpot,
+      target1Spot: cand.target1Spot,
+      stopLossSpot: cand.stopLossSpot,
+      atmIv,
+    });
+    records.push({
+      timestamp: cand.timestamp,
+      timeEt: formatEtTimeShort(cand.timestamp),
+      direction: cand.direction,
+      setupName: cand.setupName,
+      regime: cand.regime,
+      wasExecuted: false,
+      skipReason: cand.skipReason,
+      entrySpot: cand.entrySpot,
+      target1Spot: cand.target1Spot,
+      stopLossSpot: cand.stopLossSpot,
+      realizedOptionR: sim.outcomeR,
+      mfeR: sim.mfeR,
+      maeR: sim.maeR,
+      thetaAdjustedPnlPct: sim.thetaAdjustedPnlPct,
+    });
   }
-  liveTrades = [...liveTrades].sort((a, b) => a.openedTs - b.openedTs);
 
-  if (!snapshot && !params?.replayTradesOverride) {
-    const noSnapReport: ShadowParityReport = {
-      date: targetDate,
-      ticker: targetTicker,
-      generatedAt: new Date().toISOString(),
-      replayTradeCount: 0,
-      liveTradeCount: liveTrades.length,
-      matchedTrades: 0,
-      missedLiveTrades: 0,
-      extraLiveTrades: liveTrades.length,
-      slippageDriftDollars: 0,
-      parityScorePct: liveTrades.length === 0 ? 100 : 0,
-      status: "NO_SNAPSHOT",
-      details: [],
+  // 3. Update Empirical Bayes Regime Stats & Bounded Feature Weights
+  const executed = records.filter((r) => r.wasExecuted);
+  const skipped = records.filter((r) => !r.wasExecuted);
+  const executedAvgR =
+    executed.length > 0
+      ? Number((executed.reduce((s, r) => s + r.realizedOptionR, 0) / executed.length).toFixed(2))
+      : 0;
+  const skippedCounterfactualAvgR =
+    skipped.length > 0
+      ? Number((skipped.reduce((s, r) => s + r.realizedOptionR, 0) / skipped.length).toFixed(2))
+      : 0;
+  const missedAlphaCount = skipped.filter((r) => r.realizedOptionR > 0.35).length;
+  const savedChopCount = skipped.filter((r) => r.realizedOptionR <= 0).length;
+
+  for (const rec of executed) {
+    const stat = priors.regimeStats[rec.regime] ?? {
+      wins: 0,
+      losses: 0,
+      sumR: 0,
+      avgR: 0,
+      winRatePct: 50,
     };
-    if (shouldPersist) saveShadowParityToDisk(noSnapReport);
-    console.log(
-      `[AgenticSupervisor] 16:05 ET Attribution (${targetDate} ${targetTicker}): NO_SNAPSHOT (liveTrades=${liveTrades.length})`
-    );
-    return noSnapReport;
+    if (rec.realizedOptionR > 0) stat.wins += 1;
+    else stat.losses += 1;
+    stat.sumR = Number((stat.sumR + rec.realizedOptionR).toFixed(2));
+    const n = Math.max(1, stat.wins + stat.losses);
+    stat.avgR = Number((stat.sumR / n).toFixed(2));
+    stat.winRatePct = Number(((stat.wins / n) * 100).toFixed(1));
+    stat.lastUpdatedDate = input.sessionDate;
+    priors.regimeStats[rec.regime] = stat;
   }
 
-  const replayTrades = (
-    params?.replayTradesOverride ??
-    runDeterministicSnapshotReplay({
-      ticker: targetTicker,
-      snapshot: snapshot!,
-    })
-  ).sort((a, b) => a.openedTs - b.openedTs);
+  // Gentle weight update + Information Coefficient decay:
+  // Compute out-of-sample Feature IC against forward 6-bar MFE/MAE; decay weights with negative IC toward 0.60 floor.
+  const clampWeight = (val: number) => Number(Math.max(0.6, Math.min(1.6, val)).toFixed(3));
+  const sessionIc = computeFeatureInformationCoefficients({
+    bars,
+    flowSeries,
+    callWall: input.callWall,
+    putWall: input.putWall,
+    zeroGamma: input.zeroGamma,
+    zeroDteKing: input.zeroDteKing,
+    priors,
+    samples: input.featureSamples,
+  });
 
-  const usedLiveIds = new Set<string>();
-  const details: ShadowParityTradeDelta[] = [];
-  let matchedTrades = 0;
-  let slippageDriftDollars = 0;
+  const prevRollingIc = priors.rollingFeatureIc ?? zeroFeatureIc();
+  const nextRollingIc = zeroFeatureIc();
+  for (const key of FEATURE_KEYS) {
+    nextRollingIc[key] = Number(
+      (priors.rollingFeatureIc
+        ? prevRollingIc[key] * 0.65 + sessionIc[key] * 0.35
+        : sessionIc[key]
+      ).toFixed(4)
+    );
+    const effectiveIc = sessionIc[key] < 0 ? sessionIc[key] : nextRollingIc[key];
+    if (effectiveIc < 0) {
+      const decayMagnitude = Math.max(0.03, Math.min(0.25, Math.abs(effectiveIc) * 0.35));
+      priors.featureWeights[key] = clampWeight(priors.featureWeights[key] - decayMagnitude);
+    } else if (sessionIc[key] > 0.15 && nextRollingIc[key] > 0.1) {
+      priors.featureWeights[key] = clampWeight(priors.featureWeights[key] + 0.02);
+    }
+  }
+  priors.rollingFeatureIc = nextRollingIc;
 
-  for (const rep of replayTrades) {
-    let bestMatch: OptionTradePosition | null = null;
-    let bestDiff = Infinity;
-
-    for (const live of liveTrades) {
-      if (usedLiveIds.has(live.id)) continue;
-      if (normalizePosTicker(live.ticker) !== normalizePosTicker(rep.ticker)) continue;
-      if (live.contractType !== rep.direction) continue;
-      const diff = Math.abs(live.openedTs - rep.openedTs);
-      if (diff <= matchWindowSec && diff < bestDiff) {
-        bestDiff = diff;
-        bestMatch = live;
+  if (executed.length > 0) {
+    if (executedAvgR > 0.3) {
+      if (sessionIc.fluxAlignment >= 0) {
+        priors.featureWeights.fluxAlignment = clampWeight(priors.featureWeights.fluxAlignment + 0.03);
+      }
+      if (sessionIc.wallRoom >= 0) {
+        priors.featureWeights.wallRoom = clampWeight(priors.featureWeights.wallRoom + 0.02);
+      }
+    } else if (executedAvgR < 0) {
+      if (sessionIc.regimeFit >= 0) {
+        priors.featureWeights.regimeFit = clampWeight(priors.featureWeights.regimeFit + 0.04);
+      }
+      if (sessionIc.kingMagnet >= 0) {
+        priors.featureWeights.kingMagnet = clampWeight(priors.featureWeights.kingMagnet + 0.03);
       }
     }
-
-    if (bestMatch) {
-      usedLiveIds.add(bestMatch.id);
-      matchedTrades++;
-      const qty = bestMatch.contractsQty || 1;
-      const liveEntryAsk =
-        typeof bestMatch.optionAsk === "number" && bestMatch.optionAsk > 0
-          ? bestMatch.optionAsk
-          : bestMatch.btoOptionMid;
-      const entrySlippageDollars = Number(((liveEntryAsk - rep.entryAsk) * 100 * qty).toFixed(2));
-      const hasLiveExit =
-        typeof bestMatch.closedOptionMid === "number" &&
-        Number.isFinite(bestMatch.closedOptionMid);
-      const exitSlippageDollars = hasLiveExit
-        ? Number(((rep.exitBid - (bestMatch.closedOptionMid as number)) * 100 * qty).toFixed(2))
-        : 0;
-      const totalSlippageDollars = Number((entrySlippageDollars + exitSlippageDollars).toFixed(2));
-      slippageDriftDollars = Number((slippageDriftDollars + totalSlippageDollars).toFixed(2));
-
-      details.push({
-        ticker: rep.ticker,
-        direction: rep.direction,
-        replayTimeEt: rep.openedTimeEt,
-        replayTs: rep.openedTs,
-        replayStrike: rep.strike,
-        replayEntryAsk: rep.entryAsk,
-        replayExitPrice: rep.exitBid,
-        liveTradeId: bestMatch.id,
-        liveTimeEt: bestMatch.openedAt,
-        liveTs: bestMatch.openedTs,
-        liveStrike: bestMatch.strike,
-        liveEntryAsk,
-        liveExitPrice: hasLiveExit ? (bestMatch.closedOptionMid as number) : undefined,
-        matched: true,
-        entrySlippageDollars,
-        totalSlippageDollars,
-      });
-    } else {
-      details.push({
-        ticker: rep.ticker,
-        direction: rep.direction,
-        replayTimeEt: rep.openedTimeEt,
-        replayTs: rep.openedTs,
-        replayStrike: rep.strike,
-        replayEntryAsk: rep.entryAsk,
-        replayExitPrice: rep.exitBid,
-        matched: false,
-        entrySlippageDollars: 0,
-        totalSlippageDollars: 0,
-      });
-    }
+  }
+  if (missedAlphaCount > savedChopCount) {
+    priors.baselineExpectancyR = Number(
+      Math.max(0.28, Math.min(0.6, priors.baselineExpectancyR - 0.01)).toFixed(3)
+    );
+  } else if (savedChopCount > missedAlphaCount && sessionIc.regimeFit >= 0) {
+    priors.featureWeights.regimeFit = clampWeight(priors.featureWeights.regimeFit + 0.03);
   }
 
-  const missedLiveTrades = replayTrades.length - matchedTrades;
-  const extraLiveTrades = liveTrades.length - matchedTrades;
-  const parityScorePct =
-    replayTrades.length > 0
-      ? Number(((matchedTrades / replayTrades.length) * 100).toFixed(1))
-      : liveTrades.length === 0
-        ? 100
-        : 0;
-  const status: ShadowParityReport["status"] =
-    missedLiveTrades === 0 && Math.abs(slippageDriftDollars) <= 25 ? "PASS" : "DRIFT_WARNING";
+  priors.updatedAt = new Date().toISOString();
+  priors.lastAttributionDate = input.sessionDate;
 
-  const report: ShadowParityReport = {
-    date: targetDate,
-    ticker: targetTicker,
-    generatedAt: new Date().toISOString(),
-    replayTradeCount: replayTrades.length,
-    liveTradeCount: liveTrades.length,
-    matchedTrades,
-    missedLiveTrades,
-    extraLiveTrades,
-    slippageDriftDollars,
-    parityScorePct,
-    status,
-    details,
+  const updatedPriorsSummary =
+    `RegimeFit=${priors.featureWeights.regimeFit.toFixed(2)} Flux=${priors.featureWeights.fluxAlignment.toFixed(2)} ` +
+    `IC(Flux=${sessionIc.fluxAlignment.toFixed(2)},Regime=${sessionIc.regimeFit.toFixed(2)}) ` +
+    `SavedChop=${savedChopCount} MissedAlpha=${missedAlphaCount}`;
+
+  const report: PostMarketAttributionReport = {
+    sessionDate: input.sessionDate,
+    ticker: sym,
+    evaluatedAtEt: bars.length > 0 ? formatEtTimeShort(bars[bars.length - 1].ts) : "4:05 PM",
+    executedCount: executed.length,
+    executedAvgR,
+    skippedCount: skipped.length,
+    skippedCounterfactualAvgR,
+    missedAlphaCount,
+    savedChopCount,
+    featureIc: sessionIc,
+    updatedPriorsSummary,
+    records,
   };
 
-  if (shouldPersist) {
-    saveShadowParityToDisk(report);
+  if (input.persist !== false) {
+    writeAlphaPriorsSync(priors);
+    await writeAlphaPriors(priors);
+    await writePostMarketAttribution(report);
   }
-
-  console.log(
-    `[AgenticSupervisor] shadowParityReport (${targetDate} ${targetTicker}): matchedTrades=${matchedTrades}, missedLiveTrades=${missedLiveTrades}, slippageDriftDollars=$${slippageDriftDollars.toFixed(2)}, parity=${parityScorePct}% [${status}]`
-  );
 
   return report;
 }
+
+export { cloneDefaultAlphaPriors };

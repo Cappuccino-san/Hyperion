@@ -8,6 +8,7 @@ import {
   type OptionsAnalyticsPayload,
 } from "@/lib/optionsExposure";
 import type { PlaybookPayload, PlaybookPick } from "@/lib/types/playbook";
+import type { SessionPlaybookPolicy } from "@/lib/persistenceStore";
 import { evaluateExecutionStatus } from "@/lib/playbookEngine";
 
 export type ActiveView =
@@ -542,10 +543,12 @@ export interface DashboardState {
   serverActivePositions: Record<string, any>;
   serverClosedTrades: any[];
   serverTradeAlerts: any[];
+  supervisorPolicy: SessionPlaybookPolicy | null;
   setServerTrades: (payload: {
     activePositions?: Record<string, any>;
     closedPositions?: any[];
     alerts?: any[];
+    supervisorPolicy?: SessionPlaybookPolicy | null;
   }) => void;
   fetchServerTrades: (ticker?: string, sessionDate?: string) => Promise<void>;
   playbookPayload: PlaybookPayload | null;
@@ -652,12 +655,17 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   serverActivePositions: {},
   serverClosedTrades: [],
   serverTradeAlerts: [],
+  supervisorPolicy: null,
   setServerTrades: (payload) =>
-    set({
+    set((state) => ({
       serverActivePositions: payload.activePositions ?? {},
       serverClosedTrades: payload.closedPositions ?? [],
       serverTradeAlerts: payload.alerts ?? [],
-    }),
+      supervisorPolicy:
+        payload.supervisorPolicy !== undefined
+          ? payload.supervisorPolicy
+          : state.supervisorPolicy,
+    })),
   fetchServerTrades: async (ticker, sessionDate) => {
     const targetTicker = (ticker || get().activeTicker || "SPY").toUpperCase();
     serverTradesAbortCtrl?.abort();
@@ -693,6 +701,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
           serverActivePositions: data?.activePositions ?? {},
           serverClosedTrades: data?.closedPositions ?? [],
           serverTradeAlerts: data?.alerts ?? [],
+          supervisorPolicy: data?.supervisorPolicy ?? null,
         });
       }
     } catch {
@@ -837,6 +846,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         alerts: [],
         serverClosedTrades: [],
         serverTradeAlerts: [],
+        supervisorPolicy: null,
         intradayData: [],
         flowGammaVwapData: null,
       };

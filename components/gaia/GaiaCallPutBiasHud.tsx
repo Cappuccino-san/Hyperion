@@ -20,6 +20,7 @@ import {
   GaiaBarData,
   computeCausalEquilibriumDispersion,
 } from "@/lib/gaiaSignalFsm";
+import type { SessionPlaybookPolicy } from "@/lib/persistenceStore";
 import {
   RTH_OPEN_MINS as GUARD_RTH_OPEN_MINS,
   RTH_CLOSE_MINS as GUARD_RTH_CLOSE_MINS,
@@ -53,6 +54,7 @@ export interface GaiaCallPutBiasHudProps {
   liveSpot?: number | null;
   spot?: number | null;
   serverTrades?: ServerTradeData;
+  supervisorPolicy?: SessionPlaybookPolicy | null;
   sessionDate?: string;
   onSymbolChange?: (symbol: string) => void;
   onSignalsEvaluated?: (signals: PrzmSignalPoint[]) => void;
@@ -245,6 +247,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   liveSpot,
   spot,
   serverTrades: serverTradesProp,
+  supervisorPolicy: supervisorPolicyProp,
   sessionDate,
   onSymbolChange,
   onSignalsEvaluated,
@@ -263,6 +266,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const uid = useId().replace(/:/g, "");
   const activeSymbol = (symbol || ticker || "SPY").trim().toUpperCase() || "SPY";
   const storeActiveTicker = useDashboardStore((s) => s.activeTicker);
+  const storeSupervisorPolicy = useDashboardStore((s) => s.supervisorPolicy);
   const liveTickPrice = useDashboardStore((s) => s.liveTickPrice);
   const liveTickCount = useDashboardStore((s) => s.liveTickCount);
   const gammaLevels = useDashboardStore((s) => s.gammaLevels);
@@ -271,6 +275,9 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
   const [internalServerTrades, setInternalServerTrades] = useState<ServerTradeData>(
     serverTradesProp || {}
+  );
+  const [internalSupervisorPolicy, setInternalSupervisorPolicy] = useState<SessionPlaybookPolicy | null>(
+    supervisorPolicyProp ?? null
   );
 
   useEffect(() => {
@@ -305,6 +312,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             closedPositions: data?.closedPositions || [],
             alerts: data?.alerts || [],
           });
+          setInternalSupervisorPolicy(data?.supervisorPolicy ?? null);
         }
       } catch {
         // Silent fallback
@@ -1408,6 +1416,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         straddleEm={structuralMetrics.expectedMove}
         activeFsmState={fsmCommittedState}
         serverTrades={internalServerTrades}
+        supervisorPolicy={
+          supervisorPolicyProp !== undefined
+            ? supervisorPolicyProp
+            : internalSupervisorPolicy ??
+              (storeActiveTicker.toUpperCase() === activeSymbol ? storeSupervisorPolicy : null)
+        }
         isReplayMode={isReplayMode}
         replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined}
       />
