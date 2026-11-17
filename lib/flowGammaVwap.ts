@@ -752,6 +752,10 @@ export function computeBarFlowGammaVwapSeries(
   let runningHigh = -Infinity;
   let runningLow = +Infinity;
   let causalAtr = 0;
+  let preResetAtr = 0;
+  let preResetVwap = 0;
+  let lastEmpiricalVwap = candles[0].close || candles[0].open || 0;
+  let isOpeningSeedBar = false;
   const atrAlpha = 1 / 14;
   let lastRthResetDate = "";
   let prevEtMins: number | null = null;
@@ -782,13 +786,16 @@ export function computeBarFlowGammaVwapSeries(
       lastRthResetDate = etDate;
       open930 = c.open || c.close;
       if (i > 0) {
+        preResetAtr = causalAtr;
+        preResetVwap = lastEmpiricalVwap;
         engine.reset(open930);
         totalBookWeight = rebuildBookAnchors(open930);
         runningHigh = -Infinity;
         runningLow = +Infinity;
-        causalAtr = 0;
+        causalAtr = preResetAtr > 0 ? preResetAtr : 0;
         sessionStartIdx = i;
         sessionStartTs = c.timestamp;
+        isOpeningSeedBar = true;
       }
     }
 
@@ -806,13 +813,16 @@ export function computeBarFlowGammaVwapSeries(
     if (c.high > runningHigh) runningHigh = c.high;
     if (c.low < runningLow) runningLow = c.low;
 
-    // 2. Causal Wilder True Range
-    const prevClose = barsIntoSession > 0 ? candles[i - 1].close : c.open;
+    // 2. Causal Wilder True Range (preserving pre-market ATR across 09:30 reset)
+    const prevClose = i > 0 ? candles[i - 1].close : c.open;
     const trueRange =
-      barsIntoSession === 0
+      i === 0
         ? Math.max(barRange, c.close * 0.0015)
         : Math.max(barRange, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose));
-    causalAtr = barsIntoSession === 0 ? trueRange : atrAlpha * trueRange + (1 - atrAlpha) * causalAtr;
+    causalAtr =
+      barsIntoSession === 0 && preResetAtr <= 0
+        ? trueRange
+        : atrAlpha * trueRange + (1 - atrAlpha) * (causalAtr > 0 ? causalAtr : trueRange);
 
     // 3. Causal absorbing domain buffers [p_F(t_i), p_C(t_i)]
     const causalBuffer = Math.max(0.5 * causalAtr, c.close * 0.001);
@@ -860,12 +870,28 @@ export function computeBarFlowGammaVwapSeries(
       barWeight = barVol * range * 10;
     }
 
+    // Warm-start the 09:30 RTH session accumulator with a gap-safe anchor seed so W does not reset to 0 on a single bar
+    if (isOpeningSeedBar && barWeight > 0) {
+      const gapThreshold = Math.max(preResetAtr * 2.0, open930 * 0.0035);
+      const isContinuousAnchor =
+        preResetVwap > 0 && Math.abs(preResetVwap - open930) <= gapThreshold;
+      const seedAnchor = isContinuousAnchor
+        ? open930 * 0.55 + preResetVwap * 0.45
+        : open930;
+      const priorSeedWeight = Math.max(1, barWeight * 0.30);
+      engine.addPoint(seedAnchor, priorSeedWeight, c.timestamp, 0);
+      isOpeningSeedBar = false;
+    } else if (isOpeningSeedBar) {
+      isOpeningSeedBar = false;
+    }
+
     const baseSnap = engine.addPoint(
       spot,
       barWeight,
       c.timestamp,
       barWeight * barSignedBias
     );
+    lastEmpiricalVwap = baseSnap.flowVwap;
 
     // Minutes elapsed since session open
     const tsDeltaMin =
@@ -962,18 +988,30 @@ export function computeBarFlowGammaVwapSeries(
       sigmaC,
     });
 
-    // Couple incremental empirical Flow VWAP with Spectral PDE Flow VWAP (smooth orange trajectory in Image 3)
+    // Couple incremental empirical Flow VWAP with Spectral PDE Flow VWAP smoothly over early RTH bars
     const empiricalVwap = baseSnap.flowVwap;
-    const spectralWeight = barsIntoSession >= 3 ? 0.28 : 0.0;
+    const spectralWeight =
+      barsIntoSession <= 0
+        ? 0.06
+        : Math.min(0.28, 0.06 + (barsIntoSession / 4) * 0.22);
     const blendedFlowVwap =
       spectralWeight > 0
         ? empiricalVwap * (1 - spectralWeight) + pdeState.spectralFlowVwap * spectralWeight
         : empiricalVwap;
 
-    const effectiveSigma =
-      barsIntoSession >= 3
-        ? Math.max(baseSnap.sigma, pdeState.spectralSigma * 0.65)
+    // Enforce a decaying early-session volatility dispersion floor so +-1s/+-2s bands never pinch at 09:30 OPEN
+    const steadyFloor = Math.max(spot * 0.0005, causalAtr * 0.18);
+    const earlySessionFloor = Math.max(causalAtr * 0.75, spot * 0.0018);
+    const earlyDecay = Math.max(0, 1 - barsIntoSession / 6);
+    const sigmaFloor = steadyFloor + (earlySessionFloor - steadyFloor) * earlyDecay;
+
+    const spectralSigmaWeight =
+      barsIntoSession >= 3 ? 0.65 : barsIntoSession >= 1 ? 0.45 : 0.0;
+    const rawEffectiveSigma =
+      spectralSigmaWeight > 0
+        ? Math.max(baseSnap.sigma, pdeState.spectralSigma * spectralSigmaWeight)
         : baseSnap.sigma;
+    const effectiveSigma = Math.max(rawEffectiveSigma, sigmaFloor);
 
     const u1 = blendedFlowVwap + effectiveSigma;
     const l1 = blendedFlowVwap - effectiveSigma;

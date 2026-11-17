@@ -424,5 +424,16 @@ export async function checkAndSendMarketCloseRecap(
     saveTradeStore(latestStore);
   }
 
+  // Trigger 16:05 ET Post-Market Attribution & Live-vs-Replay Shadow Parity Audit
+  const isPostAttributionCutoff = etTime.hours > 16 || (etTime.hours === 16 && etTime.minutes >= 5);
+  if (isPostAttributionCutoff && !isHistoricalBackfill) {
+    try {
+      const { runPostMarketAttribution } = await import("./agenticSupervisor");
+      runPostMarketAttribution({ date: targetDate || store.date });
+    } catch {
+      // Non-fatal post-market attribution
+    }
+  }
+
   return report;
 }

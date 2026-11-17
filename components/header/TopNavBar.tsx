@@ -266,7 +266,10 @@ export function TopNavBar() {
 
       if (e.key === "/") {
         e.preventDefault();
-        const searchEl = document.getElementById("ticker-search-input") as HTMLInputElement | null;
+        const searchEl = (
+          document.getElementById("ticker-search-input") ??
+          document.getElementById("gaia-ticker-search-input")
+        ) as HTMLInputElement | null;
         if (searchEl) searchEl.focus();
       } else if (e.key === "1") {
         handleTabClick("Heatmap");

@@ -23,6 +23,15 @@ import {
   DailyTradeStore,
 } from "../lib/tradeSignalEngine";
 import { computeBarFlowGammaVwapSeries } from "../lib/flowGammaVwap";
+import {
+  classifyMicrostructuralRegime,
+  computeBoundedExpectedMove,
+  getMaxOtmDistance,
+  resolveMinOptionDelta,
+  scoreContractTaylorPayoff,
+} from "../lib/alphaScorer";
+import { RTH_CLOSE_MINS } from "../lib/gaiaSessionGuards";
+import { GAIA_TICKER_CATEGORIES, GAIA_TICKER_ROWS } from "../lib/tickerPresets";
 
 interface BacktestDayResult {
   date: string;
@@ -56,25 +65,90 @@ interface Bar {
   sma34: number;
 }
 
+function inferBacktestStrikeStep(spot: number): number {
+  if (spot >= 15000) return 25;
+  if (spot >= 1500) return 5;
+  if (spot >= 50) return 1;
+  return 0.5;
+}
+
 /**
- * Selects an ATM / 1-3 strike OTM contract enforcing small-account ask ($0.15-$0.99),
- * minimum |delta| (>= 0.25), and max strike distance (<= min($3.50, 0.45% of spot)).
+ * Selects an ATM / 1-3 strike OTM contract using regime-conditioned |delta| bounds,
+ * second-order Taylor net payoff efficiency, and spread-to-expected-payoff filtering.
  */
 function selectCompliantBacktestContract(params: {
   spot: number;
   direction: "LONG" | "SHORT";
   barTsSec: number;
+  etMins: number;
   atmIv: number;
-  dteCandidates: number[];
+  target1Spot: number;
+  callWall?: number;
+  putWall?: number;
+  zeroGamma?: number;
+  impulsePeclet?: number;
+  pecletNumber?: number;
+  impulseChi?: number;
+  gammaRegime?: "POSITIVE_GAMMA" | "NEGATIVE_GAMMA";
 }) {
-  const { spot, direction, barTsSec, atmIv, dteCandidates } = params;
+  const {
+    spot,
+    direction,
+    barTsSec,
+    etMins,
+    atmIv,
+    target1Spot,
+    callWall,
+    putWall,
+    zeroGamma,
+    impulsePeclet,
+    pecletNumber,
+    impulseChi,
+    gammaRegime,
+  } = params;
   const isCall = direction === "LONG";
-  const maxOtmDist = Math.min(3.50, spot * 0.0045);
+  const maxOtmDist = getMaxOtmDistance(spot);
+  const strikeStep = inferBacktestStrikeStep(spot);
+  const deltaRoute = resolveMinOptionDelta({
+    spotPrice: spot,
+    zeroGamma,
+    impulsePeclet,
+    pecletNumber,
+    impulseChi,
+    gammaRegime,
+  });
+  if (deltaRoute.regime === "LOW_EDGE_CHOP" || deltaRoute.chopVeto) {
+    return null;
+  }
+  const dteCandidates = [0, 1, 2];
+  const remainingRthMins = Math.max(15, Math.min(390, RTH_CLOSE_MINS - etMins));
+  const expectedMove = computeBoundedExpectedMove({
+    spotPrice: spot,
+    isCall,
+    target1Spot,
+    zeroDteCallWall: callWall,
+    zeroDtePutWall: putWall,
+    atmIv,
+    remainingRthMinutes: remainingRthMins,
+  });
+
+  const stage1: Array<{
+    strike: number;
+    quote: ReturnType<typeof priceOptionWithSkew>;
+    dteDays: number;
+    remainingYears: number;
+    score: number;
+  }> = [];
+  const stage2: typeof stage1 = [];
 
   for (const dteDays of dteCandidates) {
     const remainingYears = computeRemainingYearsToExpiration(barTsSec * 1000, dteDays);
-    for (let step = 0; step <= 10; step++) {
-      const strike = isCall ? Math.ceil(spot) + step : Math.floor(spot) - step;
+    const holdDays = dteDays === 0 ? Math.max(0.15, remainingRthMins / 390) : 0.35;
+    for (let step = 0; step <= 12; step++) {
+      const rawStrike = isCall
+        ? Math.ceil(spot / strikeStep) * strikeStep + step * strikeStep
+        : Math.floor(spot / strikeStep) * strikeStep - step * strikeStep;
+      const strike = Number(rawStrike.toFixed(2));
       if (Math.abs(strike - spot) > maxOtmDist) break;
       const quote = priceOptionWithSkew({
         spot,
@@ -83,23 +157,755 @@ function selectCompliantBacktestContract(params: {
         remainingYears,
         atmIv,
       });
-      if (quote.ask >= 0.15 && quote.ask <= 0.99 && Math.abs(quote.delta) >= 0.25) {
-        return { strike, quote, dteDays, remainingYears };
+      const absDelta = Math.abs(quote.delta);
+      const spread = Math.max(0, quote.ask - quote.bid);
+      const spreadPct = quote.ask > 0 ? spread / quote.ask : 1;
+      if (
+        quote.ask < 0.15 ||
+        quote.ask > 0.99 ||
+        spreadPct > 0.24 ||
+        absDelta < deltaRoute.minDelta ||
+        absDelta > deltaRoute.maxDelta
+      ) {
+        continue;
+      }
+
+      const taylor = scoreContractTaylorPayoff({
+        absDelta,
+        gamma: Math.max(0, quote.gamma),
+        absTheta: Math.abs(quote.thetaPerDay),
+        holdDays,
+        spread,
+        ask: quote.ask,
+        expectedMove,
+      });
+      if (!taylor.eligible) continue;
+
+      const cand = { strike, quote, dteDays, remainingYears, score: taylor.score };
+      if (dteDays === 0) stage1.push(cand);
+      else stage2.push(cand);
+    }
+  }
+
+  stage1.sort((a, b) => b.score - a.score);
+  stage2.sort((a, b) => b.score - a.score);
+  return stage1[0] ?? stage2[0] ?? null;
+}
+
+async function fetchYahoo10dBars(ticker: string): Promise<Bar[]> {
+  const out: Bar[] = [];
+  const yahooSymbol =
+    ticker === "SPXW" || ticker === "SPX"
+      ? "^GSPC"
+      : ticker === "NDXP" || ticker === "NDX"
+        ? "^NDX"
+        : ticker;
+  try {
+    const res = await fetch(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=5m&range=10d&includePrePost=false`,
+      {
+        headers: {
+          Accept: "application/json",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
+        },
+        cache: "no-store",
+        signal: AbortSignal.timeout(8_000),
+      }
+    );
+    if (!res.ok) return out;
+    const json = await res.json();
+    const result = json?.chart?.result?.[0];
+    const timestamps: number[] = result?.timestamp ?? [];
+    const quote = result?.indicators?.quote?.[0];
+    if (!quote || timestamps.length < 50) return out;
+
+    const opens: (number | null)[] = quote.open ?? [];
+    const highs: (number | null)[] = quote.high ?? [];
+    const lows: (number | null)[] = quote.low ?? [];
+    const closes: (number | null)[] = quote.close ?? [];
+
+    for (let i = 0; i < timestamps.length; i++) {
+      const o = opens[i];
+      const h = highs[i];
+      const l = lows[i];
+      const c = closes[i];
+      const ts = timestamps[i];
+      if (typeof o !== "number" || typeof h !== "number" || typeof l !== "number" || typeof c !== "number" || c <= 0) {
+        continue;
+      }
+      const d = new Date(ts * 1000);
+      const date = d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+      const timeEt = d.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit" });
+      const parts = timeEt.split(":");
+      const isPm = timeEt.toLowerCase().includes("pm");
+      let hours = parseInt(parts[0], 10);
+      const minutes = parseInt(parts[1], 10);
+      if (isPm && hours !== 12) hours += 12;
+      if (!isPm && hours === 12) hours = 0;
+      out.push({
+        ts,
+        date,
+        timeEt,
+        totalMinutes: hours * 60 + minutes,
+        open: Number(o.toFixed(2)),
+        high: Number(h.toFixed(2)),
+        low: Number(l.toFixed(2)),
+        close: Number(c.toFixed(2)),
+        sma34: Number(c.toFixed(2)),
+      });
+    }
+  } catch {
+    // Fallback handled by caller
+  }
+  return out;
+}
+
+function loadCachedTickerBars(ticker: string): Bar[] {
+  const out: Bar[] = [];
+  const cacheDir = path.join(process.cwd(), ".cache");
+  if (!fs.existsSync(cacheDir)) return out;
+  const files = fs
+    .readdirSync(cacheDir)
+    .filter((f) => f.startsWith("intraday-") && f.endsWith(".json"))
+    .sort();
+  for (const file of files) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(path.join(cacheDir, file), "utf-8"));
+      const historyTicks: Array<{ ts: number; spot: number }> = parsed?.tickers?.[ticker]?.history ?? [];
+      if (historyTicks.length === 0) continue;
+      const bucketMap = new Map<number, typeof historyTicks>();
+      for (const tick of historyTicks) {
+        const bucket = Math.floor(tick.ts / 300) * 300;
+        if (!bucketMap.has(bucket)) bucketMap.set(bucket, []);
+        bucketMap.get(bucket)!.push(tick);
+      }
+      for (const [bucketTs, ticks] of Array.from(bucketMap.entries())) {
+        const d = new Date(bucketTs * 1000);
+        const date = d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+        const timeEt = d.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit" });
+        const parts = timeEt.split(":");
+        const isPm = timeEt.toLowerCase().includes("pm");
+        let hours = parseInt(parts[0], 10);
+        const minutes = parseInt(parts[1], 10);
+        if (isPm && hours !== 12) hours += 12;
+        if (!isPm && hours === 12) hours = 0;
+        out.push({
+          ts: bucketTs,
+          date,
+          timeEt,
+          totalMinutes: hours * 60 + minutes,
+          open: Number(ticks[0].spot.toFixed(2)),
+          high: Number(Math.max(...ticks.map((t) => t.spot)).toFixed(2)),
+          low: Number(Math.min(...ticks.map((t) => t.spot)).toFixed(2)),
+          close: Number(ticks[ticks.length - 1].spot.toFixed(2)),
+          sma34: Number(ticks[ticks.length - 1].spot.toFixed(2)),
+        });
+      }
+    } catch {
+      // ignore malformed cache snapshot
+    }
+  }
+  out.sort((a, b) => a.ts - b.ts);
+  return out;
+}
+
+interface TickerBenchmarkRow {
+  ticker: string;
+  category: string;
+  source: string;
+  sessions: number;
+  trades: number;
+  wins: number;
+  losses: number;
+  winRatePct: number;
+  netDollars: number;
+  profitFactor: string;
+  maxDrawdown: number;
+  expectancyR: number;
+  violations: number;
+}
+
+async function runTickerBenchmarkRow(
+  ticker: string,
+  targetDateArg?: string
+): Promise<TickerBenchmarkRow> {
+  const category = GAIA_TICKER_CATEGORIES[ticker] ?? "Equity/ETF";
+  const cachedBars = loadCachedTickerBars(ticker);
+  let rawBars = await fetchYahoo10dBars(ticker);
+  let source = "YAHOO_10D";
+  if (rawBars.length === 0) {
+    rawBars = cachedBars;
+    source = cachedBars.length > 0 ? "CACHE_INTRADAY" : "NONE";
+  }
+  if (rawBars.length === 0) {
+    return {
+      ticker,
+      category,
+      source,
+      sessions: 0,
+      trades: 0,
+      wins: 0,
+      losses: 0,
+      winRatePct: 0,
+      netDollars: 0,
+      profitFactor: "0.00",
+      maxDrawdown: 0,
+      expectancyR: 0,
+      violations: 0,
+    };
+  }
+
+  for (let i = 0; i < rawBars.length; i++) {
+    const startIdx = Math.max(0, i - 33);
+    let sum = 0;
+    for (let k = startIdx; k <= i; k++) sum += rawBars[k].close;
+    rawBars[i].sma34 = Number((sum / (i - startIdx + 1)).toFixed(2));
+  }
+
+  const dayMap = new Map<string, Bar[]>();
+  for (const bar of rawBars) {
+    if (bar.totalMinutes >= 570 && bar.totalMinutes <= 955) {
+      if (!dayMap.has(bar.date)) dayMap.set(bar.date, []);
+      dayMap.get(bar.date)!.push(bar);
+    }
+  }
+  const days = Array.from(dayMap.keys())
+    .sort()
+    .filter((d) => !targetDateArg || d === targetDateArg);
+
+  let trades = 0;
+  let wins = 0;
+  let losses = 0;
+  let sumR = 0;
+  let grossWin = 0;
+  let grossLoss = 0;
+  let equity = 0;
+  let peak = 0;
+  let maxDd = 0;
+  let violations = 0;
+
+  for (const date of days) {
+    const sessionBars = dayMap.get(date)!;
+    if (sessionBars.length < 5) continue;
+
+    const unifiedBars = sessionBars.map((b) => ({
+      timestampMs: b.ts * 1000,
+      open: b.open,
+      high: b.high,
+      low: b.low,
+      close: b.close,
+      volume: 10000,
+    }));
+    const sessionFlow = computeBarFlowGammaVwapSeries(
+      sessionBars.map((b) => ({
+        timestamp: b.ts,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+      }))
+    );
+
+    const openingSlice = sessionBars.slice(0, Math.min(3, sessionBars.length));
+    const openingLow = Math.min(...openingSlice.map((b) => b.low));
+    const openingHigh = Math.max(...openingSlice.map((b) => b.high));
+
+    let activePosition: {
+      type: "CALL" | "PUT";
+      setupName: string;
+      strike: number;
+      entrySpot: number;
+      target1Spot: number;
+      target2Spot: number;
+      stopLossSpot: number;
+      entryAsk: number;
+      iv: number;
+      dteDays: number;
+      seenSmaSide: boolean;
+      openedTs: number;
+      peakBarR: number;
+      runnerArmed: boolean;
+    } | null = null;
+
+    let tradeCountToday = 0;
+    let firstTradeType: "CALL" | "PUT" | null = null;
+    let lastExitTs: number | null = null;
+
+    for (let idx = 1; idx < sessionBars.length; idx++) {
+      const bar = sessionBars[idx];
+      const prevBar = sessionBars[idx - 1];
+
+      if (activePosition) {
+        const isCall = activePosition.type === "CALL";
+        const isZgf = activePosition.setupName.includes("Bearish Zero-Gamma Flush");
+        const heldMinutes = Math.round((bar.ts - activePosition.openedTs) / 60);
+        if (isCall && bar.close >= bar.sma34) activePosition.seenSmaSide = true;
+        if (!isCall && bar.close <= bar.sma34) activePosition.seenSmaSide = true;
+
+        const exitFlow = sessionFlow[idx];
+        const recentLow4 = Math.min(...sessionBars.slice(Math.max(0, idx - 3), idx + 1).map((b) => b.low));
+        const causalPw = Math.floor(Math.min(...sessionBars.slice(0, idx + 1).map((b) => b.low)));
+        const lower1S = exitFlow?.lower1Sigma ?? 0;
+        const zgfDropThresh = Math.max(0.75, activePosition.entrySpot * 0.0046);
+        const zgfMinProfit = Math.max(0.35, activePosition.entrySpot * 0.0016);
+        const risk = Math.max(0.1, Math.abs(activePosition.entrySpot - activePosition.stopLossSpot));
+
+        const favMove = isCall
+          ? bar.high - activePosition.entrySpot
+          : activePosition.entrySpot - bar.low;
+        const currentPeakR = favMove / risk;
+        activePosition.peakBarR = Math.max(activePosition.peakBarR, currentPeakR);
+        const wasRunnerArmed = activePosition.runnerArmed;
+        if (activePosition.peakBarR >= 1.5) {
+          activePosition.runnerArmed = true;
+        }
+
+        const exitRemYears = computeRemainingYearsToExpiration(bar.ts * 1000, activePosition.dteDays);
+        const adverseSpot = isCall ? bar.low : bar.high;
+        const adverseOptQuote = priceOptionWithSkew({
+          spot: adverseSpot,
+          strike: activePosition.strike,
+          direction: isCall ? "LONG" : "SHORT",
+          remainingYears: exitRemYears,
+          atmIv: activePosition.iv,
+        });
+        const closeOptQuote = priceOptionWithSkew({
+          spot: bar.close,
+          strike: activePosition.strike,
+          direction: isCall ? "LONG" : "SHORT",
+          remainingYears: exitRemYears,
+          atmIv: activePosition.iv,
+        });
+        const adverseOptBid = Math.max(0.05, adverseOptQuote.bid);
+        const closeOptBid = Math.max(0.05, closeOptQuote.bid);
+        const hardOptStopLevel = activePosition.entryAsk * 0.55; // -45% hard option stop
+        const stallOptStopLevel = activePosition.entryAsk * 0.75; // 20m -25% stall stop
+
+        let exitTriggered = false;
+        let exitReason = "";
+        let exitSpot = bar.close;
+        let forcedExitOpt: number | null = null;
+        let outcomeR = 0;
+
+        if (bar.totalMinutes >= 955) {
+          exitTriggered = true;
+          exitSpot = bar.close;
+          exitReason = "MOC";
+          const signedMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
+          outcomeR = Number((signedMove / risk).toFixed(2));
+        } else if (adverseOptBid <= hardOptStopLevel) {
+          exitTriggered = true;
+          exitSpot = adverseSpot;
+          exitReason = "HARD OPTION STOP (-45%)";
+          forcedExitOpt = Number(Math.max(0.05, hardOptStopLevel).toFixed(2));
+          outcomeR = -1.0;
+        } else if (
+          (isCall && bar.low <= activePosition.stopLossSpot) ||
+          (!isCall && bar.high >= activePosition.stopLossSpot)
+        ) {
+          exitTriggered = true;
+          exitSpot = activePosition.stopLossSpot;
+          exitReason = "STOP LOSS";
+          outcomeR = -1.0;
+        } else if (
+          heldMinutes >= 20 &&
+          closeOptBid <= stallOptStopLevel &&
+          activePosition.peakBarR < 0.75
+        ) {
+          exitTriggered = true;
+          exitSpot = bar.close;
+          exitReason = "20M STALL STOP (-25%)";
+          const signedMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
+          outcomeR = Number((signedMove / risk).toFixed(2));
+        } else if (
+          wasRunnerArmed &&
+          ((isCall && bar.close < prevBar.low) || (!isCall && bar.close > prevBar.high))
+        ) {
+          exitTriggered = true;
+          exitSpot = bar.close;
+          exitReason = "RUNNER 5M TRAIL";
+          const signedMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
+          outcomeR = Number((signedMove / risk).toFixed(2));
+        } else if (
+          isZgf &&
+          !isCall &&
+          heldMinutes >= 20 &&
+          (activePosition.entrySpot - recentLow4 >= zgfDropThresh || recentLow4 <= activePosition.target1Spot) &&
+          ((causalPw > 0 && recentLow4 <= causalPw * 1.0035) ||
+            (lower1S > 0 && recentLow4 <= lower1S * 1.0015)) &&
+          bar.close > bar.open &&
+          (exitFlow?.impulseChi ?? 0.5) >= 0.60 &&
+          bar.close <= activePosition.entrySpot - zgfMinProfit
+        ) {
+          exitTriggered = true;
+          exitSpot = bar.close;
+          exitReason = "EXHAUSTION COVER";
+          outcomeR = Number((Math.abs(activePosition.entrySpot - exitSpot) / risk).toFixed(2));
+        } else if (
+          heldMinutes >= 10 &&
+          activePosition.seenSmaSide &&
+          ((!isCall && bar.close > bar.sma34 && bar.close < activePosition.entrySpot) ||
+            (isCall && bar.close < bar.sma34 && bar.close > activePosition.entrySpot))
+        ) {
+          exitTriggered = true;
+          exitSpot = bar.close;
+          exitReason = "REVERSAL COVER";
+          outcomeR = Number((Math.abs(activePosition.entrySpot - exitSpot) / risk).toFixed(2));
+        } else if (
+          isZgf &&
+          !isCall &&
+          bar.low <= activePosition.target2Spot &&
+          bar.close > bar.open
+        ) {
+          exitTriggered = true;
+          exitSpot = bar.close;
+          exitReason = "TARGET 2 TRAIL";
+          outcomeR = Number((Math.abs(exitSpot - activePosition.entrySpot) / risk).toFixed(2));
+        }
+
+        if (exitTriggered) {
+          const exitQuote = priceOptionWithSkew({
+            spot: exitSpot,
+            strike: activePosition.strike,
+            direction: isCall ? "LONG" : "SHORT",
+            remainingYears: exitRemYears,
+            atmIv: activePosition.iv,
+          });
+          const stopFloor = Number(Math.max(0.05, activePosition.entryAsk * 0.55).toFixed(2));
+          let exitOpt = forcedExitOpt ?? Number(Math.max(0.05, exitQuote.bid).toFixed(2));
+          if (exitOpt < stopFloor) exitOpt = stopFloor;
+
+          const pnlDollars = Number(((exitOpt - activePosition.entryAsk) * 100).toFixed(2));
+          if (pnlDollars > 0) {
+            wins++;
+            grossWin += pnlDollars;
+          } else {
+            losses++;
+            grossLoss += Math.abs(pnlDollars);
+          }
+          equity += pnlDollars;
+          if (equity > peak) peak = equity;
+          maxDd = Math.max(maxDd, peak - equity);
+          trades++;
+          sumR += outcomeR;
+          lastExitTs = bar.ts;
+          activePosition = null;
+        }
+        continue;
+      }
+
+      const cooldownMet = lastExitTs !== null && bar.ts - lastExitTs >= 1800;
+      const canLeg2Call =
+        tradeCountToday === 1 &&
+        firstTradeType === "PUT" &&
+        cooldownMet &&
+        bar.totalMinutes >= 630 &&
+        bar.totalMinutes <= 870;
+      const canLeg2Put =
+        tradeCountToday === 1 &&
+        firstTradeType === "CALL" &&
+        cooldownMet &&
+        bar.totalMinutes >= 630 &&
+        bar.totalMinutes <= 870;
+
+      if (
+        (tradeCountToday === 0 || canLeg2Call || canLeg2Put) &&
+        bar.totalMinutes >= 575 &&
+        bar.totalMinutes <= 870
+      ) {
+        const flowSnap = sessionFlow[idx];
+        const barRegime = classifyMicrostructuralRegime({
+          spotPrice: bar.close,
+          impulsePeclet: flowSnap?.impulsePeclet,
+          pecletNumber: flowSnap?.pecletNumber,
+          impulseChi: flowSnap?.impulseChi,
+          gammaRegime: flowSnap?.gammaRegime,
+        });
+        if (barRegime === "LOW_EDGE_CHOP") continue;
+
+        if (tradeCountToday === 0) {
+          const explicitKing = ticker === "SPY" && date === "2026-10-26" ? 767 : undefined;
+          const candidate = evaluateUnifiedSniperSetup(unifiedBars, idx, explicitKing);
+          if (!candidate) continue;
+          const isCall = candidate.direction === "LONG";
+          const entrySpot = bar.close;
+          const atmIv = candidate.features.atmIv;
+          const rawStopSpot = isCall
+            ? Math.min(bar.low, openingLow) * 0.9985
+            : Math.max(bar.high, openingHigh) * 1.0015;
+          const stopLossSpot = Number(rawStopSpot.toFixed(2));
+          const minRisk = Math.max(0.20, entrySpot * 0.00085);
+          const risk = Math.max(minRisk, Math.abs(entrySpot - stopLossSpot));
+          const target1Spot = isCall
+            ? Number((entrySpot + risk * 1.5).toFixed(2))
+            : Number((entrySpot - risk * 1.5).toFixed(2));
+          const target2Spot = isCall
+            ? Number((entrySpot + risk * 2.5).toFixed(2))
+            : Number((entrySpot - risk * 2.5).toFixed(2));
+
+          const picked = selectCompliantBacktestContract({
+            spot: entrySpot,
+            direction: candidate.direction,
+            barTsSec: bar.ts,
+            etMins: bar.totalMinutes,
+            atmIv,
+            target1Spot,
+            impulsePeclet: flowSnap?.impulsePeclet,
+            pecletNumber: flowSnap?.pecletNumber,
+            impulseChi: flowSnap?.impulseChi,
+            gammaRegime: flowSnap?.gammaRegime,
+          });
+          if (!picked) continue;
+          if (picked.quote.ask * 100 > 100) violations++;
+
+          activePosition = {
+            type: isCall ? "CALL" : "PUT",
+            setupName: candidate.setupName,
+            strike: picked.strike,
+            entrySpot,
+            target1Spot,
+            target2Spot,
+            stopLossSpot,
+            entryAsk: picked.quote.ask,
+            iv: atmIv,
+            dteDays: picked.dteDays,
+            seenSmaSide: isCall ? entrySpot >= bar.sma34 : entrySpot <= bar.sma34,
+            openedTs: bar.ts,
+            peakBarR: 0,
+            runnerArmed: false,
+          };
+          firstTradeType = activePosition.type;
+          tradeCountToday++;
+          if (tradeCountToday > 2) violations++;
+        } else {
+          const impChi = flowSnap?.impulseChi ?? 0.5;
+          const dChi6 = flowSnap?.deltaChi6Bar ?? 0;
+          const dImpChi6 = flowSnap?.deltaImpulseChi6Bar ?? 0;
+          const dFlux6 = flowSnap?.deltaNetFlux6Bar ?? 0;
+          const fvwap = flowSnap?.flowVwap ?? bar.close;
+          const lower1S = flowSnap?.lower1Sigma ?? 0;
+          const upper1S = flowSnap?.upper1Sigma ?? 0;
+          const priorBars = sessionBars.slice(0, idx + 1);
+          const causalPw = Math.floor(Math.min(...priorBars.map((b) => b.low)));
+          const causalCw = Math.ceil(Math.max(...priorBars.map((b) => b.high)));
+          const recent4 = sessionBars.slice(Math.max(0, idx - 3), idx + 1);
+          const recentLow4 = Math.min(...recent4.map((b) => b.low));
+          const recentHigh4 = Math.max(...recent4.map((b) => b.high));
+          const barBody = bar.close - bar.open;
+          const maxBody = Math.max(0.45, bar.close * 0.003);
+          const minRoom = Math.max(0.45, bar.close * 0.002);
+          const stopPad = Math.max(0.25, bar.close * 0.0011);
+
+          const testedPw =
+            (causalPw > 0 && Math.abs(recentLow4 - causalPw) / causalPw <= 0.0035) ||
+            (lower1S > 0 && (Math.abs(recentLow4 - lower1S) / lower1S <= 0.0035 || recentLow4 <= lower1S));
+          const testedCw =
+            (causalCw > 0 && Math.abs(recentHigh4 - causalCw) / causalCw <= 0.0035) ||
+            (upper1S > 0 && (Math.abs(recentHigh4 - upper1S) / upper1S <= 0.0035 || recentHigh4 >= upper1S));
+
+          let leg2Dir: "CALL" | "PUT" | null = null;
+          let leg2Stop = 0;
+          if (
+            canLeg2Call &&
+            testedPw &&
+            impChi >= 0.60 &&
+            dFlux6 > 0 &&
+            (dChi6 >= 0.03 || dImpChi6 >= 0.06) &&
+            barBody <= maxBody &&
+            causalCw - bar.close >= minRoom &&
+            bar.close > bar.open &&
+            bar.close >= fvwap &&
+            bar.close >= bar.sma34
+          ) {
+            leg2Dir = "CALL";
+            leg2Stop = Number(Math.min(recentLow4 - 0.10, bar.close - stopPad).toFixed(2));
+          } else if (
+            canLeg2Put &&
+            testedCw &&
+            impChi <= 0.40 &&
+            dFlux6 < 0 &&
+            (dChi6 <= -0.03 || dImpChi6 <= -0.06) &&
+            -barBody <= maxBody &&
+            bar.close - causalPw >= minRoom &&
+            bar.close < bar.open &&
+            bar.close <= fvwap &&
+            bar.close <= bar.sma34
+          ) {
+            leg2Dir = "PUT";
+            leg2Stop = Number(Math.max(recentHigh4 + 0.10, bar.close + stopPad).toFixed(2));
+          }
+          if (!leg2Dir) continue;
+
+          const isCall = leg2Dir === "CALL";
+          const entrySpot = bar.close;
+          const atmIv = estimateDynamicAtmIv(unifiedBars, idx);
+          const risk = Math.max(0.20, Math.abs(entrySpot - leg2Stop));
+          const minT1Dist = Math.max(0.35, entrySpot * 0.0016);
+          const target1Spot = isCall
+            ? Number((entrySpot + Math.max(minT1Dist, risk * 1.5)).toFixed(2))
+            : Number((entrySpot - Math.max(minT1Dist, risk * 1.5)).toFixed(2));
+          const target2Spot = isCall
+            ? Number((target1Spot + risk).toFixed(2))
+            : Number((target1Spot - risk).toFixed(2));
+
+          const picked = selectCompliantBacktestContract({
+            spot: entrySpot,
+            direction: isCall ? "LONG" : "SHORT",
+            barTsSec: bar.ts,
+            etMins: bar.totalMinutes,
+            atmIv,
+            target1Spot,
+            callWall: causalCw,
+            putWall: causalPw,
+            impulsePeclet: flowSnap?.impulsePeclet,
+            pecletNumber: flowSnap?.pecletNumber,
+            impulseChi: flowSnap?.impulseChi,
+            gammaRegime: flowSnap?.gammaRegime,
+          });
+          if (!picked) continue;
+          if (picked.quote.ask * 100 > 100) violations++;
+
+          activePosition = {
+            type: leg2Dir,
+            setupName: leg2Dir === "CALL" ? "Leg-2 Reclaim" : "Leg-2 Rejection",
+            strike: picked.strike,
+            entrySpot,
+            target1Spot,
+            target2Spot,
+            stopLossSpot: leg2Stop,
+            entryAsk: picked.quote.ask,
+            iv: atmIv,
+            dteDays: picked.dteDays,
+            seenSmaSide: isCall ? entrySpot >= bar.sma34 : entrySpot <= bar.sma34,
+            openedTs: bar.ts,
+            peakBarR: 0,
+            runnerArmed: false,
+          };
+          tradeCountToday++;
+          if (tradeCountToday > 2) violations++;
+        }
       }
     }
   }
-  return null;
+
+  return {
+    ticker,
+    category,
+    source,
+    sessions: days.length,
+    trades,
+    wins,
+    losses,
+    winRatePct: trades > 0 ? (wins / trades) * 100 : 0,
+    netDollars: equity,
+    profitFactor: grossLoss > 0 ? (grossWin / grossLoss).toFixed(2) : grossWin > 0 ? "INF" : "0.00",
+    maxDrawdown: maxDd,
+    expectancyR: trades > 0 ? sumR / trades : 0,
+    violations,
+  };
+}
+
+async function runAllGaiaTickersAudit(targetDateArg?: string) {
+  const allTickers = GAIA_TICKER_ROWS.flat();
+  console.log("===================================================================================================================================");
+  console.log(`   51-TICKER WALK-FORWARD AUDIT · FLUX-FIELD + TAYLOR PAYOFF ROUTER (isHistoricalBackfill: true · Zero Webhooks)`);
+  console.log("===================================================================================================================================\n");
+
+  const rows: TickerBenchmarkRow[] = [];
+  const batchSize = 6;
+  for (let i = 0; i < allTickers.length; i += batchSize) {
+    const batch = allTickers.slice(i, i + batchSize);
+    const batchResults = await Promise.all(
+      batch.map((sym) => runTickerBenchmarkRow(sym, targetDateArg))
+    );
+    rows.push(...batchResults);
+  }
+
+  rows.sort((a, b) => {
+    const aHas = a.trades > 0 ? 1 : 0;
+    const bHas = b.trades > 0 ? 1 : 0;
+    if (aHas !== bHas) return bHas - aHas;
+    if (Math.abs(b.expectancyR - a.expectancyR) > 1e-9) {
+      return b.expectancyR - a.expectancyR;
+    }
+    if (Math.abs(b.netDollars - a.netDollars) > 1e-9) {
+      return b.netDollars - a.netDollars;
+    }
+    return b.trades - a.trades;
+  });
+
+  console.log("| Ticker | Category       | Days | Trades | W/L     | Win Rate | Net PnL   | Profit Factor | Max DD  | Expectancy (R) | Invariant Violations |");
+  console.log("|--------|----------------|------|--------|---------|----------|-----------|---------------|---------|----------------|----------------------|");
+  for (const r of rows) {
+    const wl = `${r.wins}W/${r.losses}L`;
+    const pnl = `${r.netDollars >= 0 ? "+" : "-"}$${Math.abs(r.netDollars).toFixed(2)}`;
+    const exp = `${r.expectancyR >= 0 ? "+" : ""}${r.expectancyR.toFixed(2)}R`;
+    console.log(
+      `| ${r.ticker.padEnd(6)} | ${r.category.padEnd(14)} | ${String(r.sessions).padStart(4)} | ${String(r.trades).padStart(6)} | ${wl.padEnd(7)} | ${r.winRatePct.toFixed(1).padStart(7)}% | ${pnl.padStart(9)} | ${r.profitFactor.padStart(13)} | $${r.maxDrawdown.toFixed(2).padStart(6)} | ${exp.padStart(14)} | ${String(r.violations).padStart(20)} |`
+    );
+  }
+
+  const totalTrades = rows.reduce((s, r) => s + r.trades, 0);
+  const totalWins = rows.reduce((s, r) => s + r.wins, 0);
+  const totalLosses = rows.reduce((s, r) => s + r.losses, 0);
+  const totalNetDollars = rows.reduce((s, r) => s + r.netDollars, 0);
+  const totalViolations = rows.reduce((s, r) => s + r.violations, 0);
+  const tickersWithData = rows.filter((r) => r.sessions > 0).length;
+  const tickersWithTrades = rows.filter((r) => r.trades > 0).length;
+  const portfolioWinRate = totalTrades > 0 ? (totalWins / totalTrades) * 100 : 0;
+  const weightedExpectancyR =
+    totalTrades > 0
+      ? rows.reduce((s, r) => s + r.expectancyR * r.trades, 0) / totalTrades
+      : 0;
+
+  console.log("\n===================================================================================================================================");
+  console.log("   PORTFOLIO SUMMARY (ALL 51 GAIA TICKERS)");
+  console.log("===================================================================================================================================");
+  console.log(`  Tickers Audited:            ${rows.length} (${tickersWithData} with bars, ${tickersWithTrades} with signals)`);
+  console.log(`  Total Trades / W-L:         ${totalTrades} (${totalWins}W / ${totalLosses}L · ${portfolioWinRate.toFixed(1)}% Win Rate)`);
+  console.log(`  Total Net Dollar P&L:       ${totalNetDollars >= 0 ? "+" : "-"}$${Math.abs(totalNetDollars).toFixed(2)}`);
+  console.log(`  Trade-Weighted Expectancy:  ${weightedExpectancyR >= 0 ? "+" : ""}${weightedExpectancyR.toFixed(2)}R`);
+  console.log(`  Total Invariant Violations: ${totalViolations} (Must be exactly 0)`);
+
+  const whitelist = rows.filter(
+    (r) => r.trades > 0 && r.winRatePct >= 55 && r.expectancyR >= 0.35 && r.violations === 0
+  );
+  console.log("\n===================================================================================================================================");
+  console.log("   TOP-PERFORMING LIVE WHITELIST (Win Rate >= 55% · Expectancy >= +0.35R · 0 Violations)");
+  console.log("===================================================================================================================================");
+  if (whitelist.length === 0) {
+    console.log("  No tickers met all whitelist thresholds in this window.");
+  } else {
+    for (const r of whitelist) {
+      const pnl = `${r.netDollars >= 0 ? "+" : "-"}$${Math.abs(r.netDollars).toFixed(2)}`;
+      console.log(
+        `  - ${r.ticker.padEnd(6)} (${r.category.padEnd(14)}) | ${r.wins}W/${r.losses}L (${r.winRatePct.toFixed(1)}%) | ${pnl} | +${r.expectancyR.toFixed(2)}R | PF ${r.profitFactor}`
+      );
+    }
+  }
+  console.log("===================================================================================================================================\n");
+
+  if (totalViolations > 0) {
+    console.error(`\n>> [FAILED] ${totalViolations} INVARIANT VIOLATION(S) DETECTED ACROSS 51-TICKER AUDIT. <<\n`);
+    process.exit(1);
+  }
 }
 
 async function run10DaySniperAudit() {
-  console.log("================================================================================");
-  console.log("   HYPERION / GEXVEX 10-DAY WALK-FORWARD SNIPER ENGINE REPLAY AUDIT             ");
-  console.log("================================================================================\n");
-
   const args = process.argv.slice(2);
+  const allGaiaTickersFlag = args.includes("--all-gaia-tickers");
   const targetDateArg =
     args.find((a) => a.startsWith("--date="))?.split("=")[1] ||
     args.find((a) => /^\d{4}-\d{2}-\d{2}$/.test(a));
+
+  if (allGaiaTickersFlag) {
+    await runAllGaiaTickersAudit(targetDateArg);
+    return;
+  }
+
+  console.log("================================================================================");
+  console.log("   HYPERION / GEXVEX 10-DAY WALK-FORWARD SNIPER ENGINE REPLAY AUDIT             ");
+  console.log("================================================================================\n");
 
   const allBars: Bar[] = [];
   const localCachePath = targetDateArg
@@ -690,30 +1496,11 @@ async function run10DaySniperAudit() {
           const explicitKing = date === "2026-10-26" ? 767 : undefined;
           const candidate = evaluateUnifiedSniperSetup(unifiedBars, idx, explicitKing);
 
-          if (candidate) {
+  if (candidate) {
             const isCall = candidate.direction === "LONG";
             const entrySpot = bar.close;
             const atmIv = candidate.features.atmIv;
-
-            // Strict Near-ATM Invariant: <= min($3.50, 0.45%) OTM, |delta| >= 0.25, Ask <= $0.99 (Outlay <= $100)
-            const picked = selectCompliantBacktestContract({
-              spot: entrySpot,
-              direction: candidate.direction,
-              barTsSec: bar.ts,
-              atmIv,
-              dteCandidates: [0],
-            });
-            if (!picked) continue;
-
-            const { strike, quote, dteDays, remainingYears } = picked;
-
-            // Bid/ask crossing on entry: market buy at ask
-            const entryAsk = quote.ask;
-            const contractsQty = 1; // Strict 1-contract sniper limit
-            const outlay = Number((entryAsk * 100 * contractsQty).toFixed(2));
-
-            if (contractsQty !== 1) totalContractsQuantityViolations++;
-            if (outlay > 100) totalOutlayViolations++;
+            const flowSnapLeg1 = sessionFlow[idx];
 
             // Structural stops anchored below session opening low (calls) or above opening high (puts)
             const rawStopSpot = isCall
@@ -727,6 +1514,30 @@ async function run10DaySniperAudit() {
             const target2Spot = isCall
               ? Number((entrySpot + risk * 2.5).toFixed(2))
               : Number((entrySpot - risk * 2.5).toFixed(2));
+
+            // Regime-conditioned delta + second-order Taylor payoff routing
+            const picked = selectCompliantBacktestContract({
+              spot: entrySpot,
+              direction: candidate.direction,
+              barTsSec: bar.ts,
+              etMins: bar.totalMinutes,
+              atmIv,
+              target1Spot,
+              impulsePeclet: flowSnapLeg1?.impulsePeclet,
+              pecletNumber: flowSnapLeg1?.pecletNumber,
+              gammaRegime: flowSnapLeg1?.gammaRegime,
+            });
+            if (!picked) continue;
+
+            const { strike, quote, dteDays, remainingYears } = picked;
+
+            // Bid/ask crossing on entry: market buy at ask
+            const entryAsk = quote.ask;
+            const contractsQty = 1; // Strict 1-contract sniper limit
+            const outlay = Number((entryAsk * 100 * contractsQty).toFixed(2));
+
+            if (contractsQty !== 1) totalContractsQuantityViolations++;
+            if (outlay > 100) totalOutlayViolations++;
 
             activePosition = {
               type: isCall ? "CALL" : "PUT",
@@ -838,19 +1649,7 @@ async function run10DaySniperAudit() {
           if (leg2Signal) {
             const isCall = leg2Signal.dir === "CALL";
             const entrySpot = bar.close;
-            // 1 trading session DTE (never calendar 3 on Friday), falling back to 0DTE if >$0.99 or <0.25 delta
-            const dteCandidates = bar.totalMinutes >= 690 ? [1, 0] : [0];
             const atmIv = estimateDynamicAtmIv(unifiedBars, idx);
-            const picked = selectCompliantBacktestContract({
-              spot: entrySpot,
-              direction: isCall ? "LONG" : "SHORT",
-              barTsSec: bar.ts,
-              atmIv,
-              dteCandidates,
-            });
-            if (!picked) continue;
-
-            const { strike, quote, dteDays, remainingYears } = picked;
             const risk = Math.max(0.5, Math.abs(entrySpot - leg2Signal.stopLossSpot));
             const target1Spot = isCall
               ? Number((entrySpot + Math.max(1.25, risk * 1.5)).toFixed(2))
@@ -858,6 +1657,23 @@ async function run10DaySniperAudit() {
             const target2Spot = isCall
               ? Number((target1Spot + risk).toFixed(2))
               : Number((target1Spot - risk).toFixed(2));
+
+            const picked = selectCompliantBacktestContract({
+              spot: entrySpot,
+              direction: isCall ? "LONG" : "SHORT",
+              barTsSec: bar.ts,
+              etMins: bar.totalMinutes,
+              atmIv,
+              target1Spot,
+              callWall: causalCallWall,
+              putWall: causalPutWall,
+              impulsePeclet: flowSnap?.impulsePeclet,
+              pecletNumber: flowSnap?.pecletNumber,
+              gammaRegime: flowSnap?.gammaRegime,
+            });
+            if (!picked) continue;
+
+            const { strike, quote, dteDays, remainingYears } = picked;
 
             activePosition = {
               type: leg2Signal.dir,
@@ -943,6 +1759,45 @@ async function run10DaySniperAudit() {
     console.error("\n>> [FAILED] INVARIANT VIOLATION DETECTED DURING WALK-FORWARD AUDIT. <<\n");
     process.exit(1);
   }
+
+  // Multi-Ticker Benchmark Table (SPY, QQQ, IWM)
+  const spyRow: TickerBenchmarkRow = {
+    ticker: "SPY",
+    category: GAIA_TICKER_CATEGORIES["SPY"] ?? "Index/ETF",
+    source: localCacheLoaded ? "CACHE_INTRADAY" : "YAHOO_10D",
+    sessions: tradingDays.length,
+    trades: totalTradesExecuted,
+    wins: totalWinningTrades,
+    losses: totalLosingTrades,
+    winRatePct: winRate,
+    netDollars: equityDollars,
+    profitFactor,
+    maxDrawdown: maxDrawdownDollars,
+    expectancyR: avgRMultiple,
+    violations:
+      totalOutlayViolations +
+      totalContractsQuantityViolations +
+      totalOverlappingViolations +
+      totalMultiTradeViolations,
+  };
+  const qqqRow = await runTickerBenchmarkRow("QQQ", targetDateArg);
+  const iwmRow = await runTickerBenchmarkRow("IWM", targetDateArg);
+  const benchRows = [spyRow, qqqRow, iwmRow];
+
+  console.log("================================================================================");
+  console.log("   MULTI-TICKER BENCHMARK TABLE (SPY · QQQ · IWM)                              ");
+  console.log("================================================================================");
+  console.log("| Ticker | Source         | Days | Trades | W/L   | Win Rate | Net PnL   | PF    | Max DD  | Expectancy | Violations |");
+  console.log("|--------|----------------|------|--------|-------|----------|-----------|-------|---------|------------|------------|");
+  for (const r of benchRows) {
+    const wl = `${r.wins}W/${r.losses}L`;
+    const pnl = `${r.netDollars >= 0 ? "+" : ""}$${r.netDollars.toFixed(2)}`;
+    const exp = `${r.expectancyR >= 0 ? "+" : ""}${r.expectancyR.toFixed(2)}R`;
+    console.log(
+      `| ${r.ticker.padEnd(6)} | ${r.source.padEnd(14)} | ${String(r.sessions).padStart(4)} | ${String(r.trades).padStart(6)} | ${wl.padEnd(5)} | ${r.winRatePct.toFixed(1).padStart(7)}% | ${pnl.padStart(9)} | ${r.profitFactor.padStart(5)} | $${r.maxDrawdown.toFixed(2).padStart(6)} | ${exp.padStart(10)} | ${String(r.violations).padStart(10)} |`
+    );
+  }
+  console.log("================================================================================\n");
 }
 
 run10DaySniperAudit().catch((err) => {

@@ -13,6 +13,8 @@ import {
   deriveTacticalStructuralLevels,
   type NormalizedOptionContract,
 } from "@/lib/optionsExposure";
+import { fetchLiveTickQuote } from "@/lib/liveTick";
+import { runPostMarketAttribution } from "@/lib/agenticSupervisor";
 
 const POLL_INTERVAL_MS = 20_000; // 20 seconds during RTH
 const DEFAULT_WATCH_TICKERS = ["SPY"] as const;
@@ -34,6 +36,7 @@ interface LiveBotGlobalState {
   lastStatus: string;
   pollCount: number;
   sessionDateEt: string;
+  lastAttributionDate?: string;
   dispatchedCount: number;
   activeTrackedTickers: Map<string, number>;
 }
@@ -373,6 +376,19 @@ export async function runLiveBotTick(): Promise<void> {
   const initialStore = loadTradeStore();
   const hasStrandedOpen = Object.keys(initialStore.activePositions || {}).length > 0;
   if (!rthOpen && !hasStrandedOpen) {
+    if (
+      startClock.isWeekday &&
+      startClock.etMins >= 965 &&
+      botState.lastAttributionDate !== startClock.etDate &&
+      !initialStore.shadowParityReport
+    ) {
+      botState.lastAttributionDate = startClock.etDate;
+      try {
+        runPostMarketAttribution({ date: startClock.etDate });
+      } catch {
+        // Non-fatal post-market attribution
+      }
+    }
     releaseBarEvaluationLock(lockToken);
     if (!botState.isStopped) botState.lastStatus = "OUTSIDE_RTH";
     return;
@@ -509,7 +525,22 @@ export async function runLiveBotTick(): Promise<void> {
         let enrichedCandle = candleResult.candle;
         const divergence5m = candleResult.divergence5m;
         const divergence30m = candleResult.divergence30m;
-        const resolvedSpot = cachedLiveSpot > 0 ? cachedLiveSpot : enrichedCandle?.close ?? 0;
+        const liveTick = await fetchLiveTickQuote(
+          ticker === "SPXW" ? "SPX" : ticker,
+          controller.signal
+        ).catch(() => null);
+        const tickSpot =
+          liveTick && liveTick.spot > 0
+            ? ticker === "SPXW" || ticker === "SPX"
+              ? Number(liveTick.spot.toFixed(2))
+              : liveTick.spot
+            : 0;
+        const resolvedSpot =
+          tickSpot > 0
+            ? tickSpot
+            : cachedLiveSpot > 0
+              ? cachedLiveSpot
+              : enrichedCandle?.close ?? 0;
 
         let resolvedLevels = initialLevels;
         if (!resolvedLevels && resolvedSpot > 0 && contracts.length > 0) {
@@ -545,6 +576,7 @@ export async function runLiveBotTick(): Promise<void> {
           filteredKing: resolvedLevels?.tacticalKing,
           bookCenter: resolvedLevels?.zeroGamma ?? 0,
           netGex: resolvedLevels?.netGexMillions,
+          dataSource: "CBOE_MARKET_DATA",
           contracts,
           latest5mCandle: enrichedCandle,
           divergence5m,

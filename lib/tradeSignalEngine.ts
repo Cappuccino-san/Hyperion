@@ -13,6 +13,15 @@ import {
 } from "@/lib/flowGammaVwap";
 import { WATCH_LIST } from "@/lib/tickerPresets";
 import { computeAdaptiveQuantMetrics } from "@/lib/gaiaSignalFsm";
+import { fetchLiveTickQuote } from "@/lib/liveTick";
+import {
+  resolveMinOptionDelta,
+  computeBoundedExpectedMove,
+  scoreContractTaylorPayoff,
+  getMaxOtmDistance,
+  classifyMicrostructuralRegime,
+  type MicrostructuralRegime,
+} from "@/lib/alphaScorer";
 import {
   RTH_OPEN_MINS,
   ENTRY_START_MINS,
@@ -174,6 +183,40 @@ export interface TradeLifecycleAlert {
   pecletNumber?: number;
 }
 
+export interface ShadowParityTradeDelta {
+  ticker: string;
+  direction: ContractType;
+  replayTimeEt: string;
+  replayTs: number;
+  replayStrike: number;
+  replayEntryAsk: number;
+  replayExitPrice: number;
+  liveTradeId?: string;
+  liveTimeEt?: string;
+  liveTs?: number;
+  liveStrike?: number;
+  liveEntryAsk?: number;
+  liveExitPrice?: number;
+  matched: boolean;
+  entrySlippageDollars: number;
+  totalSlippageDollars: number;
+}
+
+export interface ShadowParityReport {
+  date: string;
+  ticker: string;
+  generatedAt: string;
+  replayTradeCount: number;
+  liveTradeCount: number;
+  matchedTrades: number;
+  missedLiveTrades: number;
+  extraLiveTrades: number;
+  slippageDriftDollars: number;
+  parityScorePct: number;
+  status: "PASS" | "DRIFT_WARNING" | "NO_SNAPSHOT";
+  details: ShadowParityTradeDelta[];
+}
+
 export interface DailyTradeStore {
   date: string; // YYYY-MM-DD (ET)
   version?: number;
@@ -185,6 +228,7 @@ export interface DailyTradeStore {
   backfilledTickers?: Record<string, boolean>;
   dispatchedAlertIds?: Record<string, boolean>;
   dailyRecapSent?: boolean;
+  shadowParityReport?: ShadowParityReport;
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
   macroRegime?: "CALL" | "PUT";
   chiPct?: number;
@@ -263,6 +307,7 @@ export interface TradeEvaluationParams {
   priorClose?: number;
   premarketFlowVwap?: number;
   netGex?: number;
+  dataSource?: string;
   signal?: AbortSignal;
 }
 
@@ -595,6 +640,29 @@ export function getNowEtTime(date?: Date): { hours: number; minutes: number; tot
   return { hours, minutes, totalMinutes: hours * 60 + minutes };
 }
 
+function resolveActiveTradeFilePath(cacheDir: string, date: string): string {
+  const isTestRunner =
+    typeof process !== "undefined" &&
+    (process.env.NODE_ENV === "test" ||
+      (Array.isArray(process.argv) &&
+        process.argv.some((arg) =>
+          /verifyExecutionInvariants|testDiscordSignalDispatch|\.(test|spec)\./.test(arg)
+        )));
+  if (isTestRunner && date === getTodayEt()) {
+    const isolatedPath = path.join(cacheDir, `active-trades-${date}.test-${process.pid}.tmp.json`);
+    if (!(globalThis as any).__hyperionIsolatedCleanupRegistered) {
+      (globalThis as any).__hyperionIsolatedCleanupRegistered = true;
+      process.once("exit", () => {
+        try {
+          if (fs.existsSync(isolatedPath)) fs.unlinkSync(isolatedPath);
+        } catch {}
+      });
+    }
+    return isolatedPath;
+  }
+  return path.join(cacheDir, `active-trades-${date}.json`);
+}
+
 export function loadTradeStore(requestedDate?: string): DailyTradeStore {
   const today = getTodayEt();
   const cacheDir = getCacheDir();
@@ -624,7 +692,7 @@ export function loadTradeStore(requestedDate?: string): DailyTradeStore {
     };
   }
 
-  const filePath = path.join(cacheDir, `active-trades-${today}.json`);
+  const filePath = resolveActiveTradeFilePath(cacheDir, today);
 
   if (inMemoryTradeStore && inMemoryTradeStore.date === today) {
     if (fs.existsSync(filePath)) {
@@ -718,16 +786,21 @@ export function loadTradeStore(requestedDate?: string): DailyTradeStore {
 
 export function saveTradeStore(store: DailyTradeStore): void {
   const cacheDir = getCacheDir();
-  const filePath = path.join(cacheDir, `active-trades-${store.date}.json`);
+  const filePath = resolveActiveTradeFilePath(cacheDir, store.date);
   const writeSeq = ((globalThis as any).__tradeWriteSeq = ((globalThis as any).__tradeWriteSeq || 0) + 1);
   const tmpPath = path.join(cacheDir, `active-trades-${store.date}.json.tmp.${process.pid}.${Date.now()}.${writeSeq}`);
+  const prevVersion =
+    inMemoryTradeStore && inMemoryTradeStore.date === store.date
+      ? (inMemoryTradeStore.version ?? 0)
+      : 0;
   try {
-    store.version = (store.version ?? 0) + 1;
+    store.version = Math.max(store.version ?? 0, prevVersion) + 1;
     store.updatedAtMs = Date.now();
+    const serialized = JSON.stringify(store, null, 2);
     inMemoryTradeStore = store;
     globalForTradeStore.__hyperionInMemoryTradeStore = store;
-    fs.writeFileSync(tmpPath, JSON.stringify(store, null, 2), "utf-8");
-    for (let attempt = 0; attempt < 3; attempt++) {
+    fs.writeFileSync(tmpPath, serialized, "utf-8");
+    for (let attempt = 0; attempt < 6; attempt++) {
       try {
         fs.renameSync(tmpPath, filePath);
         if (store.date === getTodayEt()) {
@@ -740,9 +813,19 @@ export function saveTradeStore(store: DailyTradeStore): void {
         return;
       } catch (renameErr: any) {
         const code = renameErr?.code;
-        if (attempt < 2 && (code === "EPERM" || code === "EACCES" || code === "EBUSY")) {
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+        if (attempt < 5 && (code === "EPERM" || code === "EACCES" || code === "EBUSY")) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15 * (attempt + 1));
           continue;
+        }
+        if (code === "EPERM" || code === "EACCES" || code === "EBUSY") {
+          // Windows AV/indexer fallback: overwrite target directly so memory and disk never diverge
+          fs.writeFileSync(filePath, serialized, "utf-8");
+          if (store.date === getTodayEt()) {
+            try {
+              globalForTradeStore.__hyperionTradeStoreMtimeMs = fs.statSync(filePath).mtimeMs;
+            } catch {}
+          }
+          return;
         }
         throw renameErr;
       }
@@ -830,6 +913,100 @@ export function getCachedSpotPrice(ticker: string): number | null {
   return spotPriceCache.get(cboeSymbol) ?? spotPriceCache.get(sym) ?? null;
 }
 
+export function isTradierDataSource(dataSource?: string | null): boolean {
+  if (!dataSource) return false;
+  const norm = dataSource.trim().toLowerCase();
+  return norm === "tradier" || norm === "tradier_live";
+}
+
+/**
+ * Re-anchors delayed (non-Tradier) option quotes (mid, bid, ask, Greeks) against live
+ * underlying spotPrice and chain implied volatility using Black-Scholes with skew.
+ */
+export function reanchorDelayedOptionContract(params: {
+  contract: NormalizedOptionContract;
+  liveSpotPrice: number;
+  dataSource?: string | null;
+  todayEt?: string;
+  nowMs?: number;
+  fallbackAtmIv?: number;
+}): NormalizedOptionContract {
+  const { contract, liveSpotPrice, dataSource, todayEt, nowMs, fallbackAtmIv } = params;
+  if (isTradierDataSource(dataSource)) return contract;
+  if (!Number.isFinite(liveSpotPrice) || liveSpotPrice <= 0) return contract;
+  if (typeof contract.expiration !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(contract.expiration)) {
+    return contract;
+  }
+
+  const rawBid = typeof contract.bid === "number" && Number.isFinite(contract.bid) ? contract.bid : undefined;
+  const rawAsk = typeof contract.ask === "number" && Number.isFinite(contract.ask) ? contract.ask : undefined;
+  // Preserve crossed or dead quotes so downstream spread/ask firewalls reject them cleanly
+  if (rawBid !== undefined && rawAsk !== undefined && rawBid > rawAsk) return contract;
+  if (rawAsk !== undefined && rawAsk <= 0) return contract;
+
+  const refDate = todayEt || getTodayEt();
+  if (contract.expiration < refDate) return contract;
+  const { dte } = formatExpirationHuman(contract.expiration, refDate);
+  if (!Number.isFinite(dte) || dte < 0) return contract;
+
+  const rawIv =
+    typeof contract.iv === "number" && Number.isFinite(contract.iv) && contract.iv > 0
+      ? contract.iv > 4
+        ? contract.iv / 100
+        : contract.iv
+      : 0;
+  const hasChainIv = rawIv >= 0.04 && rawIv <= 2.5;
+  const fallbackIv =
+    typeof fallbackAtmIv === "number" && Number.isFinite(fallbackAtmIv) && fallbackAtmIv >= 0.04
+      ? Math.min(2.5, fallbackAtmIv)
+      : 0;
+  if (!hasChainIv && fallbackIv <= 0) return contract;
+
+  const rawMid =
+    rawBid !== undefined && rawAsk !== undefined && rawBid > 0 && rawAsk >= rawBid
+      ? (rawBid + rawAsk) / 2
+      : getContractMidPrice(contract);
+  const rawHalfSpreadPct =
+    rawBid !== undefined && rawAsk !== undefined && rawBid > 0 && rawAsk >= rawBid && rawMid > 0
+      ? (rawAsk - rawBid) / (2 * rawMid)
+      : 0.012;
+  const halfSpreadPct = Math.max(0.012, rawHalfSpreadPct);
+
+  const remainingYears = computeRemainingYearsToExpiration(nowMs ?? Date.now(), Math.max(0, dte));
+  const bsQuote = priceOptionWithSkew({
+    spot: liveSpotPrice,
+    strike: contract.strike,
+    direction: contract.optionType === "C" ? "LONG" : "SHORT",
+    remainingYears,
+    atmIv: hasChainIv ? rawIv : fallbackIv,
+    skewSlope: hasChainIv ? 0 : -3.5,
+    smileConvexity: hasChainIv ? 0 : 12.0,
+    halfSpreadPct,
+  });
+
+  // Preserve wide-spread rejection signal if raw chain spread exceeded 24%
+  let reanchoredBid = bsQuote.bid;
+  let reanchoredAsk = bsQuote.ask;
+  if (rawHalfSpreadPct > 0.14) {
+    reanchoredBid = Math.max(0.01, Number((bsQuote.mid * (1 - rawHalfSpreadPct)).toFixed(2)));
+    reanchoredAsk = Math.max(reanchoredBid + 0.01, Number((bsQuote.mid * (1 + rawHalfSpreadPct)).toFixed(2)));
+  }
+  if (rawBid !== undefined && rawBid <= 0) {
+    reanchoredBid = rawBid;
+  }
+
+  return {
+    ...contract,
+    bid: reanchoredBid,
+    ask: reanchoredAsk,
+    last: bsQuote.mid,
+    delta: Number(bsQuote.delta.toFixed(4)),
+    gamma: Number(bsQuote.gamma.toFixed(4)),
+    theta: Number(bsQuote.thetaPerDay.toFixed(4)),
+    iv: hasChainIv ? rawIv : bsQuote.iv,
+  };
+}
+
 export async function fetchLiveCboeOptions(
   ticker: string,
   signal?: AbortSignal
@@ -862,10 +1039,17 @@ export async function fetchLiveCboeOptions(
 
     const spot = Number(data.current_price ?? data.close ?? 0);
 
-    // Fetch live real-time spot price directly from Robinhood (sub-second OPRA/NLS feed; skip index NDX/NDXP)
-    const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym;
+    // Fetch sub-second live spot via /api/tick multi-source race (CNBC, Robinhood, Yahoo)
+    const tickSym = sym === "SPXW" ? "SPX" : sym === "NDXP" ? "NDX" : sym;
     let realTimeSpot = spot;
-    if (sym !== "NDX" && sym !== "NDXP") {
+    const tickQuote = await fetchLiveTickQuote(tickSym, signal);
+    if (tickQuote && tickQuote.spot > 0 && Number.isFinite(tickQuote.spot)) {
+      realTimeSpot = tickQuote.spot;
+    }
+
+    // Fallback: Robinhood direct OPRA/NLS quote
+    if ((realTimeSpot <= 0 || realTimeSpot === spot) && sym !== "NDX" && sym !== "NDXP") {
+      const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym;
       try {
         const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
           headers: {
@@ -931,8 +1115,9 @@ export async function fetchLiveCboeOptions(
       }
     }
 
-    // Difference between real-time market spot and 15-minute delayed CBOE spot
     const deltaSpot = realTimeSpot > 0 && spot > 0 ? realTimeSpot - spot : 0;
+    const todayEt = getTodayEt();
+    const nowMs = Date.now();
 
     const rawOptions = data.options;
     if (!Array.isArray(rawOptions)) return cached?.contracts ?? [];
@@ -950,28 +1135,14 @@ export async function fetchLiveCboeOptions(
 
       const openInterest = Number(raw.open_interest ?? 0);
       const volume = Number(raw.volume ?? 0);
-      let bid = Number(raw.bid ?? 0);
-      let ask = Number(raw.ask ?? 0);
-      let last = Number(raw.last_trade_price ?? 0);
+      const bid = Number(raw.bid ?? 0);
+      const ask = Number(raw.ask ?? 0);
+      const last = Number(raw.last_trade_price ?? 0);
 
       // Filter out totally dead contracts with zero quote & zero interest
       if (bid <= 0 && ask <= 0 && last <= 0 && openInterest <= 0 && volume <= 0) continue;
 
-      const delta = Number(raw.delta ?? 0);
-      const gamma = Math.max(0, Number(raw.gamma ?? 0.05));
-      const isCall = typeChar === "C";
-      const signedDelta = isCall ? Math.abs(delta || 0.45) : -Math.abs(delta || 0.45);
-
-      // Real-time Greek synchronization: adjust delayed CBOE option pricing to current live spot
-      if (Math.abs(deltaSpot) > 0.05 && Math.abs(delta) > 0.02) {
-        // First-order Taylor delta adjustment + second-order gamma convexity
-        const priceAdj = deltaSpot * signedDelta + 0.5 * gamma * deltaSpot * deltaSpot;
-        if (bid > 0) bid = Number(Math.max(0.01, bid + priceAdj).toFixed(2));
-        if (ask > 0) ask = Number(Math.max(0.02, ask + priceAdj).toFixed(2));
-        if (last > 0) last = Number(Math.max(0.01, last + priceAdj).toFixed(2));
-      }
-
-      contracts.push({
+      const rawContract: NormalizedOptionContract = {
         symbol: occ,
         expiration,
         optionType: typeChar as "C" | "P",
@@ -979,14 +1150,29 @@ export async function fetchLiveCboeOptions(
         openInterest,
         volume,
         iv: Number(raw.iv ?? 0),
-        delta,
+        delta: Number(raw.delta ?? 0),
         gamma: Number(raw.gamma ?? 0),
         vega: Number(raw.vega ?? 0),
+        theta: typeof raw.theta === "number" && Number.isFinite(raw.theta) ? raw.theta : undefined,
         percentChange: Number(raw.percent_change ?? 0),
         bid,
         ask,
         last,
-      });
+      };
+
+      // Live-Spot Black-Scholes Re-Anchoring for delayed CBOE feed using priceOptionWithSkew
+      const syncedContract =
+        Math.abs(deltaSpot) > 0.02 && effectiveSpot > 0
+          ? reanchorDelayedOptionContract({
+              contract: rawContract,
+              liveSpotPrice: effectiveSpot,
+              dataSource: "CBOE_MARKET_DATA",
+              todayEt,
+              nowMs,
+            })
+          : rawContract;
+
+      contracts.push(syncedContract);
     }
 
     if (contracts.length > 0) {
@@ -1071,6 +1257,14 @@ export async function selectSmallAccountContract(params: {
   nowEt?: Date;
   zeroDteCallWall?: number;
   zeroDtePutWall?: number;
+  dailyExpectedMove?: { low: number; high: number } | null;
+  dataSource?: string;
+  regime?: MicrostructuralRegime;
+  impulsePeclet?: number;
+  pecletNumber?: number;
+  gammaRegime?: "POSITIVE_GAMMA" | "NEGATIVE_GAMMA";
+  netGex?: number;
+  zeroGamma?: number;
   signal?: AbortSignal;
 }): Promise<SelectedOptionContract | null> {
   const {
@@ -1083,6 +1277,14 @@ export async function selectSmallAccountContract(params: {
     nowEt,
     zeroDteCallWall,
     zeroDtePutWall,
+    dailyExpectedMove,
+    dataSource,
+    regime,
+    impulsePeclet,
+    pecletNumber,
+    gammaRegime,
+    netGex,
+    zeroGamma,
     signal,
   } = params;
 
@@ -1118,12 +1320,14 @@ export async function selectSmallAccountContract(params: {
     Array.isArray(contracts) &&
     contracts.length > 0 &&
     contracts.some((c) => c.strike > effectiveSpot * 3);
+  let resolvedDataSource = dataSource;
   if (!contracts || contracts.length === 0 || hasSpxScaleChain) {
     contracts = await fetchLiveCboeOptions(effectiveSym, signal);
+    if (!resolvedDataSource) resolvedDataSource = "CBOE_MARKET_DATA";
     if (signal?.aborted) return null;
   }
 
-  // 2. Filter from real CBOE chain
+  // 2. Filter from real chain (with live-spot BS re-anchoring for delayed non-Tradier chains)
   if (contracts && contracts.length > 0) {
     interface Candidate {
       contract: NormalizedOptionContract;
@@ -1139,27 +1343,112 @@ export async function selectSmallAccountContract(params: {
     }
 
     const stage1Candidates: Candidate[] = []; // Preferred DTEs
-    const stage2Candidates: Candidate[] = []; // Alternate DTEs
+    const stage2Candidates: Candidate[] = []; // Fallback DTEs
+    const stage3Candidates: Candidate[] = []; // Secondary long-dated fallback
 
     const isAfternoon = etTime.hours > 11 || (etTime.hours === 11 && etTime.minutes >= 30);
     const hasFutureExpirations = contracts.some(
       (item) => typeof item.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(item.expiration) && item.expiration > todayEt
     );
 
-    for (const c of contracts) {
-      if (c.optionType !== typeLetter) continue;
-      if (typeof c.expiration !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(c.expiration)) continue;
-      const mid = getContractMidPrice(c);
+    // Estimate ATM IV from chain for BS re-anchoring and remaining IV expected move
+    const chainIvSamples = contracts
+      .filter((item) => {
+        const ivVal = typeof item.iv === "number" && Number.isFinite(item.iv) ? (item.iv > 4 ? item.iv / 100 : item.iv) : 0;
+        return ivVal >= 0.04 && ivVal <= 2.5 && Math.abs(item.strike - effectiveSpot) <= effectiveSpot * 0.03;
+      })
+      .map((item) => (item.iv > 4 ? item.iv / 100 : item.iv));
+    const fallbackAtmIv =
+      chainIvSamples.length > 0
+        ? chainIvSamples.reduce((acc, v) => acc + v, 0) / chainIvSamples.length
+        : 0.16;
 
+    const shouldReanchorDelayed = Boolean(resolvedDataSource && !isTradierDataSource(resolvedDataSource));
+    const nowMs = (nowEt ?? new Date()).getTime();
+
+    const normZeroGamma =
+      typeof zeroGamma === "number" && zeroGamma > 0
+        ? (isSpxw ? zeroGamma / 10 : zeroGamma)
+        : undefined;
+    const hasRegimeContext =
+      regime !== undefined ||
+      impulsePeclet !== undefined ||
+      pecletNumber !== undefined ||
+      normZeroGamma !== undefined ||
+      netGex !== undefined ||
+      gammaRegime !== undefined;
+
+    const deltaRoute = hasRegimeContext
+      ? resolveMinOptionDelta({
+          regime,
+          spotPrice: effectiveSpot,
+          zeroGamma: normZeroGamma,
+          netGex,
+          impulsePeclet,
+          pecletNumber,
+          gammaRegime,
+        })
+      : {
+          regime: "POS_GAMMA_PIN" as MicrostructuralRegime,
+          minDelta: 0.25,
+          maxDelta: 0.50,
+          preferZeroDte: !isAfternoon,
+          fallbackOneToTwoDte: true,
+        };
+
+    const normZeroDteCw =
+      typeof zeroDteCallWall === "number" && zeroDteCallWall > 0
+        ? isSpxw
+          ? zeroDteCallWall / 10
+          : zeroDteCallWall
+        : 0;
+    const normZeroDtePw =
+      typeof zeroDtePutWall === "number" && zeroDtePutWall > 0
+        ? isSpxw
+          ? zeroDtePutWall / 10
+          : zeroDtePutWall
+        : 0;
+    const normDailyEm = dailyExpectedMove
+      ? isSpxw
+        ? { low: dailyExpectedMove.low / 10, high: dailyExpectedMove.high / 10 }
+        : dailyExpectedMove
+      : null;
+    const remainingRthMins = Math.max(15, Math.min(390, RTH_CLOSE_MINS - etTime.totalMinutes));
+    const boundedExpectedMove = computeBoundedExpectedMove({
+      spotPrice: effectiveSpot,
+      isCall,
+      target1Spot: effectiveTarget1,
+      target2Spot: effectiveTarget2,
+      zeroDteCallWall: normZeroDteCw,
+      zeroDtePutWall: normZeroDtePw,
+      dailyExpectedMove: normDailyEm,
+      atmIv: fallbackAtmIv,
+      remainingRthMinutes: remainingRthMins,
+    });
+    const maxOtmDistance = getMaxOtmDistance(effectiveSpot);
+
+    for (const rawContract of contracts) {
+      if (rawContract.optionType !== typeLetter) continue;
+      if (typeof rawContract.expiration !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(rawContract.expiration)) continue;
+
+      const c = shouldReanchorDelayed
+        ? reanchorDelayedOptionContract({
+            contract: rawContract,
+            liveSpotPrice: effectiveSpot,
+            dataSource: resolvedDataSource,
+            todayEt,
+            nowMs,
+            fallbackAtmIv,
+          })
+        : rawContract;
+
+      const mid = getContractMidPrice(c);
       const rawBid = typeof c.bid === "number" && Number.isFinite(c.bid) ? c.bid : undefined;
       const rawAsk = typeof c.ask === "number" && Number.isFinite(c.ask) ? c.ask : undefined;
       const askPrice = rawAsk !== undefined ? rawAsk : mid;
+
       // Strict Sub-$1.00 Ask Cap: retail buys at ASK ($0.15 <= ask <= $0.99)
       if (askPrice < 0.15 || askPrice > 0.99) continue;
-
-      // Reject low-delta lotto contracts (< 0.25 delta); never spoof missing/0 delta as 0.30
-      const absDelta = typeof c.delta === "number" && Number.isFinite(c.delta) ? Math.abs(c.delta) : 0;
-      if (absDelta < 0.25) continue;
 
       // Reject crossed/invalid quotes & wide-spread contracts (> 24% spread); never skip spread check when bid is missing
       const effectiveBid = rawBid ?? (askPrice > 0 ? 0 : -1);
@@ -1167,12 +1456,15 @@ export async function selectSmallAccountContract(params: {
       const spreadPct = (askPrice - effectiveBid) / askPrice;
       if (spreadPct > 0.24) continue;
 
+      // Regime-conditioned |delta| bounds (0.24..0.50 in NEG_GAMMA_TREND/ZERO_GAMMA_FLIP, 0.35..0.50 in POS_GAMMA_PIN)
+      const absDelta = typeof c.delta === "number" && Number.isFinite(c.delta) ? Math.abs(c.delta) : 0;
+      if (absDelta < deltaRoute.minDelta || absDelta > deltaRoute.maxDelta) continue;
+
       // Strike direction filter: OTM / near ATM in direction of move
       if (isCall && c.strike < effectiveSpot * 0.998) continue;
       if (!isCall && c.strike > effectiveSpot * 1.002) continue;
 
       // Hard Near-ATM / 1-3 Strike OTM Ceiling: never select deep-OTM lottos (> min($3.50, 0.45%) from spot)
-      const maxOtmDistance = Math.min(3.50, effectiveSpot * 0.0045);
       if (Math.abs(c.strike - effectiveSpot) > maxOtmDistance) continue;
 
       const { expHuman, robinhoodExp, robinhoodTab, dte } = formatExpirationHuman(c.expiration, todayEt);
@@ -1186,65 +1478,7 @@ export async function selectSmallAccountContract(params: {
         continue;
       }
 
-      // Sweet spot distance ($0.35 - $0.85 preferred)
-      let priceScore = 0;
-      if (mid >= 0.35 && mid <= 0.85) {
-        priceScore += 50;
-      } else {
-        priceScore += 25;
-      }
-
-      // Proximity to target1
-      const distToTarget = Math.abs(c.strike - effectiveTarget1);
-      const targetDistUnit = Math.max(0.20, effectiveSpot * 0.0013);
-      const targetScore = Math.max(0, 40 - (distToTarget / targetDistUnit) * 4);
-
-      // Convexity-per-dollar score (with absDelta >= 0.25 floor already enforced)
-      const gammaEst = Math.max(0, c.gamma || 0);
-      const expMove = Math.max(effectiveSpot * 0.0007, Math.abs(effectiveTarget1 - effectiveSpot));
-      const convexityPerDollar = (absDelta + 0.5 * gammaEst * expMove) / Math.max(0.15, askPrice);
-      const deltaScore = (absDelta >= 0.25 && absDelta <= 0.45 ? 20 : 5) + Math.min(35, convexityPerDollar * 20);
-
-      // Liquidity score
-      const liqScore = Math.min(25, ((c.openInterest || 0) + (c.volume || 0)) / 100);
-
-      // 0DTE Wall Affinity Score:
-      // In small account trading, strike selection for BTO Puts (rejection setups) must be closely
-      // related to the 0DTE walls (i.e. Put Wall target and the 0DTE wall corridor).
-      let wallAffinityScore = 0;
-      const targetWall = isCall
-        ? (zeroDteCallWall && isSpxw ? zeroDteCallWall / 10 : zeroDteCallWall) || effectiveTarget2
-        : (zeroDtePutWall && isSpxw ? zeroDtePutWall / 10 : zeroDtePutWall) || effectiveTarget2;
-
-      if (targetWall && targetWall > 0) {
-        const distToWall = Math.abs(c.strike - targetWall);
-        const wallTier1 = Math.max(0.5, effectiveSpot * 0.0027);
-        const wallTier2 = Math.max(1.0, effectiveSpot * 0.0053);
-        const wallTier3 = Math.max(2.0, effectiveSpot * 0.0107);
-        if (distToWall <= wallTier1) {
-          wallAffinityScore += 50; // Directly at or adjacent to 0DTE Wall
-        } else if (distToWall <= wallTier2) {
-          wallAffinityScore += 30; // Very close to 0DTE Wall
-        } else if (distToWall <= wallTier3) {
-          wallAffinityScore += 10;
-        }
-
-        // Heavy penalty for strikes far past the 0DTE destination wall
-        // e.g. buying deep OTM puts below the 0DTE Put Wall that suffer theta burn
-        if (!isCall && c.strike < targetWall - wallTier2) {
-          wallAffinityScore -= 35;
-        } else if (isCall && c.strike > targetWall + wallTier2) {
-          wallAffinityScore -= 35;
-        }
-      }
-
-      const totalScore = priceScore + targetScore + deltaScore + liqScore + wallAffinityScore;
-
       // Structural Wall Strike Ceiling: Never buy OTM Calls above an active overhead 0DTE Call Wall
-      const normZeroDteCw = typeof zeroDteCallWall === "number" && zeroDteCallWall > 0
-        ? (isSpxw ? zeroDteCallWall / 10 : zeroDteCallWall) : 0;
-      const normZeroDtePw = typeof zeroDtePutWall === "number" && zeroDtePutWall > 0
-        ? (isSpxw ? zeroDtePutWall / 10 : zeroDtePutWall) : 0;
       const overheadCeiling = normZeroDteCw > effectiveSpot ? normZeroDteCw : 0;
       if (contractType === "CALL" && overheadCeiling > 0 && c.strike > overheadCeiling) {
         continue;
@@ -1256,6 +1490,42 @@ export async function selectSmallAccountContract(params: {
         continue;
       }
 
+      // Second-order Taylor net payoff efficiency + 22% spread-to-expected-payoff friction guard
+      const rawContractIv =
+        typeof c.iv === "number" && Number.isFinite(c.iv) && c.iv > 0
+          ? c.iv > 4
+            ? c.iv / 100
+            : c.iv
+          : fallbackAtmIv;
+      const effectiveContractIv = rawContractIv >= 0.04 && rawContractIv <= 2.5 ? rawContractIv : fallbackAtmIv;
+      const contractTYears = computeRemainingYearsToExpiration(nowMs, Math.max(0, dte));
+      const absTheta =
+        typeof c.theta === "number" && Number.isFinite(c.theta) && c.theta !== 0
+          ? Math.abs(c.theta)
+          : Math.abs(
+              priceOptionWithSkew({
+                spot: effectiveSpot,
+                strike: c.strike,
+                direction: isCall ? "LONG" : "SHORT",
+                remainingYears: contractTYears,
+                atmIv: effectiveContractIv,
+                skewSlope: 0,
+                smileConvexity: 0,
+              }).thetaPerDay
+            );
+      const holdDays = dte === 0 ? Math.max(0.15, remainingRthMins / 390) : 0.35;
+      const spreadDollars = Math.max(0, askPrice - effectiveBid);
+      const taylor = scoreContractTaylorPayoff({
+        absDelta,
+        gamma: Math.max(0, c.gamma || 0),
+        absTheta,
+        holdDays,
+        spread: spreadDollars,
+        ask: askPrice,
+        expectedMove: boundedExpectedMove,
+      });
+      if (!taylor.eligible) continue;
+
       const candidateObj: Candidate = {
         contract: c,
         mid,
@@ -1266,11 +1536,25 @@ export async function selectSmallAccountContract(params: {
         robinhoodExp,
         robinhoodTab,
         absDelta,
-        score: totalScore,
+        score: taylor.score,
       };
 
-      if (isAfternoon) {
-        // After 11:30 AM ET: 1-2 DTE is primary (avoids 0DTE theta crush); 3+ DTE / 0DTE penalized fallback
+      if (hasRegimeContext) {
+        const isAdvectiveTrend =
+          deltaRoute.regime === "NEG_GAMMA_TREND" || deltaRoute.minDelta <= 0.24;
+        if (isAdvectiveTrend) {
+          // Trend / Gamma-Flip advection: 0DTE preferred at any RTH hour when <= $0.99 & near-ATM; 1-2 DTE fallback
+          if (dte === 0) stage1Candidates.push(candidateObj);
+          else if (dte >= 1 && dte <= 2) stage2Candidates.push(candidateObj);
+          else stage3Candidates.push(candidateObj);
+        } else {
+          // POS_GAMMA_PIN mean-reversion: 0DTE when <= $0.99, with 1-2 DTE fallback when 0DTE exceeds $0.99
+          if (dte === 0) stage1Candidates.push(candidateObj);
+          else if (dte >= 1 && dte <= 2) stage2Candidates.push(candidateObj);
+          else stage3Candidates.push(candidateObj);
+        }
+      } else if (isAfternoon) {
+        // Legacy fallback when no microstructural context is supplied: 1-2 DTE -> 3+ DTE -> 0DTE
         if (dte >= 1 && dte <= 2) {
           stage1Candidates.push(candidateObj);
         } else if (dte >= 3) {
@@ -1280,7 +1564,6 @@ export async function selectSmallAccountContract(params: {
           stage2Candidates.push(candidateObj);
         }
       } else {
-        // Morning: 0-2 DTE are primary
         if (dte >= 0 && dte <= 2) {
           stage1Candidates.push(candidateObj);
         } else if (dte > 2) {
@@ -1289,11 +1572,12 @@ export async function selectSmallAccountContract(params: {
       }
     }
 
-    // Pick top scored candidate from preferred stage, falling back to secondary
+    // Pick top Taylor-scored candidate from preferred stage, falling back cleanly
     stage1Candidates.sort((a, b) => b.score - a.score);
     stage2Candidates.sort((a, b) => b.score - a.score);
+    stage3Candidates.sort((a, b) => b.score - a.score);
 
-    const chosen = stage1Candidates[0] ?? stage2Candidates[0];
+    const chosen = stage1Candidates[0] ?? stage2Candidates[0] ?? stage3Candidates[0];
 
     if (chosen) {
       const c = chosen.contract;
@@ -2412,6 +2696,7 @@ export async function evaluateTradeSignals(
   // Ensure real-time live CBOE option contracts are available before computing Flow VWAP & structural walls
   if (!params.contracts || params.contracts.length === 0) {
     params.contracts = await fetchLiveCboeOptions(normalizedTicker, params.signal);
+    if (!params.dataSource) params.dataSource = "CBOE_MARKET_DATA";
     if (params.signal?.aborted) {
       return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadTradeStore().alerts };
     }
@@ -4111,7 +4396,15 @@ export async function evaluateTradeSignals(
           };
         }
 
-        // Select optimal Sub-$1.00 contract with position sizing
+        // Select optimal Sub-$1.00 contract with regime-conditioned delta & Taylor payoff ranking
+        const entryRegime = classifyMicrostructuralRegime({
+          spotPrice: entryClampedSpot,
+          zeroGamma: effectiveZeroGamma,
+          netGex: resolvedNetGex,
+          impulsePeclet: impPe,
+          pecletNumber: currentPe,
+          gammaRegime: flowSnap?.gammaRegime,
+        });
         const optimalContract = await selectSmallAccountContract({
           ticker: normalizedTicker,
           contractType: candidateBto.contractType,
@@ -4124,6 +4417,14 @@ export async function evaluateTradeSignals(
           nowEt: now,
           zeroDteCallWall: params.zeroDteCallWall || tacticalCw,
           zeroDtePutWall: params.zeroDtePutWall || tacticalPw,
+          dailyExpectedMove: params.dailyExpectedMove ?? null,
+          dataSource: params.dataSource,
+          regime: entryRegime,
+          impulsePeclet: impPe,
+          pecletNumber: currentPe,
+          gammaRegime: flowSnap?.gammaRegime,
+          netGex: resolvedNetGex,
+          zeroGamma: effectiveZeroGamma,
           signal: params.signal,
         });
 
@@ -5457,6 +5758,8 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         stopLossSpot: contractSl,
         conviction: 92,
         nowEt: sigDate,
+        zeroGamma: typeof params.zeroGamma === "number" ? params.zeroGamma : undefined,
+        dataSource: "CBOE_MARKET_DATA",
         signal: params.signal,
       }).catch(() => null);
 

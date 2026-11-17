@@ -689,7 +689,12 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     if (enrichedPoints.length === 0) return "";
     return enrichedPoints.reduce((acc, pt, i) => {
       const vy = yForPrice(pt.flowVwap);
-      return i === 0 ? `M ${pt.baseX.toFixed(1)} ${vy.toFixed(1)}` : `${acc} L ${pt.baseX.toFixed(1)} ${vy.toFixed(1)}`;
+      if (i === 0) return `M ${pt.baseX.toFixed(1)} ${vy.toFixed(1)}`;
+      const prev = enrichedPoints[i - 1];
+      const minSigma = Math.max(0.05, Math.min(prev.sigma ?? 0, pt.sigma ?? 0));
+      const cmd =
+        Math.abs(pt.flowVwap - prev.flowVwap) > 1.5 * minSigma ? "M" : "L";
+      return `${acc} ${cmd} ${pt.baseX.toFixed(1)} ${vy.toFixed(1)}`;
     }, "");
   }, [enrichedPoints, yForPrice]);
 

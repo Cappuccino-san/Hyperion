@@ -348,6 +348,39 @@ runTest("09:30 ET RTH Session Boundary resets accumulators & maintains exact cau
   assert.strictEqual(computeBarFlowGammaVwapSeries(bars.slice(0, 3))[2].netFluxJ, full[2].netFluxJ, "09:30 reset bar netFluxJ is strictly causal");
 });
 
+runTest("09:30 OPEN Dispersion Floor & Smooth RTH Seed prevent ±1σ/±2σ funnel pinch", () => {
+  const baseTs = 1794579600; // 09:20 ET
+  const bars = [
+    { timestamp: baseTs + 0, etMins: 560, open: 585.0, high: 586.0, low: 584.2, close: 585.4, volume: 18000 },
+    { timestamp: baseTs + 300, etMins: 565, open: 585.4, high: 586.2, low: 584.8, close: 585.6, volume: 21000 },
+    { timestamp: baseTs + 600, etMins: 570, open: 585.5, high: 586.4, low: 584.9, close: 586.0, volume: 85000 }, // 09:30 OPEN
+    { timestamp: baseTs + 900, etMins: 575, open: 586.0, high: 587.1, low: 585.7, close: 586.8, volume: 78000 }, // 09:35
+    { timestamp: baseTs + 1200, etMins: 580, open: 586.8, high: 587.5, low: 586.2, close: 587.1, volume: 70000 },
+  ];
+  const series = computeBarFlowGammaVwapSeries(bars);
+  const openBar = series[2];
+  const bar0935 = series[3];
+
+  const minFloor930 = openBar.spot * 0.0018;
+  assert.ok(
+    openBar.upper1s - openBar.lower1s >= 2 * minFloor930 - 1e-6,
+    `09:30 ±1σ width must stay floored above ${2 * minFloor930} (got ${openBar.upper1s - openBar.lower1s})`
+  );
+  assert.ok(
+    bar0935.upper1s - bar0935.lower1s >= 1.5 * minFloor930,
+    `09:35 ±1σ width must not pinch inward (got ${bar0935.upper1s - bar0935.lower1s})`
+  );
+  // Continuous open near pre-market VWAP blends smoothly across 09:30 OPEN
+  assert.ok(
+    Math.abs(openBar.flowVwap - series[1].flowVwap) < 1.0,
+    `Continuous pre-market -> 09:30 flowVwap transitions smoothly (pre=${series[1].flowVwap}, rth=${openBar.flowVwap})`
+  );
+  // Causal prefix invariance holds with warm seed & ATR preservation
+  const prefix3 = computeBarFlowGammaVwapSeries(bars.slice(0, 3));
+  assert.strictEqual(prefix3[2].sigma, openBar.sigma, "09:30 sigma must remain strictly causal");
+  assert.strictEqual(prefix3[2].flowVwap, openBar.flowVwap, "09:30 flowVwap must remain strictly causal");
+});
+
 console.log(`\n=======================================================`);
 console.log(`Test Results: ${testsPassed} / ${testsRun} Passed`);
 console.log(`=======================================================\n`);

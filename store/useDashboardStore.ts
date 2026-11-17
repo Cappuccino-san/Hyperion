@@ -500,6 +500,7 @@ let serverTradesReqSeq = 0;
 export interface DashboardState {
   activeView: ActiveView;
   activeTicker: string;
+  loadedTicker: string;
   dataSource: DataSourceType;
   isLoadingChain: boolean;
   toastMessage: string | null;
@@ -606,6 +607,7 @@ const EMPTY_KING_NODE: KingNodeMetrics = {
 export const useDashboardStore = create<DashboardState>((set, get) => ({
   activeView: "Heatmap",
   activeTicker: "SPY",
+  loadedTicker: "SPY",
   dataSource: "CBOE_MARKET_DATA",
   connectionStatus: "SYNCING",
   isStaleSnapshot: false,
@@ -803,6 +805,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
       return {
         activeTicker: preset.ticker,
+        loadedTicker: preset.ticker,
         isLoadingChain: true,
         connectionStatus: "SYNCING",
         isStaleSnapshot: false,

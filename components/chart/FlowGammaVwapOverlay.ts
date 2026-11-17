@@ -158,6 +158,20 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     ctx.restore();
   }
 
+  // Partition series into continuous segments separated across sharp pre-market -> RTH VWAP jumps
+  const flowSegments: Array<[number, number]> = [];
+  let segStart = 0;
+  for (let i = 1; i <= validLimit; i++) {
+    const prevPt = points[i - 1];
+    const currPt = points[i];
+    const minSigma = Math.max(0.05, Math.min(prevPt.sigma, currPt.sigma));
+    if (Math.abs(currPt.flowVwap - prevPt.flowVwap) > 1.5 * minSigma) {
+      flowSegments.push([segStart, i - 1]);
+      segStart = i;
+    }
+  }
+  flowSegments.push([segStart, validLimit]);
+
   // -------------------------------------------------------------
   // 1. Subtle Regime-Tinted Flux Field Corridor (Alpha capped 0.06 - 0.12 max)
   // -------------------------------------------------------------
@@ -206,6 +220,29 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
       cushionFill = "rgba(244, 63, 94, 0.04)";
     }
 
+    const fillRibbonSegments = (
+      getTopPrice: (pt: FlowGammaVwapSnapshot) => number,
+      getBottomPrice: (pt: FlowGammaVwapSnapshot) => number,
+      fillStyle: string | CanvasGradient
+    ) => {
+      ctx.fillStyle = fillStyle;
+      for (const [s0, s1] of flowSegments) {
+        if (s1 <= s0) continue;
+        ctx.beginPath();
+        for (let i = s0; i <= s1; i++) {
+          const x = barToX(i);
+          const y = priceToY(getTopPrice(points[i]));
+          if (i === s0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        for (let i = s1; i >= s0; i--) {
+          ctx.lineTo(barToX(i), priceToY(getBottomPrice(points[i])));
+        }
+        ctx.closePath();
+        ctx.fill();
+      }
+    };
+
     // Tier 1A: Base Full Corridor (-2σ to +2σ) Institutional Translucent Gradient
     const corridorGrad = ctx.createLinearGradient(0, topMinY, 0, bottomMaxY);
     corridorGrad.addColorStop(0.0, edgeColor);
@@ -214,58 +251,41 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     corridorGrad.addColorStop(0.76, midColor);
     corridorGrad.addColorStop(1.0, edgeColor);
 
-    ctx.beginPath();
-    for (let i = 0; i <= validLimit; i++) {
-      const x = barToX(i);
-      const y = priceToY(points[i].upper2s ?? points[i].upper2Sigma);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    for (let i = validLimit; i >= 0; i--) {
-      const x = barToX(i);
-      const y = priceToY(points[i].lower2s ?? points[i].lower2Sigma);
-      ctx.lineTo(x, y);
-    }
-    ctx.closePath();
-    ctx.fillStyle = corridorGrad;
-    ctx.fill();
+    fillRibbonSegments(
+      (pt) => pt.upper2s ?? pt.upper2Sigma,
+      (pt) => pt.lower2s ?? pt.lower2Sigma,
+      corridorGrad
+    );
 
     // Tier 1B: Upper Cushion Ribbon (+1σ to +2σ)
-    ctx.beginPath();
-    for (let i = 0; i <= validLimit; i++) {
-      const x = barToX(i);
-      const y = priceToY(points[i].upper2s ?? points[i].upper2Sigma);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    for (let i = validLimit; i >= 0; i--) {
-      const x = barToX(i);
-      const y = priceToY(points[i].upper1s ?? points[i].upper1Sigma);
-      ctx.lineTo(x, y);
-    }
-    ctx.closePath();
-    ctx.fillStyle = cushionFill;
-    ctx.fill();
+    fillRibbonSegments(
+      (pt) => pt.upper2s ?? pt.upper2Sigma,
+      (pt) => pt.upper1s ?? pt.upper1Sigma,
+      cushionFill
+    );
 
     // Tier 1C: Lower Cushion Ribbon (-1σ to -2σ)
-    ctx.beginPath();
-    for (let i = 0; i <= validLimit; i++) {
-      const x = barToX(i);
-      const y = priceToY(points[i].lower1s ?? points[i].lower1Sigma);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    for (let i = validLimit; i >= 0; i--) {
-      const x = barToX(i);
-      const y = priceToY(points[i].lower2s ?? points[i].lower2Sigma);
-      ctx.lineTo(x, y);
-    }
-    ctx.closePath();
-    ctx.fillStyle = cushionFill;
-    ctx.fill();
+    fillRibbonSegments(
+      (pt) => pt.lower1s ?? pt.lower1Sigma,
+      (pt) => pt.lower2s ?? pt.lower2Sigma,
+      cushionFill
+    );
 
     ctx.restore();
   }
+
+  const strokeSegmentedCurve = (getPrice: (pt: FlowGammaVwapSnapshot) => number) => {
+    ctx.beginPath();
+    for (const [s0, s1] of flowSegments) {
+      for (let i = s0; i <= s1; i++) {
+        const x = barToX(i);
+        const y = priceToY(getPrice(points[i]));
+        if (i === s0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+  };
 
   // -------------------------------------------------------------
   // 2. Dispersion Contours (Fine Dotted ±1σ / ±2σ Flux Boundaries)
@@ -277,25 +297,8 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     ctx.lineWidth = 1.0;
     ctx.setLineDash([2, 3]);
 
-    // +2 sigma
-    ctx.beginPath();
-    for (let i = 0; i <= validLimit; i++) {
-      const x = barToX(i);
-      const y = priceToY(points[i].upper2s ?? points[i].upper2Sigma);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    // -2 sigma
-    ctx.beginPath();
-    for (let i = 0; i <= validLimit; i++) {
-      const x = barToX(i);
-      const y = priceToY(points[i].lower2s ?? points[i].lower2Sigma);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
+    strokeSegmentedCurve((pt) => pt.upper2s ?? pt.upper2Sigma);
+    strokeSegmentedCurve((pt) => pt.lower2s ?? pt.lower2Sigma);
     ctx.restore();
 
     // B. Inner Bands (±1σ): Fine dotted envelope
@@ -304,25 +307,8 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     ctx.lineWidth = 1.0;
     ctx.setLineDash([2, 3]);
 
-    // +1 sigma
-    ctx.beginPath();
-    for (let i = 0; i <= validLimit; i++) {
-      const x = barToX(i);
-      const y = priceToY(points[i].upper1s ?? points[i].upper1Sigma);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    // -1 sigma
-    ctx.beginPath();
-    for (let i = 0; i <= validLimit; i++) {
-      const x = barToX(i);
-      const y = priceToY(points[i].lower1s ?? points[i].lower1Sigma);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
+    strokeSegmentedCurve((pt) => pt.upper1s ?? pt.upper1Sigma);
+    strokeSegmentedCurve((pt) => pt.lower1s ?? pt.lower1Sigma);
     ctx.restore();
   }
 
@@ -336,28 +322,14 @@ export function drawFlowGammaVwapOverlay(options: RenderFlowGammaVwapOptions): v
     ctx.setLineDash([]);
 
     // Pass 1: Ambient golden-orange glow
-    ctx.beginPath();
-    for (let i = 0; i <= validLimit; i++) {
-      const x = barToX(i);
-      const y = priceToY(points[i].flowVwap);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
     ctx.lineWidth = 3.5;
     ctx.strokeStyle = "rgba(245, 158, 11, 0.18)";
-    ctx.stroke();
+    strokeSegmentedCurve((pt) => pt.flowVwap);
 
     // Pass 2: Crisp luminous golden-amber core
     ctx.lineWidth = 1.65;
     ctx.strokeStyle = "#fbbf24";
-    ctx.beginPath();
-    for (let i = 0; i <= validLimit; i++) {
-      const x = barToX(i);
-      const y = priceToY(points[i].flowVwap);
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
+    strokeSegmentedCurve((pt) => pt.flowVwap);
     ctx.restore();
   }
 

@@ -19,6 +19,7 @@ export interface NormalizedOptionContract {
   delta: number;
   gamma: number;
   vega: number;
+  theta?: number;
   percentChange: number;
   bid?: number;
   ask?: number;
