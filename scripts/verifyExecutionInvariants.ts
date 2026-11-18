@@ -2097,7 +2097,7 @@ async function runTestSuite() {
       ticker: "IWM", spotPrice: 220.0, prevSpotPrice: 219.6, callWall: 221.15, putWall: 219.10, zeroGamma: 220.60,
       priorClose: 219.5, premarketFlowVwap: 219.75, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
       contracts: [{ symbol: "IWM_220_5C", strike: 220.5, expiration: mtExpLive, optionType: "C", bid: 0.65, ask: 0.68, last: 0.67, volume: 12000, openInterest: 9000, iv: 0.24, delta: 0.38, gamma: 0.10, vega: 0.04, percentChange: 0 }],
-      latest5mCandle: { open: 219.65, high: 220.08, low: 219.12, prevLow: 219.12, close: 220.0, sma34: 219.80, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(220.0, 219.75, 0.55, 0.62, 0.68, 1.3, 0.16, 0.16) },
+      latest5mCandle: { open: 219.65, high: 220.08, low: 219.12, prevLow: 219.12, close: 220.0, sma34: 219.80, timestamp: mtEvalTs, flowSnapshot: { ...makeMtFlow(220.0, 219.75, 0.55, 0.62, 0.68, 1.3, 0.16, 0.16), atr5m: 0.45 } },
     });
     assert(iwmTriggerRes.activePosition?.ticker === "IWM" && iwmTriggerRes.activePosition?.strike === 220.5, `13A: IWM ($220) triggers valid BTO CALL with $1.15 wall room (got ${iwmTriggerRes.activePosition?.strike ?? "none"})`);
 
@@ -2205,7 +2205,7 @@ async function runTestSuite() {
       ticker: "IWM", spotPrice: 220.0, prevSpotPrice: 219.6, callWall: 221.15, putWall: 219.10, zeroGamma: 220.60,
       priorClose: 219.5, premarketFlowVwap: 219.75, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
       contracts: [{ symbol: "IWM_220_5C", strike: 220.5, expiration: mtExpLive, optionType: "C", bid: 0.65, ask: 0.68, last: 0.67, volume: 12000, openInterest: 9000, iv: 0.24, delta: 0.38, gamma: 0.10, vega: 0.04, percentChange: 0 }],
-      latest5mCandle: { open: 219.65, high: 220.08, low: 219.12, prevLow: 219.12, close: 220.0, sma34: 219.80, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(220.0, 219.75, 0.55, 0.62, 0.68, 1.3, 0.16, 0.16) },
+      latest5mCandle: { open: 219.65, high: 220.08, low: 219.12, prevLow: 219.12, close: 220.0, sma34: 219.80, timestamp: mtEvalTs, flowSnapshot: { ...makeMtFlow(220.0, 219.75, 0.55, 0.62, 0.68, 1.3, 0.16, 0.16), atr5m: 0.45 } },
     });
     assert(nvdaAfterSpyClose.activePosition?.ticker === "NVDA" && iwmBlockedByNvda.activePosition === null && Object.keys(loadTradeStore().activePositions).length === 1, "14C: Closing SPY unlocks NVDA; active NVDA blocks IWM");
 

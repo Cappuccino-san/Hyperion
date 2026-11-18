@@ -247,6 +247,12 @@ async function backfillIntradaySessionSignals(
       flowContracts
     );
 
+    const resetBounceStore = loadTradeStore();
+    if (resetBounceStore.bouncedPutWalls && Object.keys(resetBounceStore.bouncedPutWalls).length > 0) {
+      resetBounceStore.bouncedPutWalls = {};
+      saveTradeStore(resetBounceStore);
+    }
+
     const replayStartIdx = Math.min(1, sessionBars.length - 1);
     const replayEndIdx = sessionBars.length;
     for (let idx = replayStartIdx; idx < replayEndIdx; idx++) {
@@ -784,9 +790,17 @@ export async function evaluateTradeSignals(
         const passesExpectancy = calibration.passesGate && alphaScore.passesGate;
         if (params.signal?.aborted || !passesExpectancy) {
           const freshAbortStore = loadTradeStore();
-          if (store.bookCenterHistoryByTicker) {
-            freshAbortStore.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
-            freshAbortStore.bookCenterLastTsByTicker = store.bookCenterLastTsByTicker;
+          if (store.bookCenterHistoryByTicker || store.bouncedPutWalls) {
+            if (store.bookCenterHistoryByTicker) {
+              freshAbortStore.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
+              freshAbortStore.bookCenterLastTsByTicker = store.bookCenterLastTsByTicker;
+            }
+            if (store.bouncedPutWalls) {
+              freshAbortStore.bouncedPutWalls = {
+                ...(freshAbortStore.bouncedPutWalls || {}),
+                ...store.bouncedPutWalls,
+              };
+            }
             saveTradeStore(freshAbortStore);
           }
           return {
@@ -832,6 +846,13 @@ export async function evaluateTradeSignals(
 
         if (params.signal?.aborted || !optimalContract) {
           const freshAbortStore = loadTradeStore();
+          if (store.bouncedPutWalls) {
+            freshAbortStore.bouncedPutWalls = {
+              ...(freshAbortStore.bouncedPutWalls || {}),
+              ...store.bouncedPutWalls,
+            };
+            saveTradeStore(freshAbortStore);
+          }
           return {
             ticker: normalizedTicker,
             activePosition:
@@ -1000,6 +1021,12 @@ export async function evaluateTradeSignals(
           latestStoreBeforeCommit.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
           latestStoreBeforeCommit.bookCenterLastTsByTicker = store.bookCenterLastTsByTicker;
         }
+        if (store.bouncedPutWalls) {
+          latestStoreBeforeCommit.bouncedPutWalls = {
+            ...(latestStoreBeforeCommit.bouncedPutWalls || {}),
+            ...store.bouncedPutWalls,
+          };
+        }
         if (Object.keys(latestStoreBeforeCommit.activePositions || {}).length > 0) {
           console.warn(
             `[evaluateTradeSignals] Aborted ${positionTicker} BTO commit: global slot already occupied (${Object.keys(latestStoreBeforeCommit.activePositions).join(", ")}).`
@@ -1022,12 +1049,19 @@ export async function evaluateTradeSignals(
     const latestIdleStore = loadTradeStore();
     if (
       latestIdleStore.prevSpotPrices[normalizedTicker] !== spotPrice ||
-      Boolean(store.bookCenterHistoryByTicker?.[normalizedTicker]?.length)
+      Boolean(store.bookCenterHistoryByTicker?.[normalizedTicker]?.length) ||
+      Boolean(store.bouncedPutWalls?.[normalizedTicker])
     ) {
       latestIdleStore.prevSpotPrices[normalizedTicker] = spotPrice;
       if (store.bookCenterHistoryByTicker) {
         latestIdleStore.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
         latestIdleStore.bookCenterLastTsByTicker = store.bookCenterLastTsByTicker;
+      }
+      if (store.bouncedPutWalls) {
+        latestIdleStore.bouncedPutWalls = {
+          ...(latestIdleStore.bouncedPutWalls || {}),
+          ...store.bouncedPutWalls,
+        };
       }
       saveTradeStore(latestIdleStore);
     }

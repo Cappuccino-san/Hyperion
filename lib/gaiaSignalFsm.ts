@@ -254,6 +254,7 @@ export class GaiaSignalFsm {
   private closedTradesToday: number = 0;
   private lastClosedDirection: "LONG" | "SHORT" | null = null;
   private lastExitBarTs: number = 0;
+  private bouncedPutWallPrice: number = 0;
 
   constructor(initialState: GaiaFsmState = "STAND_ASIDE") {
     this.committedState = initialState;
@@ -276,6 +277,7 @@ export class GaiaSignalFsm {
     this.closedTradesToday = 0;
     this.lastClosedDirection = null;
     this.lastExitBarTs = 0;
+    this.bouncedPutWallPrice = 0;
   }
 
   /**
@@ -318,12 +320,24 @@ export class GaiaSignalFsm {
     const eChi = (bar.chi - 0.50) / dispersion.sigmaChi;
     const eFlux = bar.netFlux / dispersion.sigmaFlux;
 
-    // Mutually exclusive macro regime gating: chi >= 0.50 is strictly Bull Macro, < 0.50 is strictly Bear Macro
+    // Mutually exclusive macro regime gating with strict neutral chop deadband (0.44 < chi < 0.56)
     const effectiveChi = typeof macro?.callDominancePct === "number" ? macro.callDominancePct / 100 : bar.chi;
+    const isNeutralChopZone = effectiveChi > 0.44 && effectiveChi < 0.56;
+    const hasValidPeclet = typeof bar.peclet === "number" && Number.isFinite(bar.peclet);
     const isBullMacro = macro
-      ? (macro.macroRegime === "CALL" || effectiveChi >= 0.50)
-      : bar.chi >= 0.50;
-    const isBearMacro = !isBullMacro;
+      ? !isNeutralChopZone && (macro.macroRegime === "CALL" || effectiveChi >= 0.56)
+      : bar.chi >= 0.56;
+    const isBearMacro = !isNeutralChopZone && effectiveChi <= 0.44;
+    const strictBullFlux =
+      bar.chi >= 0.56 &&
+      bar.netFlux > 0 &&
+      (bar.peclet === undefined || !hasValidPeclet || bar.peclet > 0) &&
+      !isNeutralChopZone;
+    const strictBearFlux =
+      bar.chi <= 0.44 &&
+      bar.netFlux < 0 &&
+      (bar.peclet === undefined || !hasValidPeclet || bar.peclet < 0) &&
+      !isNeutralChopZone;
 
     // Dynamic SNR Flux Threshold scaled by normalized session volatility
     const volRatio = dispersion.atr / Math.max(1, bar.close * 0.0035);
@@ -370,12 +384,47 @@ export class GaiaSignalFsm {
     const callBlockedByWall =
       nearestOverheadWall !== undefined && nearestOverheadWall - bar.close < qm.wallProximityBuffer;
 
+    const minOpposingWallClearance =
+      bar.close >= 400 ? Math.max(2.25, bar.close * 0.0032) : bar.close * 0.0032;
+    const decisivePutBreakdown =
+      putWall !== undefined &&
+      bar.close < putWall &&
+      bar.chi <= 0.44 &&
+      (bar.peclet === undefined || !hasValidPeclet || bar.peclet <= -1.5);
+    const decisiveCallBreakout =
+      callWall !== undefined &&
+      bar.close > callWall &&
+      bar.chi >= 0.56 &&
+      (bar.peclet === undefined || !hasValidPeclet || bar.peclet >= 1.5);
     const putBlockedByWall =
-      putWall !== undefined && putWall < bar.close && bar.close - putWall < qm.wallProximityBuffer;
+      putWall !== undefined &&
+      !decisivePutBreakdown &&
+      (bar.close >= putWall
+        ? bar.close - putWall < Math.max(qm.wallProximityBuffer, minOpposingWallClearance)
+        : true);
+    const callBlockedByWallStrict =
+      callBlockedByWall ||
+      (callWall !== undefined &&
+        !decisiveCallBreakout &&
+        bar.close <= callWall &&
+        callWall - bar.close < Math.max(qm.wallProximityBuffer, minOpposingWallClearance));
 
     const unitRisk = qm.unitRisk;
 
     if (currentState === "STAND_ASIDE") {
+      if (putWall !== undefined && bar.low <= putWall * 1.0015 && bar.close > putWall) {
+        this.bouncedPutWallPrice = putWall;
+      }
+      const bouncedPutWallRecently =
+        putWall !== undefined &&
+        this.bouncedPutWallPrice > 0 &&
+        Math.abs(this.bouncedPutWallPrice - putWall) <= Math.max(0.5, putWall * 0.002);
+      const testUpperHigh = bar.recentHigh3 ?? Math.max(bar.high, bar.open);
+      const nearUpperResistance = [zg, callWall, pdh, sigmaPlus1].some(
+        (lvl) => typeof lvl === "number" && lvl > (putWall ?? 0) && testUpperHigh >= lvl * 0.9965
+      );
+      const midRangePutBlockedAfterBounce =
+        bouncedPutWallRecently && putWall !== undefined && bar.close >= putWall && !nearUpperResistance;
       if (!isWithinEntryWindow) {
         return { nextState: "STAND_ASIDE" };
       }
@@ -390,8 +439,22 @@ export class GaiaSignalFsm {
           return { nextState: "STAND_ASIDE" };
         }
       }
-      const allowShort = this.closedTradesToday === 0 || this.lastClosedDirection === "LONG";
-      const allowLong = this.closedTradesToday === 0 || this.lastClosedDirection === "SHORT";
+      const allowShort =
+        (isLeg2
+          ? impulseChi <= 0.40 &&
+            (bar.netFlux < 0 || deltaNetFlux6Bar < 0) &&
+            (bar.impulsePeclet === undefined || bar.impulsePeclet < 0)
+          : strictBearFlux) &&
+        !midRangePutBlockedAfterBounce &&
+        (this.closedTradesToday === 0 || this.lastClosedDirection === "LONG");
+      const allowLong =
+        (isLeg2
+          ? impulseChi >= 0.60 &&
+            (bar.netFlux > 0 || deltaNetFlux6Bar > 0) &&
+            (bar.impulsePeclet === undefined || bar.impulsePeclet > 0)
+          : strictBullFlux) &&
+        !callBlockedByWallStrict &&
+        (this.closedTradesToday === 0 || this.lastClosedDirection === "SHORT");
 
       // =========================================================================
       // LEG 2 HIGH-CONVICTION OPPOSITE-DIRECTION STRUCTURAL ROTATION (10:30-14:30 ET)
@@ -934,6 +997,7 @@ export class GaiaSignalFsm {
       this.lastExitBarTs = 0;
       this.prevBarLow = 0;
       this.prevBarHigh = 0;
+      this.bouncedPutWallPrice = 0;
     }
     if (barEtDate) this.currentSessionEtDate = barEtDate;
     if (typeof resolvedEtMins === "number") this.lastEtMinsSeen = resolvedEtMins;

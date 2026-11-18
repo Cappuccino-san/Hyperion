@@ -40,7 +40,7 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
       { barTimestamp: 1300, open: 765.0, high: 765.2, low: 764.2, close: 764.5, chi: 0.49, bias: -0.03, netFlux: -0.01, peclet: 0.4, etMins: 555, isClosed: true },
       { barTimestamp: 1600, open: 764.5, high: 764.8, low: 763.8, close: 764.0, chi: 0.47, bias: -0.08, netFlux: -0.04, peclet: 0.6, etMins: 560, isClosed: true },
       { barTimestamp: 1900, open: 764.0, high: 764.2, low: 763.2, close: 763.5, chi: 0.48, bias: -0.06, netFlux: -0.03, peclet: 0.5, etMins: 565, isClosed: true },
-      { barTimestamp: 2200, open: 763.5, high: 763.8, low: 761.0, close: 761.5, chi: 0.35, bias: -0.38, netFlux: -0.28, peclet: 2.4, etMins: 575, isClosed: true },
+      { barTimestamp: 2200, open: 763.5, high: 763.8, low: 761.0, close: 761.5, chi: 0.35, bias: -0.38, netFlux: -0.28, peclet: -2.4, etMins: 575, isClosed: true },
     ];
 
     const { newlyCommitted, snapshot } = fsm.commitSeries(bars, {
@@ -502,12 +502,12 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
     const fsm = new GaiaSignalFsm();
     const bars: GaiaBarData[] = [
       // Morning positive-gamma sweep to Put Wall 752 / -1σ 752.4 with bullDiv5m and reclaim of Flow VWAP / SMA 34 -> LONG to Book Center
-      { barTimestamp: 1000, open: 752.2, high: 753.6, low: 751.9, close: 753.4, recentLow4: 751.9, chi: 0.49, impulseChi: 0.54, bias: 0.12, netFlux: 0.08, peclet: 0.6, netGex: 1_800_000, flowVwap: 753.1, sma34: 753.0, sigmaMinus1: 752.4, sigmaPlus1: 756.5, bullDiv5m: true, etMins: 585, isClosed: true },
+      { barTimestamp: 1000, open: 752.2, high: 753.6, low: 751.9, close: 753.4, recentLow4: 751.9, chi: 0.57, impulseChi: 0.58, bias: 0.12, netFlux: 0.08, peclet: 0.6, netGex: 1_800_000, flowVwap: 753.1, sma34: 753.0, sigmaMinus1: 752.4, sigmaPlus1: 756.5, bullDiv5m: true, etMins: 585, isClosed: true },
     ];
 
     const { newlyCommitted } = fsm.commitSeries(bars, {
       macroRegime: "CALL",
-      callDominancePct: 50,
+      callDominancePct: 57,
       netGex: 1_800_000,
       structuralLevels: { putWall: 752, callWall: 758, zeroGamma: 750, bookCenter: 755 },
     });
@@ -660,11 +660,18 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
     assert.strictEqual(jamOut.newlyCommitted.length, 0, "Wall proximity <$0.224 must still block NVDA SHORT");
   });
 
-  it("Multi-Ticker QQQ ($510): dynamic ATR/% gates trigger valid setup with $1.10 wall room", () => {
+  it("Multi-Ticker QQQ ($510): blocks tight $1.10 room above Put Wall and admits >= $2.25 clearance", () => {
+    const fsmBlocked = new GaiaSignalFsm();
+    const blockedRes = fsmBlocked.commitSeries(
+      [{ barTimestamp: 1000, open: 510.25, high: 510.35, low: 509.80, close: 509.95, chi: 0.25, bias: -0.45, netFlux: -0.35, peclet: -2.2, flowVwap: 510.15, sma34: 510.20, etMins: 575, isClosed: true }],
+      { macroRegime: "PUT", callDominancePct: 35, structuralLevels: { putWall: 508.85, callWall: 511.20, zeroGamma: 510.10, bookCenter: 510.10 } }
+    );
+    assert.strictEqual(blockedRes.newlyCommitted.length, 0);
+
     const fsm = new GaiaSignalFsm();
     const { newlyCommitted } = fsm.commitSeries(
       [{ barTimestamp: 1000, open: 510.25, high: 510.35, low: 509.80, close: 509.95, chi: 0.25, bias: -0.45, netFlux: -0.35, peclet: -2.2, flowVwap: 510.15, sma34: 510.20, etMins: 575, isClosed: true }],
-      { macroRegime: "PUT", callDominancePct: 35, structuralLevels: { putWall: 508.85, callWall: 511.20, zeroGamma: 510.10, bookCenter: 510.10 } }
+      { macroRegime: "PUT", callDominancePct: 35, structuralLevels: { putWall: 507.60, callWall: 511.20, zeroGamma: 510.10, bookCenter: 510.10 } }
     );
     assert.strictEqual(newlyCommitted.length, 1);
     assert.strictEqual(newlyCommitted[0].toState, "SHORT");

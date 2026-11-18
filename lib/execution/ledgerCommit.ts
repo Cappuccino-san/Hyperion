@@ -95,6 +95,7 @@ export function clearDailyTrades(): void {
     closedPositions: [],
     alerts: [],
     prevSpotPrices: {},
+    bouncedPutWalls: {},
     dailyRecapSent: false,
   });
 }

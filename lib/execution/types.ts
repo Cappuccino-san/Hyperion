@@ -180,6 +180,7 @@ export interface DailyTradeStore {
   >;
   bookCenterHistoryByTicker?: Record<string, number[]>;
   bookCenterLastTsByTicker?: Record<string, number>;
+  bouncedPutWalls?: Record<string, number>;
 }
 
 export interface SelectedOptionContract {

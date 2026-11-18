@@ -652,8 +652,44 @@ export function evaluateBtoCandidateSetup(input: {
   const stopWickBuf = entryMetrics.stopWickBuffer;
   const smallTargetTrim = Math.max(0.02, spotPrice * 0.00013);
   const barBody = latest5mCandle ? latest5mCandle.close - latest5mCandle.open : 0;
-  const hasAdequatePutRoomToWall = !(tacticalPw > 0 && spotPrice > tacticalPw && (spotPrice - tacticalPw) < entryMetrics.wallProximityBuffer);
-  const hasAdequateCallRoomToWall = !(tacticalCw > 0 && spotPrice < tacticalCw && (tacticalCw - spotPrice) < entryMetrics.wallProximityBuffer);
+  const minOpposingWallClearance =
+    spotPrice >= 400 ? Math.max(2.25, spotPrice * 0.0032) : spotPrice * 0.0032;
+  const opposingPutWall =
+    params.zeroDtePutWall && params.zeroDtePutWall > 0 && params.zeroDtePutWall <= spotPrice * 1.005
+      ? params.zeroDtePutWall
+      : tacticalPw > 0
+        ? tacticalPw
+        : putWall > 0
+          ? putWall
+          : 0;
+  const opposingCallWall =
+    params.zeroDteCallWall && params.zeroDteCallWall > 0 && params.zeroDteCallWall >= spotPrice * 0.995
+      ? params.zeroDteCallWall
+      : tacticalCw > 0
+        ? tacticalCw
+        : callWall > 0
+          ? callWall
+          : 0;
+  const hasDecisivePutBreakdown =
+    opposingPutWall > 0 &&
+    spotPrice < opposingPutWall &&
+    (!latest5mCandle || latest5mCandle.close < opposingPutWall) &&
+    currentChi <= 0.44 &&
+    currentPe <= -1.5;
+  const hasDecisiveCallBreakout =
+    opposingCallWall > 0 &&
+    spotPrice > opposingCallWall &&
+    (!latest5mCandle || latest5mCandle.close > opposingCallWall) &&
+    currentChi >= 0.56 &&
+    currentPe >= 1.5;
+  const hasAdequatePutRoomToWall =
+    opposingPutWall <= 0 ||
+    hasDecisivePutBreakdown ||
+    (spotPrice >= opposingPutWall && spotPrice - opposingPutWall >= minOpposingWallClearance);
+  const hasAdequateCallRoomToWall =
+    opposingCallWall <= 0 ||
+    hasDecisiveCallBreakout ||
+    (spotPrice <= opposingCallWall && opposingCallWall - spotPrice >= minOpposingWallClearance);
   const effectiveZeroGamma =
     zeroGamma > 0
       ? zeroGamma
@@ -1620,6 +1656,61 @@ export function evaluateBtoCandidateSetup(input: {
         : leg2PutRoom >= entryMetrics.minWallRoom;
     if (!leg2Gate.allowed || !minLeg2RoomOk) {
       candidateBto = null;
+    }
+  }
+
+  // Persist Put Wall bounce memory (>= 0.15% touch + bounce above Put Wall) on DailyTradeStore
+  const barLowForWall = latest5mCandle ? Math.min(latest5mCandle.low, spotPrice) : spotPrice;
+  const barHighForResist = latest5mCandle ? Math.max(latest5mCandle.high, spotPrice) : spotPrice;
+  if (
+    opposingPutWall > 0 &&
+    barLowForWall <= opposingPutWall * 1.0015 &&
+    spotPrice > opposingPutWall
+  ) {
+    store.bouncedPutWalls = {
+      ...(store.bouncedPutWalls || {}),
+      [normalizedTicker]: opposingPutWall,
+    };
+  }
+
+  if (candidateBto) {
+    const candRisk = Math.max(minRiskFloor, Math.abs(spotPrice - candidateBto.stopLossSpot));
+    if (candidateBto.contractType === "PUT") {
+      // Strict Flux Polarity Gate: block neutral chop (0.44 < chi < 0.56) and opposing J_net / Pe
+      const fluxBearAligned = currentChi <= 0.44 && currentNetFlux < 0 && currentPe < 0;
+      // Dynamic Opposing-Wall Clearance (>= max(2.25, 0.32% spot) AND >= 2.0R) or decisive close below PW
+      const putWallClearanceOk =
+        opposingPutWall <= 0 ||
+        hasDecisivePutBreakdown ||
+        (spotPrice - opposingPutWall >= minOpposingWallClearance &&
+          (spotPrice - opposingPutWall) / candRisk >= 2.0);
+      // Post-Put-Wall-Bounce Mid-Range Block (unless rejecting upper resistance or breaking below PW)
+      const bouncedPw = store.bouncedPutWalls?.[normalizedTicker];
+      const bouncedPutWallRecently =
+        typeof bouncedPw === "number" &&
+        bouncedPw > 0 &&
+        Math.abs(bouncedPw - opposingPutWall) <= Math.max(0.5, opposingPutWall * 0.002);
+      const isRejectingUpperResist = [effectiveZeroGamma, opposingCallWall, flowSnap?.upper1Sigma].some(
+        (lvl) => typeof lvl === "number" && lvl > opposingPutWall && barHighForResist >= lvl * 0.9965
+      );
+      const postBouncePutBlocked =
+        bouncedPutWallRecently &&
+        opposingPutWall > 0 &&
+        spotPrice >= opposingPutWall &&
+        !isRejectingUpperResist;
+      if (!fluxBearAligned || !putWallClearanceOk || postBouncePutBlocked) {
+        candidateBto = null;
+      }
+    } else {
+      const fluxBullAligned = currentChi >= 0.56 && currentNetFlux > 0 && currentPe > 0;
+      const callWallClearanceOk =
+        opposingCallWall <= 0 ||
+        hasDecisiveCallBreakout ||
+        (opposingCallWall - spotPrice >= minOpposingWallClearance &&
+          (opposingCallWall - spotPrice) / candRisk >= 2.0);
+      if (!fluxBullAligned || !callWallClearanceOk) {
+        candidateBto = null;
+      }
     }
   }
 
