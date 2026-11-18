@@ -68,6 +68,7 @@ export interface ServerTradeData {
   activePositions?: Record<string, any>;
   closedPositions?: any[];
   alerts?: any[];
+  loaded?: boolean;
 }
 
 export interface PrzmLedgerSummary {
@@ -469,10 +470,16 @@ export function evaluatePrzmCallLedger(
     };
   });
 
-  // When authoritative server trades exist, lock the ledger to the Single-Slot Sniper Automaton
-  // so unexecuted FSM transitions do not dilute the 1-Trade-Max scoreboard.
+  // When authoritative server trades exist or have loaded cleanly, lock the ledger to the Single-Slot Sniper Automaton
+  // so unexecuted FSM transitions do not dilute the live execution scoreboard.
+  const ledgerLoaded =
+    serverTrades !== undefined
+      ? Boolean(serverTrades.loaded)
+      : Boolean(storeState?.serverTradesLoaded);
   const mergedEntries: EvaluatedCallEntry[] =
-    serverEntries.length > 0 ? [...serverEntries] : [...chronologicalEntries];
+    serverEntries.length > 0 || ledgerLoaded
+      ? [...serverEntries]
+      : [...chronologicalEntries];
 
   let rightCount = mergedEntries.filter((e) => e.status === "RIGHT").length;
   const wrongCount = mergedEntries.filter((e) => e.status === "WRONG").length;

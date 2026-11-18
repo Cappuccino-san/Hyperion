@@ -4,7 +4,7 @@ import {
   TickerSymbol,
   GammaLevels,
 } from "@/lib/tickerPresets";
-import { RTH_OPEN_MINS, RTH_CLOSE_MINS } from "@/lib/gaiaSessionGuards";
+import { getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
 
 export type DataSourceType = "TRADIER_LIVE" | "CBOE_MARKET_DATA" | "ROBINHOOD_LIVE";
 
@@ -24,6 +24,7 @@ export interface NormalizedOptionContract {
   bid?: number;
   ask?: number;
   last?: number;
+  theta?: number;
 }
 
 const globalForOptionsExposure = globalThis as unknown as {
@@ -354,6 +355,7 @@ export function getActiveExpirationSelection(allRawExpirations: string[]): {
   activeExpirations: string[];
 } {
   const { nowEtIso, isWeekday, mins } = getEtClockParts();
+  const sessionBounds = getSessionBoundsEt(nowEtIso);
   const sorted = Array.from(
     new Set(
       allRawExpirations
@@ -369,10 +371,14 @@ export function getActiveExpirationSelection(allRawExpirations: string[]): {
     };
   }
 
-  const isRegularSession = isWeekday && mins >= RTH_OPEN_MINS && mins < RTH_CLOSE_MINS;
+  const isRegularSession =
+    isWeekday &&
+    sessionBounds.isTradingDay &&
+    mins >= sessionBounds.rthOpenMins &&
+    mins < sessionBounds.rthCloseMins;
 
   // Strict Expired-Contract Firewall: always purge exp < todayEt (and exp === todayEt post-close/weekend)
-  if (isWeekday && mins < RTH_CLOSE_MINS) {
+  if (isWeekday && sessionBounds.isTradingDay && mins < sessionBounds.rthCloseMins) {
     const active = sorted.filter((exp) => exp >= nowEtIso);
     return {
       referenceDate: nowEtIso,
@@ -695,7 +701,12 @@ export function computeOptionsAnalytics(params: {
     }
 
     const days = isoToDays.get(contract.expiration) ?? 0;
-    const T = Math.max(1 / 365, days / 365);
+    const { rthCloseMins } = getSessionBoundsEt(todayEtIso);
+    const remainingRthMin = Math.max(5, Math.min(390, rthCloseMins - currentEtMinutes));
+    const T =
+      days === 0
+        ? Math.max(5 / (252 * 390), remainingRthMin / (252 * 390))
+        : Math.max(1 / 365, days / 365);
     const contractIv = resolveSafeIv(contract.iv, safeIv);
 
     // Calibrated Gamma Greeks (r = 0.0460, q = 0.0, calendar T = days / 365)
@@ -1037,9 +1048,9 @@ export function computeOptionsAnalytics(params: {
     const days = isoToDays.get(c.expiration) ?? 0;
     let T: number;
     if (days === 0) {
-      const closeEtMinutes = RTH_CLOSE_MINS; // 16:00 ET
+      const closeEtMinutes = getSessionBoundsEt(todayEtIso).rthCloseMins;
       const remainingMin = Math.max(5, Math.min(390, closeEtMinutes - currentEtMinutes));
-      T = remainingMin / (365 * 390);
+      T = Math.max(5 / (252 * 390), remainingMin / (252 * 390));
     } else {
       T = Math.max(1 / 365, days / 365);
     }
@@ -1055,12 +1066,13 @@ export function computeOptionsAnalytics(params: {
   }
 
   // Test hypothetical spot prices from 0.85 * spotPrice to 1.15 * spotPrice on a 41-point grid
+  // plus strike-dense interior nodes so narrow 0DTE gamma peaks are never aliased
   const testSpotCount = 41;
   const minSpot = 0.85 * safeSpot;
   const maxSpot = 1.15 * safeSpot;
   const spotStepSize = (maxSpot - minSpot) / (testSpotCount - 1);
-  const zgRate = 0.045;
-  const zgDividend = 0.012;
+  const zgRate = 0.046;
+  const zgDividend = 0.0;
 
   const solveZeroGamma = (contractsToSolve: ZgContractItem[]) => {
     if (safeSpot <= 0) {
@@ -1069,9 +1081,18 @@ export function computeOptionsAnalytics(params: {
     if (contractsToSolve.length === 0) {
       return { zeroGamma: Number(safeSpot.toFixed(2)), hasZeroGammaFlip: false };
     }
-    const curve: { s: number; netGex: number }[] = [];
+    const gridSet = new Set<number>();
     for (let i = 0; i < testSpotCount; i++) {
-      const s = minSpot + i * spotStepSize;
+      gridSet.add(Number((minSpot + i * spotStepSize).toFixed(4)));
+    }
+    for (const item of contractsToSolve) {
+      if (item.strike >= minSpot && item.strike <= maxSpot) {
+        gridSet.add(Number(item.strike.toFixed(4)));
+      }
+    }
+    const testSpots = Array.from(gridSet).sort((a, b) => a - b);
+    const curve: { s: number; netGex: number }[] = [];
+    for (const s of testSpots) {
       if (!Number.isFinite(s) || s <= 0) continue;
       let totalGexAtS = 0;
       for (const item of contractsToSolve) {
@@ -1124,13 +1145,8 @@ export function computeOptionsAnalytics(params: {
       zgPrice = Number(crossings[0].zeroPrice.toFixed(2));
       flip = true;
     } else {
-      const minPoint = [...curve].sort(
-        (a, b) => Math.abs(a.netGex) - Math.abs(b.netGex)
-      )[0];
-      zgPrice =
-        minPoint && Math.abs(minPoint.netGex) > 1e-12
-          ? Number(minPoint.s.toFixed(2))
-          : Number(safeSpot.toFixed(2));
+      // When Net GEX is strictly one-signed across the grid, never collapse to the ±15% tail boundary where Gamma -> 0
+      zgPrice = Number(safeSpot.toFixed(2));
       flip = false;
     }
     return { zeroGamma: zgPrice, hasZeroGammaFlip: flip };
@@ -1434,7 +1450,7 @@ export function deriveTacticalStructuralLevels(
   }
 
   const zeroGamma =
-    zeroDteLevels?.zeroGamma && zeroDteLevels.zeroGamma > 0
+    zeroDteLevels?.hasZeroGammaFlip && zeroDteLevels.zeroGamma > 0
       ? zeroDteLevels.zeroGamma
       : gammaLevels.zeroGamma;
 

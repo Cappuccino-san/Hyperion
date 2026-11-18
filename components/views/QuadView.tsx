@@ -4,7 +4,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ExposureMetric,
-  getTickerPreset,
+  getStaticTickerPreset,
   useDashboardStore,
 } from "@/store/useDashboardStore";
 import { OptionsAnalyticsPayload } from "@/lib/optionsExposure";
@@ -217,7 +217,7 @@ export function QuadView() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
         {QUAD_TICKERS.map((sym) => {
           const payload = quadPayloads[sym];
-          const preset = getTickerPreset(sym);
+          const preset = getStaticTickerPreset(sym);
           const spot = payload?.spotPrice ?? preset.spotPrice;
           const prevClose = payload?.previousClose ?? preset.previousClose;
           const pctChange =

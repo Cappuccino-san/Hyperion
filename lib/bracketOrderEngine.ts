@@ -17,7 +17,12 @@
  */
 
 import { NbboQuote } from "@/lib/marketDataService";
-import { etSecondsOfDay, EOD_FORCE_FLAT_MINS } from "@/lib/gaiaSessionGuards";
+import {
+  etSecondsOfDay,
+  formatEtMinsAsTimeString,
+  getSessionBoundsEt,
+  getTodayEt,
+} from "@/lib/gaiaSessionGuards";
 
 export const DEFAULT_HARD_OPTION_STOP_LOSS_PCT = 45;
 export const STALL_STOP_MINUTES = 20;
@@ -159,7 +164,7 @@ export function initializeOcoBrackets(config: OcoBracketConfig): OcoBracketState
   const rawStop = Math.max(0.05, entryPrice * (1 - effectiveStopPct / 100));
   const hardStopPrice = Number((Math.round((rawStop + Number.EPSILON) * 100) / 100).toFixed(2));
 
-  // Staged momentum time stop is active if position was opened before 10:15 AM ET
+  // Elapsed 30-90m staged momentum time stop is active whenever entry timestamp/time is valid
   const parsedSec = parseEtTimeSeconds(openedAtEt);
   const openedSec =
     parsedSec > 0
@@ -167,7 +172,11 @@ export function initializeOcoBrackets(config: OcoBracketConfig): OcoBracketState
       : Number.isFinite(config.openedTs) && config.openedTs > 0
         ? etSecondsOfDay(config.openedTs)
         : 0;
-  const openedBefore1015 = openedSec > 0 && openedSec < 10 * 3600 + 15 * 60;
+  const openedEtDate =
+    Number.isFinite(config.openedTs) && config.openedTs > 0
+      ? getTodayEt(new Date((config.openedTs > 1e11 ? Math.floor(config.openedTs / 1000) : config.openedTs) * 1000))
+      : undefined;
+  const sessionBounds = getSessionBoundsEt(openedEtDate);
 
   return {
     tp1LimitPrice,
@@ -175,10 +184,10 @@ export function initializeOcoBrackets(config: OcoBracketConfig): OcoBracketState
     hardStopPrice,
     breakevenStopPrice: entryPrice,
     isTrailingBreakevenArmed: false,
-    stagedMomentumTimeStopActive: openedBefore1015,
+    stagedMomentumTimeStopActive: openedSec > 0,
     peakPnlPct: 0,
     stallTightened: false,
-    marketOnCloseCutoffTimeEt: "15:55:00",
+    marketOnCloseCutoffTimeEt: formatEtMinsAsTimeString(sessionBounds.eodFlatMins),
     remainingContracts: contractsQty,
     status: "ARMED",
   };
@@ -284,16 +293,18 @@ export function evaluateOcoBrackets(params: {
   }
 
   // --------------------------------------------------------------------------
-  // RULE 1: 15:55:00 ET Hard Market-On-Close Liquidation
+  // RULE 1: Hard Market-On-Close Liquidation (15:55:00 ET regular / 12:55:00 ET early close)
   // --------------------------------------------------------------------------
-  if (totalSeconds >= EOD_FORCE_FLAT_MINS * 60) {
+  const sessionBounds = getSessionBoundsEt(getTodayEt(now));
+  const mocTimeLabel = formatEtMinsAsTimeString(sessionBounds.eodFlatMins);
+  if (totalSeconds >= sessionBounds.eodFlatMins * 60) {
     updatedBracket.status = "CLOSED";
     const closingQty = updatedBracket.remainingContracts;
     updatedBracket.remainingContracts = 0;
     return {
       action: "EXIT_MOC",
       triggered: true,
-      reason: "15:55:00 ET HARD MARKET-ON-CLOSE CUTOFF (Eliminate Expiry / Theta Wipeout)",
+      reason: `${mocTimeLabel} ET HARD MARKET-ON-CLOSE CUTOFF (Eliminate Expiry / Theta Wipeout)`,
       exitPrice: liveBid,
       pnlPct,
       contractsToClose: closingQty,
@@ -302,14 +313,24 @@ export function evaluateOcoBrackets(params: {
   }
 
   // --------------------------------------------------------------------------
-  // RULE 2: 10:45 AM Staged Momentum Time-Stop (Avoid Midday Theta Crush)
+  // RULE 2: Elapsed 30-90m (6-18 Bar) Staged Momentum Time-Stop (Avoid Midday Theta Crush)
   // --------------------------------------------------------------------------
+  const openedSecOfDay =
+    parseEtTimeSeconds(config.openedAtEt) ||
+    (config.openedTs > 0 ? etSecondsOfDay(config.openedTs) : 0);
+  const elapsedClockMins =
+    heldMinutes > 0
+      ? heldMinutes
+      : openedSecOfDay > 0 && totalSeconds >= openedSecOfDay
+        ? (totalSeconds - openedSecOfDay) / 60
+        : 0;
   if (
     updatedBracket.status === "ARMED" &&
     updatedBracket.stagedMomentumTimeStopActive &&
-    totalMins >= 10 * 60 + 45 &&
-    totalMins <= 11 * 60 + 15 &&
-    pnlPct < 25
+    elapsedClockMins >= 30 &&
+    elapsedClockMins <= 90 &&
+    pnlPct < 25 &&
+    totalMins >= 0
   ) {
     const momentumFailed = isCall
       ? candle5m && candle5m.close < candle5m.sma34
@@ -322,7 +343,7 @@ export function evaluateOcoBrackets(params: {
       return {
         action: "EXIT_TIME_STOP",
         triggered: true,
-        reason: "10:45 AM MOMENTUM TIME-STOP (Price Stalled Below 5m SMA34 · Protect Capital)",
+        reason: `ELAPSED ${Math.round(elapsedClockMins)}M MOMENTUM TIME-STOP (Price Stalled Beyond 5m SMA34 · Protect Capital)`,
         exitPrice: liveBid,
         pnlPct,
         contractsToClose: closingQty,

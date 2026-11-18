@@ -109,74 +109,127 @@ function computeNicePriceTicks(
     .reverse();
 }
 
+interface PreparedGaiaBucket {
+  strike: number;
+  logStrike: number;
+  inActive: boolean;
+  inNextExp: boolean;
+  hasCall: boolean;
+  hasPut: boolean;
+  callOiScale: number;
+  putOiScale: number;
+  callInvIvSqrtT: number;
+  callDriftT: number;
+  callInvIvSqrtTVex: number;
+  callIvSqrtTVex: number;
+  callVexDriftT: number;
+  callInvIv: number;
+  callDiscountQ: number;
+  putInvIvSqrtT: number;
+  putDriftT: number;
+  putInvIvSqrtTVex: number;
+  putIvSqrtTVex: number;
+  putVexDriftT: number;
+  putInvIv: number;
+  putDiscountQ: number;
+}
+
+function prepareGaiaBucket(
+  bucket: GaiaStrikeExpBucket,
+  inActive: boolean,
+  inNextExp: boolean
+): PreparedGaiaBucket | null {
+  if (bucket.callOI <= 0 && bucket.putOI <= 0) return null;
+  const days = bucket.dteDays;
+  const T = Math.max(1 / 365, days / 365);
+  const sqrtT = Math.sqrt(T);
+  const T_vex = Math.max(1 / 365, (days + 0.5) / 365);
+  const sqrtT_vex = Math.sqrt(T_vex);
+  const discountQ_vex = Math.exp(-0.012 * T_vex);
+
+  const hasCall = bucket.callOI > 0;
+  const callIv = hasCall ? Math.max(0.02, Math.min(3.5, bucket.callIv)) : 0.2;
+  const hasPut = bucket.putOI > 0;
+  const putIv = hasPut ? Math.max(0.02, Math.min(3.5, bucket.putIv)) : 0.2;
+
+  return {
+    strike: bucket.strike,
+    logStrike: Math.log(Math.max(1e-4, bucket.strike)),
+    inActive,
+    inNextExp,
+    hasCall,
+    hasPut,
+    callOiScale: (bucket.callOI * 100 * 0.01) / 1e6,
+    putOiScale: (bucket.putOI * 100 * 0.01) / 1e6,
+    callInvIvSqrtT: 1 / (callIv * sqrtT),
+    callDriftT: (0.046 + 0.5 * callIv * callIv) * T,
+    callInvIvSqrtTVex: 1 / (callIv * sqrtT_vex),
+    callIvSqrtTVex: callIv * sqrtT_vex,
+    callVexDriftT: (0.045 - 0.012 + 0.5 * callIv * callIv) * T_vex,
+    callInvIv: 1 / callIv,
+    callDiscountQ: discountQ_vex,
+    putInvIvSqrtT: 1 / (putIv * sqrtT),
+    putDriftT: (0.046 + 0.5 * putIv * putIv) * T,
+    putInvIvSqrtTVex: 1 / (putIv * sqrtT_vex),
+    putIvSqrtTVex: putIv * sqrtT_vex,
+    putVexDriftT: (0.045 - 0.012 + 0.5 * putIv * putIv) * T_vex,
+    putInvIv: 1 / putIv,
+    putDiscountQ: discountQ_vex,
+  };
+}
+
+function evaluatePreparedBucketDual(
+  spot: number,
+  logSpot: number,
+  p: PreparedGaiaBucket
+): { netGexM: number; netVexM: number } {
+  const rawLogMoneyness = logSpot - p.logStrike;
+  const logMoneyness = rawLogMoneyness > -9.210340371976182 ? rawLogMoneyness : -9.210340371976182;
+
+  let callGexM = 0;
+  let callVexM = 0;
+  if (p.hasCall) {
+    const d1 = (logMoneyness + p.callDriftT) * p.callInvIvSqrtT;
+    const pdf = normPDF(d1);
+    const gammaSpot = pdf * p.callInvIvSqrtT; // gamma * spot
+    const d1v = (logMoneyness + p.callVexDriftT) * p.callInvIvSqrtTVex;
+    const d2v = d1v - p.callIvSqrtTVex;
+    const vanna = -p.callDiscountQ * normPDF(d1v) * (d2v * p.callInvIv);
+    callGexM = p.callOiScale * gammaSpot * spot;
+    callVexM = p.callOiScale * vanna * spot;
+  }
+
+  let putGexM = 0;
+  let putVexM = 0;
+  if (p.hasPut) {
+    const d1 = (logMoneyness + p.putDriftT) * p.putInvIvSqrtT;
+    const pdf = normPDF(d1);
+    const gammaSpot = pdf * p.putInvIvSqrtT;
+    const d1v = (logMoneyness + p.putVexDriftT) * p.putInvIvSqrtTVex;
+    const d2v = d1v - p.putIvSqrtTVex;
+    const vanna = -p.putDiscountQ * normPDF(d1v) * (d2v * p.putInvIv);
+    putGexM = p.putOiScale * gammaSpot * spot;
+    putVexM = p.putOiScale * vanna * spot;
+  }
+
+  return {
+    netGexM: callGexM - putGexM,
+    netVexM: callVexM - putVexM,
+  };
+}
+
 function evaluateBucketExposureM(
   spot: number,
   bucket: GaiaStrikeExpBucket,
   mode: ExposureMode
 ): number {
-  const days = bucket.dteDays;
-  const T = Math.max(1 / 365, days / 365);
-  const sqrtT = Math.sqrt(T);
-
-  let callGexM = 0;
-  let callVexM = 0;
-  if (bucket.callOI > 0) {
-    const iv = Math.max(0.02, Math.min(3.5, bucket.callIv));
-    // Calibrated Black-Scholes Gamma (r = 0.046, q = 0.0, T = days / 365) matching optionsExposure.ts exactly
-    const d1 =
-      (Math.log(Math.max(1e-4, spot / bucket.strike)) +
-        (0.046 + 0.5 * iv * iv) * T) /
-      (iv * sqrtT);
-    const pdf = normPDF(d1);
-    const gamma = pdf / (spot * iv * sqrtT);
-
-    // Calibrated VEX Vanna (r = 0.045, q = 0.012, T_vex = (days + 0.5) / 365)
-    const T_vex = Math.max(1 / 365, (days + 0.5) / 365);
-    const sqrtT_vex = Math.sqrt(T_vex);
-    const d1_vex =
-      (Math.log(Math.max(1e-4, spot / bucket.strike)) +
-        (0.045 - 0.012 + 0.5 * iv * iv) * T_vex) /
-      (iv * sqrtT_vex);
-    const d2_vex = d1_vex - iv * sqrtT_vex;
-    const pdf_vex = normPDF(d1_vex);
-    const discountQ_vex = Math.exp(-0.012 * T_vex);
-    const vanna = -discountQ_vex * pdf_vex * (d2_vex / iv);
-
-    callGexM = (bucket.callOI * gamma * 100 * (spot * spot) * 0.01) / 1e6;
-    callVexM = (bucket.callOI * vanna * 100 * spot * 0.01) / 1e6;
-  }
-
-  let putGexM = 0;
-  let putVexM = 0;
-  if (bucket.putOI > 0) {
-    const iv = Math.max(0.02, Math.min(3.5, bucket.putIv));
-    // Calibrated Black-Scholes Gamma (r = 0.046, q = 0.0, T = days / 365) matching optionsExposure.ts exactly
-    const d1 =
-      (Math.log(Math.max(1e-4, spot / bucket.strike)) +
-        (0.046 + 0.5 * iv * iv) * T) /
-      (iv * sqrtT);
-    const pdf = normPDF(d1);
-    const gamma = pdf / (spot * iv * sqrtT);
-
-    // Calibrated VEX Vanna (r = 0.045, q = 0.012, T_vex = (days + 0.5) / 365)
-    const T_vex = Math.max(1 / 365, (days + 0.5) / 365);
-    const sqrtT_vex = Math.sqrt(T_vex);
-    const d1_vex =
-      (Math.log(Math.max(1e-4, spot / bucket.strike)) +
-        (0.045 - 0.012 + 0.5 * iv * iv) * T_vex) /
-      (iv * sqrtT_vex);
-    const d2_vex = d1_vex - iv * sqrtT_vex;
-    const pdf_vex = normPDF(d1_vex);
-    const discountQ_vex = Math.exp(-0.012 * T_vex);
-    const vanna = -discountQ_vex * pdf_vex * (d2_vex / iv);
-
-    putGexM = (bucket.putOI * gamma * 100 * (spot * spot) * 0.01) / 1e6;
-    putVexM = (bucket.putOI * vanna * 100 * spot * 0.01) / 1e6;
-  }
-
-  const netGexM = callGexM - putGexM;
-  const netVexM = callVexM - putVexM;
-
+  const prep = prepareGaiaBucket(bucket, true, false);
+  if (!prep) return 0;
+  const { netGexM, netVexM } = evaluatePreparedBucketDual(
+    spot,
+    Math.log(Math.max(1e-4, spot)),
+    prep
+  );
   if (mode === "GEX") return netGexM;
   if (mode === "VEX") return netVexM;
   return netGexM + netVexM;
@@ -332,21 +385,67 @@ function buildLiveGaiaDataset(
     payload.sessions.length === 0 ||
     sessionDate === payload.sessions[0].isoDate;
 
-  // Evaluate Black-Scholes exposure across both all-expiration buckets and active filtered buckets at each 5m bar
+  const activeBucketSet = new Set(activeBuckets);
+  const nextExpBucketSet = new Set(nextExpBuckets);
+  const preparedAll: PreparedGaiaBucket[] = [];
+  for (const b of optionBuckets) {
+    const p = prepareGaiaBucket(b, activeBucketSet.has(b), nextExpBucketSet.has(b));
+    if (p) preparedAll.push(p);
+  }
+
+  // Evaluate Black-Scholes exposure in a single pass across prepared buckets per bar
   const columnsByBar: StrikeExposureColumn[] = candles.map((candle, idx) => {
     const spot =
       isLatestSession && idx === candles.length - 1
         ? payload.spotPrice
         : candle.close;
+    const logSpot = Math.log(Math.max(1e-4, spot));
 
-    // 1. Global All-Expiration King calculation across all optionBuckets
     const allExpStrikeTotals = new Map<number, number>();
-    for (const bucket of optionBuckets) {
-      const valM = evaluateBucketExposureM(spot, bucket, exposureMode);
+    const strikeTotals = expFilter === "ALL" ? allExpStrikeTotals : new Map<number, number>();
+    const strikeGexTotals = new Map<number, number>();
+    const strikeVexTotals = new Map<number, number>();
+    const nextExpTotals = expFilter === "ALL" && nextExpBuckets.length > 0 ? new Map<number, number>() : null;
+
+    for (let i = 0; i < preparedAll.length; i++) {
+      const prep = preparedAll[i];
+      const { netGexM, netVexM } = evaluatePreparedBucketDual(spot, logSpot, prep);
+      const valM =
+        exposureMode === "GEX"
+          ? netGexM
+          : exposureMode === "VEX"
+          ? netVexM
+          : netGexM + netVexM;
+
       allExpStrikeTotals.set(
-        bucket.strike,
-        (allExpStrikeTotals.get(bucket.strike) ?? 0) + valM
+        prep.strike,
+        (allExpStrikeTotals.get(prep.strike) ?? 0) + valM
       );
+
+      if (expFilter === "ALL" || prep.inActive) {
+        strikeGexTotals.set(
+          prep.strike,
+          (strikeGexTotals.get(prep.strike) ?? 0) + netGexM
+        );
+        strikeVexTotals.set(
+          prep.strike,
+          (strikeVexTotals.get(prep.strike) ?? 0) + netVexM
+        );
+      }
+
+      if (expFilter !== "ALL" && prep.inActive) {
+        strikeTotals.set(
+          prep.strike,
+          (strikeTotals.get(prep.strike) ?? 0) + valM
+        );
+      }
+
+      if (nextExpTotals && prep.inNextExp) {
+        nextExpTotals.set(
+          prep.strike,
+          (nextExpTotals.get(prep.strike) ?? 0) + valM
+        );
+      }
     }
 
     let totalAllExpAbsBoardM = 0;
@@ -366,36 +465,6 @@ function buildLiveGaiaDataset(
       totalAllExpAbsBoardM > 0
         ? Number(((allExpKingAbsM / totalAllExpAbsBoardM) * 100).toFixed(1))
         : 0;
-
-    // 2. Filtered Expiration King & Active Book calculation across activeBuckets
-    const strikeTotals =
-      expFilter === "ALL" ? allExpStrikeTotals : new Map<number, number>();
-    const strikeGexTotals = new Map<number, number>();
-    const strikeVexTotals = new Map<number, number>();
-
-    const bucketsForDual = expFilter === "ALL" ? optionBuckets : activeBuckets;
-    for (const bucket of bucketsForDual) {
-      const gex = evaluateBucketExposureM(spot, bucket, "GEX");
-      const vex = evaluateBucketExposureM(spot, bucket, "VEX");
-      strikeGexTotals.set(
-        bucket.strike,
-        (strikeGexTotals.get(bucket.strike) ?? 0) + gex
-      );
-      strikeVexTotals.set(
-        bucket.strike,
-        (strikeVexTotals.get(bucket.strike) ?? 0) + vex
-      );
-    }
-
-    if (expFilter !== "ALL") {
-      for (const bucket of activeBuckets) {
-        const valM = evaluateBucketExposureM(spot, bucket, exposureMode);
-        strikeTotals.set(
-          bucket.strike,
-          (strikeTotals.get(bucket.strike) ?? 0) + valM
-        );
-      }
-    }
 
     let totalNetM = 0;
     let totalAbsBoardM = 0;
@@ -438,13 +507,8 @@ function buildLiveGaiaDataset(
         : 0;
 
     // When viewing All-Exp, also compute the Tactical 0DTE/Next-Exp King so the chart always shows the nearest expiration magnet alongside All-Exp King
-    if (expFilter === "ALL" && nextExpBuckets.length > 0) {
-      const nextExpTotals = new Map<number, number>();
+    if (nextExpTotals) {
       let nextExpAbsBoardM = 0;
-      for (const bucket of nextExpBuckets) {
-        const valM = evaluateBucketExposureM(spot, bucket, exposureMode);
-        nextExpTotals.set(bucket.strike, (nextExpTotals.get(bucket.strike) ?? 0) + valM);
-      }
       let bestNextStrike = allExpKingStrike;
       let bestNextAbsM = -1;
       for (const [strike, valM] of Array.from(nextExpTotals.entries())) {
@@ -574,6 +638,9 @@ export function GaiaView() {
   const storeTradeAlerts = useDashboardStore(
     (state) => state.serverTradeAlerts
   );
+  const storeServerTradesLoaded = useDashboardStore(
+    (state) => state.serverTradesLoaded
+  );
   const storeSupervisorPolicy = useDashboardStore(
     (state) => state.supervisorPolicy
   );
@@ -582,6 +649,7 @@ export function GaiaView() {
     activePositions: storeActivePositions,
     closedPositions: storeClosedTrades,
     alerts: storeTradeAlerts,
+    loaded: storeServerTradesLoaded,
   });
   const [historicalSupervisorPolicy, setHistoricalSupervisorPolicy] =
     useState<SessionPlaybookPolicy | null>(null);
@@ -598,7 +666,7 @@ export function GaiaView() {
 
   useEffect(() => {
     setPrzmHudSignals([]);
-    setServerTrades({ activePositions: {}, closedPositions: [], alerts: [] });
+    setServerTrades({ activePositions: {}, closedPositions: [], alerts: [], loaded: false });
     setHistoricalSupervisorPolicy(null);
   }, [loadedTicker]);
 
@@ -630,14 +698,16 @@ export function GaiaView() {
         activePositions: serverTrades.activePositions || {},
         closedPositions: serverTrades.closedPositions || [],
         alerts: serverTrades.alerts || [],
+        loaded: Boolean(serverTrades.loaded),
       };
     }
     return {
       activePositions: storeActivePositions,
       closedPositions: storeClosedTrades,
       alerts: storeTradeAlerts,
+      loaded: storeServerTradesLoaded,
     };
-  }, [selectedSessionIso, serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts]);
+  }, [selectedSessionIso, serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts, storeServerTradesLoaded]);
   const storeHeatmapKingNode = useDashboardStore((s) => s.kingNode);
   const storeHeatmapTicker = useDashboardStore((s) => s.activeTicker);
   const isReplayingRef = useRef<boolean>(false);
@@ -711,18 +781,24 @@ export function GaiaView() {
   const [canvasWidth, setCanvasWidth] = useState<number>(1016);
   const gaiaAbortRef = useRef<AbortController | null>(null);
   const gaiaReqSeqRef = useRef<number>(0);
+  const gaiaInFlightRef = useRef<boolean>(false);
 
   useEffect(() => {
     return () => {
       gaiaAbortRef.current?.abort();
+      gaiaInFlightRef.current = false;
     };
   }, []);
 
   const fetchLiveGaia = useCallback(
     async (tickerSymbol: string, sessionIso?: string, sHour: number = startHour, silent: boolean = false) => {
+      if (silent && gaiaInFlightRef.current) {
+        return;
+      }
       gaiaAbortRef.current?.abort();
       const controller = new AbortController();
       gaiaAbortRef.current = controller;
+      gaiaInFlightRef.current = true;
       const reqSeq = ++gaiaReqSeqRef.current;
       if (!silent) {
         setIsLoading(true);
@@ -759,7 +835,8 @@ export function GaiaView() {
           setErrorMsg(msg);
         }
       } finally {
-        if (!silent && reqSeq === gaiaReqSeqRef.current) {
+        if (reqSeq === gaiaReqSeqRef.current) {
+          gaiaInFlightRef.current = false;
           setIsLoading(false);
         }
       }
@@ -841,7 +918,7 @@ export function GaiaView() {
         ) {
           fetchLiveGaia(loadedTicker, "", startHour, true);
         }
-      }, 2500);
+      }, 8000);
       return () => clearInterval(liveInterval);
     }
   }, [loadedTicker, selectedSessionIso, startHour, isReplaying, isReplayFrozen, fetchLiveGaia]);
@@ -862,6 +939,13 @@ export function GaiaView() {
       const candles = prev.candles;
       if (!candles || candles.length === 0) return prev;
       const lastCandle = candles[candles.length - 1];
+      if (
+        Math.abs(liveTickPrice - lastCandle.close) < 1e-6 &&
+        lastCandle.high >= liveTickPrice &&
+        lastCandle.low <= liveTickPrice
+      ) {
+        return prev;
+      }
       const relDiff = Math.abs(liveTickPrice - lastCandle.close) / Math.max(1, lastCandle.close);
       if (relDiff > 0.005) return prev;
 
@@ -946,7 +1030,7 @@ export function GaiaView() {
   // Historical Session Trade Signals Hook (live session uses GlobalMarketDataSync store state)
   useEffect(() => {
     if (!selectedSessionIso) {
-      setServerTrades({ activePositions: {}, closedPositions: [], alerts: [] });
+      setServerTrades({ activePositions: {}, closedPositions: [], alerts: [], loaded: false });
       setHistoricalSupervisorPolicy(null);
       return;
     }
@@ -970,6 +1054,7 @@ export function GaiaView() {
             activePositions: data.activePositions || {},
             closedPositions: data.closedPositions || [],
             alerts: data.alerts || [],
+            loaded: true,
           });
           setHistoricalSupervisorPolicy(data.supervisorPolicy ?? null);
         }
@@ -1730,8 +1815,7 @@ export function GaiaView() {
     const dayPlus2 = dataset.priorClose + dataset.sigma2Move;
     const dayMinus2 = dataset.priorClose - dataset.sigma2Move;
     const pdhPrice =
-      (livePayload as (GaiaLivePayload & { pdh?: number }) | null)?.pdh ??
-      dataset.priorClose;
+      (livePayload as (GaiaLivePayload & { pdh?: number }) | null)?.pdh ?? 0;
     const pdlPrice =
       (livePayload as (GaiaLivePayload & { pdl?: number }) | null)?.pdl ?? 0;
 
@@ -1755,7 +1839,7 @@ export function GaiaView() {
         stroke: "rgba(250, 204, 21, 0.75)",
         dash: [4, 4],
         lineWidth: 1.25,
-        label: `0DTE KING ${filteredKingStrike}`,
+        label: `${canvasFilterBadgePrefix.toUpperCase()} KING ${filteredKingStrike}`,
         textColor: "#facc15",
         priority: 95,
       });
@@ -2055,7 +2139,7 @@ export function GaiaView() {
       }
     };
 
-    const curKing = dataset.columnsByBar[safeActiveIdx]?.allExpKingStrike ?? 0;
+    const curKing = liveAllExpKingStrike || (dataset.columnsByBar[safeActiveIdx]?.allExpKingStrike ?? 0);
     for (const sig of dataset.pivotSignals5m) {
       if (safeActiveIdx < sig.confirmedAtIndex) continue;
 
@@ -2767,10 +2851,16 @@ export function GaiaView() {
           />
           <button
             type="submit"
-            disabled={isLoading}
+            disabled={
+              isLoading &&
+              (tickerInput.trim().toUpperCase() || "SPY") === loadedTicker
+            }
             className="bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16] font-bold text-xs px-5 py-2 rounded-lg hover:opacity-95 transition cursor-pointer disabled:opacity-50"
           >
-            {isLoading ? "Loading..." : "Load"}
+            {isLoading &&
+            (tickerInput.trim().toUpperCase() || "SPY") === loadedTicker
+              ? "Loading..."
+              : "Load"}
           </button>
         </form>
       </div>

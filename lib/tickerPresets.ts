@@ -751,75 +751,7 @@ export const TICKER_PRESETS: Record<string, TickerPreset> = {
   },
 };
 
-export function getTickerPreset(rawTicker: string, liveSpot?: number): TickerPreset {
-  const clean = rawTicker.trim().toUpperCase();
-
-  // 1. Check live memory cache dynamically first
-  const globalCache = (
-    globalThis as unknown as {
-      __hyperionOptionsMemoryCache?: Map<string, { timestamp: number; payload: any }>;
-    }
-  ).__hyperionOptionsMemoryCache;
-
-  const cached = globalCache?.get(clean)?.payload;
-  if (cached && cached.spotPrice > 0) {
-    const spot = cached.spotPrice;
-    const step = cached.strikeStep || (spot >= 250 ? 5 : spot >= 100 ? 2.5 : 1);
-    const center = Math.round(spot / step) * step;
-    return {
-      ticker: clean,
-      name: `${clean} Options Chain`,
-      spotPrice: spot,
-      previousClose: cached.previousClose ?? spot,
-      impliedVolatility: cached.impliedVolatility ?? 0.25,
-      netMetrics: cached.netMetrics ?? { netGex: 0, netVex: 0 },
-      gammaLevels: cached.gammaLevels ?? {
-        putWall: center - step * 3,
-        zeroGamma: center,
-        callWall: center + step * 3,
-      },
-      kingPreset: {
-        allExpKing: cached.kingNode?.allExpKing ?? center,
-        zeroDteKing: cached.kingNode?.zeroDteKing ?? cached.kingNode?.allExpKing ?? center,
-        weeklyKing: cached.kingNode?.weeklyKing ?? cached.kingNode?.allExpKing ?? center,
-        opexKing: cached.kingNode?.opexKing ?? cached.kingNode?.allExpKing ?? center,
-        kingValue: cached.kingNode?.kingValue ?? 100,
-        secondLargestStrike: cached.kingNode?.secondLargestStrike ?? center - step,
-        secondLargestValue: cached.kingNode?.secondLargestValue ?? 50,
-        totalBoardGamma: cached.kingNode?.totalBoardGamma ?? 500,
-      },
-      strikeStep: step,
-    };
-  }
-
-  // 2. Check static presets (SPY, QQQ, etc. baseline fallbacks)
-  if (TICKER_PRESETS[clean]) {
-    const base = TICKER_PRESETS[clean];
-    if (liveSpot && liveSpot > 0 && Math.abs(liveSpot - base.spotPrice) / base.spotPrice > 0.05) {
-      // Dynamic scaling if liveSpot diverges from old static preset
-      const step = base.strikeStep;
-      const center = Math.round(liveSpot / step) * step;
-      return {
-        ...base,
-        spotPrice: liveSpot,
-        previousClose: liveSpot,
-        gammaLevels: {
-          putWall: center - step * 3,
-          zeroGamma: center,
-          callWall: center + step * 3,
-        },
-        kingPreset: {
-          ...base.kingPreset,
-          allExpKing: center,
-          zeroDteKing: center,
-          weeklyKing: center,
-        },
-      };
-    }
-    return base;
-  }
-
-  // 3. Dynamic synthesis for unlisted tickers (Zero hardcoded ASCII hash % 340)
+function buildSyntheticPreset(clean: string, liveSpot?: number): TickerPreset {
   const baseSpot = liveSpot && liveSpot > 0 ? liveSpot : 100.0;
   const step = baseSpot >= 250 ? 5 : baseSpot >= 100 ? 2.5 : 1;
   const centerStrike = Math.round(baseSpot / step) * step;
@@ -854,73 +786,81 @@ export function getTickerPreset(rawTicker: string, liveSpot?: number): TickerPre
 }
 
 /**
- * Full 51-ticker Gaia quick-select layout grouped into 4 curated rows matching WATCH_LIST.
+ * Deterministic SSR/Client-safe preset lookup (never reads server-only globalThis memory cache).
+ * Use in React UI components and initial client store state to avoid hydration mismatches.
  */
-export const GAIA_TICKER_ROWS: string[][] = [
-  ["SPY", "QQQ", "SPXW", "IWM", "NDXP", "DIA"],
-  [
-    "SMH", "TLT", "GLD", "SLV", "XLE", "TQQQ", "SOXL", "IBIT",
-    "NVDA", "AAPL", "TSLA", "MSFT", "AMZN", "META", "GOOGL", "AVGO",
-    "NFLX", "ORCL", "AMD", "MU", "INTC", "TSM",
-  ],
-  [
-    "ARM", "PLTR", "COIN", "MSTR", "HOOD", "SOFI", "SMCI", "CRWD",
-    "UBER", "SHOP", "RBLX", "JPM", "BAC", "WMT", "COST", "XOM",
-    "BA", "LLY", "GME", "RIVN", "MARA", "BABA",
-  ],
-  ["SPCX"],
-];
+export function getStaticTickerPreset(rawTicker: string, liveSpot?: number): TickerPreset {
+  const clean = rawTicker.trim().toUpperCase();
+  if (TICKER_PRESETS[clean]) {
+    const base = TICKER_PRESETS[clean];
+    if (liveSpot && liveSpot > 0 && Math.abs(liveSpot - base.spotPrice) / base.spotPrice > 0.05) {
+      const step = base.strikeStep;
+      const center = Math.round(liveSpot / step) * step;
+      return {
+        ...base,
+        spotPrice: liveSpot,
+        previousClose: liveSpot,
+        gammaLevels: {
+          putWall: center - step * 3,
+          zeroGamma: center,
+          callWall: center + step * 3,
+        },
+        kingPreset: {
+          ...base.kingPreset,
+          allExpKing: center,
+          zeroDteKing: center,
+          weeklyKing: center,
+        },
+      };
+    }
+    return base;
+  }
 
-export const GAIA_TICKER_CATEGORIES: Record<string, string> = {
-  SPY: "Index/ETF",
-  QQQ: "Index/ETF",
-  SPXW: "Index/ETF",
-  IWM: "Index/ETF",
-  NDXP: "Index/ETF",
-  DIA: "Index/ETF",
-  SMH: "Sector ETF",
-  TLT: "Rates ETF",
-  GLD: "Commodity",
-  SLV: "Commodity",
-  XLE: "Sector ETF",
-  TQQQ: "Leveraged",
-  SOXL: "Leveraged",
-  IBIT: "Crypto ETF",
-  NVDA: "Mega-Cap Tech",
-  AAPL: "Mega-Cap Tech",
-  TSLA: "Mega-Cap Tech",
-  MSFT: "Mega-Cap Tech",
-  AMZN: "Mega-Cap Tech",
-  META: "Mega-Cap Tech",
-  GOOGL: "Mega-Cap Tech",
-  AVGO: "Mega-Cap Tech",
-  NFLX: "Mega-Cap Tech",
-  ORCL: "Mega-Cap Tech",
-  AMD: "Semis",
-  MU: "Semis",
-  INTC: "Semis",
-  TSM: "Semis",
-  ARM: "Semis/AI",
-  PLTR: "High-Beta AI",
-  COIN: "Crypto Proxy",
-  MSTR: "Crypto Proxy",
-  HOOD: "Fintech",
-  SOFI: "Fintech",
-  SMCI: "High-Beta AI",
-  CRWD: "Cyber/SaaS",
-  UBER: "Tech/Mobility",
-  SHOP: "E-Commerce",
-  RBLX: "Gaming/Tech",
-  JPM: "Financials",
-  BAC: "Financials",
-  WMT: "Consumer",
-  COST: "Consumer",
-  XOM: "Energy",
-  BA: "Industrials",
-  LLY: "Healthcare",
-  GME: "High-Beta Retail",
-  RIVN: "EV/Beta",
-  MARA: "Crypto Proxy",
-  BABA: "China ADR",
-  SPCX: "Thematic ETF",
-};
+  return buildSyntheticPreset(clean, liveSpot);
+}
+
+export function getTickerPreset(rawTicker: string, liveSpot?: number): TickerPreset {
+  const clean = rawTicker.trim().toUpperCase();
+
+  // 1. Check live memory cache dynamically first (server-side optimization)
+  const globalCache = (
+    globalThis as unknown as {
+      __hyperionOptionsMemoryCache?: Map<string, { timestamp: number; payload: any }>;
+    }
+  ).__hyperionOptionsMemoryCache;
+
+  const cached = globalCache?.get(clean)?.payload;
+  if (cached && cached.spotPrice > 0) {
+    const spot = cached.spotPrice;
+    const step = cached.strikeStep || (spot >= 250 ? 5 : spot >= 100 ? 2.5 : 1);
+    const center = Math.round(spot / step) * step;
+    const knownName = TICKER_PRESETS[clean]?.name;
+    return {
+      ticker: clean,
+      name: knownName ?? `${clean} Options Chain`,
+      spotPrice: spot,
+      previousClose: cached.previousClose ?? spot,
+      impliedVolatility: cached.impliedVolatility ?? 0.25,
+      netMetrics: cached.netMetrics ?? { netGex: 0, netVex: 0 },
+      gammaLevels: cached.gammaLevels ?? {
+        putWall: center - step * 3,
+        zeroGamma: center,
+        callWall: center + step * 3,
+      },
+      kingPreset: {
+        allExpKing: cached.kingNode?.allExpKing ?? center,
+        zeroDteKing: cached.kingNode?.zeroDteKing ?? cached.kingNode?.allExpKing ?? center,
+        weeklyKing: cached.kingNode?.weeklyKing ?? cached.kingNode?.allExpKing ?? center,
+        opexKing: cached.kingNode?.opexKing ?? cached.kingNode?.allExpKing ?? center,
+        kingValue: cached.kingNode?.kingValue ?? 100,
+        secondLargestStrike: cached.kingNode?.secondLargestStrike ?? center - step,
+        secondLargestValue: cached.kingNode?.secondLargestValue ?? 50,
+        totalBoardGamma: cached.kingNode?.totalBoardGamma ?? 500,
+      },
+      strikeStep: step,
+    };
+  }
+
+  // 2. Fall back to deterministic static presets / dynamic synthesis
+  return getStaticTickerPreset(clean, liveSpot);
+}

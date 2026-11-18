@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { evaluatePrzmCallLedger, PrzmSignalPoint, PrzmCandlePoint } from "@/components/gaia/PrzmTacticalHud";
 import {
@@ -13,6 +14,7 @@ import { initializeOcoBrackets, evaluateOcoBrackets } from "@/lib/bracketOrderEn
 import { NbboQuote } from "@/lib/marketDataService";
 import { clampToCandleRange } from "@/lib/tradeSignalEngine";
 import { acquireBarEvaluationLock, releaseBarEvaluationLock } from "@/lib/liveBotDaemon";
+import { releaseCrossProcessExecutionLease } from "@/lib/executionLease";
 
 describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
   it("Duration Normalization Invariant: 44-minute millisecond trade produces 44M, NOT 723H", () => {
@@ -540,11 +542,21 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
   });
 
   it("Daemon Lock Token Ownership Invariant: Mismatched release token cannot clear active bar lock", () => {
-    const tok = acquireBarEvaluationLock();
-    assert.ok(tok, "Initial lock acquisition must succeed");
-    releaseBarEvaluationLock(999999 as any);
-    assert.strictEqual(acquireBarEvaluationLock(), 0 as any, "Wrong token must not release active lock");
-    releaseBarEvaluationLock(tok as any);
+    const prevCacheDir = process.env.HYPERION_CACHE_DIR;
+    const tmpCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "hyperion-viewport-lock-"));
+    process.env.HYPERION_CACHE_DIR = tmpCacheDir;
+    try {
+      const tok = acquireBarEvaluationLock();
+      assert.ok(tok, "Initial lock acquisition must succeed");
+      releaseBarEvaluationLock(999999 as any);
+      assert.strictEqual(acquireBarEvaluationLock(), 0 as any, "Wrong token must not release active lock");
+      releaseBarEvaluationLock(tok as any);
+      releaseCrossProcessExecutionLease();
+    } finally {
+      if (prevCacheDir === undefined) delete process.env.HYPERION_CACHE_DIR;
+      else process.env.HYPERION_CACHE_DIR = prevCacheDir;
+      fs.rmSync(tmpCacheDir, { recursive: true, force: true });
+    }
   });
 
   it("Cross-Day Trade Marker Firewall: matchTradeToCandleIndex rejects prior-day timestamps despite identical HH:MM timeLabel", () => {

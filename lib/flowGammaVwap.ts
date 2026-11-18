@@ -315,14 +315,15 @@ export function evaluateSpectralFlowAndFluxAtTau(params: {
   }
 
   const prefactor = (safeGamma * Math.PI) / W;
-  const expHalfPePos = Math.exp(Math.max(-12, Math.min(12, pe / 2)));
-  const expHalfPeNeg = Math.exp(Math.max(-12, Math.min(12, -pe / 2)));
+  // baseModes.B is calibrated at opening reference muDelta = 0 and at x = 0 the gauge factor equals 1;
+  // bound ceiling transient multiplier and remove e^{-Pe/2} blowup on floorFluxJ.
+  const expHalfPePos = Math.exp(Math.max(-1.5, Math.min(1.5, pe * 0.15)));
 
-  // J_c(tau) = chi * sigma_c * W + (Gamma * pi / W) * e^{Pe/2} * sum (-1)^{n+1} n B_n e^{-lambda_n tau}
+  // J_c(tau) = chi * sigma_c * W + (Gamma * pi / W) * expFactor * sum (-1)^{n+1} n B_n e^{-lambda_n tau}
   const ceilingFluxJ =
     chi * sigmaC * W + prefactor * expHalfPePos * transientCeilingSum;
   const floorFluxJ =
-    (1 - chi) * sigmaC * W + prefactor * expHalfPeNeg * transientFloorSum;
+    (1 - chi) * sigmaC * W + prefactor * transientFloorSum;
   const netFluxJ = ceilingFluxJ - floorFluxJ;
 
   // Flux Alpha A(T) = alpha * { chi * W * T * sigma_c + (Gamma * pi / W) * e^{Pe/2} * sum (-1)^{n+1} (n B_n / lambda_n) (1 - e^{-lambda_n T}) }
@@ -735,8 +736,8 @@ export function computeBarFlowGammaVwapSeries(
       return val;
     };
 
-    const gammaDiff = (baseW * baseW) / (Math.PI * Math.PI * 140);
-    const kappa = gammaDiff;
+    const kappa = (baseW * baseW) / (Math.PI * Math.PI * 140);
+    const gammaDiff = Math.max(kappa, 0.85 * baseW);
     const baseModes = computeSpectralModes({
       openingProfile,
       W: baseW,
@@ -776,6 +777,8 @@ export function computeBarFlowGammaVwapSeries(
     const barRange = Math.max(0, c.high - c.low);
     if (prevEtMins !== null && typeof etMins === "number" && etMins < prevEtMins) {
       lastRthResetDate = "";
+      sessionStartIdx = i;
+      sessionStartTs = c.timestamp;
     }
     if (typeof etMins === "number") {
       prevEtMins = etMins;
@@ -830,14 +833,17 @@ export function computeBarFlowGammaVwapSeries(
     const causalFloor = Math.max(0.01, runningLow - causalBuffer);
 
     const floorNode =
-      structuralNodes?.floorNode && structuralNodes.floorNode > 0 && structuralNodes.floorNode < runningHigh
+      structuralNodes?.floorNode &&
+      structuralNodes.floorNode > 0 &&
+      structuralNodes.floorNode < Math.min(spot, runningHigh)
         ? structuralNodes.floorNode
         : putWallCandidate > 0 && putWallCandidate < spot
           ? Math.min(putWallCandidate, causalFloor)
           : Number(causalFloor.toFixed(2));
 
     const ceilingNode =
-      structuralNodes?.ceilingNode && structuralNodes.ceilingNode > floorNode
+      structuralNodes?.ceilingNode &&
+      structuralNodes.ceilingNode > Math.max(floorNode, spot)
         ? structuralNodes.ceilingNode
         : callWallCandidate > floorNode && callWallCandidate > spot
           ? Math.max(callWallCandidate, causalCeiling)
@@ -983,7 +989,7 @@ export function computeBarFlowGammaVwapSeries(
       A: baseModes.A,
       B: baseModes.B,
       kappa,
-      gammaDiff,
+      gammaDiff: Math.max(gammaDiff, 0.85 * W),
       muDelta,
       sigmaC,
     });

@@ -3,13 +3,18 @@ import {
   NormalizedOptionContract,
 } from "@/lib/optionsExposure";
 import { FlowGammaVwapSnapshot } from "@/lib/flowGammaVwap";
-import { RTH_CLOSE_MINS } from "@/lib/gaiaSessionGuards";
+import { getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
 import {
   AlphaPriorsState,
   MarketRegimeId,
   cloneDefaultAlphaPriors,
 } from "@/lib/persistenceStore";
-import { MAX_OPTION_DELTA, MIN_OPTION_DELTA, resolveMinOptionDelta } from "@/lib/positionSizer";
+import {
+  computeTaylorNetPayoff,
+  MAX_OPTION_DELTA,
+  MAX_SPREAD_TO_EDGE_RATIO,
+  resolveMinOptionDelta,
+} from "@/lib/positionSizer";
 
 export type { MarketRegimeId };
 
@@ -174,11 +179,15 @@ export function evaluateLeg2StructuralGate(
     calibratedExpectancyR,
   } = input;
 
-  if (etMins < 630 || etMins > 870) {
+  const sessionDateEt = new Date(nowTsSec * 1000).toLocaleDateString("en-CA", {
+    timeZone: "America/New_York",
+  });
+  const { entryCutoffMins } = getSessionBoundsEt(sessionDateEt);
+  if (etMins < 630 || etMins > entryCutoffMins) {
     return {
       allowed: false,
       requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
-      reason: `LEG2_WINDOW_CLOSED: etMins=${etMins} outside [630, 870]`,
+      reason: `LEG2_WINDOW_CLOSED: etMins=${etMins} outside [630, ${entryCutoffMins}]`,
     };
   }
 
@@ -414,6 +423,8 @@ export interface ScoredContractSelection {
     gammaThetaEfficiency: number;
     ivSkewAdjustment: number;
     dailyTheta: number;
+    netEv: number;
+    spreadToEdgeRatio: number;
   };
   evaluatedCount: number;
 }
@@ -449,7 +460,8 @@ export function resolveEtMinutesFromMs(nowMs: number): number {
 export function estimateRemainingYears(nowMs: number, dteDays: number): number {
   const safeDte = Math.max(0, dteDays);
   const etMins = resolveEtMinutesFromMs(nowMs);
-  const minsLeftToday = Math.max(15, RTH_CLOSE_MINS - etMins);
+  const { rthCloseMins } = getSessionBoundsEt();
+  const minsLeftToday = Math.max(15, rthCloseMins - etMins);
   const totalTradingMinutes = safeDte * 390 + (safeDte === 0 ? minsLeftToday : 240);
   return Math.max(15 / (252 * 390), totalTradingMinutes / (252 * 390));
 }
@@ -1009,6 +1021,9 @@ export function selectOptimalSmallAccountContract(params: {
   zeroDtePutWall?: number;
   isAfternoon: boolean;
   preferredDte?: "0DTE" | "1-2DTE" | "NONE";
+  regime?: MarketRegimeId;
+  absImpulsePeclet?: number;
+  remainingExpectedMove?: number;
   etMins?: number;
   nowMs?: number;
 }): ScoredContractSelection | null {
@@ -1023,18 +1038,18 @@ export function selectOptimalSmallAccountContract(params: {
     zeroDtePutWall,
     isAfternoon,
     preferredDte,
-    etMins,
+    regime,
+    absImpulsePeclet,
+    remainingExpectedMove,
     nowMs = Date.now(),
   } = params;
 
   if (!candidates || candidates.length === 0) return null;
 
-  const effectiveMinDelta =
-    typeof etMins === "number" && Number.isFinite(etMins)
-      ? resolveMinOptionDelta(etMins)
-      : params.nowMs !== undefined
-        ? resolveMinOptionDelta(resolveEtMinutesFromMs(params.nowMs))
-        : MIN_OPTION_DELTA;
+  const effectiveMinDelta = resolveMinOptionDelta({
+    regime: regime ?? (preferredDte === "1-2DTE" ? "POS_GAMMA_PIN" : undefined),
+    absImpulsePeclet,
+  });
 
   // Compute median ATM IV across valid candidates for IV-skew evaluation
   const nearAtmIvs = candidates
@@ -1053,12 +1068,36 @@ export function selectOptimalSmallAccountContract(params: {
     gammaThetaEfficiency: number;
     ivSkewAdjustment: number;
     dailyTheta: number;
+    netEv: number;
+    spreadToEdgeRatio: number;
   };
 
   const stage1: ScoredCand[] = [];
   const stage2: ScoredCand[] = [];
   const stage3: ScoredCand[] = [];
   const maxOtmDist = Math.min(3.5, spotPrice * 0.0045);
+
+  const structuralTargetWall = isCall
+    ? (zeroDteCallWall && isSpxw ? zeroDteCallWall / 10 : zeroDteCallWall)
+    : (zeroDtePutWall && isSpxw ? zeroDtePutWall / 10 : zeroDtePutWall);
+  const rawTargetMove = Math.abs(target1Spot - spotPrice);
+  const wallRoom =
+    structuralTargetWall &&
+    structuralTargetWall > 0 &&
+    ((isCall && structuralTargetWall > spotPrice) || (!isCall && structuralTargetWall < spotPrice))
+      ? Math.abs(structuralTargetWall - spotPrice)
+      : rawTargetMove;
+  const minExpectedMove = spotPrice * 0.0007;
+  const boundedByWall = Math.max(
+    minExpectedMove,
+    Math.min(Math.max(minExpectedMove, rawTargetMove), Math.max(minExpectedMove, wallRoom))
+  );
+  const expMove =
+    typeof remainingExpectedMove === "number" &&
+    Number.isFinite(remainingExpectedMove) &&
+    remainingExpectedMove > 0
+      ? Math.max(minExpectedMove, Math.min(boundedByWall, remainingExpectedMove))
+      : boundedByWall;
 
   for (const cand of candidates) {
     const c = cand.contract;
@@ -1068,7 +1107,7 @@ export function selectOptimalSmallAccountContract(params: {
     const dte = cand.dte;
     const absDelta = cand.absDelta;
 
-    // Hard Time-of-Day Adaptive Delta Band ([0.24..0.50] pre-10:30 ET, [0.35..0.50] >=10:30 ET)
+    // Regime & advection conditioned delta band
     if (!Number.isFinite(absDelta) || absDelta < effectiveMinDelta || absDelta > MAX_OPTION_DELTA) {
       continue;
     }
@@ -1093,9 +1132,6 @@ export function selectOptimalSmallAccountContract(params: {
     const targetScore = Math.max(0, 35 - (distToTarget / targetDistUnit) * 3.5);
 
     const gammaEst = Math.max(0, c.gamma || 0);
-    const expMove = Math.max(spotPrice * 0.0007, Math.abs(target1Spot - spotPrice));
-    const convexityPerDollar = (absDelta + 0.5 * gammaEst * expMove) / Math.max(0.15, askPrice);
-    const deltaScore = 18 + Math.min(30, convexityPerDollar * 18);
 
     // Gamma-to-Theta efficiency: Γ / max(0.005, |Θ_daily|)
     const rawIv =
@@ -1109,6 +1145,22 @@ export function selectOptimalSmallAccountContract(params: {
       typeof cand.theta === "number" && Number.isFinite(cand.theta) && cand.theta < 0
         ? cand.theta
         : computeDailyOptionTheta(spotPrice, c.strike, tYears, rawIv, isCall);
+
+    // Second-Order Taylor Net Payoff Router & Hard Spread-to-Edge Veto (spread / expectedDollarMove > 0.22)
+    const taylorEval = computeTaylorNetPayoff({
+      absDelta,
+      gamma: gammaEst,
+      dailyTheta,
+      bid: bidPrice,
+      ask: askPrice,
+      expectedUnderlyingMove: expMove,
+      minDelta: effectiveMinDelta,
+    });
+    if (!taylorEval.allowed) {
+      continue;
+    }
+    const deltaScore = 18 + Math.min(42, taylorEval.netEvPerDollarAsk * 45);
+
     const gammaThetaEfficiency = Number(
       (gammaEst / Math.max(0.005, Math.abs(dailyTheta))).toFixed(3)
     );
@@ -1122,8 +1174,11 @@ export function selectOptimalSmallAccountContract(params: {
       else if (ivRatio >= 1.2) ivSkewAdjustment = -15;
     }
 
-    // Spread tightness score
-    const spreadTightnessScore = Math.max(0, (1 - spreadPct / 0.24) * 16);
+    // Spread-to-edge tightness score anchored to hard 0.22 veto boundary
+    const spreadTightnessScore = Math.max(
+      0,
+      (1 - taylorEval.spreadToEdgeRatio / MAX_SPREAD_TO_EDGE_RATIO) * 18
+    );
 
     const liqScore = Math.min(20, ((c.openInterest || 0) + (c.volume || 0)) / 120);
 
@@ -1163,6 +1218,8 @@ export function selectOptimalSmallAccountContract(params: {
       gammaThetaEfficiency,
       ivSkewAdjustment,
       dailyTheta: Number(dailyTheta.toFixed(4)),
+      netEv: Number(taylorEval.netEvPerDollarAsk.toFixed(4)),
+      spreadToEdgeRatio: Number(taylorEval.spreadToEdgeRatio.toFixed(4)),
     };
 
     if (preferredDte === "0DTE") {

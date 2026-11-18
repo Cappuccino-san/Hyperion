@@ -14,6 +14,11 @@ export function GlobalMarketDataSync() {
   const activeTicker = useDashboardStore((state) => state.activeTicker);
   const fetchOptionsChain = useDashboardStore((state) => state.fetchOptionsChain);
   const fetchServerTrades = useDashboardStore((state) => state.fetchServerTrades);
+  const hydrateDiscordConfig = useDashboardStore((state) => state.hydrateDiscordConfig);
+
+  useEffect(() => {
+    hydrateDiscordConfig();
+  }, [hydrateDiscordConfig]);
 
   useEffect(() => {
     // Initial fetch on mount or ticker change

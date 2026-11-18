@@ -33,6 +33,7 @@ export interface ServerTradesState {
   activePositions?: Record<string, any>;
   closedPositions?: any[];
   alerts?: any[];
+  loaded?: boolean;
 }
 
 export interface NormalizedChartTrade {
@@ -317,8 +318,8 @@ export function extractNormalizedTradesForTicker(
     }
   }
 
-  // 4. Fallback: Synthesize NormalizedChartTrade items from FSM signals if server trades are absent
-  if (byId.size === 0 && Array.isArray(fsmSignals) && fsmSignals.length > 0) {
+  // 4. Fallback: Synthesize NormalizedChartTrade items from FSM signals only while server trades have not yet loaded
+  if (byId.size === 0 && !serverTrades?.loaded && Array.isArray(fsmSignals) && fsmSignals.length > 0) {
     fsmSignals.forEach((sig: any, idx: number) => {
       if (!sig) return;
       if (sig.ticker && String(sig.ticker).toUpperCase() !== sym) return;

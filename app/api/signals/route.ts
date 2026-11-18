@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
 import {
   evaluateTradeSignals,
@@ -8,11 +9,14 @@ import {
   clearDailyTrades,
   getTodayEt,
   selectOptimalContract,
-  generateDailyPerformanceReport,
-  checkAndSendMarketCloseRecap,
   TradeLifecycleAlert,
   syncGaiaTickerSignalsToDiscord,
 } from "@/lib/tradeSignalEngine";
+import {
+  generateDailyPerformanceReport,
+  checkAndSendMarketCloseRecap,
+} from "@/lib/tradePerformanceEngine";
+import { getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
 import {
   getPreTradeRadarData,
   sendPreTradeRadarDiscordCard,
@@ -40,6 +44,48 @@ export const dynamic = "force-dynamic";
 const globalForSignals = globalThis as unknown as {
   __hyperionLastGetEvalAtMs?: number;
 };
+
+function isLoopbackHostname(host: string): boolean {
+  const clean = host.trim().toLowerCase().replace(/^\[|\]$/g, "").split(":")[0];
+  return clean === "localhost" || clean === "127.0.0.1" || clean === "::1";
+}
+
+function authorizeAdminRequest(req: NextRequest): NextResponse | null {
+  const configuredToken = process.env.HYPERION_ADMIN_TOKEN?.trim();
+  if (configuredToken) {
+    const headerToken = req.headers.get("x-hyperion-admin-token")?.trim();
+    const authHeader = req.headers.get("authorization")?.trim() ?? "";
+    const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
+      ? authHeader.slice(7).trim()
+      : "";
+    const provided = headerToken || bearerToken;
+    if (!provided) {
+      return NextResponse.json({ error: "Unauthorized admin request" }, { status: 401 });
+    }
+    const providedBuf = Buffer.from(provided, "utf-8");
+    const expectedBuf = Buffer.from(configuredToken, "utf-8");
+    if (
+      providedBuf.length !== expectedBuf.length ||
+      !crypto.timingSafeEqual(providedBuf, expectedBuf)
+    ) {
+      return NextResponse.json({ error: "Unauthorized admin request" }, { status: 401 });
+    }
+    return null;
+  }
+
+  if (process.env.NODE_ENV === "production") {
+    const reqHost = req.headers.get("host") ?? req.nextUrl.hostname ?? "";
+    const forwardedFor = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "";
+    const isLocalHost = isLoopbackHostname(reqHost) && (!forwardedFor || isLoopbackHostname(forwardedFor));
+    if (!isLocalHost) {
+      return NextResponse.json(
+        { error: "HYPERION_ADMIN_TOKEN is required for non-loopback admin actions in production." },
+        { status: 403 }
+      );
+    }
+  }
+  return null;
+}
 
 function sanitizeWebhookUrl(raw: unknown): { url?: string; invalid: boolean } {
   if (raw == null) return { url: undefined, invalid: false };
@@ -344,6 +390,8 @@ export async function GET(req: NextRequest) {
     }
 
     if (searchParams.get("action") === "clear") {
+      const authError = authorizeAdminRequest(req);
+      if (authError) return authError;
       const lockToken = acquireBarEvaluationLock();
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
@@ -468,7 +516,8 @@ export async function GET(req: NextRequest) {
         await evaluateAllActivePositions({ webhookUrl, signal: evalController.signal });
       } finally {
         const clock = getEtClockNow();
-        if (clock.etMins >= 955) {
+        const bounds = getSessionBoundsEt(clock.etDate);
+        if (clock.etMins >= bounds.eodFlatMins) {
           await ensureMocCutoffForRemainingPositions(webhookUrl, clock).catch(() => {});
         }
         clearTimeout(evalTimeout);
@@ -568,7 +617,8 @@ export async function POST(req: NextRequest) {
           signal: syncController.signal,
         });
         const clock = getEtClockNow();
-        if (!backfill && clock.etMins >= 955) {
+        const syncBounds = getSessionBoundsEt(clock.etDate);
+        if (!backfill && clock.etMins >= syncBounds.eodFlatMins) {
           await ensureMocCutoffForRemainingPositions(validWebhookUrl, clock);
         }
         return NextResponse.json({ success: true, ...res });
@@ -580,6 +630,8 @@ export async function POST(req: NextRequest) {
     }
 
     if (body.action === "clear") {
+      const authError = authorizeAdminRequest(req);
+      if (authError) return authError;
       const lockToken = await acquireBarEvaluationLockWithWait(2500, req.signal);
       if (!lockToken) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
@@ -679,7 +731,8 @@ export async function POST(req: NextRequest) {
       };
       const result = await evaluateTradeSignals(normalizedBody);
       const clock = getEtClockNow();
-      if (!backfill && clock.etMins >= 955) {
+      const postBounds = getSessionBoundsEt(clock.etDate);
+      if (!backfill && clock.etMins >= postBounds.eodFlatMins) {
         await ensureMocCutoffForRemainingPositions(validWebhookUrl, clock);
       }
       return NextResponse.json(result);

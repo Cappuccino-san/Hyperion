@@ -5,6 +5,7 @@ import {
   evaluateAllActivePositions,
   fetchLiveCboeOptions,
   fetchLive5mCandleAndDivergence,
+  flushPendingDiscordAlerts,
   getCachedSpotPrice,
   loadTradeStore,
 } from "@/lib/tradeSignalEngine";
@@ -25,6 +26,12 @@ import {
 } from "@/lib/persistenceStore";
 import { getMergedIntradayHistory } from "@/lib/intradayHistory";
 import { computeBarFlowGammaVwapSeries } from "@/lib/flowGammaVwap";
+import { getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
+import {
+  acquireCrossProcessExecutionLease,
+  getExecutionRole,
+  releaseCrossProcessExecutionLease,
+} from "@/lib/executionLease";
 
 const POLL_INTERVAL_MS = 20_000; // 20 seconds during RTH
 const DEFAULT_WATCH_TICKERS = ["SPY"] as const;
@@ -33,6 +40,7 @@ const TRACKED_TICKER_TTL_MS = 4 * 60 * 60_000;
 
 interface LiveBotGlobalState {
   intervalId: ReturnType<typeof setInterval> | null;
+  mocTimerId: ReturnType<typeof setTimeout> | null;
   isPolling: boolean;
   inFlightTickPromise: Promise<void> | null;
   activeController: AbortController | null;
@@ -89,13 +97,14 @@ function getEtDateString(nowMs: number = Date.now()): string {
 
 function isWithinRthWindow(nowMs: number = Date.now()): boolean {
   const dt = new Date(nowMs);
-  const { isWeekday, etMins } = getEtClockNow(nowMs);
+  const { isWeekday, etMins, etDate } = getEtClockNow(nowMs);
   if (!isWeekday) return false;
 
   const mkt = isMarketOpen(dt);
   if (!mkt.open) return false;
 
-  return etMins >= 9 * 60 + 30 && etMins < 16 * 60;
+  const bounds = getSessionBoundsEt(etDate);
+  return etMins >= bounds.rthOpenMins && etMins < bounds.rthCloseMins;
 }
 
 function getBotState(): LiveBotGlobalState {
@@ -103,6 +112,7 @@ function getBotState(): LiveBotGlobalState {
   if (!globalThis.__hyperionLiveBotState) {
     globalThis.__hyperionLiveBotState = {
       intervalId: null,
+      mocTimerId: null,
       isPolling: false,
       inFlightTickPromise: null,
       activeController: null,
@@ -122,6 +132,42 @@ function getBotState(): LiveBotGlobalState {
     globalThis.__hyperionLiveBotState.activeTrackedTickers = new Map<string, number>([["SPY", now]]);
   }
   return globalThis.__hyperionLiveBotState;
+}
+
+function scheduleAlignedMocTick(): void {
+  const botState = getBotState();
+  if (botState.isStopped || getExecutionRole() === "observer") return;
+
+  if (botState.mocTimerId) {
+    clearTimeout(botState.mocTimerId);
+    botState.mocTimerId = null;
+  }
+
+  const nowMs = Date.now();
+  const clock = getEtClockNow(nowMs);
+  if (!clock.isWeekday) return;
+
+  const bounds = getSessionBoundsEt(clock.etDate);
+  if (clock.etMins >= bounds.eodFlatMins) return;
+
+  // Align precisely to the start of eodFlatMins (15:55:00 ET or 12:55:00 ET on early close)
+  const minsUntilMoc = bounds.eodFlatMins - clock.etMins;
+  const dtNow = new Date(nowMs);
+  const secRemainderMs = (60 - dtNow.getSeconds()) * 1000 - dtNow.getMilliseconds();
+  const delayMs = Math.max(250, (minsUntilMoc - 1) * 60_000 + secRemainderMs + 150);
+
+  if (delayMs > 8 * 60 * 60_000) return;
+
+  botState.mocTimerId = setTimeout(() => {
+    botState.mocTimerId = null;
+    if (!botState.isStopped) {
+      void runLiveBotTick();
+    }
+  }, delayMs);
+
+  if (typeof botState.mocTimerId === "object" && "unref" in botState.mocTimerId) {
+    botState.mocTimerId.unref();
+  }
 }
 
 export function normalizeTrackedTicker(raw?: string): string {
@@ -209,6 +255,11 @@ export function isEvaluatingLiveBar(): boolean {
 
 export function acquireBarEvaluationLock(): number {
   const state = getBotState();
+  if (getExecutionRole() === "observer") {
+    state.lastStatus = "OBSERVER_MODE";
+    return 0;
+  }
+
   const nowMs = Date.now();
   if (state.isEvaluatingLiveBar && nowMs - state.lockAcquiredAtMs < 30_000) {
     return 0;
@@ -223,6 +274,13 @@ export function acquireBarEvaluationLock(): number {
     state.inFlightTickPromise = null;
     state.isPolling = false;
   }
+
+  const lease = acquireCrossProcessExecutionLease({ nowMs });
+  if (!lease.acquired) {
+    state.lastStatus = lease.role === "observer" ? "OBSERVER_MODE" : "LEASE_HELD_BY_PEER";
+    return 0;
+  }
+
   state.isEvaluatingLiveBar = true;
   state.lockAcquiredAtMs = nowMs;
   state.lockToken = (state.lockToken || 0) + 1;
@@ -233,6 +291,9 @@ export async function acquireBarEvaluationLockWithWait(
   timeoutMs: number = 2500,
   signal?: AbortSignal
 ): Promise<number> {
+  if (getExecutionRole() === "observer") {
+    return 0;
+  }
   const immediate = acquireBarEvaluationLock();
   if (immediate) return immediate;
 
@@ -272,7 +333,9 @@ export async function acquireBarEvaluationLockWithWait(
 export function refreshBarEvaluationLock(token?: number): void {
   const state = getBotState();
   if (typeof token === "number" && token > 0 && state.lockToken === token && state.isEvaluatingLiveBar) {
-    state.lockAcquiredAtMs = Date.now();
+    const nowMs = Date.now();
+    state.lockAcquiredAtMs = nowMs;
+    acquireCrossProcessExecutionLease({ nowMs });
   }
 }
 
@@ -296,7 +359,7 @@ export function releaseBarEvaluationLock(token?: number): void {
 }
 
 /**
- * Fail-Closed 15:55:00 ET MOC Force-Liquidation Fallback:
+ * Fail-Closed Hard MOC Force-Liquidation Fallback (15:55:00 ET / 12:55:00 ET early close):
  * Closes still-open positions using cached spot + synthetic contract when upstream feeds stall/abort.
  * Caller must hold acquireBarEvaluationLock().
  */
@@ -304,7 +367,8 @@ export async function ensureMocCutoffForRemainingPositions(
   webhookUrl?: string,
   clock: { etDate: string; etMins: number } = getEtClockNow()
 ): Promise<number> {
-  if (clock.etMins < 955) return 0;
+  const bounds = getSessionBoundsEt(clock.etDate);
+  if (clock.etMins < bounds.eodFlatMins) return 0;
   const store = loadTradeStore();
   const openEntries = Object.entries(store.activePositions || {}).filter(
     ([, pos]) => Boolean(pos && (pos.status === "OPEN" || pos.status === "PARTIAL_TP1"))
@@ -374,20 +438,36 @@ export async function ensureMocCutoffForRemainingPositions(
 
 export async function runLiveBotTick(): Promise<void> {
   const botState = getBotState();
+  if (getExecutionRole() === "observer") {
+    botState.lastStatus = "OBSERVER_MODE";
+    return;
+  }
   if (botState.isStopped || botState.isPolling || botState.inFlightTickPromise) return;
 
-  // Acquire token-owned lock BEFORE inspecting mutable trade store
   const lockToken = acquireBarEvaluationLock();
   if (!lockToken) return;
 
   const rthOpen = isWithinRthWindow();
   const startClock = getEtClockNow();
+  const startBounds = getSessionBoundsEt(startClock.etDate);
   const initialStore = loadTradeStore();
   const hasStrandedOpen = Object.keys(initialStore.activePositions || {}).length > 0;
+  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+  const hasWebhook = Boolean(webhookUrl?.trim());
+
   if (!rthOpen && !hasStrandedOpen) {
     if (
       startClock.isWeekday &&
-      startClock.etMins >= 965 &&
+      startClock.etMins >= startBounds.rthCloseMins &&
+      startClock.etMins <= startBounds.rthCloseMins + 20 &&
+      hasWebhook
+    ) {
+      await flushPendingDiscordAlerts({ webhookUrl }).catch(() => 0);
+    }
+
+    if (
+      startClock.isWeekday &&
+      startClock.etMins >= startBounds.rthCloseMins + 5 &&
       readAlphaPriorsSync().lastAttributionDate !== startClock.etDate
     ) {
       try {
@@ -443,12 +523,17 @@ export async function runLiveBotTick(): Promise<void> {
     }
     return;
   }
-  if (rthOpen && !hasStrandedOpen && startClock.etMins > 870) {
+
+  if (rthOpen && !hasStrandedOpen && startClock.etMins > startBounds.entryCutoffMins) {
+    if (hasWebhook) {
+      await flushPendingDiscordAlerts({ webhookUrl }).catch(() => 0);
+    }
     releaseBarEvaluationLock(lockToken);
     if (!botState.isStopped) botState.lastStatus = "OUTSIDE_ENTRY_WINDOW";
     return;
   }
 
+  scheduleAlignedMocTick();
   botState.isPolling = true;
   botState.lastPollAtMs = Date.now();
   botState.pollCount += 1;
@@ -460,14 +545,13 @@ export async function runLiveBotTick(): Promise<void> {
   botState.activeController = controller;
   const timeoutId = setTimeout(() => controller.abort(), 12_000);
 
-  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
-  const hasWebhook = Boolean(webhookUrl?.trim());
-
-  // Keep lockToken & inFlightTickPromise held until tickWork settles (prevents Promise.race split-brain)
   let tickWork: Promise<void> | null = null;
   tickWork = (async () => {
+    // Yield microtask so `botState.inFlightTickPromise = tickWork` is assigned before cleanup
+    await Promise.resolve();
     try {
       const todayStr = getEtDateString();
+      const todayBounds = getSessionBoundsEt(todayStr);
       if (botState.sessionDateEt !== todayStr) {
         botState.sessionDateEt = todayStr;
         botState.dispatchedCount = 0;
@@ -476,7 +560,6 @@ export async function runLiveBotTick(): Promise<void> {
       const store = loadTradeStore();
       const activeKeys = Object.keys(store.activePositions || {});
 
-      // 1. Always evaluate active positions for STC / 15:55 ET MOC exit first (even after 16:00 ET if stranded)
       if (activeKeys.length > 0) {
         if (!botState.isStopped) botState.lastStatus = "ACTIVE_EVAL_STC";
         try {
@@ -492,14 +575,17 @@ export async function runLiveBotTick(): Promise<void> {
         } finally {
           refreshBarEvaluationLock(lockToken);
           const mocClock = getEtClockNow();
-          if (mocClock.etMins >= 955) {
+          const mocBounds = getSessionBoundsEt(mocClock.etDate);
+          if (mocClock.etMins >= mocBounds.eodFlatMins) {
             botState.dispatchedCount += await ensureMocCutoffForRemainingPositions(
               webhookUrl,
               mocClock
             );
           }
+          if (hasWebhook) {
+            await flushPendingDiscordAlerts({ webhookUrl, signal: controller.signal }).catch(() => 0);
+          }
         }
-        // Same-Bar Flip Guard: Exit immediately with no same-bar flip re-entries permitted
         return;
       }
 
@@ -509,9 +595,11 @@ export async function runLiveBotTick(): Promise<void> {
         return;
       }
 
-      // Poll tracked tickers for new BTO setups when flat (or Phase-2 opposite reclaim eligible)
       const nowClock = getEtClockNow();
-      if (nowClock.etMins > 870) {
+      if (nowClock.etMins > todayBounds.entryCutoffMins) {
+        if (hasWebhook) {
+          await flushPendingDiscordAlerts({ webhookUrl, signal: controller.signal }).catch(() => 0);
+        }
         if (!botState.isStopped) botState.lastStatus = "OUTSIDE_ENTRY_WINDOW";
         return;
       }
@@ -629,7 +717,7 @@ export async function runLiveBotTick(): Promise<void> {
             putWall: resolvedLevels?.putWall ?? 0,
             zeroGamma: zgLevel,
             zeroDteKing: resolvedLevels?.kingNode?.zeroDteKing,
-            allExpKing: resolvedLevels?.tacticalKing,
+            allExpKing: resolvedLevels?.kingNode?.allExpKing ?? resolvedLevels?.tacticalKing,
             bookCenter: zgLevel,
             netGex: resolvedLevels?.netGexMillions,
             flowSnapshot: enrichedCandle?.flowSnapshot ?? null,
@@ -656,9 +744,11 @@ export async function runLiveBotTick(): Promise<void> {
           dailyExpectedMove: resolvedLevels?.dailyExpectedMove ?? null,
           kingNode: resolvedLevels?.kingNode,
           filteredKing: resolvedLevels?.tacticalKing,
+          allExpKing: resolvedLevels?.kingNode?.allExpKing,
           bookCenter: resolvedLevels?.zeroGamma ?? 0,
           netGex: resolvedLevels?.netGexMillions,
           contracts,
+          contractsAlreadyAnchored: true,
           latest5mCandle: enrichedCandle,
           divergence5m,
           divergence30m,
@@ -672,11 +762,14 @@ export async function runLiveBotTick(): Promise<void> {
           ).length;
         }
 
-        // Single-Slot Guard: Stop polling further tickers if a position was opened
         const refreshedStore = loadTradeStore();
         if (Object.keys(refreshedStore.activePositions || {}).length > 0) {
           break;
         }
+      }
+
+      if (hasWebhook) {
+        await flushPendingDiscordAlerts({ webhookUrl, signal: controller.signal }).catch(() => 0);
       }
 
       if (!botState.isStopped) {
@@ -694,7 +787,9 @@ export async function runLiveBotTick(): Promise<void> {
       clearTimeout(timeoutId);
       if (botState.activeController === controller) botState.activeController = null;
       if (botState.inFlightTickPromise === tickWork) botState.inFlightTickPromise = null;
-      botState.isPolling = false;
+      if (botState.lockToken === lockToken) {
+        botState.isPolling = false;
+      }
       releaseBarEvaluationLock(lockToken);
     }
   })();
@@ -719,6 +814,14 @@ export async function runLiveBotTick(): Promise<void> {
 
 export function ensureLiveBotRunning(): { running: boolean; pollCount: number; lastStatus: string } {
   const botState = getBotState();
+  if (getExecutionRole() === "observer") {
+    botState.lastStatus = "OBSERVER_MODE";
+    return {
+      running: false,
+      pollCount: botState.pollCount,
+      lastStatus: botState.lastStatus,
+    };
+  }
   botState.isStopped = false;
   if (!botState.intervalId) {
     botState.intervalId = setInterval(() => {
@@ -728,6 +831,7 @@ export function ensureLiveBotRunning(): { running: boolean; pollCount: number; l
     if (typeof botState.intervalId === "object" && "unref" in botState.intervalId) {
       botState.intervalId.unref();
     }
+    scheduleAlignedMocTick();
     void runLiveBotTick();
   }
   return {
@@ -744,7 +848,12 @@ export function stopLiveBot(): void {
     clearInterval(botState.intervalId);
     botState.intervalId = null;
   }
+  if (botState.mocTimerId) {
+    clearTimeout(botState.mocTimerId);
+    botState.mocTimerId = null;
+  }
   botState.activeController?.abort();
+  releaseCrossProcessExecutionLease();
   if (!botState.inFlightTickPromise) {
     botState.isPolling = false;
     botState.isEvaluatingLiveBar = false;
@@ -759,7 +868,6 @@ export function stopLiveBot(): void {
   botState.lastStatus = "STOPPED";
 }
 
-// Register graceful shutdown hooks for container lifecycles (guarded against HMR & test/CLI runs)
 const globalForShutdownHooks = globalThis as unknown as {
   __hyperionShutdownHooksRegistered?: boolean;
 };
@@ -791,6 +899,7 @@ export function getLiveBotStatus() {
   const botState = getBotState();
   return {
     running: Boolean(botState.intervalId),
+    role: getExecutionRole(),
     isPolling: botState.isPolling,
     isEvaluatingLiveBar: botState.isEvaluatingLiveBar,
     startedAtMs: botState.startedAtMs,

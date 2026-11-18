@@ -500,12 +500,12 @@ async function runTestSuite() {
   // ===========================================================================
   // TEST SECTION 5B: DEEP-OTM STRIKE & LOW-DELTA FIREWALL (selectSmallAccountContract)
   // ===========================================================================
-  console.log("\n5B. Verifying Deep-OTM (> min($3.50, 0.45%)) & absDelta < 0.35 Rejection...");
+  console.log("\n5B. Verifying Deep-OTM (> min($3.50, 0.45%)) & POS_GAMMA_PIN absDelta < 0.35 Rejection...");
   const friAfternoonEt = new Date("2026-11-13T11:35:00-05:00");
   const deepOtmCallChain: NormalizedOptionContract[] = [
     { symbol: "SPY261113C00769000", strike: 769, expiration: "2026-11-13", optionType: "C", bid: 0.43, ask: 0.45, last: 0.44, volume: 12000, openInterest: 9000, iv: 0.16, delta: 0.08, gamma: 0.01, vega: 0.03, percentChange: 0 },
     { symbol: "SPY261116C00756000", strike: 756, expiration: "2026-11-16", optionType: "C", bid: 0.70, ask: 0.72, last: 0.71, volume: 8000, openInterest: 6000, iv: 0.16, delta: 0.38, gamma: 0.03, vega: 0.07, percentChange: 0 }, // +$3.69 (0.49%) > 0.45% ($3.385)
-    { symbol: "SPY261116C00755000", strike: 755, expiration: "2026-11-16", optionType: "C", bid: 0.78, ask: 0.80, last: 0.79, volume: 9000, openInterest: 7000, iv: 0.16, delta: 0.33, gamma: 0.04, vega: 0.08, percentChange: 0 }, // absDelta 0.33 < 0.35
+    { symbol: "SPY261116C00755000", strike: 755, expiration: "2026-11-16", optionType: "C", bid: 0.78, ask: 0.80, last: 0.79, volume: 9000, openInterest: 7000, iv: 0.16, delta: 0.33, gamma: 0.04, vega: 0.08, percentChange: 0 }, // absDelta 0.33 < 0.35 in POS_GAMMA_PIN
     { symbol: "SPY261116C00754000", strike: 754, expiration: "2026-11-16", optionType: "C", bid: 0.82, ask: 0.84, last: 0.83, volume: 9000, openInterest: 7000, iv: 0.16, delta: 0, gamma: 0.04, vega: 0.08, percentChange: 0 }, // missing/0 delta must not spoof
   ];
   const rejectedAllCalls = await selectSmallAccountContract({
@@ -517,17 +517,19 @@ async function runTestSuite() {
     stopLossSpot: 750.80,
     contracts: deepOtmCallChain,
     nowEt: friAfternoonEt,
+    regime: "POS_GAMMA_PIN",
+    absImpulsePeclet: 0.8,
   });
   assert(
     rejectedAllCalls === null,
-    `5B.1: Deep-OTM (769C/756C) and <0.35 delta (755C/0-delta) sub-$0.99 calls must return null (got ${rejectedAllCalls?.strike})`
+    `5B.1: Deep-OTM (769C/756C) and <0.35 POS_GAMMA_PIN delta (755C/0-delta) sub-$0.99 calls must return null (got ${rejectedAllCalls?.strike})`
   );
 
   const friAfternoonMixedCalls: NormalizedOptionContract[] = [
     ...deepOtmCallChain,
     { symbol: "SPY261112C00753000", strike: 753, expiration: "2026-11-12", optionType: "C", bid: 0.88, ask: 0.90, last: 0.89, volume: 9500, openInterest: 9500, iv: 0.16, delta: 0.38, gamma: 0.06, vega: 0.04, percentChange: 0 }, // expired dte < 0
     { symbol: "SPY261113C00753000", strike: 753, expiration: "2026-11-13", optionType: "C", bid: 0.78, ask: 0.80, last: 0.79, volume: 15000, openInterest: 12000, iv: 0.16, delta: 0.36, gamma: 0.06, vega: 0.05, percentChange: 0 }, // 0-DTE afternoon fallback (-25 penalty)
-    { symbol: "SPY261116C00753000", strike: 753, expiration: "2026-11-16", optionType: "C", bid: 0.80, ask: 0.82, last: 0.81, volume: 15000, openInterest: 12000, iv: 0.17, delta: 0.38, gamma: 0.04, vega: 0.10, percentChange: 0 }, // Fri 3-DTE primary in [0.35, 0.85]
+    { symbol: "SPY261116C00753000", strike: 753, expiration: "2026-11-16", optionType: "C", bid: 0.80, ask: 0.82, last: 0.81, volume: 15000, openInterest: 12000, iv: 0.17, delta: 0.38, gamma: 0.04, vega: 0.10, percentChange: 0 }, // Fri 3-DTE primary in [0.35, 0.50]
   ];
   const pickedNearCall = await selectSmallAccountContract({
     ticker: "SPY",
@@ -538,6 +540,8 @@ async function runTestSuite() {
     stopLossSpot: 750.80,
     contracts: friAfternoonMixedCalls,
     nowEt: friAfternoonEt,
+    regime: "POS_GAMMA_PIN",
+    absImpulsePeclet: 0.8,
   });
   assert(pickedNearCall?.strike === 753, `5B.2: Near-ATM 753C selected over deep-OTM/low-delta lottos (got ${pickedNearCall?.strike})`);
   assert(pickedNearCall?.expiration === "2026-11-16", `5B.2b: Friday afternoon prioritizes non-expired 3-DTE 2026-11-16 (got ${pickedNearCall?.expiration})`);
@@ -554,10 +558,12 @@ async function runTestSuite() {
       { symbol: "SPY261116C00803550", strike: 803.55, expiration: "2026-11-16", optionType: "C", bid: 0.80, ask: 0.82, last: 0.81, volume: 5000, openInterest: 4000, iv: 0.17, delta: 0.29, gamma: 0.03, vega: 0.08, percentChange: 0 },
     ],
     nowEt: friAfternoonEt,
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.0,
   });
   assert(cap350Rejected === null, "5B.3: Strike +$3.55 OTM (> $3.50 hard ceiling despite 0.44% < 0.45%) rejected");
 
-  // Put-side symmetry at $752.31: reject -$4.31 OTM (748P) & absDelta 0.24 (750P), select 751P
+  // Put-side symmetry at $752.31: reject -$4.31 OTM (748P) & absDelta 0.24 in POS_GAMMA_PIN (750P), select 751P
   const putFirewallOnlyRejected = await selectSmallAccountContract({
     ticker: "SPY",
     contractType: "PUT",
@@ -570,8 +576,10 @@ async function runTestSuite() {
       { symbol: "SPY261116P00750000", strike: 750, expiration: "2026-11-16", optionType: "P", bid: 0.73, ask: 0.75, last: 0.74, volume: 9000, openInterest: 7000, iv: 0.16, delta: -0.24, gamma: 0.04, vega: 0.08, percentChange: 0 },
     ],
     nowEt: friAfternoonEt,
+    regime: "POS_GAMMA_PIN",
+    absImpulsePeclet: 0.7,
   });
-  assert(putFirewallOnlyRejected === null, "5B.4a: Deep-OTM 748P (-$4.31) & low-delta 750P (-0.24) strictly rejected");
+  assert(putFirewallOnlyRejected === null, "5B.4a: Deep-OTM 748P (-$4.31) & low-delta 750P (-0.24 in POS_GAMMA_PIN) strictly rejected");
 
   const putValidPicked = await selectSmallAccountContract({
     ticker: "SPY",
@@ -585,6 +593,8 @@ async function runTestSuite() {
       { symbol: "SPY261116P00751000", strike: 751, expiration: "2026-11-16", optionType: "P", bid: 0.80, ask: 0.82, last: 0.81, volume: 11000, openInterest: 9500, iv: 0.16, delta: -0.37, gamma: 0.05, vega: 0.09, percentChange: 0 },
     ],
     nowEt: friAfternoonEt,
+    regime: "POS_GAMMA_PIN",
+    absImpulsePeclet: 0.7,
   });
   assert(putValidPicked?.strike === 751, `5B.4b: Valid near-ATM 751P selected (got ${putValidPicked?.strike})`);
 
@@ -2241,8 +2251,8 @@ async function runTestSuite() {
   // ===========================================================================
   // TEST SECTION 15: JANE STREET QUANT UPGRADES (DELTA FLOOR, -45%/20M STOPS, ANTI-WHIPSAW)
   // ===========================================================================
-  console.log("\n15. Verifying Adaptive Delta Floor (0.24 pre-10:30, 0.35 post-10:30), -45% / 20m -25% Stops & Post-Loss Leg-2 Anti-Whipsaw...");
-  const morning24Admitted = await selectSmallAccountContract({
+  console.log("\n15. Verifying Regime & Advection Delta Floor (0.24 NEG_GAMMA/|Pe|>=1.8, 0.35 POS_GAMMA_PIN), -45% / 20m -25% Stops & Anti-Whipsaw...");
+  const negGamma24Admitted = await selectSmallAccountContract({
     ticker: "SPY",
     contractType: "CALL",
     spotPrice: 755.0,
@@ -2252,9 +2262,11 @@ async function runTestSuite() {
     contracts: [
       { symbol: "SPY261113C00757000", strike: 757, expiration: "2026-11-13", optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 12000, openInterest: 9000, iv: 0.16, delta: 0.24, gamma: 0.04, vega: 0.06, percentChange: 0 },
     ],
-    nowEt: new Date("2026-11-13T10:05:00-05:00"),
+    nowEt: new Date("2026-11-13T12:15:00-05:00"),
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.1,
   });
-  assert(morning24Admitted?.delta === 0.24, "15.0: Morning window (10:05 ET < 10:30) admits >= 0.24 delta contract");
+  assert(negGamma24Admitted?.delta === 0.24, "15.0: NEG_GAMMA_TREND / |Pe|>=1.8 admits >= 0.24 delta contract regardless of RTH hour");
 
   const sub35Rejected = await selectSmallAccountContract({
     ticker: "SPY",
@@ -2267,8 +2279,10 @@ async function runTestSuite() {
       { symbol: "SPY261113C00757000", strike: 757, expiration: "2026-11-13", optionType: "C", bid: 0.72, ask: 0.75, last: 0.74, volume: 12000, openInterest: 9000, iv: 0.16, delta: 0.33, gamma: 0.04, vega: 0.06, percentChange: 0 },
     ],
     nowEt: new Date("2026-11-13T11:30:00-05:00"),
+    regime: "POS_GAMMA_PIN",
+    absImpulsePeclet: 0.7,
   });
-  assert(sub35Rejected === null, "15.1: Sub-0.35 delta (0.33) strictly rejected at >= 10:30 ET");
+  assert(sub35Rejected === null, "15.1: Sub-0.35 delta (0.33) strictly rejected in POS_GAMMA_PIN");
 
   const hardStopEval = evaluateOptionRiskStop({ entryPrice: 0.80, currentPrice: 0.44, peakPnlPct: 4, heldMinutes: 6 });
   assert(hardStopEval.triggered && hardStopEval.reason === "OPTION_HARD_STOP_45", "15.2: -45% hard option stop triggers at entry * 0.55");

@@ -15,6 +15,7 @@ import {
   MarketRegimeId,
   PostMarketAttributionReport,
   SessionPlaybookPolicy,
+  ShadowParityReport,
   cloneDefaultAlphaPriors,
   readAlphaPriorsSync,
   readPostMarketAttribution,
@@ -25,7 +26,7 @@ import {
   writeSupervisorPolicy,
   writeSupervisorPolicySync,
 } from "@/lib/persistenceStore";
-import type { DailyTradeStore } from "@/lib/tradeSignalEngine";
+import type { DailyTradeStore } from "@/lib/execution/types";
 
 export interface SessionPlaybookInput {
   sessionDate: string;
@@ -83,6 +84,7 @@ export interface RunPostMarketAttributionInput {
   zeroGamma?: number;
   zeroDteKing?: number;
   executedTrades?: DailyTradeStore["closedPositions"];
+  shadowReplayTrades?: DailyTradeStore["closedPositions"];
   candidateSetups?: AttributionCandidateSetup[];
   featureSamples?: FeatureIcSample[];
   atmIv?: number;
@@ -787,6 +789,11 @@ export async function runPostMarketAttribution(
     `IC(Flux=${sessionIc.fluxAlignment.toFixed(2)},Regime=${sessionIc.regimeFit.toFixed(2)}) ` +
     `SavedChop=${savedChopCount} MissedAlpha=${missedAlphaCount}`;
 
+  const shadowParityReport = computeShadowReplayParity(
+    input.executedTrades ?? [],
+    input.shadowReplayTrades
+  );
+
   const report: PostMarketAttributionReport = {
     sessionDate: input.sessionDate,
     ticker: sym,
@@ -798,6 +805,7 @@ export async function runPostMarketAttribution(
     missedAlphaCount,
     savedChopCount,
     featureIc: sessionIc,
+    shadowParityReport,
     updatedPriorsSummary,
     records,
   };
@@ -809,6 +817,86 @@ export async function runPostMarketAttribution(
   }
 
   return report;
+}
+
+/**
+ * Compares live executed closed positions against deterministic shadow replay trades
+ * to surface execution drift (spot slip, R-multiple drift, direction mismatch) at 16:05 ET.
+ */
+export function computeShadowReplayParity(
+  liveTrades: DailyTradeStore["closedPositions"] = [],
+  shadowReplayTrades?: DailyTradeStore["closedPositions"]
+): ShadowParityReport {
+  if (!Array.isArray(shadowReplayTrades) || shadowReplayTrades.length === 0) {
+    return {
+      liveTradeCount: liveTrades.length,
+      replayTradeCount: 0,
+      matchedCount: 0,
+      directionMatchPct: liveTrades.length === 0 ? 100 : 0,
+      meanEntrySpotDrift: 0,
+      meanOutcomeRDrift: 0,
+      maxPnlPctDrift: 0,
+      parityStatus: "NO_DATA",
+    };
+  }
+
+  if (liveTrades.length === 0) {
+    return {
+      liveTradeCount: 0,
+      replayTradeCount: shadowReplayTrades.length,
+      matchedCount: 0,
+      directionMatchPct: 0,
+      meanEntrySpotDrift: 0,
+      meanOutcomeRDrift: 0,
+      maxPnlPctDrift: 0,
+      parityStatus: "DRIFT_WARN",
+    };
+  }
+
+  const sortedLive = [...liveTrades].sort((a, b) => (a.openedTs || 0) - (b.openedTs || 0));
+  const sortedReplay = [...shadowReplayTrades].sort((a, b) => (a.openedTs || 0) - (b.openedTs || 0));
+  const pairCount = Math.min(sortedLive.length, sortedReplay.length);
+
+  let dirMatches = 0;
+  let spotDriftSum = 0;
+  let outcomeRDriftSum = 0;
+  let maxPnlPctDrift = 0;
+
+  for (let i = 0; i < pairCount; i++) {
+    const live = sortedLive[i];
+    const replay = sortedReplay[i];
+    if (live.contractType === replay.contractType) {
+      dirMatches++;
+    }
+    const spotDrift = Math.abs((live.btoSpotPrice || 0) - (replay.btoSpotPrice || 0));
+    spotDriftSum += spotDrift;
+
+    const livePnl = typeof live.pnlOptionPct === "number" ? live.pnlOptionPct : 0;
+    const replayPnl = typeof replay.pnlOptionPct === "number" ? replay.pnlOptionPct : 0;
+    const pnlDrift = Math.abs(livePnl - replayPnl);
+    maxPnlPctDrift = Math.max(maxPnlPctDrift, pnlDrift);
+    outcomeRDriftSum += Math.abs(livePnl / 25 - replayPnl / 25);
+  }
+
+  const directionMatchPct = Number(((dirMatches / pairCount) * 100).toFixed(1));
+  const meanEntrySpotDrift = Number((spotDriftSum / pairCount).toFixed(3));
+  const meanOutcomeRDrift = Number((outcomeRDriftSum / pairCount).toFixed(3));
+  const countMismatch = sortedLive.length !== sortedReplay.length;
+  const parityStatus: ShadowParityReport["parityStatus"] =
+    countMismatch || directionMatchPct < 100 || meanOutcomeRDrift > 0.35 || maxPnlPctDrift > 25
+      ? "DRIFT_WARN"
+      : "PASS";
+
+  return {
+    liveTradeCount: sortedLive.length,
+    replayTradeCount: sortedReplay.length,
+    matchedCount: pairCount,
+    directionMatchPct,
+    meanEntrySpotDrift,
+    meanOutcomeRDrift,
+    maxPnlPctDrift: Number(maxPnlPctDrift.toFixed(1)),
+    parityStatus,
+  };
 }
 
 export { cloneDefaultAlphaPriors };

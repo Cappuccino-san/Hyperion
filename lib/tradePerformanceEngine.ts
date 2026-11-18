@@ -1,12 +1,9 @@
 import fs from "fs";
 import path from "path";
-import {
-  OptionTradePosition,
-  loadTradeStore,
-  saveTradeStore,
-  getTodayEt,
-  getNowEtTime,
-} from "./tradeSignalEngine";
+import type { OptionTradePosition } from "./execution/types";
+import { loadTradeStore, saveTradeStore } from "./execution/ledgerCommit";
+import { getTodayEt, getSessionBoundsEt } from "./gaiaSessionGuards";
+import { getNowEtTime } from "./execution/optionPricing";
 import { getPersistenceCacheDir } from "./persistenceStore";
 
 export interface TradePerformanceItem {
@@ -381,13 +378,10 @@ export async function checkAndSendMarketCloseRecap(
 
   const store = loadTradeStore(targetDate);
   const etTime = getNowEtTime();
+  const bounds = getSessionBoundsEt(targetDate || store.date || todayEt);
 
-  // STRICT RULE: Absolutely NO End-of-Day recap prior to 16:00 (4:00 PM ET)
-  if (etTime.hours < 16 && !params?.force) {
-    return null;
-  }
-
-  const isMarketClosed = etTime.hours >= 16;
+  // STRICT RULE: Absolutely NO End-of-Day recap prior to official RTH close (16:00 ET / 13:00 ET early close)
+  const isMarketClosed = etTime.totalMinutes >= bounds.rthCloseMins;
   if (!isMarketClosed && !params?.force) {
     return null;
   }

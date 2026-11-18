@@ -30,7 +30,7 @@ import {
   getTodayEtShort,
   getFridayEtShort,
   buildKingNodeMetrics,
-  getTickerPreset,
+  getStaticTickerPreset,
 } from "@/lib/tickerPresets";
 
 export type ExposureMetric = "GEX" | "VEX" | "DEX" | "Charm";
@@ -497,6 +497,7 @@ let flowVwapAbortCtrl: AbortController | null = null;
 let flowVwapReqSeq = 0;
 let serverTradesAbortCtrl: AbortController | null = null;
 let serverTradesReqSeq = 0;
+let localAlertSeq = 0;
 
 export interface DashboardState {
   activeView: ActiveView;
@@ -543,12 +544,14 @@ export interface DashboardState {
   serverActivePositions: Record<string, any>;
   serverClosedTrades: any[];
   serverTradeAlerts: any[];
+  serverTradesLoaded: boolean;
   supervisorPolicy: SessionPlaybookPolicy | null;
   setServerTrades: (payload: {
     activePositions?: Record<string, any>;
     closedPositions?: any[];
     alerts?: any[];
     supervisorPolicy?: SessionPlaybookPolicy | null;
+    loaded?: boolean;
   }) => void;
   fetchServerTrades: (ticker?: string, sessionDate?: string) => Promise<void>;
   playbookPayload: PlaybookPayload | null;
@@ -567,6 +570,7 @@ export interface DashboardState {
   addAlert: (alert: { message: string; type: AlertType; timestamp?: string }) => void;
   setFilters: (filters: Partial<GridFilters>) => void;
   setSetupModalOpen: (open: boolean) => void;
+  hydrateDiscordConfig: () => void;
   updateDiscordConfig: (cfg: Partial<DiscordConfig>) => void;
   hydrateFromMarketData: (payload: OptionsAnalyticsPayload) => void;
   fetchOptionsChain: (
@@ -645,7 +649,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   alerts: [],
   intradayData: [],
   flowGammaVwapData: null,
-  discordConfig: getInitialDiscordConfig(),
+  discordConfig: DEFAULT_DISCORD_CONFIG,
   isSetupModalOpen: false,
   gaiaMode: "classic",
   uiMode: "signal",
@@ -655,12 +659,14 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   serverActivePositions: {},
   serverClosedTrades: [],
   serverTradeAlerts: [],
+  serverTradesLoaded: false,
   supervisorPolicy: null,
   setServerTrades: (payload) =>
     set((state) => ({
       serverActivePositions: payload.activePositions ?? {},
       serverClosedTrades: payload.closedPositions ?? [],
       serverTradeAlerts: payload.alerts ?? [],
+      serverTradesLoaded: payload.loaded ?? true,
       supervisorPolicy:
         payload.supervisorPolicy !== undefined
           ? payload.supervisorPolicy
@@ -701,6 +707,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
           serverActivePositions: data?.activePositions ?? {},
           serverClosedTrades: data?.closedPositions ?? [],
           serverTradeAlerts: data?.alerts ?? [],
+          serverTradesLoaded: true,
           supervisorPolicy: data?.supervisorPolicy ?? null,
         });
       }
@@ -780,6 +787,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
   setGaiaMode: (mode) => set({ gaiaMode: mode }),
   setSetupModalOpen: (open) => set({ isSetupModalOpen: open }),
+  hydrateDiscordConfig: () => {
+    set({ discordConfig: getInitialDiscordConfig() });
+  },
   updateDiscordConfig: (cfg) => {
     set((state) => {
       const next = { ...state.discordConfig, ...cfg };
@@ -795,7 +805,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   setToastMessage: (msg) => set({ toastMessage: msg }),
 
   setTicker: (rawTicker) => {
-    const preset = getTickerPreset(rawTicker);
+    const preset = getStaticTickerPreset(rawTicker);
     if (preset.ticker === get().activeTicker) {
       return;
     }
@@ -844,8 +854,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
           expiration: safeExpFilter,
         },
         alerts: [],
+        serverActivePositions: {},
         serverClosedTrades: [],
         serverTradeAlerts: [],
+        serverTradesLoaded: false,
         supervisorPolicy: null,
         intradayData: [],
         flowGammaVwapData: null,
@@ -967,7 +979,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       alerts: [
         ...state.alerts.slice(-49),
         {
-          id: `alert-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          id: `alert-${Date.now()}-${++localAlertSeq}`,
           timestamp: nowLabel,
           message,
           type,
@@ -991,7 +1003,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         return { gridFilters: nextFilters };
       }
 
-      const preset = getTickerPreset(state.activeTicker);
+      const preset = getStaticTickerPreset(state.activeTicker);
       const filtered = computeFilteredSummaryMetrics({
         expirationFilter: nextFilters.expiration,
         preset,
@@ -1019,7 +1031,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         return state;
       }
 
-      const preset = getTickerPreset(payload.ticker);
+      const preset = getStaticTickerPreset(payload.ticker);
       const baseAllExpKingNode: KingNodeMetrics = {
         ...payload.kingNode,
         zeroDteKing:

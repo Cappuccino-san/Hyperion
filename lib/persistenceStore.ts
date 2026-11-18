@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import type { DailyTradeStore } from "@/lib/tradeSignalEngine";
+import type { DailyTradeStore } from "@/lib/execution/types";
 import type { DailyStore } from "@/lib/intradayHistory";
 import { getTodayEt } from "@/lib/gaiaSessionGuards";
 
@@ -83,6 +83,17 @@ export interface CounterfactualEvalRecord {
   thetaAdjustedPnlPct: number;
 }
 
+export interface ShadowParityReport {
+  liveTradeCount: number;
+  replayTradeCount: number;
+  matchedCount: number;
+  directionMatchPct: number;
+  meanEntrySpotDrift: number;
+  meanOutcomeRDrift: number;
+  maxPnlPctDrift: number;
+  parityStatus: "PASS" | "DRIFT_WARN" | "NO_DATA";
+}
+
 export interface PostMarketAttributionReport {
   sessionDate: string;
   ticker: string;
@@ -94,6 +105,7 @@ export interface PostMarketAttributionReport {
   missedAlphaCount: number;
   savedChopCount: number;
   featureIc?: FeatureIcMap;
+  shadowParityReport?: ShadowParityReport;
   updatedPriorsSummary: string;
   records: CounterfactualEvalRecord[];
 }
@@ -639,6 +651,10 @@ export function writeSessionLedgerSync(store: DailyTradeStore): void {
   store.version = (store.version ?? 0) + 1;
   store.updatedAtMs = Date.now();
   const mtimeMs = atomicWriteJsonSync(filePath, store);
+  if (mtimeMs === 0) {
+    getLedgerMemMap().delete(store.date);
+    throw new Error(`LEDGER_WRITE_FAILED: Failed to atomically write ${filePath}`);
+  }
   getLedgerMemMap().set(store.date, { store, mtimeMs });
   scheduleRemoteWrite(`${KEY_PREFIX}ledger:${store.date}`, store);
 }
@@ -683,6 +699,10 @@ export async function writeSessionLedger(store: DailyTradeStore): Promise<void> 
   store.version = (store.version ?? 0) + 1;
   store.updatedAtMs = Date.now();
   const mtimeMs = atomicWriteJsonSync(filePath, store);
+  if (mtimeMs === 0) {
+    getLedgerMemMap().delete(store.date);
+    throw new Error(`LEDGER_WRITE_FAILED: Failed to atomically write ${filePath}`);
+  }
   getLedgerMemMap().set(store.date, { store, mtimeMs });
   await writeRemoteNow(`${KEY_PREFIX}ledger:${store.date}`, store);
 }

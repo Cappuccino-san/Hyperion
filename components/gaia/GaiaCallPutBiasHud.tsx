@@ -281,10 +281,18 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   );
 
   useEffect(() => {
-    if (serverTradesProp) {
+    if (serverTradesProp !== undefined) {
       setInternalServerTrades(serverTradesProp);
+      return;
     }
-  }, [serverTradesProp]);
+    setInternalServerTrades({
+      activePositions: {},
+      closedPositions: [],
+      alerts: [],
+      loaded: false,
+    });
+    setInternalSupervisorPolicy(null);
+  }, [activeSymbol, sessionDate, serverTradesProp]);
 
   // Dynamic Trade Signals Engine Hook: Polls /api/signals only when parent does not supply serverTradesProp
   useEffect(() => {
@@ -311,6 +319,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             activePositions: data?.activePositions || {},
             closedPositions: data?.closedPositions || [],
             alerts: data?.alerts || [],
+            loaded: true,
           });
           setInternalSupervisorPolicy(data?.supervisorPolicy ?? null);
         }
@@ -400,21 +409,27 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       return [];
     }
 
-    // Normalize timestamps (seconds vs ms)
-    const cloned = raw.map((c, i) => {
-      const rawTs = c.timestamp ?? c.time ?? 0;
-      const ts = rawTs > 1e11 ? rawTs : rawTs > 1e9 ? rawTs * 1000 : Date.now() - (raw.length - i) * 300_000;
-      return {
-        ...c,
-        timestamp: ts,
-        open: Number(c.open) || Number(c.close) || 0,
-        high: Number(c.high) || Number(c.close) || 0,
-        low: Number(c.low) || Number(c.close) || 0,
-        close: Number(c.close) || 0,
-        volume: Number(c.volume) || 0,
-        timeLabel: c.timeLabel || formatTimeEt(ts).full,
-      };
-    });
+    // Normalize timestamps (seconds vs ms) and drop bars missing valid timestamps (no synthetic Date.now fallback)
+    const cloned = raw
+      .map((c) => {
+        const rawTs = c.timestamp ?? c.time ?? 0;
+        const ts = rawTs > 1e11 ? rawTs : rawTs > 1e9 ? rawTs * 1000 : 0;
+        if (!Number.isFinite(ts) || ts <= 0) return null;
+        return {
+          ...c,
+          timestamp: ts,
+          open: Number(c.open) || Number(c.close) || 0,
+          high: Number(c.high) || Number(c.close) || 0,
+          low: Number(c.low) || Number(c.close) || 0,
+          close: Number(c.close) || 0,
+          volume: Number(c.volume) || 0,
+          timeLabel: c.timeLabel || formatTimeEt(ts).full,
+        };
+      })
+      .filter((c): c is NonNullable<typeof c> => c !== null);
+    if (cloned.length === 0) {
+      return [];
+    }
 
     // Adaptive ATR Tail Sanitizer & Static Preset Guard
     const STATIC_PRESET_SPOTS = new Set([759.75, 608.91, 502.5, 208.45, 7597.5]);
@@ -477,7 +492,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     try {
       return computeBarFlowGammaVwapSeries(
         effectiveCandles.map((c) => ({
-          timestamp: c.timestamp ?? Date.now(),
+          timestamp: c.timestamp,
           open: c.open,
           high: c.high,
           low: c.low,

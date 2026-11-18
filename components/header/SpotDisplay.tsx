@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { getTickerPreset, useDashboardStore } from "@/store/useDashboardStore";
+import { getStaticTickerPreset, useDashboardStore } from "@/store/useDashboardStore";
 import { ExpectedMovesBadges } from "./ExpectedMovesBadges";
 import { cn } from "@/lib/utils";
 import { Database, RefreshCw } from "lucide-react";
@@ -31,7 +31,7 @@ export function SpotDisplay() {
   const pctChange = hasValidSpot && hasValidPrevClose ? (absChange / previousClose) * 100 : 0;
   const isPositive = absChange >= 0;
   const isPositiveGamma = netGex >= 0;
-  const preset = getTickerPreset(activeTicker);
+  const preset = getStaticTickerPreset(activeTicker);
   const showExtended =
     extendedQuote &&
     Number.isFinite(extendedQuote.price) &&

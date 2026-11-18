@@ -23,23 +23,185 @@ export interface PositionSizingResult {
 
 export const MAX_SMALL_ACCOUNT_BUDGET = 100.0; // Hard dollar ceiling: strictly <= $100.00
 const MAX_OUTLAY_CENTS = 10000; // $100.00 in cents
-export const MORNING_MIN_OPTION_DELTA = 0.24; // 09:35-10:29 ET (etMins < 630)
-export const INTRADAY_MIN_OPTION_DELTA = 0.35; // >= 10:30 ET (etMins >= 630)
-export const MIN_OPTION_DELTA = INTRADAY_MIN_OPTION_DELTA;
+export const MIN_OPTION_DELTA = 0.24;
+export const MORNING_MIN_OPTION_DELTA = 0.24;
+export const INTRADAY_MIN_OPTION_DELTA = 0.35;
+export const POS_GAMMA_MIN_OPTION_DELTA = 0.35;
+export const NEG_GAMMA_MIN_OPTION_DELTA = 0.24;
 export const MAX_OPTION_DELTA = 0.50;
+export const MAX_SPREAD_TO_EDGE_RATIO = 0.22; // Hard veto: spread / max(0.05, expectedDollarMove) > 0.22
+export const DEFAULT_HOLD_HORIZON_MINUTES = 30; // 6 bars (5m) expected hold horizon
 
-export function resolveMinOptionDelta(etMins?: number): number {
-  if (typeof etMins === "number" && Number.isFinite(etMins) && etMins < 630) {
-    return MORNING_MIN_OPTION_DELTA;
-  }
-  return INTRADAY_MIN_OPTION_DELTA;
+export type DeltaRegimeContext =
+  | string
+  | {
+      regime?: string | null;
+      absImpulsePeclet?: number;
+      etMins?: number;
+    }
+  | number;
+
+export interface TaylorPayoffEvaluation {
+  allowed: boolean;
+  expectedDollarMove: number;
+  thetaDragDollars: number;
+  halfSpreadDollars: number;
+  netDollarEdge: number;
+  netEvPerDollarAsk: number;
+  spreadToEdgeRatio: number;
+  rejectionReason:
+    | "DELTA_OUT_OF_BAND"
+    | "INVALID_QUOTE"
+    | "SPREAD_TO_EDGE_VETO"
+    | "NEGATIVE_NET_EV"
+    | null;
 }
 
-export function isDeltaInTargetBand(delta: number, etMins?: number): boolean {
+/**
+ * Regime & advection-conditioned minimum |delta| floor (eliminates the 10:30 AM etMins < 630 clock step):
+ * - NEG_GAMMA_TREND / ZERO_GAMMA_FLIP or |impulsePeclet| >= 1.8 -> 0.24
+ * - POS_GAMMA_PIN (without strong advection) -> 0.35
+ * - Default fallback -> 0.24
+ */
+export function resolveMinOptionDelta(regimeOrOpts?: DeltaRegimeContext): number {
+  if (typeof regimeOrOpts === "string") {
+    return regimeOrOpts === "POS_GAMMA_PIN"
+      ? POS_GAMMA_MIN_OPTION_DELTA
+      : NEG_GAMMA_MIN_OPTION_DELTA;
+  }
+  if (regimeOrOpts && typeof regimeOrOpts === "object") {
+    const absImpPe =
+      typeof regimeOrOpts.absImpulsePeclet === "number" &&
+      Number.isFinite(regimeOrOpts.absImpulsePeclet)
+        ? Math.abs(regimeOrOpts.absImpulsePeclet)
+        : 0;
+    if (
+      regimeOrOpts.regime === "NEG_GAMMA_TREND" ||
+      regimeOrOpts.regime === "ZERO_GAMMA_FLIP" ||
+      absImpPe >= 1.8
+    ) {
+      return NEG_GAMMA_MIN_OPTION_DELTA;
+    }
+    if (regimeOrOpts.regime === "POS_GAMMA_PIN") {
+      return POS_GAMMA_MIN_OPTION_DELTA;
+    }
+    return MIN_OPTION_DELTA;
+  }
+  return MIN_OPTION_DELTA;
+}
+
+export function isDeltaInTargetBand(
+  delta: number,
+  regimeOrOpts?: DeltaRegimeContext
+): boolean {
   if (!Number.isFinite(delta)) return false;
   const absDelta = Math.abs(delta);
-  const minDelta = resolveMinOptionDelta(etMins);
+  const minDelta = resolveMinOptionDelta(regimeOrOpts);
   return absDelta >= minDelta && absDelta <= MAX_OPTION_DELTA;
+}
+
+/**
+ * Second-Order Taylor Net Payoff Router:
+ *   NetEV(K,T) = (|Delta| * dS_exp + 0.5 * Gamma * dS_exp^2 - |Theta| * dt_hold - 0.5 * Spread) / Ask
+ * Paired with hard spread-to-edge veto:
+ *   Spread / max(0.05, |Delta| * dS_exp + 0.5 * Gamma * dS_exp^2) > 0.22 -> VETO
+ */
+export function computeTaylorNetPayoff(params: {
+  absDelta: number;
+  gamma: number;
+  dailyTheta: number; // dollars per 390-min RTH trading day
+  bid: number;
+  ask: number;
+  expectedUnderlyingMove: number; // dS_exp in dollars (> 0)
+  holdMinutes?: number;
+  minDelta?: number;
+}): TaylorPayoffEvaluation {
+  const {
+    absDelta,
+    gamma,
+    dailyTheta,
+    bid,
+    ask,
+    expectedUnderlyingMove,
+    holdMinutes = DEFAULT_HOLD_HORIZON_MINUTES,
+    minDelta = MIN_OPTION_DELTA,
+  } = params;
+
+  if (!Number.isFinite(ask) || ask <= 0 || !Number.isFinite(bid) || bid < 0 || bid > ask) {
+    return {
+      allowed: false,
+      expectedDollarMove: 0,
+      thetaDragDollars: 0,
+      halfSpreadDollars: 0,
+      netDollarEdge: 0,
+      netEvPerDollarAsk: -1,
+      spreadToEdgeRatio: Infinity,
+      rejectionReason: "INVALID_QUOTE",
+    };
+  }
+  const absD = Math.abs(absDelta);
+  if (!Number.isFinite(absD) || absD < minDelta || absD > MAX_OPTION_DELTA) {
+    return {
+      allowed: false,
+      expectedDollarMove: 0,
+      thetaDragDollars: 0,
+      halfSpreadDollars: 0,
+      netDollarEdge: 0,
+      netEvPerDollarAsk: -1,
+      spreadToEdgeRatio: Infinity,
+      rejectionReason: "DELTA_OUT_OF_BAND",
+    };
+  }
+
+  const dS = Math.max(
+    0.01,
+    Number.isFinite(expectedUnderlyingMove) ? Math.abs(expectedUnderlyingMove) : 0.01
+  );
+  const safeGamma = Number.isFinite(gamma) && gamma > 0 ? gamma : 0;
+  const expectedDollarMove = absD * dS + 0.5 * safeGamma * dS * dS;
+  const spread = Math.max(0, ask - bid);
+  const halfSpreadDollars = 0.5 * spread;
+  const dtHoldDays = Math.max(5, holdMinutes) / 390;
+  const thetaDragDollars = Math.abs(Number.isFinite(dailyTheta) ? dailyTheta : 0) * dtHoldDays;
+  const netDollarEdge = expectedDollarMove - thetaDragDollars - halfSpreadDollars;
+  const netEvPerDollarAsk = netDollarEdge / ask;
+  const spreadToEdgeRatio = spread / Math.max(0.05, expectedDollarMove);
+
+  if (spreadToEdgeRatio > MAX_SPREAD_TO_EDGE_RATIO) {
+    return {
+      allowed: false,
+      expectedDollarMove,
+      thetaDragDollars,
+      halfSpreadDollars,
+      netDollarEdge,
+      netEvPerDollarAsk,
+      spreadToEdgeRatio,
+      rejectionReason: "SPREAD_TO_EDGE_VETO",
+    };
+  }
+  if (netEvPerDollarAsk <= 0) {
+    return {
+      allowed: false,
+      expectedDollarMove,
+      thetaDragDollars,
+      halfSpreadDollars,
+      netDollarEdge,
+      netEvPerDollarAsk,
+      spreadToEdgeRatio,
+      rejectionReason: "NEGATIVE_NET_EV",
+    };
+  }
+
+  return {
+    allowed: true,
+    expectedDollarMove,
+    thetaDragDollars,
+    halfSpreadDollars,
+    netDollarEdge,
+    netEvPerDollarAsk,
+    spreadToEdgeRatio,
+    rejectionReason: null,
+  };
 }
 
 export interface SizingResult {

@@ -26,8 +26,69 @@ export const HOLIDAYS_2026: ReadonlySet<string> = new Set([
   "2026-12-25",
 ]);
 
+export const EARLY_CLOSES_2026: Readonly<Record<string, number>> = {
+  "2026-11-27": 780, // Day after Thanksgiving: 13:00 ET close
+  "2026-12-24": 780, // Christmas Eve: 13:00 ET close
+};
+
+export interface SessionBoundsEt {
+  sessionDate: string;
+  isTradingDay: boolean;
+  isEarlyClose: boolean;
+  rthOpenMins: number;
+  entryStartMins: number;
+  entryCutoffMins: number;
+  eodFlatMins: number;
+  rthCloseMins: number;
+}
+
 export function getTodayEt(now: Date = new Date()): string {
   return now.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
+/**
+ * Returns session calendar and intraday RTH cutoff bounds for a given ET date (YYYY-MM-DD).
+ * Early-close sessions (13:00 ET close) enforce an 11:30 ET entry cutoff and 12:55 ET MOC flat.
+ */
+export function getSessionBoundsEt(etDate?: string): SessionBoundsEt {
+  const sessionDate =
+    etDate && /^\d{4}-\d{2}-\d{2}$/.test(etDate) ? etDate : getTodayEt();
+  const [y, m, d] = sessionDate.split("-").map(Number);
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  const isHoliday = HOLIDAYS_2026.has(sessionDate);
+  const isTradingDay = dow !== 0 && dow !== 6 && !isHoliday;
+  const earlyCloseMins = EARLY_CLOSES_2026[sessionDate];
+  const isEarlyClose = typeof earlyCloseMins === "number";
+
+  if (isEarlyClose) {
+    return {
+      sessionDate,
+      isTradingDay,
+      isEarlyClose: true,
+      rthOpenMins: RTH_OPEN_MINS,
+      entryStartMins: ENTRY_START_MINS,
+      entryCutoffMins: Math.min(ENTRY_CUTOFF_MINS, earlyCloseMins - 90), // 11:30 ET (690)
+      eodFlatMins: earlyCloseMins - 5, // 12:55 ET (775)
+      rthCloseMins: earlyCloseMins, // 13:00 ET (780)
+    };
+  }
+
+  return {
+    sessionDate,
+    isTradingDay,
+    isEarlyClose: false,
+    rthOpenMins: RTH_OPEN_MINS,
+    entryStartMins: ENTRY_START_MINS,
+    entryCutoffMins: ENTRY_CUTOFF_MINS,
+    eodFlatMins: EOD_FORCE_FLAT_MINS,
+    rthCloseMins: RTH_CLOSE_MINS,
+  };
+}
+
+export function formatEtMinsAsTimeString(mins: number): string {
+  const hh = Math.floor(mins / 60);
+  const mm = mins % 60;
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:00`;
 }
 
 const EOD_FORCE_FLAT_SECS = EOD_FORCE_FLAT_MINS * 60;
@@ -58,32 +119,40 @@ export function etMinutesOfDay(ts: number): number {
   return Math.floor(etSecondsOfDay(ts) / 60);
 }
 
-export function isWithinRth(etMins: number): boolean {
-  return etMins >= RTH_OPEN_MINS && etMins < RTH_CLOSE_MINS;
+export function isWithinRth(etMins: number, etDate?: string): boolean {
+  const bounds = getSessionBoundsEt(etDate);
+  return etMins >= bounds.rthOpenMins && etMins < bounds.rthCloseMins;
 }
 
-export function isWithinEntryWindow(etMins: number): boolean {
-  return etMins >= ENTRY_START_MINS && etMins <= ENTRY_CUTOFF_MINS;
+export function isWithinEntryWindow(etMins: number, etDate?: string): boolean {
+  const bounds = getSessionBoundsEt(etDate);
+  return etMins >= bounds.entryStartMins && etMins <= bounds.entryCutoffMins;
 }
 
-export function isAtOrPastEodFlat(etMins: number): boolean {
-  return etMins >= EOD_FORCE_FLAT_MINS;
+export function isAtOrPastEodFlat(etMins: number, etDate?: string): boolean {
+  const bounds = getSessionBoundsEt(etDate);
+  return etMins >= bounds.eodFlatMins;
 }
 
 /**
- * Caps an exit timestamp to 15:55:00 ET of the session it belongs to.
- * - At/after 15:55 ET → that day's 15:55:00 ET.
- * - Before 09:30 ET (overnight carry) → the prior day's 15:55:00 ET.
+ * Caps an exit timestamp to 15:55:00 ET (or 12:55:00 ET on early-close sessions).
+ * - At/after MOC cutoff -> that day's MOC cutoff.
+ * - Before 09:30 ET (overnight carry) -> the prior session's MOC cutoff.
  * Returns the original timestamp when it is already inside the tradable window.
  */
-export function capExitTsToEodFlat(tsSec: number): { ts: number; capped: boolean } {
+export function capExitTsToEodFlat(tsSec: number, etDate?: string): { ts: number; capped: boolean } {
   const ts = toEpochSec(tsSec);
   const sod = etSecondsOfDay(ts);
-  if (sod >= EOD_FORCE_FLAT_SECS) {
-    return { ts: ts - (sod - EOD_FORCE_FLAT_SECS), capped: true };
+  const dateStr = etDate || getTodayEt(new Date(ts * 1000));
+  const bounds = getSessionBoundsEt(dateStr);
+  const eodFlatSecs = bounds.eodFlatMins * 60;
+  if (sod >= eodFlatSecs) {
+    return { ts: ts - (sod - eodFlatSecs), capped: true };
   }
-  if (sod < RTH_OPEN_MINS * 60) {
-    return { ts: ts - sod - (86400 - EOD_FORCE_FLAT_SECS), capped: true };
+  if (sod < bounds.rthOpenMins * 60) {
+    const prevDateStr = getTodayEt(new Date((ts - sod - 43200) * 1000));
+    const prevEodFlatSecs = getSessionBoundsEt(prevDateStr).eodFlatMins * 60;
+    return { ts: ts - sod - (86400 - prevEodFlatSecs), capped: true };
   }
   return { ts, capped: false };
 }

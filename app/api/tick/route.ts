@@ -1,11 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { VALID_TICKER_REGEX } from "@/lib/marketCache";
-import { fetchLiveTickQuote, type LiveTickResponse } from "@/lib/liveTick";
-
-export const dynamic = "force-dynamic";
-export const revalidate = 0;
+import { fetchLiveTickQuote, LiveTickResponse } from "@/lib/liveTick";
 
 export type { LiveTickResponse };
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -17,7 +16,7 @@ export async function GET(req: NextRequest) {
   try {
     const winner = await fetchLiveTickQuote(rawTicker);
     if (!winner) {
-      throw new Error("All upstream live tick sources failed");
+      throw new Error("All upstream live tick feeds failed");
     }
     return NextResponse.json(winner, {
       headers: {

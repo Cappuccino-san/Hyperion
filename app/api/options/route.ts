@@ -13,7 +13,9 @@ import {
   evaluateTradeSignals,
   evaluateAllActivePositions,
   loadTradeStore,
+  reanchorDelayedContractsToSpot,
 } from "@/lib/tradeSignalEngine";
+import { fetchLiveTickQuote } from "@/lib/liveTick";
 import {
   ensureLiveBotRunning,
   acquireBarEvaluationLock,
@@ -23,9 +25,8 @@ import {
 } from "@/lib/liveBotDaemon";
 import { globalTelemetry } from "@/lib/telemetry";
 import {
+  getSessionBoundsEt,
   getTodayEt,
-  RTH_OPEN_MINS,
-  RTH_CLOSE_MINS,
 } from "@/lib/gaiaSessionGuards";
 import {
   BoundedMap,
@@ -114,85 +115,16 @@ async function fetchRealtimeSpotQuote(
   ticker: string
 ): Promise<{ spotPrice: number; previousClose?: number } | null> {
   const sym = ticker.toUpperCase();
-
-  // 1. Primary: Sub-second live exchange quote via Robinhood public feed
-  const rhSym =
-    sym === "SPXW" || sym === "SPX"
-      ? "SPY"
-      : sym === "NDXP" || sym === "NDX"
-        ? "QQQ"
-        : sym;
-
-  try {
-    const rhRes = await fetch(
-      `https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`,
-      {
-        headers: {
-          Accept: "application/json",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
-        },
-        cache: "no-store",
-        signal: AbortSignal.timeout(2200),
-      }
-    );
-    if (rhRes.ok) {
-      const rhJson = await rhRes.json();
-      const q = rhJson?.results?.[0];
-      const p = Number(q?.last_trade_price ?? q?.bid_price ?? 0);
-      const prevClose = Number(q?.previous_close ?? 0);
-      if (p > 0 && Number.isFinite(p)) {
-        const mult = sym === "SPXW" || sym === "SPX" ? 10 : sym === "NDXP" || sym === "NDX" ? 40 : 1;
-        return {
-          spotPrice: Number((p * mult).toFixed(2)),
-          previousClose: prevClose > 0 ? Number((prevClose * mult).toFixed(2)) : undefined,
-        };
-      }
-    }
-  } catch {
-    // Non-fatal fallback to Yahoo
+  const mapped =
+    sym === "SPXW" ? "SPX" : sym === "NDXP" ? "NDX" : sym;
+  const tick = await fetchLiveTickQuote(mapped).catch(() => null);
+  if (tick && tick.spot > 0 && Number.isFinite(tick.spot)) {
+    return {
+      spotPrice: Number(tick.spot.toFixed(2)),
+      previousClose: tick.prevClose > 0 ? Number(tick.prevClose.toFixed(2)) : undefined,
+    };
   }
-
-  // 2. Secondary: Yahoo Finance fallback
-  const yahooSym =
-    sym === "SPXW" || sym === "SPX"
-      ? "^GSPC"
-      : sym === "NDXP" || sym === "NDX"
-        ? "^NDX"
-        : sym;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 2200);
-  try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
-      yahooSym
-    )}?range=1d&interval=1m`;
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        Accept: "application/json",
-        "User-Agent": "Mozilla/5.0 (compatible; HyperionAnalytics/1.0)",
-      },
-      cache: "no-store",
-    });
-    if (!res.ok) return null;
-    const json = await res.json();
-    const meta = json?.chart?.result?.[0]?.meta;
-    const regularPrice = Number(meta?.regularMarketPrice ?? 0);
-    const prevClose = Number(
-      meta?.chartPreviousClose ?? meta?.previousClose ?? 0
-    );
-    if (regularPrice > 0 && Number.isFinite(regularPrice)) {
-      return {
-        spotPrice: Number(regularPrice.toFixed(2)),
-        previousClose: prevClose > 0 ? Number(prevClose.toFixed(2)) : undefined,
-      };
-    }
-    return null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
+  return null;
 }
 
 async function fetchExtendedQuote(
@@ -201,9 +133,10 @@ async function fetchExtendedQuote(
 ): Promise<ExtendedQuoteInfo | null> {
   if (NO_EXT_SET.has(ticker.toUpperCase())) return null;
   try {
-    const { isWeekday, etMins: mins } = getEtClockNow();
-    // During regular market hours (Mon-Fri 9:30 AM - 4:00 PM ET), no extended quote badge is shown
-    if (isWeekday && mins >= RTH_OPEN_MINS && mins < RTH_CLOSE_MINS) {
+    const { isWeekday, etMins: mins, etDate } = getEtClockNow();
+    const bounds = getSessionBoundsEt(etDate);
+    // During regular market hours (9:30 AM - 4:00 PM / 1:00 PM early close ET), no extended quote badge is shown
+    if (isWeekday && mins >= bounds.rthOpenMins && mins < bounds.rthCloseMins) {
       return null;
     }
 
@@ -225,7 +158,7 @@ async function fetchExtendedQuote(
     if (!meta) return null;
 
     const sessionType: "pre" | "after" =
-      isWeekday && mins >= 240 && mins < RTH_OPEN_MINS ? "pre" : "after";
+      isWeekday && mins >= 240 && mins < bounds.rthOpenMins ? "pre" : "after";
 
     let extPrice = Number(
       sessionType === "pre"
@@ -470,7 +403,14 @@ async function fetchCboeOptions(
 
   if (contracts.length === 0) return null;
 
-  setBoundedMapEntry(contractsCache, ticker, contracts, 64);
+  const anchoredContracts = reanchorDelayedContractsToSpot({
+    contracts,
+    referenceSpot: cboeSpotPrice,
+    liveSpot: spotPrice,
+    fallbackIv: impliedVolatility,
+  });
+
+  setBoundedMapEntry(contractsCache, ticker, anchoredContracts, 64);
   const extendedQuote = await fetchExtendedQuote(ticker, spotPrice);
 
   return computeOptionsAnalytics({
@@ -479,7 +419,7 @@ async function fetchCboeOptions(
     spotPrice,
     previousClose,
     impliedVolatility,
-    contracts,
+    contracts: anchoredContracts,
     extendedQuote,
     openGexMap,
   });
@@ -637,8 +577,12 @@ async function attachIntraday(
           : null,
         kingNode: payload.kingNode,
         filteredKing: tacticalKing,
+        allExpKing: payload.kingNode?.allExpKing ?? payload.kingByFilter?.ALL?.strike,
         bookCenter: tacticalZeroGamma,
         contracts,
+        dataSource: payload.dataSource,
+        referenceSpotPrice: payload.spotPrice,
+        contractsAlreadyAnchored: true,
         signal: evalController.signal,
       });
 
@@ -669,7 +613,8 @@ async function attachIntraday(
       // Non-fatal
     } finally {
       const clock = getEtClockNow();
-      if (clock.etMins >= 955) {
+      const bounds = getSessionBoundsEt(clock.etDate);
+      if (clock.etMins >= bounds.eodFlatMins) {
         await ensureMocCutoffForRemainingPositions(process.env.DISCORD_WEBHOOK_URL, clock).catch(() => {});
       }
       clearTimeout(evalTimeout);

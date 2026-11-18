@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import { useDashboardStore, getTickerPreset } from "@/store/useDashboardStore";
+import { useDashboardStore, getStaticTickerPreset } from "@/store/useDashboardStore";
 
 interface OptionTradePositionUI {
   id: string;
@@ -48,7 +48,7 @@ export function AlertsFeed() {
   // Tactical 0DTE / Next-Exp levels for intraday Pre-Trade Radar
   // Anchors BTO Put triggers and Call triggers to 0DTE walls instead of distant all-expiration LEAPS outliers
   const zeroDteLevels = gammaLevelsByFilter?.["0DTE"] ?? gammaLevelsByFilter?.["THIS_WEEK"];
-  const currentSpot = spotPrice > 0 ? spotPrice : (getTickerPreset(activeTicker)?.spotPrice || 0);
+  const currentSpot = spotPrice > 0 ? spotPrice : (getStaticTickerPreset(activeTicker)?.spotPrice || 0);
   const strikeStep = useDashboardStore((state) => state.strikeStep) || 1;
   const roundToStep = (v: number) =>
     Number.isFinite(v) && strikeStep > 0

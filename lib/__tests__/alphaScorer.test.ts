@@ -288,87 +288,93 @@ test("selectOptimalSmallAccountContract honors Gamma/Theta efficiency, IV skew, 
   assert.ok(selection.chosen.gammaThetaEfficiency > 0.3);
 });
 
-test("selectOptimalSmallAccountContract enforces Time-of-Day Adaptive Delta Floor (0.24 pre-10:30 ET, 0.35 from 10:30 ET onward) and 1-2 DTE fallback", () => {
-  const belowMorningFloor = makeContractCandidate({
+test("selectOptimalSmallAccountContract conditions delta floor on regime/advection and enforces Second-Order Taylor NetEV & 0.22 spread-to-edge veto", () => {
+  const belowNegGammaFloor = makeContractCandidate({
     symbol: "SPY261113C00758500",
     strike: 758.2,
     dte: 0,
     expiration: "2026-11-13",
-    bid: 0.42,
+    bid: 0.43,
     ask: 0.45,
-    delta: 0.23, // < 0.24 morning floor -> always rejected
+    delta: 0.23, // < 0.24 floor -> always rejected
     gamma: 0.035,
     iv: 0.16,
     theta: -0.22,
   });
 
-  const morningExactFloor = makeContractCandidate({
+  const negGammaExactFloor = makeContractCandidate({
     symbol: "SPY261113C00758000",
     strike: 758,
     dte: 0,
     expiration: "2026-11-13",
-    bid: 0.55,
+    bid: 0.56,
     ask: 0.58,
-    delta: 0.24, // exact 0.24 morning floor -> admitted at etMins < 630, rejected at etMins >= 630
+    delta: 0.24, // admitted in NEG_GAMMA_TREND / |Pe| >= 1.8 even in afternoon, rejected in POS_GAMMA_PIN
     gamma: 0.04,
     iv: 0.16,
     theta: -0.25,
   });
 
-  const subIntradayBorderline = makeContractCandidate({
+  const posPinSub35 = makeContractCandidate({
     symbol: "SPY261113C00757500",
     strike: 757.5,
     dte: 0,
     expiration: "2026-11-13",
-    bid: 0.70,
+    bid: 0.71,
     ask: 0.73,
-    delta: 0.34, // admitted pre-10:30 ET, rejected >= 10:30 ET (< 0.35)
+    delta: 0.34, // admitted in NEG_GAMMA_TREND / ZERO_GAMMA_FLIP, rejected in POS_GAMMA_PIN (< 0.35)
     gamma: 0.045,
     iv: 0.16,
     theta: -0.22,
   });
 
-  // 1. Morning Window (09:35-10:29 ET, etMins = 585 & boundary 629): 0.23 rejected, 0.24 admitted
-  const morningRejectSub24 = selectOptimalSmallAccountContract({
-    candidates: [belowMorningFloor],
+  // 1. NEG_GAMMA_TREND rejects < 0.24 and admits 0.24 even after 10:30 ET (etMins = 750)
+  const negRejectSub24 = selectOptimalSmallAccountContract({
+    candidates: [belowNegGammaFloor],
+    spotPrice: 755,
+    target1Spot: 758,
+    target2Spot: 760,
+    isCall: true,
+    isAfternoon: true,
+    preferredDte: "0DTE",
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.3,
+    etMins: 750,
+  });
+  assert.equal(negRejectSub24, null);
+
+  const negAccept24Afternoon = selectOptimalSmallAccountContract({
+    candidates: [belowNegGammaFloor, negGammaExactFloor],
+    spotPrice: 755,
+    target1Spot: 758,
+    target2Spot: 760,
+    isCall: true,
+    isAfternoon: true,
+    preferredDte: "0DTE",
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.3,
+    etMins: 750, // Afternoon hour no longer blocks 0.24 under NEG_GAMMA_TREND
+  });
+  assert.ok(negAccept24Afternoon);
+  assert.equal(negAccept24Afternoon.chosen.contract.symbol, "SPY261113C00758000");
+  assert.equal(negAccept24Afternoon.chosen.absDelta, 0.24);
+
+  // 2. POS_GAMMA_PIN rejects 0.24 & 0.34 (< 0.35) even in the morning (etMins = 590)
+  const posPinRejected = selectOptimalSmallAccountContract({
+    candidates: [belowNegGammaFloor, negGammaExactFloor, posPinSub35],
     spotPrice: 755,
     target1Spot: 758,
     target2Spot: 760,
     isCall: true,
     isAfternoon: false,
-    preferredDte: "0DTE",
-    etMins: 585, // 09:45 AM ET
+    preferredDte: "1-2DTE",
+    regime: "POS_GAMMA_PIN",
+    absImpulsePeclet: 0.9,
+    etMins: 590,
   });
-  assert.equal(morningRejectSub24, null);
+  assert.equal(posPinRejected, null);
 
-  const morningAccept24 = selectOptimalSmallAccountContract({
-    candidates: [belowMorningFloor, morningExactFloor],
-    spotPrice: 755,
-    target1Spot: 758,
-    target2Spot: 760,
-    isCall: true,
-    isAfternoon: false,
-    preferredDte: "0DTE",
-    etMins: 629, // 10:29 AM ET (last minute of morning window)
-  });
-  assert.ok(morningAccept24);
-  assert.equal(morningAccept24.chosen.contract.symbol, "SPY261113C00758000");
-  assert.equal(morningAccept24.chosen.absDelta, 0.24);
-
-  // 2. Intraday / Afternoon Window (>= 10:30 ET, etMins = 630): 0.24 & 0.34 both rejected (< 0.35)
-  const post1030Rejected = selectOptimalSmallAccountContract({
-    candidates: [belowMorningFloor, morningExactFloor, subIntradayBorderline],
-    spotPrice: 755,
-    target1Spot: 758,
-    target2Spot: 760,
-    isCall: true,
-    isAfternoon: false,
-    preferredDte: "0DTE",
-    etMins: 630, // exact 10:30 AM ET
-  });
-  assert.equal(post1030Rejected, null);
-
-  // 3. Intraday >= 10:30 ET: 0DTE 0.42-delta exceeds $0.99 ask cap -> falls back to 1-2 DTE >= 0.35-delta
+  // 3. POS_GAMMA_PIN: 0DTE 0.42-delta exceeds $0.99 ask cap -> falls back to 1-2 DTE >= 0.35-delta
   const expensive0Dte = makeContractCandidate({
     symbol: "SPY261113C00755000",
     strike: 755,
@@ -396,19 +402,47 @@ test("selectOptimalSmallAccountContract enforces Time-of-Day Adaptive Delta Floo
   });
 
   const selection = selectOptimalSmallAccountContract({
-    candidates: [morningExactFloor, subIntradayBorderline, expensive0Dte, fallback1Dte],
+    candidates: [negGammaExactFloor, posPinSub35, expensive0Dte, fallback1Dte],
     spotPrice: 755,
     target1Spot: 758,
     target2Spot: 760,
     isCall: true,
     isAfternoon: true,
-    preferredDte: "0DTE",
-    etMins: 720, // 12:00 PM ET (>= 10:30 ET)
+    preferredDte: "1-2DTE",
+    regime: "POS_GAMMA_PIN",
+    absImpulsePeclet: 0.8,
+    etMins: 720,
   });
   assert.ok(selection);
   assert.equal(selection.chosen.dte, 1);
   assert.equal(selection.chosen.contract.symbol, "SPY261114C00757000");
   assert.ok(selection.chosen.absDelta >= 0.35 && selection.chosen.absDelta <= 0.5);
+
+  // 4. Hard spread-to-edge veto: spread <= 24% of ask, but spread / expectedDollarMove > 0.22 must reject
+  const wideSpreadSmallMove = makeContractCandidate({
+    symbol: "SPY261113C00757500",
+    strike: 757.5,
+    dte: 0,
+    expiration: "2026-11-13",
+    bid: 0.54,
+    ask: 0.70, // 22.9% ask spread (< 24%), spread = $0.16; expectedMove $1.0 -> edge ~$0.39 -> ratio 0.41 > 0.22
+    delta: 0.36,
+    gamma: 0.05,
+    iv: 0.16,
+    theta: -0.12,
+  });
+  const vetoedWideEdge = selectOptimalSmallAccountContract({
+    candidates: [wideSpreadSmallMove],
+    spotPrice: 755,
+    target1Spot: 756.0,
+    target2Spot: 757.0,
+    isCall: true,
+    isAfternoon: false,
+    preferredDte: "0DTE",
+    regime: "POS_GAMMA_PIN",
+    absImpulsePeclet: 0.9,
+  });
+  assert.equal(vetoedWideEdge, null);
 });
 
 test("evaluateOpeningHorizonAlignment blocks pre-10:00 King/Book-Center conflicts and admits >= 10:00 ET", () => {
