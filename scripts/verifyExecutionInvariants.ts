@@ -1583,29 +1583,32 @@ async function runTestSuite() {
     });
     assert(smallRevRes.activePosition !== null, "10E.5: <$0.75 adverse bounce (+$0.60) at >=10m hold must NOT trigger reversal exit");
 
-    // 10E.6: +20m (>=10m hold) with +$0.80 (>=$0.75) reversal: closes Leg-2 via reversal (2 closed total)
+    // 10E.6: +20m with profitable (+15% option) bullish reversal closes Leg-2 cleanly via Momentum Reversal Profit Lock
+    const hold5mProfitChain: NormalizedOptionContract[] = [
+      { symbol: "QQQ20991231P00505000", strike: 505, expiration: "2099-12-31", optionType: "P", bid: 0.99, ask: 1.01, last: 1.0, volume: 1500, openInterest: 3000, iv: 0.20, delta: -0.35, gamma: 0.05, vega: 0.03, percentChange: 0 },
+    ];
     const validRevRes = await evaluateTradeSignals({
       ticker: "QQQ",
-      spotPrice: 506.0,
-      prevSpotPrice: 505.8,
+      spotPrice: 504.7,
+      prevSpotPrice: 504.6,
       callWall: 506.5,
       putWall: 494.0,
       zeroGamma: 500.0,
       priorClose: 499.0,
       premarketFlowVwap: 505.5,
       divergence5m: "BULL",
-      contracts: hold5mChain,
+      contracts: hold5mProfitChain,
       nowEt: new Date((leg2Ts + 1200) * 1000),
-      latest5mCandle: { open: 505.8, high: 506.05, low: 505.6, close: 506.0, sma34: 505.6, flowSnapshot: makeFlow(leg2Ts + 1200, 506.0, 505.5, 0.65, 0.68, 1.2, 0.22, 0.15) },
+      latest5mCandle: { open: 504.6, high: 505.8, low: 504.55, close: 505.75, sma34: 505.5, flowSnapshot: makeFlow(leg2Ts + 1200, 504.7, 505.5, 0.65, 0.68, 1.2, 0.22, 0.15) },
     });
     const qqqClosed10E = loadTradeStore().closedPositions.filter((p) => p.ticker === "QQQ");
     assert(
       validRevRes.activePosition === null && qqqClosed10E.length === 2,
-      `10E.6: >=10m hold + >=$0.75 reversal closes Leg-2 cleanly (2 closed total, got ${qqqClosed10E.length})`
+      `10E.6: >=10m hold + >=10% option profit + divergence closes Leg-2 cleanly (2 closed total, got ${qqqClosed10E.length})`
     );
     assert(
       /REVERSAL|DIVERGENCE/.test(qqqClosed10E[0]?.exitReason || ""),
-      `10E.6b: Leg-2 exit reason must be Momentum Reversal/Divergence Cover (got ${qqqClosed10E[0]?.exitReason})`
+      `10E.6b: Leg-2 exit reason must be Momentum Reversal/Divergence Lock (got ${qqqClosed10E[0]?.exitReason})`
     );
 
     // 10E.7: At 13:30 ET after 2 closed trades (CALL + PUT), 3rd trade attempt is strictly LOCKED_FOR_DAY
@@ -2110,7 +2113,7 @@ async function runTestSuite() {
       ticker: "NVDA", spotPrice: 140.0, prevSpotPrice: 139.6, callWall: 140.95, putWall: 139.20, zeroGamma: 140.50,
       priorClose: 139.6, premarketFlowVwap: 139.80, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
       contracts: nvdaChainLive,
-      latest5mCandle: { open: 139.65, high: 140.05, low: 139.18, prevLow: 139.18, close: 140.0, sma34: 139.80, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(140.0, 139.80, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18) },
+      latest5mCandle: { open: 139.65, high: 140.05, low: 139.18, prevLow: 139.18, close: 140.0, sma34: 139.80, timestamp: mtEvalTs, flowSnapshot: { ...makeMtFlow(140.0, 139.80, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18), atr5m: 0.40 } },
     });
     assert(nvdaTriggerRes.activePosition?.ticker === "NVDA" && nvdaTriggerRes.activePosition?.strike === 140.5, `13B.1: NVDA ($140 @ 48% IV) triggers valid BTO CALL with $0.95 wall room (got ${nvdaTriggerRes.activePosition?.strike ?? "none"})`);
 
@@ -2124,7 +2127,7 @@ async function runTestSuite() {
     });
     assert(nvdaChaseBlocked.activePosition === null, "13B.2: Dynamic maxSignalBarBody (~$0.79) blocks $1.15 NVDA chase candle that old $2.25 SPY constant allowed");
 
-    // 13B.3: Proportional minReversalInvalidation ($0.40 adverse move < $0.75 SPY constant) closes held NVDA position
+    // 13B.3: STRUCT_CLOSE & 1.0x ATR stop guard — 0.55x ATR5m intra-bar wick inside 1.0x ATR close-confirmed stop must NOT stop out prematurely
     const nvdaExitTime = makeEtDateMt(11, 45);
     const nvdaExitTs = Math.floor(nvdaExitTime.getTime() / 1000);
     saveTradeStore({
@@ -2132,20 +2135,28 @@ async function runTestSuite() {
       activePositions: {
         NVDA: {
           id: "NVDA-CALL-TEST", ticker: "NVDA", contractType: "CALL", contractLabel: "NVDA 140.5C", strike: 140.5, expiration: mtExpLive,
-          setupName: "Impulse Flux & Divergence Reclaim [BTO CALL]", status: "OPEN", btoSpotPrice: 140.0, btoOptionMid: 0.75, optionBid: 0.72, optionAsk: 0.75,
-          contractsQty: 1, remainingQty: 1, totalOutlay: 75, target1Spot: 140.9, target2Spot: 141.5, stopLossSpot: 139.1,
-          openedAt: "11:30 AM", openedTs: nvdaExitTs - 900, initialRisk: 0.9,
+          setupName: "Gaia Advection Breakout [BTO CALL]", status: "OPEN", btoSpotPrice: 140.0, btoOptionMid: 0.75, optionBid: 0.72, optionAsk: 0.75,
+          contractsQty: 1, remainingQty: 1, totalOutlay: 75, target1Spot: 141.35, target2Spot: 141.9, stopLossSpot: 139.10,
+          openedAt: "11:30 AM", openedTs: nvdaExitTs - 900, initialRisk: 0.90,
         },
       },
       closedPositions: [], alerts: [], prevSpotPrices: { NVDA: 140.0 },
     });
-    const nvdaRevExit = await evaluateTradeSignals({
-      ticker: "NVDA", spotPrice: 139.60, prevSpotPrice: 139.90, callWall: 141.5, putWall: 138.5, zeroGamma: 140.5,
+    const nvdaWickHold = await evaluateTradeSignals({
+      ticker: "NVDA", spotPrice: 139.50, prevSpotPrice: 139.90, callWall: 141.5, putWall: 138.5, zeroGamma: 140.5,
       divergence5m: "BEAR", nowEt: nvdaExitTime, isHistoricalBackfill: true,
       contracts: [{ symbol: "NVDA_140_5C", strike: 140.5, expiration: mtExpLive, optionType: "C", bid: 0.62, ask: 0.65, last: 0.63, volume: 18500, openInterest: 14200, iv: 0.48, delta: 0.33, gamma: 0.13, vega: 0.04, percentChange: 0 }],
-      latest5mCandle: { open: 139.90, high: 139.95, low: 139.55, close: 139.60, sma34: 139.85, timestamp: nvdaExitTs, flowSnapshot: makeMtFlow(139.60, 139.85, 0.45, 0.35, 0.32, -1.2, -0.15, -0.15) },
+      latest5mCandle: { open: 139.90, high: 139.95, low: 139.05, close: 139.50, sma34: 139.85, timestamp: nvdaExitTs, flowSnapshot: { ...makeMtFlow(139.50, 139.85, 0.45, 0.35, 0.32, -1.2, -0.15, -0.15), atr5m: 0.90 } },
     });
-    assert(nvdaRevExit.activePosition === null && loadTradeStore().closedPositions.length === 1, "13B.3: Proportional minReversalInvalidation closes NVDA on -$0.40 (<$0.75 SPY constant) reversal");
+    assert(nvdaWickHold.activePosition !== null && loadTradeStore().closedPositions.length === 0, "13B.3a: 0.55x ATR5m (-$0.50) close / intra-bar wick inside 1.0x ATR ($0.90) STRUCT_CLOSE stop must NOT prematurely stop out");
+
+    const nvdaCloseBreakExit = await evaluateTradeSignals({
+      ticker: "NVDA", spotPrice: 139.02, prevSpotPrice: 139.50, callWall: 141.5, putWall: 138.5, zeroGamma: 140.5,
+      divergence5m: "BEAR", nowEt: new Date((nvdaExitTs + 300) * 1000), isHistoricalBackfill: true,
+      contracts: [{ symbol: "NVDA_140_5C", strike: 140.5, expiration: mtExpLive, optionType: "C", bid: 0.46, ask: 0.49, last: 0.47, volume: 18500, openInterest: 14200, iv: 0.48, delta: 0.25, gamma: 0.10, vega: 0.04, percentChange: 0 }],
+      latest5mCandle: { open: 139.50, high: 139.55, low: 139.00, close: 139.02, sma34: 139.75, timestamp: nvdaExitTs + 300, flowSnapshot: { ...makeMtFlow(139.02, 139.75, 0.45, 0.30, 0.28, -1.5, -0.20, -0.18), atr5m: 0.90 } },
+    });
+    assert(nvdaCloseBreakExit.activePosition === null && loadTradeStore().closedPositions.length === 1, "13B.3b: Confirmed 5m close <= stopLossSpot (139.02 <= 139.10) triggers clean STRUCT_CLOSE exit");
 
     // =========================================================================
     // TEST SECTION 14: GLOBAL SINGLE-SLOT LOCK ACROSS TICKERS (SPY ACTIVE -> NVDA BLOCKED)
@@ -2164,7 +2175,7 @@ async function runTestSuite() {
       ticker: "NVDA", spotPrice: 140.0, prevSpotPrice: 139.6, callWall: 140.95, putWall: 139.20, zeroGamma: 140.50,
       priorClose: 139.6, premarketFlowVwap: 139.80, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
       contracts: nvdaChainLive,
-      latest5mCandle: { open: 139.65, high: 140.05, low: 139.18, prevLow: 139.18, close: 140.0, sma34: 139.80, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(140.0, 139.80, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18) },
+      latest5mCandle: { open: 139.65, high: 140.05, low: 139.18, prevLow: 139.18, close: 140.0, sma34: 139.80, timestamp: mtEvalTs, flowSnapshot: { ...makeMtFlow(140.0, 139.80, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18), atr5m: 0.40 } },
     });
     const storeAfter14A = loadTradeStore();
     assert(nvdaLockedEval.activePosition === null && nvdaLockedEval.emittedAlerts.length === 0, "14A.1: evaluateTradeSignals strictly blocks NVDA while SPY has an active position");
@@ -2199,7 +2210,7 @@ async function runTestSuite() {
       ticker: "NVDA", spotPrice: 140.0, prevSpotPrice: 139.6, callWall: 140.95, putWall: 139.20, zeroGamma: 140.50,
       priorClose: 139.6, premarketFlowVwap: 139.80, divergence5m: "BULL", nowEt: mtEvalTime, isHistoricalBackfill: true,
       contracts: nvdaChainLive,
-      latest5mCandle: { open: 139.65, high: 140.05, low: 139.18, prevLow: 139.18, close: 140.0, sma34: 139.80, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(140.0, 139.80, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18) },
+      latest5mCandle: { open: 139.65, high: 140.05, low: 139.18, prevLow: 139.18, close: 140.0, sma34: 139.80, timestamp: mtEvalTs, flowSnapshot: { ...makeMtFlow(140.0, 139.80, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18), atr5m: 0.40 } },
     });
     const iwmBlockedByNvda = await evaluateTradeSignals({
       ticker: "IWM", spotPrice: 220.0, prevSpotPrice: 219.6, callWall: 221.15, putWall: 219.10, zeroGamma: 220.60,
@@ -2287,8 +2298,11 @@ async function runTestSuite() {
   const hardStopEval = evaluateOptionRiskStop({ entryPrice: 0.80, currentPrice: 0.44, peakPnlPct: 4, heldMinutes: 6 });
   assert(hardStopEval.triggered && hardStopEval.reason === "OPTION_HARD_STOP_45", "15.2: -45% hard option stop triggers at entry * 0.55");
 
-  const stallStopEval = evaluateOptionRiskStop({ entryPrice: 0.80, currentPrice: 0.60, peakPnlPct: 12, heldMinutes: 20 });
-  assert(stallStopEval.triggered && stallStopEval.reason === "OPTION_STALL_STOP_25", "15.3: 20-minute -25% theta-stall tightener triggers when peak < +20%");
+  const earlyStallHold = evaluateOptionRiskStop({ entryPrice: 0.80, currentPrice: 0.60, peakPnlPct: 12, heldMinutes: 20 });
+  assert(!earlyStallHold.triggered && !earlyStallHold.stallTightened, "15.3a: 20m / -25% no longer triggers premature stall tightener (75m / -38% threshold)");
+
+  const stallStopEval = evaluateOptionRiskStop({ entryPrice: 0.80, currentPrice: 0.49, peakPnlPct: 12, heldMinutes: 75 });
+  assert(stallStopEval.triggered && stallStopEval.stallTightened && stallStopEval.activeStopLossPct === 38 && stallStopEval.reason === "OPTION_STALL_STOP_25", "15.3b: 75-minute -38% theta-stall tightener triggers when peak < +20%");
 
   const storeBackup15 = loadTradeStore();
   try {

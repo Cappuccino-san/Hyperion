@@ -648,7 +648,7 @@ export function evaluateBtoCandidateSetup(input: {
         ? flowSnap.sigma
         : spotPrice * 0.0015;
   const maxSignalBarBody = computeAdaptiveQuantMetrics(spotPrice, signalBodyBaselineAtr).maxSignalBarBody;
-  const minRiskFloor = Math.max(0.05, spotPrice * 0.00067);
+  const minRiskFloor = Math.max(0.15, entryAtr5m * 0.90, spotPrice * 0.0010);
   const stopWickBuf = entryMetrics.stopWickBuffer;
   const smallTargetTrim = Math.max(0.02, spotPrice * 0.00013);
   const barBody = latest5mCandle ? latest5mCandle.close - latest5mCandle.open : 0;
@@ -755,7 +755,7 @@ export function evaluateBtoCandidateSetup(input: {
       Math.min(spotPrice * 0.0045, fluxSigma * 1.25)
     );
     const stopAnchor = Math.min(rawStructuralStop, spotPrice + maxTacticalSpotRisk);
-    const stopLoss = Number((Math.max(spotPrice + entryMetrics.minReversalInvalidation * 0.85, stopAnchor) * 1.001).toFixed(2));
+    const stopLoss = Number(Math.max(spotPrice + minRiskFloor, stopAnchor * 1.001).toFixed(2));
     const risk = Math.max(minRiskFloor, stopLoss - spotPrice);
     const pwFloor = tacticalPw > 0 && tacticalPw < spotPrice ? tacticalPw : 0;
     if (pwFloor === 0 || spotPrice - pwFloor >= risk * 1.5) {
@@ -773,7 +773,7 @@ export function evaluateBtoCandidateSetup(input: {
           ? Number(Math.min(target1, Math.max(pwFloor, uncappedT2)).toFixed(2))
           : Number(Math.min(target1, uncappedT2).toFixed(2));
 
-      if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
+      if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5 - 1e-6) {
         candidateBto = {
           contractType: "PUT",
           setupName: (etTotalMinutes >= sessionBounds.entryStartMins && etTotalMinutes <= 615)
@@ -849,7 +849,7 @@ export function evaluateBtoCandidateSetup(input: {
       const target1 = Number(Math.min(cwWallBound, Math.max(minT1, uncappedT1)).toFixed(2));
       const rawT2 = Number((cwWallBound - smallTargetTrim).toFixed(2));
       const target2 = Number(Math.min(cwWallBound, Math.max(target1, rawT2)).toFixed(2));
-      if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+      if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5 - 1e-6) {
         candidateBto = {
           contractType: "CALL",
           setupName: "Put Wall / King Node & Flux Extremity Reclaim [BTO CALL]",
@@ -889,7 +889,7 @@ export function evaluateBtoCandidateSetup(input: {
       const target1 = Number(Math.min(cwWallBound, Math.max(minT1, uncappedT1)).toFixed(2));
       const rawT2 = Number((cwWallBound - Math.max(0.02, spotPrice * 0.00016)).toFixed(2));
       const target2 = Number(Math.min(cwWallBound, Math.max(target1, rawT2)).toFixed(2));
-      if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+      if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5 - 1e-6) {
         candidateBto = {
           contractType: "CALL",
           setupName: "Zero-Gamma Flip & Flux Reclaim [BTO CALL]",
@@ -933,7 +933,7 @@ export function evaluateBtoCandidateSetup(input: {
           Math.max(target1 + Math.max(0.05, spotPrice * 0.0005), flowSnap.upper1Sigma, cwCeiling > 0 ? cwCeiling : flowSnap.upper2Sigma).toFixed(2)
         );
         const target2 = cwCeiling > 0 ? Number(Math.max(target1, Math.min(cwCeiling, desiredT2)).toFixed(2)) : desiredT2;
-        if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+        if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5 - 1e-6) {
           candidateBto = {
             contractType: "CALL",
             setupName: `Gaia Call Regime -2σ Flow Bounce (χ=${(currentChi * 100).toFixed(0)}%)`,
@@ -972,7 +972,7 @@ export function evaluateBtoCandidateSetup(input: {
           Math.min(target1 - Math.max(0.05, spotPrice * 0.0005), flowSnap.lower1Sigma, pwFloor > 0 ? pwFloor : flowSnap.lower2Sigma).toFixed(2)
         );
         const target2 = pwFloor > 0 ? Number(Math.min(target1, Math.max(pwFloor, desiredT2)).toFixed(2)) : desiredT2;
-        if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
+        if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5 - 1e-6) {
           candidateBto = {
             contractType: "PUT",
             setupName: `Gaia Put Regime +2σ Flow Rejection (χ=${(currentChi * 100).toFixed(0)}%)`,
@@ -991,17 +991,14 @@ export function evaluateBtoCandidateSetup(input: {
       spotPrice > flowSnap.flowVwap &&
       latest5mCandle.close > latest5mCandle.sma34 &&
       latest5mCandle.close > latest5mCandle.open &&
+      Math.abs(spotPrice - flowSnap.flowVwap) <= entryAtr5m * 0.75 &&
       Math.abs(barBody) <= maxSignalBarBody
     ) {
-      const candleStop = Number((Math.min(flowSnap.flowVwap, latest5mCandle.low) - spotPrice * 0.0005).toFixed(2));
-      const candleRisk = Math.max(minRiskFloor, spotPrice - candleStop);
-      const vwapStop = Number((flowSnap.flowVwap - spotPrice * 0.0005).toFixed(2));
-      const vwapRisk = Math.max(minRiskFloor, spotPrice - vwapStop);
+      const candleStop = Number(
+        Math.min(spotPrice - minRiskFloor, Math.min(flowSnap.flowVwap, latest5mCandle.low) - spotPrice * 0.0005).toFixed(2)
+      );
       const cwCeiling = tacticalCw > spotPrice ? tacticalCw : 0;
-      const stopLoss =
-        cwCeiling > 0 && cwCeiling - spotPrice < candleRisk * 1.5 && cwCeiling - spotPrice >= vwapRisk * 1.5
-          ? vwapStop
-          : candleStop;
+      const stopLoss = candleStop;
       const risk = Math.max(minRiskFloor, spotPrice - stopLoss);
       if (cwCeiling === 0 || cwCeiling - spotPrice >= risk * 1.5) {
         const minT1 = Math.ceil((spotPrice + risk * 1.5 - 1e-9) * 100) / 100;
@@ -1010,7 +1007,7 @@ export function evaluateBtoCandidateSetup(input: {
         const target1 = cwCeiling > 0 ? Math.min(cwCeiling, rawT1) : rawT1;
         const rawT2 = Number(Math.max(target1 + Math.max(0.05, spotPrice * 0.0005), flowSnap.upper2Sigma, cwCeiling).toFixed(2));
         const target2 = cwCeiling > 0 ? Number(Math.max(target1, Math.min(cwCeiling, rawT2)).toFixed(2)) : rawT2;
-        if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+        if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5 - 1e-6) {
           candidateBto = {
             contractType: "CALL",
             setupName: `Gaia Advection Breakout (χ=${(currentChi * 100).toFixed(0)}%, Pe=+${currentPe.toFixed(2)})`,
@@ -1029,17 +1026,14 @@ export function evaluateBtoCandidateSetup(input: {
       spotPrice < flowSnap.flowVwap &&
       latest5mCandle.close < latest5mCandle.sma34 &&
       latest5mCandle.close < latest5mCandle.open &&
+      Math.abs(spotPrice - flowSnap.flowVwap) <= entryAtr5m * 0.75 &&
       Math.abs(barBody) <= maxSignalBarBody
     ) {
-      const candleStop = Number((Math.max(flowSnap.flowVwap, latest5mCandle.high) + spotPrice * 0.0005).toFixed(2));
-      const candleRisk = Math.max(minRiskFloor, candleStop - spotPrice);
-      const vwapStop = Number((flowSnap.flowVwap + spotPrice * 0.0005).toFixed(2));
-      const vwapRisk = Math.max(minRiskFloor, vwapStop - spotPrice);
+      const candleStop = Number(
+        Math.max(spotPrice + minRiskFloor, Math.max(flowSnap.flowVwap, latest5mCandle.high) + spotPrice * 0.0005).toFixed(2)
+      );
       const pwFloor = tacticalPw > 0 && tacticalPw < spotPrice ? tacticalPw : 0;
-      const stopLoss =
-        pwFloor > 0 && spotPrice - pwFloor < candleRisk * 1.5 && spotPrice - pwFloor >= vwapRisk * 1.5
-          ? vwapStop
-          : candleStop;
+      const stopLoss = candleStop;
       const risk = Math.max(minRiskFloor, stopLoss - spotPrice);
       if (pwFloor === 0 || spotPrice - pwFloor >= risk * 1.5) {
         const maxT1 = Math.floor((spotPrice - risk * 1.5 + 1e-9) * 100) / 100;
@@ -1050,7 +1044,7 @@ export function evaluateBtoCandidateSetup(input: {
           Math.min(target1 - Math.max(0.05, spotPrice * 0.0005), flowSnap.lower2Sigma, pwFloor > 0 ? pwFloor : flowSnap.lower2Sigma).toFixed(2)
         );
         const target2 = pwFloor > 0 ? Number(Math.min(target1, Math.max(pwFloor, rawT2)).toFixed(2)) : rawT2;
-        if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
+        if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5 - 1e-6) {
           candidateBto = {
             contractType: "PUT",
             setupName: `Gaia Advection Breakdown (χ=${(currentChi * 100).toFixed(0)}%, Pe=${currentPe.toFixed(2)})`,
@@ -1235,7 +1229,7 @@ export function evaluateBtoCandidateSetup(input: {
         ? Math.min(...candidates)
         : Number(Math.min(target2 - stopWickBuf, Math.max(minTarget1, spotPrice + totalReward2 * 0.56)).toFixed(2));
 
-    if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+    if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5 - 1e-6) {
       candidateBto = {
         contractType: "CALL",
         setupName: "Support Bounce / Bullish Reversal",
@@ -1263,7 +1257,7 @@ export function evaluateBtoCandidateSetup(input: {
     const risk = Math.max(Math.max(0.05, spotPrice * 0.00033), spotPrice - stopLoss);
     const target2 = filteredKing;
     const target1 = Number((spotPrice + Math.max(risk * 1.5, (target2 - spotPrice) * 0.5)).toFixed(2));
-    if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+    if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5 - 1e-6) {
       candidateBto = {
         contractType: "CALL",
         setupName: "King Magnet Trend Pull",
@@ -1354,7 +1348,7 @@ export function evaluateBtoCandidateSetup(input: {
           ? Math.max(...candidates)
           : Number(Math.max(target2 + stopWickBuf, Math.min(maxTarget1, spotPrice - totalReward2 * 0.55)).toFixed(2));
 
-      if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
+      if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5 - 1e-6) {
         candidateBto = {
           contractType: "PUT",
           setupName: "Resistance Rejection / Bearish Reversal",
@@ -1389,7 +1383,7 @@ export function evaluateBtoCandidateSetup(input: {
               ? Number((spotPrice + 0.5 * (Math.min(callWall, dailyExpectedMove.high) - spotPrice)).toFixed(2))
               : Number((spotPrice + 0.5 * (callWall - spotPrice)).toFixed(2));
         const target1 = Number(Math.min(callWall, Math.max(minT1, rawT1)).toFixed(2));
-        if (target1 > spotPrice && callWall >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+        if (target1 > spotPrice && callWall >= target1 && (target1 - spotPrice) / risk >= 1.5 - 1e-6) {
           candidateBto = {
             contractType: "CALL",
             setupName: "Zero-Gamma Bullish Volatility Breakout",
@@ -1421,7 +1415,7 @@ export function evaluateBtoCandidateSetup(input: {
               ? Number((spotPrice - 0.5 * (spotPrice - dailyExpectedMove.low)).toFixed(2))
               : Number((spotPrice - 0.5 * (spotPrice - tacticalPw)).toFixed(2));
         const target1 = Number(Math.max(tacticalPw, Math.min(maxT1, rawT1)).toFixed(2));
-        if (target1 < spotPrice && tacticalPw <= target1 && (spotPrice - target1) / risk >= 1.5) {
+        if (target1 < spotPrice && tacticalPw <= target1 && (spotPrice - target1) / risk >= 1.5 - 1e-6) {
           candidateBto = {
             contractType: "PUT",
             setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
@@ -1476,7 +1470,7 @@ export function evaluateBtoCandidateSetup(input: {
         if (cwMagnetCap - spotPrice >= risk * 1.5) {
           const minT1 = Math.ceil((spotPrice + risk * 1.5 - 1e-9) * 100) / 100;
           const target1 = Number(Math.min(cwMagnetCap, Math.max(minT1, (spotPrice + cwMagnetCap) / 2)).toFixed(2));
-          if (target1 > spotPrice && cwMagnetCap >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+          if (target1 > spotPrice && cwMagnetCap >= target1 && (target1 - spotPrice) / risk >= 1.5 - 1e-6) {
             candidateBto = {
               contractType: "CALL",
               setupName: isTacticalMagnet
@@ -1504,7 +1498,7 @@ export function evaluateBtoCandidateSetup(input: {
         if (spotPrice - pwMagnetCap >= risk * 1.5) {
           const maxT1 = Math.floor((spotPrice - risk * 1.5 + 1e-9) * 100) / 100;
           const target1 = Number(Math.max(pwMagnetCap, Math.min(maxT1, (spotPrice + pwMagnetCap) / 2)).toFixed(2));
-          if (target1 < spotPrice && pwMagnetCap <= target1 && (spotPrice - target1) / risk >= 1.5) {
+          if (target1 < spotPrice && pwMagnetCap <= target1 && (spotPrice - target1) / risk >= 1.5 - 1e-6) {
             candidateBto = {
               contractType: "PUT",
               setupName: isTacticalMagnet
@@ -1548,7 +1542,7 @@ export function evaluateBtoCandidateSetup(input: {
       const minT1 = Math.ceil((spotPrice + Math.max(entryMetrics.wallProximityBuffer, risk * 1.5) - 1e-9) * 100) / 100;
       const target1 = Number(Math.min(callTargetWall, minT1).toFixed(2));
       const target2 = Number(Math.min(callTargetWall, Math.max(target1, callTargetWall - smallTargetTrim)).toFixed(2));
-      if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5) {
+      if (target1 > spotPrice && target2 >= target1 && (target1 - spotPrice) / risk >= 1.5 - 1e-6) {
         candidateBto = {
           contractType: "CALL",
           setupName: "Impulse Flux & Divergence Reclaim [BTO CALL]",
@@ -1581,7 +1575,7 @@ export function evaluateBtoCandidateSetup(input: {
       const maxT1 = Math.floor((spotPrice - Math.max(entryMetrics.wallProximityBuffer, risk * 1.5) + 1e-9) * 100) / 100;
       const target1 = Number(Math.max(putTargetWall, maxT1).toFixed(2));
       const target2 = Number(Math.max(putTargetWall, Math.min(target1, putTargetWall + smallTargetTrim)).toFixed(2));
-      if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5) {
+      if (target1 < spotPrice && target2 <= target1 && (spotPrice - target1) / risk >= 1.5 - 1e-6) {
         candidateBto = {
           contractType: "PUT",
           setupName: "Impulse Flux & Divergence Rejection [BTO PUT]",

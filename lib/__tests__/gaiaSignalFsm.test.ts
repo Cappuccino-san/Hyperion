@@ -574,8 +574,8 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
       { barTimestamp: 4600, open: 751.7, high: 751.8, low: 750.8, close: 750.85, chi: 0.42, bias: -0.25, netFlux: -0.18, peclet: -1.1, flowVwap: 751.5, sma34: 751.5, etMins: 635, isClosed: true },
       // Bar +2 (barsHeld=2 >= 2): -$0.70 adverse (< $0.75) + negative flux -> MUST hold (<$0.75 guard)
       { barTimestamp: 4900, open: 750.85, high: 751.1, low: 750.8, close: 751.0, chi: 0.42, bias: -0.22, netFlux: -0.16, peclet: -1.0, flowVwap: 751.5, sma34: 751.4, etMins: 640, isClosed: true },
-      // Bar +3 (barsHeld=3 >= 2): -$0.80 adverse (>= $0.75) + negative flux + pe<=-0.75 -> MUST exit
-      { barTimestamp: 5200, open: 751.0, high: 751.1, low: 750.7, close: 750.9, chi: 0.40, bias: -0.28, netFlux: -0.20, peclet: -1.2, flowVwap: 751.5, sma34: 751.4, etMins: 645, isClosed: true },
+      // Bar +3 (barsHeld=3 >= 2): -$1.55 adverse (>= 0.85x ATR minReversalInvalidation, > stopPrice 749.95) + negative flux + pe<=-0.75 -> MUST exit
+      { barTimestamp: 5200, open: 751.0, high: 751.1, low: 750.05, close: 750.15, chi: 0.40, bias: -0.28, netFlux: -0.20, peclet: -1.2, flowVwap: 751.5, sma34: 751.4, etMins: 645, isClosed: true },
     ];
     const longOut = longFsm.commitSeries(longBars, {
       macroRegime: "PUT",
@@ -635,8 +635,8 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
       // 09:35 ET: close 139.75 vs putWall 138.90 ($0.85 < $1.25 old SPY constant)
       { barTimestamp: 1000, open: 139.98, high: 140.02, low: 139.70, close: 139.75, chi: 0.24, bias: -0.42, netFlux: -0.32, peclet: -2.0, flowVwap: 139.90, sma34: 139.95, etMins: 575, isClosed: true },
       { barTimestamp: 1300, open: 139.75, high: 139.82, low: 139.50, close: 139.55, chi: 0.32, bias: -0.25, netFlux: -0.18, peclet: -1.4, flowVwap: 139.75, sma34: 139.85, etMins: 580, isClosed: true },
-      // 09:45 ET (barsHeld=2): +$0.37 adverse bounce (<$0.75 old SPY constant, >=$0.21 minReversalInvalidation) triggers flux-flip exit
-      { barTimestamp: 1600, open: 139.55, high: 140.16, low: 139.52, close: 140.12, chi: 0.58, bias: 0.22, netFlux: 0.16, peclet: 0.90, flowVwap: 139.90, sma34: 139.88, etMins: 585, isClosed: true },
+      // 09:45 ET (barsHeld=2): +$0.47 adverse bounce (<$0.75 old SPY constant, >= 0.85x ATR minReversalInvalidation) triggers flux-flip exit before stop
+      { barTimestamp: 1600, open: 139.55, high: 140.25, low: 139.52, close: 140.22, chi: 0.58, bias: 0.22, netFlux: 0.16, peclet: 0.90, flowVwap: 139.90, sma34: 139.88, etMins: 585, isClosed: true },
       // 11:30 ET (+2100s >= 1800s): Leg-2 LONG at 139.18 vs callWall 140.25 ($1.07 < $1.50 old SPY constant, >= $0.30 minWallRoom)
       { barTimestamp: 3700, open: 139.00, high: 139.25, low: 138.92, close: 139.18, recentLow4: 138.92, chi: 0.58, impulseChi: 0.69, deltaNetFlux6Bar: 0.16, bias: 0.30, netFlux: 0.20, peclet: 0.85, impulsePeclet: 1.6, flowVwap: 139.10, sma34: 139.12, sigmaMinus1: 139.00, sigmaPlus1: 140.20, bullDiv5m: true, etMins: 690, isClosed: true },
     ];

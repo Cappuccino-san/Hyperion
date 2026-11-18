@@ -4,7 +4,7 @@ import {
   etMinutesOfDay,
   getSessionBoundsEt,
 } from "@/lib/gaiaSessionGuards";
-import { evaluateOptionRiskStop } from "@/lib/bracketOrderEngine";
+import { evaluateOptionRiskStop, STALL_STOP_MINUTES } from "@/lib/bracketOrderEngine";
 import type { NormalizedOptionContract } from "@/lib/optionsExposure";
 import type {
   Candle5m,
@@ -353,7 +353,7 @@ export function evaluateActivePositionStepA(input: {
     activePos.status === "OPEN" &&
     !(isRunnerSetup && solidFluxAligned) &&
     rawHeldMin >= 10 &&
-    (adverseSpotMove >= exitMetrics.minReversalInvalidation || pnlOptionPct >= 10) &&
+    pnlOptionPct >= 10 &&
     ((!isCall &&
       ((posPutWall > 0 &&
         posSpotPrice <= posPutWall * 1.0012 &&
@@ -402,19 +402,20 @@ export function evaluateActivePositionStepA(input: {
   ) {
     closePosition("TARGET 1 HIT · FULL PROFIT EXIT (1 CONTRACT)");
   }
-  // 6. STC (STOP LOSS / LEVEL INVALIDATION / OPTION -45% HARD STOP OR 20M -25% STALL STOP)
+  // 6. STC (STOP LOSS / LEVEL INVALIDATION / OPTION -45% HARD STOP OR 75M -38% STALL STOP)
   else if (
-    (isCall && posSpotPrice <= activePos.stopLossSpot) ||
-    (!isCall && posSpotPrice >= activePos.stopLossSpot) ||
+    (isCall && (posCandle ? posCandle.close : posSpotPrice) <= activePos.stopLossSpot) ||
+    (!isCall && (posCandle ? posCandle.close : posSpotPrice) >= activePos.stopLossSpot) ||
     optStopEval.triggered
   ) {
+    const closeRefSpot = posCandle ? posCandle.close : posSpotPrice;
     const isBreakeven =
       activePos.status === "PARTIAL_TP1" ||
       Math.abs(activePos.stopLossSpot - activePos.btoSpotPrice) < 0.02;
     const isTrailingProfit =
       pnlOptionPct > 0 &&
-      ((isCall && activePos.stopLossSpot > activePos.btoSpotPrice + 0.01 && posSpotPrice > activePos.btoSpotPrice) ||
-       (!isCall && activePos.stopLossSpot < activePos.btoSpotPrice - 0.01 && posSpotPrice < activePos.btoSpotPrice));
+      ((isCall && activePos.stopLossSpot > activePos.btoSpotPrice + 0.01 && closeRefSpot > activePos.btoSpotPrice) ||
+       (!isCall && activePos.stopLossSpot < activePos.btoSpotPrice - 0.01 && closeRefSpot < activePos.btoSpotPrice));
     const isOptionHardStop = !isBreakeven && !isTrailingProfit && optStopEval.triggered;
     const reason = isTrailingProfit
       ? "TRAILING PROFIT LOCKED"
@@ -422,7 +423,7 @@ export function evaluateActivePositionStepA(input: {
         ? "BREAKEVEN STOP HIT"
         : isOptionHardStop
           ? optStopEval.reason === "OPTION_STALL_STOP_25"
-            ? "OPTION STALL STOP HIT (-25% 20M THETA CAP)"
+            ? `OPTION STALL STOP HIT (-${optStopEval.activeStopLossPct}% ${STALL_STOP_MINUTES}M THETA CAP)`
             : "OPTION HARD STOP HIT (-45% MAX LOSS)"
           : "STOP LOSS / LEVEL INVALIDATION";
     closePosition(reason);

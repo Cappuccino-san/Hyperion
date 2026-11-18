@@ -291,8 +291,8 @@ async function backfillIntradaySessionSignals(
       let evalSpot = bar.close;
       if (openPos) {
         if (openPos.contractType === "CALL") {
-          if (barLowPos <= openPos.stopLossSpot) {
-            evalSpot = Math.min(bar.close, Number((openPos.stopLossSpot * posScale).toFixed(2)));
+          if (barClosePos <= openPos.stopLossSpot) {
+            evalSpot = bar.close;
           } else if (barHighPos >= openPos.target1Spot) {
             evalSpot =
               barHighPos >= openPos.target2Spot
@@ -300,8 +300,8 @@ async function backfillIntradaySessionSignals(
                 : Math.max(bar.close, Number((openPos.target1Spot * posScale).toFixed(2)));
           }
         } else {
-          if (barHighPos >= openPos.stopLossSpot) {
-            evalSpot = Math.max(bar.close, Number((openPos.stopLossSpot * posScale).toFixed(2)));
+          if (barClosePos >= openPos.stopLossSpot) {
+            evalSpot = bar.close;
           } else if (!isZeroGammaFlushPos && barLowPos <= openPos.target1Spot) {
             evalSpot =
               barLowPos <= openPos.target2Spot

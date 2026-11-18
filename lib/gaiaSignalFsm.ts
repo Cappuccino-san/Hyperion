@@ -56,7 +56,7 @@ export function computeAdaptiveQuantMetrics(spot: number, atr5m: number): Adapti
   return {
     minWallRoom: Math.max(safeSpot * 0.0020, 0.75 * safeAtr),
     wallProximityBuffer: Math.max(safeSpot * 0.0016, 0.50 * safeAtr),
-    minReversalInvalidation: Math.max(safeSpot * 0.0010, 0.50 * safeAtr),
+    minReversalInvalidation: Math.max(safeSpot * 0.0012, 0.85 * safeAtr),
     maxSignalBarBody: Math.max(safeSpot * 0.0030, 1.75 * safeAtr),
     unitRisk: Math.max(safeSpot * 0.0012, 1.15 * safeAtr),
     stopWickBuffer: Math.max(0.03, safeSpot * 0.0002),

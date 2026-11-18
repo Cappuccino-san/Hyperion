@@ -597,7 +597,7 @@ test("evaluateLeg2StructuralGate enforces asymmetric structural transition & pos
   assert.ok(weakPeclet.reason?.includes("LEG2_WEAK_PECLET"));
 });
 
-test("evaluateOptionRiskStop enforces -45% hard stop and 20m -25% theta-stall tightener", () => {
+test("evaluateOptionRiskStop enforces -45% hard stop and 75m -38% theta-stall tightener", () => {
   // 1. -45% hard stop triggers immediately on entry * 0.55
   const hardStop = evaluateOptionRiskStop({
     entryPrice: 0.8,
@@ -609,24 +609,35 @@ test("evaluateOptionRiskStop enforces -45% hard stop and 20m -25% theta-stall ti
   assert.equal(hardStop.reason, "OPTION_HARD_STOP_45");
   assert.equal(hardStop.activeStopPrice, 0.44);
 
-  // 2. 20m stall tightener: elapsed >= 20m, peak < +20%, price <= entry * 0.75 (-25%) -> triggers
-  const stallStop = evaluateOptionRiskStop({
+  // 2a. At 20m with -25% drawdown, premature 20m stall tightener does NOT fire (now 75m / -38%)
+  const prematureHold = evaluateOptionRiskStop({
     entryPrice: 0.8,
     currentPrice: 0.6, // -25.0%
     peakPnlPct: 12,
     heldMinutes: 20,
   });
+  assert.equal(prematureHold.triggered, false);
+  assert.equal(prematureHold.stallTightened, false);
+
+  // 2b. 75m stall tightener: elapsed >= 75m, peak < +20%, price <= entry * 0.62 (-38%) -> triggers
+  const stallStop = evaluateOptionRiskStop({
+    entryPrice: 0.8,
+    currentPrice: 0.49, // -38.75% (<= 0.50 rounded -38% floor)
+    peakPnlPct: 12,
+    heldMinutes: 75,
+  });
   assert.equal(stallStop.triggered, true);
   assert.equal(stallStop.stallTightened, true);
   assert.equal(stallStop.reason, "OPTION_STALL_STOP_25");
-  assert.equal(stallStop.activeStopPrice, 0.6);
+  assert.equal(stallStop.activeStopLossPct, 38);
+  assert.equal(stallStop.activeStopPrice, 0.5);
 
-  // 3. If peak profit reached >= +20% before pulling back to -25%, 20m stall tightener stays inactive
+  // 3. If peak profit reached >= +20% before pulling back to -38%, 75m stall tightener stays inactive
   const runnerPullback = evaluateOptionRiskStop({
     entryPrice: 0.8,
-    currentPrice: 0.6, // -25.0%, still above -45% hard floor
+    currentPrice: 0.5, // -37.5%..38%, still above -45% hard floor
     peakPnlPct: 24,
-    heldMinutes: 22,
+    heldMinutes: 78,
   });
   assert.equal(runnerPullback.triggered, false);
   assert.equal(runnerPullback.stallTightened, false);

@@ -25,9 +25,9 @@ import {
 } from "@/lib/gaiaSessionGuards";
 
 export const DEFAULT_HARD_OPTION_STOP_LOSS_PCT = 45;
-export const STALL_STOP_MINUTES = 20;
+export const STALL_STOP_MINUTES = 75;
 export const STALL_MIN_PROFIT_PCT = 20;
-export const STALL_TIGHTENED_LOSS_PCT = 25;
+export const STALL_TIGHTENED_LOSS_PCT = 38;
 
 export interface OptionRiskStopEvaluation {
   triggered: boolean;
@@ -466,7 +466,7 @@ export function evaluateOcoBrackets(params: {
       reason: isBreakeven
         ? `BREAKEVEN STOP HIT · SELL @ $${liveBid.toFixed(2)} (${pnlPct >= 0 ? "+" : ""}${pnlPct}%)`
         : stallEval.reason === "OPTION_STALL_STOP_25"
-          ? `STALL STOP LOSS HIT (-${stallEval.activeStopLossPct}% 20M THETA CAP) · SELL @ $${liveBid.toFixed(2)} (${pnlPct}%)`
+          ? `STALL STOP LOSS HIT (-${stallEval.activeStopLossPct}% ${STALL_STOP_MINUTES}M THETA CAP) · SELL @ $${liveBid.toFixed(2)} (${pnlPct}%)`
           : `HARD STOP LOSS HIT (-${stallEval.activeStopLossPct}% MAX LOSS) · SELL @ $${liveBid.toFixed(2)} (${pnlPct}%)`,
       exitPrice: liveBid,
       pnlPct,
