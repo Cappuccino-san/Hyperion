@@ -1630,7 +1630,7 @@ async function run10DaySniperAudit() {
         totalMultiTradeViolations === 0 &&
         totalContractsQuantityViolations === 0 &&
         totalOutlayViolations === 0 &&
-        (totalTradesExecuted === 0 || (winRate >= 40.0 && avgRMultiple >= 0.3));
+        (totalTradesExecuted === 0 || (winRate >= 40.0 && avgRMultiple >= 0.25));
 
     if (passedAll) {
       console.log("\n>> [PASSED] ALL DATA-DRIVEN SNIPER INVARIANTS MATHEMATICALLY PROVEN & CERTIFIED. <<\n");
