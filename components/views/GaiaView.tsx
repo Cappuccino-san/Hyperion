@@ -682,7 +682,7 @@ export function GaiaView() {
 
   // Chart Layout Metrics (Unified constants across canvas draw & pointer projection)
   const CHART_PAD_LEFT = 24;
-  const CHART_RIGHT_AXIS_WIDTH = 84;
+  const CHART_RIGHT_AXIS_WIDTH = 96;
   const CHART_PAD_TOP = 18;
   const CHART_PAD_BOTTOM = 32;
 
@@ -733,12 +733,12 @@ export function GaiaView() {
   const [dividerRatio, setDividerRatio] = useState<number>(0.88); // 0.88 in Flux Focus (88% Candlesticks) .. 0.65 in Expanded Outlook
   const [xScale, setXScale] = useState<number>(1.0); // 0.5 .. 4.0 horizontal candle zoom
   const [xPanOffset, setXPanOffset] = useState<number>(0); // horizontal pan px
-  const [startHour, setStartHour] = useState<number>(0); // 0 = 24H Full Day (default), 7 = 7:00 AM Premkt, 8 = 8:00 AM, 9 = 9:30 AM RTH
+  const [startHour, setStartHour] = useState<number>(9); // 9 = 9:30 AM - 5:00 PM ET (default), 8 = 8:00 AM, 7 = 7:00 AM, 0 = 24H
   const [yScale, setYScale] = useState<number>(1.0); // 0.2 .. 10.0
   const [yPanOffset, setYPanOffset] = useState<number>(0); // price points
   const [scopePreset, setScopePreset] = useState<"focus" | "tactical" | "cone">("cone");
   const resetViewportTo24H = useCallback(() => {
-    setStartHour(0);
+    setStartHour(9);
     setXScale(1.0);
     setXPanOffset(0);
     setYScale(1.0);
@@ -822,7 +822,16 @@ export function GaiaView() {
         const payload = data as GaiaLivePayload;
         setLivePayload(payload);
         if (!isReplayingRef.current && !isReplayFrozenRef.current) {
-          setActiveBarIndex(Math.max(0, payload.candles.length - 1));
+          {
+          const winStart = startHour === 0 ? 0 : startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
+          const winEnd = startHour === 0 ? 1440 : 1020;
+          let lastAllowed = payload.candles.length - 1;
+          for (let i = payload.candles.length - 1; i >= 0; i--) {
+            const m = getCandleEtMinutes(payload.candles[i]);
+            if (m !== null && m >= winStart && m <= winEnd) { lastAllowed = i; break; }
+          }
+          setActiveBarIndex(Math.max(0, lastAllowed));
+        }
         }
         setHoverBarIndex(null);
       } catch (err) {
@@ -980,10 +989,23 @@ export function GaiaView() {
     return () => observer.disconnect();
   }, []);
 
-  const maxBarIdx = useMemo(
-    () => Math.max(0, (livePayload?.candles.length ?? 1) - 1),
-    [livePayload]
-  );
+  const { minBarIdx, maxBarIdx } = useMemo(() => {
+    const candles = livePayload?.candles ?? [];
+    if (candles.length === 0) return { minBarIdx: 0, maxBarIdx: 0 };
+    const winStartMins = startHour === 0 ? 0 : startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
+    const winEndMins = startHour === 0 ? 1440 : 1020; // 5:00 PM ET (17:00)
+    let first = -1;
+    let last = -1;
+    for (let i = 0; i < candles.length; i++) {
+      const m = getCandleEtMinutes(candles[i]);
+      if (m !== null && m >= winStartMins && m <= winEndMins) {
+        if (first === -1) first = i;
+        last = i;
+      }
+    }
+    if (first === -1) return { minBarIdx: 0, maxBarIdx: candles.length - 1 };
+    return { minBarIdx: first, maxBarIdx: last };
+  }, [livePayload, startHour]);
 
   // Automatic bar-by-bar replay timer scaled by replaySpeed (1x / 2x / 4x)
   useEffect(() => {
@@ -1234,7 +1256,7 @@ export function GaiaView() {
     setExposureMode("GEX");
     setExpFilter("ALL");
     setSelectedDateExp("");
-    setStartHour(0);
+    setStartHour(9);
     isReplayingRef.current = false;
     setIsReplaying(false);
     isReplayFrozenRef.current = false;
@@ -1250,7 +1272,7 @@ export function GaiaView() {
   };
 
   const handleResetZoom = () => {
-    setStartHour(0);
+    setStartHour(9);
     setXScale(1.0);
     setXPanOffset(0);
     setYScale(1.0);
@@ -1268,8 +1290,8 @@ export function GaiaView() {
       isReplayFrozenRef.current = false;
       setIsReplayFrozen(false);
       isReplayingRef.current = true;
-      if (activeBarIndex >= maxBarIdx - 1) {
-        setActiveBarIndex(0);
+      if (activeBarIndex >= maxBarIdx - 1 || activeBarIndex < minBarIdx) {
+        setActiveBarIndex(minBarIdx);
       }
       setIsReplaying(true);
     }
@@ -1280,7 +1302,7 @@ export function GaiaView() {
     setIsReplaying(false);
     isReplayFrozenRef.current = true;
     setIsReplayFrozen(true);
-    setActiveBarIndex((prev) => Math.max(0, Math.min(maxBarIdx, prev + delta)));
+    setActiveBarIndex((prev) => Math.max(minBarIdx, Math.min(maxBarIdx, prev + delta)));
   };
 
   const handleSnapToLive = () => {
@@ -1478,7 +1500,7 @@ export function GaiaView() {
   };
 
   const handleCanvasDoubleClick = () => {
-    setStartHour(0);
+    setStartHour(9);
     setYScale(1.0);
     setYPanOffset(0);
     setXScale(1.0);
@@ -1517,7 +1539,7 @@ export function GaiaView() {
       setYScale((s) => Math.max(0.2, s * 0.82));
     } else if (e.key === "0") {
       e.preventDefault();
-      setStartHour(0);
+      setStartHour(9);
       setYScale(1.0);
       setYPanOffset(0);
       setXScale(1.0);
@@ -1557,9 +1579,7 @@ export function GaiaView() {
           ? "ew-resize"
           : "crosshair";
 
-  const safeActiveIdx = dataset
-    ? Math.min(activeBarIndex, dataset.candles.length - 1)
-    : 0;
+  const safeActiveIdx = dataset ? Math.max(minBarIdx, Math.min(activeBarIndex, maxBarIdx, dataset.candles.length - 1)) : 0;
   const getCurrentBarCountdownStr = (): string => {
     if (isHistoricalOrReplay) {
       const barLabel = dataset?.candles[safeActiveIdx]?.timeLabel;
@@ -1639,7 +1659,7 @@ export function GaiaView() {
 
     // 1. Reserve 84px right-hand axis gutter for {Strike} — {Concentration %} & countdown badge
     const padLeft = CHART_PAD_LEFT;
-    const rightAxisWidth = 84;
+    const rightAxisWidth = CHART_RIGHT_AXIS_WIDTH;
     const outlookRightX = width - rightAxisWidth;
     const padTop = 18;
     const padBottom = 32;
@@ -1958,8 +1978,7 @@ export function GaiaView() {
       ySpot >= padTop && ySpot <= height - padBottom
         ? [{ centerY: spotCenterY, halfH: spotHalfH }]
         : [];
-    const levelStepOffsets = [-7, 7, -22, 22, -37, 37, -52, 52, -67, 67];
-
+    // Draw all horizontal lines first, then place labels in strict top-to-bottom price order
     for (const ln of mergedLines) {
       ctx.strokeStyle = ln.stroke;
       ctx.lineWidth = ln.lineWidth;
@@ -1968,35 +1987,43 @@ export function GaiaView() {
       ctx.moveTo(padLeft, ln.y);
       ctx.lineTo(dividerX, ln.y);
       ctx.stroke();
+    }
 
-      const candidates = levelStepOffsets.map((dy) => ({
-        anchorY: dy < 0 ? ln.y + dy + 5 : ln.y + dy - 5,
-        centerY: ln.y + dy,
-        baseline: (dy < 0 ? "bottom" : "top") as CanvasTextBaseline,
-      }));
-      const chosen = candidates.find(
-        (c) =>
-          c.centerY >= padTop + 8 &&
-          c.centerY <= height - padBottom - 22 &&
-          !hasYCollision(occupiedLevelBoxes, c.centerY, 5)
-      );
-      if (chosen) {
-        if (Math.abs(chosen.centerY - ln.y) > 12) {
-          ctx.save();
-          ctx.setLineDash([]);
-          ctx.strokeStyle = ln.stroke;
-          ctx.lineWidth = 0.75;
-          ctx.beginPath();
-          ctx.moveTo(dividerX - 3, ln.y);
-          ctx.lineTo(dividerX - 3, chosen.centerY);
-          ctx.stroke();
-          ctx.restore();
-        }
-        ctx.textBaseline = chosen.baseline;
-        ctx.fillStyle = ln.textColor;
-        ctx.fillText(ln.label, dividerX - 6, chosen.anchorY);
-        occupiedLevelBoxes.push({ centerY: chosen.centerY, halfH: 5 });
+    const sortedByPriceDesc = [...mergedLines].sort((a, b) => b.price - a.price);
+    let prevLabelCenterY = -Infinity;
+    for (const ln of sortedByPriceDesc) {
+      // Natural placement: 7px above the line, flipping 7px below only if too close to top edge
+      let targetCenterY = ln.y - 7 < padTop + 8 ? ln.y + 7 : ln.y - 7;
+      // Avoid Live Spot Pill box while keeping monotonic top-to-bottom order
+      if (
+        ySpot >= padTop &&
+        ySpot <= height - padBottom &&
+        Math.abs(targetCenterY - spotCenterY) < spotHalfH + 7
+      ) {
+        targetCenterY = ln.y <= spotCenterY ? spotCenterY - spotHalfH - 7 : spotCenterY + spotHalfH + 7;
       }
+      // Enforce strict top-to-bottom ordering (>= 13px below previous higher-priced label)
+      if (targetCenterY < prevLabelCenterY + 13) {
+        targetCenterY = prevLabelCenterY + 13;
+      }
+      if (targetCenterY > height - padBottom - 16) continue;
+
+      const deltaFromLine = targetCenterY - ln.y;
+      if (Math.abs(deltaFromLine) > 10) {
+        ctx.save();
+        ctx.setLineDash([]);
+        ctx.strokeStyle = ln.stroke;
+        ctx.lineWidth = 0.75;
+        ctx.beginPath();
+        ctx.moveTo(dividerX - 3, ln.y);
+        ctx.lineTo(dividerX - 3, targetCenterY);
+        ctx.stroke();
+        ctx.restore();
+      }
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = ln.textColor;
+      ctx.fillText(ln.label, dividerX - 6, targetCenterY);
+      prevLabelCenterY = targetCenterY;
     }
     ctx.restore();
     ctx.setLineDash([]);
@@ -2734,8 +2761,7 @@ export function GaiaView() {
   const isSma34Bullish = activeCandle
     ? activeCandle.close >= activeCandle.sma34
     : true;
-  const sliderProgressPct =
-    maxBarIdx > 0 ? (safeActiveIdx / maxBarIdx) * 100 : 100;
+  const sliderProgressPct = maxBarIdx > minBarIdx ? ((safeActiveIdx - minBarIdx) / (maxBarIdx - minBarIdx)) * 100 : 100;
 
   return (
     <div className="space-y-3.5 pb-4">
@@ -3082,7 +3108,7 @@ export function GaiaView() {
         </button>
 
         {/* Auto Width Reset Pill (appears when width or divider is customized) */}
-        {(chartWidth !== null || dividerRatio !== (fluxFocusMode ? 0.88 : 0.76) || Math.abs(xScale - 1.0) > 1e-3 || Math.abs(xPanOffset) > 1e-3 || startHour !== 0) && (
+        {(chartWidth !== null || dividerRatio !== (fluxFocusMode ? 0.88 : 0.76) || Math.abs(xScale - 1.0) > 1e-3 || Math.abs(xPanOffset) > 1e-3 || startHour !== 9) && (
           <button
             type="button"
             onClick={() => {
@@ -3168,7 +3194,7 @@ export function GaiaView() {
             title="Auto-Fit / Reset Zoom Scale (Double-click canvas)"
             className={cn(
               "px-2.5 py-0.5 rounded-full text-[11px] font-bold transition cursor-pointer",
-              Math.abs(yScale - 1.0) > 1e-3 || Math.abs(yPanOffset) > 1e-3 || Math.abs(xScale - 1.0) > 1e-3 || Math.abs(xPanOffset) > 1e-3 || startHour !== 0
+              Math.abs(yScale - 1.0) > 1e-3 || Math.abs(yPanOffset) > 1e-3 || Math.abs(xScale - 1.0) > 1e-3 || Math.abs(xPanOffset) > 1e-3 || startHour !== 9
                 ? "bg-cyan-500/20 text-cyan-300 border border-cyan-400/40"
                 : "text-slate-400 hover:text-white"
             )}
@@ -3399,7 +3425,7 @@ export function GaiaView() {
           setXPanOffset(p);
         }}
         onResetViewport={() => {
-          setStartHour(0);
+          setStartHour(9);
           setXScale(1.0);
           setXPanOffset(0);
           setYScale(1.0);
@@ -3592,7 +3618,7 @@ export function GaiaView() {
           />
 
           {/* Floating Auto-Fit Reset Button on Canvas when zoomed / panned */}
-          {(Math.abs(xScale - 1.0) > 1e-3 || Math.abs(xPanOffset) > 1e-3 || Math.abs(yScale - 1.0) > 1e-3 || Math.abs(yPanOffset) > 1e-3 || startHour !== 0 || scopePreset !== "cone") && (
+          {(Math.abs(xScale - 1.0) > 1e-3 || Math.abs(xPanOffset) > 1e-3 || Math.abs(yScale - 1.0) > 1e-3 || Math.abs(yPanOffset) > 1e-3 || startHour !== 9 || scopePreset !== "cone") && (
             <button
               type="button"
               onClick={handleCanvasDoubleClick}
@@ -3660,7 +3686,7 @@ export function GaiaView() {
               <button
                 type="button"
                 onClick={() => handleStepBar(-1)}
-                disabled={safeActiveIdx <= 0}
+                disabled={safeActiveIdx <= minBarIdx}
                 aria-label="Step back one candle"
                 title="Previous candle (ArrowLeft)"
                 className="w-7 h-7 flex items-center justify-center rounded-full border border-[#232d42] bg-[#151b28] text-slate-200 hover:text-white hover:border-[#38bdf8] disabled:opacity-40 disabled:cursor-not-allowed transition cursor-pointer text-[11px]"
@@ -3719,7 +3745,7 @@ export function GaiaView() {
                 max={maxBarIdx}
                 value={safeActiveIdx}
                 aria-label="Session replay scrubber"
-                aria-valuemin={0}
+                aria-valuemin={minBarIdx}
                 aria-valuemax={maxBarIdx}
                 aria-valuenow={safeActiveIdx}
                 aria-valuetext={`Time ${dataset.candles[safeActiveIdx]?.timeLabel ?? ""}, Price $${activeCandle?.close.toFixed(2) ?? ""}`}

@@ -514,7 +514,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         : 980;
   const svgHeight = 440;
   const padLeft = 24;
-  const padRight = 84; // Room for right Y-axis price labels
+  const padRight = 96; // Room for right Y-axis price labels
   const padTop = 36;
   const chartBottom = 265;
   const ribbonTop = 290;

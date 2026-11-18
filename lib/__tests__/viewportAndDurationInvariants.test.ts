@@ -591,8 +591,8 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
       { startHour: 9, xScale: 1.2, xPanOffset: 10 },
     ];
     for (const cfg of configurations) {
-      const axisStartMins = cfg.startHour === 0 ? 0 : cfg.startHour === 7 ? 420 : cfg.startHour === 8 ? 480 : 570;
-      const axisEndMins = cfg.startHour === 0 ? 1440 : 1020;
+      const axisStartMins = cfg.startHour === 9 ? 0 : cfg.startHour === 7 ? 420 : cfg.startHour === 8 ? 480 : 570;
+      const axisEndMins = cfg.startHour === 9 ? 1440 : 1020;
       const axisSpanMins = axisEndMins - axisStartMins;
       const totalSlots = Math.round(axisSpanMins / 5);
       const stepX = (plotW / totalSlots) * cfg.xScale;
@@ -676,21 +676,21 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
     assert.match(gaiaViewSrc, /occupiedLevelBoxes[\s\S]{0,160}spotCenterY/, "GaiaView must reserve live spot pill band against structural labels");
   });
 
-  it("24H Full Viewport Reset Invariant: Reset restores xScale === 1.0, xPanOffset === 0, startHour === 0", () => {
+  it("24H Full Viewport Reset Invariant: Reset restores xScale === 1.0, xPanOffset === 0, startHour === 9", () => {
     const gaiaViewSrc = fs.readFileSync(path.join(process.cwd(), "components/views/GaiaView.tsx"), "utf8");
     const hudSrc = fs.readFileSync(path.join(process.cwd(), "components/gaia/GaiaCallPutBiasHud.tsx"), "utf8");
 
-    assert.match(gaiaViewSrc, /const handleCanvasDoubleClick[\s\S]{0,220}setStartHour\(0\)[\s\S]{0,120}setXScale\(1\.0\)[\s\S]{0,80}setXPanOffset\(0\)/);
-    assert.match(gaiaViewSrc, /const handleResetZoom[\s\S]{0,180}setStartHour\(0\)[\s\S]{0,120}setXScale\(1\.0\)[\s\S]{0,80}setXPanOffset\(0\)/);
+    assert.match(gaiaViewSrc, /const handleCanvasDoubleClick[\s\S]{0,220}setStartHour\(9\)[\s\S]{0,120}setXScale\(1\.0\)[\s\S]{0,80}setXPanOffset\(0\)/);
+    assert.match(gaiaViewSrc, /const handleResetZoom[\s\S]{0,180}setStartHour\(9\)[\s\S]{0,120}setXScale\(1\.0\)[\s\S]{0,80}setXPanOffset\(0\)/);
     assert.match(
       gaiaViewSrc,
-      /(?:xScale\s*!==\s*1\.0|Math\.abs\(xScale\s*-\s*1\.0\)\s*>\s*1e-3)[\s\S]{0,120}(?:xPanOffset\s*!==\s*0|Math\.abs\(xPanOffset\)\s*>\s*1e-3)[\s\S]{0,180}startHour\s*!==\s*0/,
+      /(?:xScale\s*!==\s*1\.0|Math\.abs\(xScale\s*-\s*1\.0\)\s*>\s*1e-3)[\s\S]{0,120}(?:xPanOffset\s*!==\s*0|Math\.abs\(xPanOffset\)\s*>\s*1e-3)[\s\S]{0,180}startHour\s*!==\s*9/,
       "GaiaView Auto-Fit pill visibility must track xScale, xPanOffset & startHour"
     );
     assert.match(
       hudSrc,
       /onClick=\{[^}]*handleReset\(\)[^}]*\}[\s\S]{0,120}title="Auto-fit all candles in session"/,
-      "GaiaCallPutBiasHud Fit Data button must invoke handleReset() (calls onResetViewport -> startHour=0)"
+      "GaiaCallPutBiasHud Fit Data button must invoke handleReset() (calls onResetViewport -> startHour=9)"
     );
   });
 
