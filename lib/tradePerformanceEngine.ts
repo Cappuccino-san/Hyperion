@@ -416,7 +416,7 @@ export async function checkAndSendMarketCloseRecap(
   if (isPostAttributionCutoff && !isHistoricalBackfill) {
     try {
       const { runPostMarketAttribution } = await import("./agenticSupervisor");
-      runPostMarketAttribution({ date: targetDate || store.date });
+      runPostMarketAttribution({ sessionDate: targetDate || store.date, ticker: "SPY", bars: [] });
     } catch {
       // Non-fatal post-market attribution
     }

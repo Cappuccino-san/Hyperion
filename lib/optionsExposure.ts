@@ -24,7 +24,6 @@ export interface NormalizedOptionContract {
   bid?: number;
   ask?: number;
   last?: number;
-  theta?: number;
 }
 
 const globalForOptionsExposure = globalThis as unknown as {
