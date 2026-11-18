@@ -1668,6 +1668,21 @@ export function evaluateBtoCandidateSetup(input: {
   }
 
   if (candidateBto) {
+    const isExplicitReversionOrBounceSetup =
+      /Flow Bounce|Flow Rejection|Support Bounce|Resistance Rejection|Extremity Reclaim|Zero-Gamma Flip/i.test(
+        candidateBto.setupName
+      );
+    const vwapStretchOverExtended =
+      !isExplicitReversionOrBounceSetup &&
+      flowSnap &&
+      flowSnap.flowVwap > 0 &&
+      Math.abs(spotPrice - flowSnap.flowVwap) > entryAtr5m * 0.90;
+    if (vwapStretchOverExtended) {
+      candidateBto = null;
+    }
+  }
+
+  if (candidateBto) {
     const candRisk = Math.max(minRiskFloor, Math.abs(spotPrice - candidateBto.stopLossSpot));
     if (candidateBto.contractType === "PUT") {
       // Strict Flux Polarity Gate: block neutral chop (0.44 < chi < 0.56) and opposing J_net / Pe

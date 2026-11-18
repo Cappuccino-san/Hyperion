@@ -210,6 +210,10 @@ export async function selectSmallAccountContract(params: {
       if (Math.abs(c.strike - effectiveSpot) > maxOtmDistance) continue;
 
       const { expHuman, robinhoodExp, robinhoodTab, dte } = formatExpirationHuman(c.expiration, todayEt);
+      const minAskFloor = dte === 0 ? 0.45 : 0.15;
+      if (askPrice < minAskFloor) {
+        continue;
+      }
       if (
         !Number.isFinite(dte) ||
         dte < 0 ||

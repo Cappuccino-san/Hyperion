@@ -33,6 +33,7 @@ import {
 } from "../executionLease";
 import { resetPersistenceMemCachesForTests } from "../persistenceStore";
 import { evaluateBtoCandidateSetup } from "../execution/signalScoring";
+import { selectSmallAccountContract } from "../execution/contractRouter";
 import { GaiaSignalFsm, computeCausalEquilibriumDispersion, type GaiaBarData } from "../gaiaSignalFsm";
 import { GET as getSignalsRoute, POST as postSignalsRoute } from "../../app/api/signals/route";
 import type { OptionTradePosition } from "../execution/types";
@@ -664,4 +665,204 @@ test("forensic 2026-11-18 guardrails block $731.36 post-bounce mid-range Put abo
   };
   const sig = fsm.commitClosedBar(midRangePutBar, disp, macro, { isHistoricalBackfill: false });
   assert.equal(sig, null);
+});
+
+test("universal VWAP stretch cap blocks >0.90x ATR bottom-tick chases and 0DTE enforces >= $0.45 ask floor", async () => {
+  const sessionDate = "2026-11-18";
+  const evalTs = Math.floor(new Date("2026-11-18T11:15:00-05:00").getTime() / 1000);
+  const store = loadTradeStore(sessionDate);
+  store.date = sessionDate;
+  store.activePositions = {};
+  store.closedPositions = [];
+  store.bouncedPutWalls = {};
+
+  const makeFlow = (spot: number, vwap: number, chi: number, pe: number, flux: number) => ({
+    timestamp: evalTs,
+    spot,
+    flowVwap: vwap,
+    ceilingShareChi: chi,
+    impulseChi: chi,
+    pecletNumber: pe,
+    impulsePeclet: pe,
+    netFluxJ: flux,
+    deltaChi6Bar: -0.05,
+    deltaImpulseChi6Bar: -0.05,
+    deltaNetFlux6Bar: flux,
+    upper1s: vwap + 1.8,
+    lower1s: vwap - 1.8,
+    upper2s: vwap + 3.6,
+    lower2s: vwap - 3.6,
+    upper1Sigma: vwap + 1.8,
+    lower1Sigma: vwap - 1.8,
+    upper2Sigma: vwap + 3.6,
+    lower2Sigma: vwap - 3.6,
+    sigma: 1.8,
+    variance: 3.24,
+    cumGammaWeight: 100,
+    totalWeight: 100,
+    signedGammaAcceleration: 0,
+    count: 10,
+    bandSignal: null,
+    atr5m: 2.0,
+    gammaRegime: "NEGATIVE_GAMMA" as const,
+  });
+
+  // 11:15 AM bottom-tick chase at $728.25 when Flow VWAP is $731.00 (|spot - vwap| = $2.75 > 0.90 * $2.00 = $1.80) -> BLOCKED
+  const overStretchedFlush = evaluateBtoCandidateSetup({
+    normalizedTicker: "SPY",
+    spotPrice: 728.25,
+    prevSpotPrice: 729.0,
+    params: {
+      ticker: "SPY",
+      spotPrice: 728.25,
+      callWall: 750,
+      putWall: 720,
+      zeroGamma: 751.29,
+      zeroDtePutWall: 720,
+      zeroDteCallWall: 750,
+      priorClose: 731.85,
+      netGex: -1757.79,
+    },
+    store,
+    latest5mCandle: {
+      open: 729.1,
+      high: 729.2,
+      low: 728.1,
+      close: 728.25,
+      sma34: 730.2,
+      timestamp: evalTs,
+      flowSnapshot: makeFlow(728.25, 731.0, 0.25, -2.4, -0.35),
+    },
+    divergence5m: "NO",
+    divergence30m: "NO",
+    etTotalMinutes: 675,
+    nowTs: evalTs,
+    sessionDate,
+    isPhase2ReclaimWindow: false,
+    sameTickerClosedCount: 0,
+  });
+  assert.equal(overStretchedFlush.candidateBto, null);
+
+  // Explicit mean-reversion Flow Bounce setup remains exempt from trend VWAP stretch cap
+  const explicitBounceFlow = {
+    ...makeFlow(727.3, 731.0, 0.64, 0.9, 0.14),
+    bandSignal: "LOWER_2S_BOUNCE" as const,
+  };
+  const explicitBounceAllowed = evaluateBtoCandidateSetup({
+    normalizedTicker: "SPY",
+    spotPrice: 727.3,
+    prevSpotPrice: 726.9,
+    params: {
+      ticker: "SPY",
+      spotPrice: 727.3,
+      callWall: 750,
+      putWall: 726,
+      zeroGamma: 751.29,
+      zeroDtePutWall: 726,
+      zeroDteCallWall: 750,
+      priorClose: 731.85,
+      netGex: -1757.79,
+    },
+    store,
+    latest5mCandle: {
+      open: 726.9,
+      high: 727.4,
+      low: 726.8,
+      close: 727.3,
+      sma34: 728.0,
+      timestamp: evalTs,
+      flowSnapshot: explicitBounceFlow,
+    },
+    divergence5m: "BULL",
+    divergence30m: "NO",
+    etTotalMinutes: 675,
+    nowTs: evalTs,
+    sessionDate,
+    isPhase2ReclaimWindow: false,
+    sameTickerClosedCount: 0,
+  });
+  assert.ok(
+    explicitBounceAllowed.candidateBto !== null &&
+      /Flow Bounce|Support Bounce|Extremity Reclaim/i.test(explicitBounceAllowed.candidateBto.setupName)
+  );
+
+  // 0DTE $0.28 ultra-cheap OTM Put strictly rejected (< $0.45 floor); $0.52 0DTE and $0.28 1DTE remain eligible
+  const nowEt = new Date("2026-11-18T11:15:00-05:00");
+  const zeroDteCheapOnly = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "PUT",
+    spotPrice: 728.25,
+    target1Spot: 724.5,
+    target2Spot: 722.0,
+    stopLossSpot: 730.25,
+    contracts: [
+      {
+        symbol: "SPY261118P00726000",
+        strike: 726,
+        expiration: "2026-11-18",
+        optionType: "P",
+        bid: 0.25,
+        ask: 0.28,
+        last: 0.27,
+        volume: 15000,
+        openInterest: 10000,
+        iv: 0.24,
+        delta: -0.25,
+        gamma: 0.04,
+        vega: 0.03,
+        percentChange: 0,
+      },
+    ],
+    nowEt,
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.1,
+  });
+  assert.equal(zeroDteCheapOnly, null);
+
+  const oneDteCheapAllowed = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "PUT",
+    spotPrice: 728.25,
+    target1Spot: 724.5,
+    target2Spot: 722.0,
+    stopLossSpot: 730.25,
+    contracts: [
+      {
+        symbol: "SPY261118P00726000",
+        strike: 726,
+        expiration: "2026-11-18",
+        optionType: "P",
+        bid: 0.25,
+        ask: 0.28,
+        last: 0.27,
+        volume: 15000,
+        openInterest: 10000,
+        iv: 0.24,
+        delta: -0.25,
+        gamma: 0.04,
+        vega: 0.03,
+        percentChange: 0,
+      },
+      {
+        symbol: "SPY261119P00726000",
+        strike: 726,
+        expiration: "2026-11-19",
+        optionType: "P",
+        bid: 0.26,
+        ask: 0.28,
+        last: 0.27,
+        volume: 15000,
+        openInterest: 10000,
+        iv: 0.24,
+        delta: -0.26,
+        gamma: 0.04,
+        vega: 0.05,
+        percentChange: 0,
+      },
+    ],
+    nowEt,
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.1,
+  });
+  assert.equal(oneDteCheapAllowed?.expiration, "2026-11-19");
 });
