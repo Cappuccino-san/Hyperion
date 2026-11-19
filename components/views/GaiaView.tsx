@@ -3053,77 +3053,7 @@ export function GaiaView() {
           </span>
         </div>
 
-        {/* 4. Session Start Time Filter: 7:00 AM Premkt (default) | 8:00 AM Premkt | 9:30 AM RTH */}
-        <div className="bg-[#151b28] border border-[#232d42] rounded-full p-1 flex items-center gap-1 font-mono text-xs">
-          <button
-            type="button"
-            onClick={() => {
-              setStartHour(0);
-              setXScale(1.0);
-              setXPanOffset(0);
-            }}
-            title="Full 24-Hour ET Day (00:00 – 24:00 ET)"
-            className={cn(
-              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
-              startHour === 0
-                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
-                : "text-slate-300 hover:text-white"
-            )}
-          >
-            24H Full Day
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setStartHour(7);
-              setXScale(1.0);
-              setXPanOffset(0);
-            }}
-            title="Start session at 7:00 AM ET (Early pre-market volume & catalyst discovery)"
-            className={cn(
-              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
-              startHour === 7
-                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
-                : "text-slate-300 hover:text-white"
-            )}
-          >
-            7:00 AM Premkt
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setStartHour(8);
-              setXScale(1.0);
-              setXPanOffset(0);
-            }}
-            title="Start session at 8:00 AM ET (Regular pre-market session)"
-            className={cn(
-              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
-              startHour === 8
-                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
-                : "text-slate-300 hover:text-white"
-            )}
-          >
-            8:00 AM Premkt
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setStartHour(9);
-              setXScale(1.0);
-              setXPanOffset(0);
-            }}
-            title="Start session at 9:30 AM ET (Regular Trading Hours only)"
-            className={cn(
-              "px-3 py-1 text-xs rounded-full transition cursor-pointer font-bold",
-              startHour === 9
-                ? "bg-gradient-to-r from-[#38bdf8] to-[#818cf8] text-[#090d16]"
-                : "text-slate-300 hover:text-white"
-            )}
-          >
-            9:30 AM RTH
-          </button>
-        </div>
+        {/* Session start locked to 9:30 AM RTH */}
 
         {/* Flux Focus Viewport Mode Toggle (Benchmark Image 1 Style) */}
         <button

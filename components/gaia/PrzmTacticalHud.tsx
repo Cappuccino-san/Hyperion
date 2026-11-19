@@ -54,6 +54,8 @@ export interface EvaluatedCallEntry {
   closedPrice?: number;
   closedTimeFormatted?: string;
   pnlOptionPct?: number;
+  btoOptionPrice?: number;
+  stcOptionPrice?: number;
   status: "OPEN" | "RIGHT" | "FLAT" | "WRONG";
   delta: number;
   heldMinutes: number;
@@ -261,6 +263,18 @@ export function evaluatePrzmCallLedger(
     const exitBar = exitBucket > 0 ? series.find((b) => Math.floor(toEpochSeconds(b.timestamp) / 300) * 300 === exitBucket) : undefined;
     const clampedBto = entryBar && btoSpot > 0 ? Math.max(entryBar.low, Math.min(entryBar.high, btoSpot)) : btoSpot;
     const clampedClosed = exitBar && closedSpot > 0 ? Math.max(exitBar.low, Math.min(exitBar.high, closedSpot)) : closedSpot;
+    const btoOpt =
+      typeof pos.btoOptionMid === "number" && pos.btoOptionMid > 0
+        ? pos.btoOptionMid
+        : typeof pos.btoPrice === "number" && pos.btoPrice > 0
+          ? pos.btoPrice
+          : undefined;
+    const stcOpt =
+      typeof pos.closedOptionMid === "number" && pos.closedOptionMid > 0
+        ? pos.closedOptionMid
+        : typeof pos.stcPrice === "number" && pos.stcPrice > 0
+          ? pos.stcPrice
+          : undefined;
 
     if (isStillOpenInReplay) {
       const currentSpot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : clampedBto;
@@ -276,6 +290,7 @@ export function evaluatePrzmCallLedger(
         type,
         contractType: isCall ? "CALL" : "PUT",
         entryPrice: clampedBto,
+        btoOptionPrice: btoOpt,
         status: "OPEN",
         delta,
         heldMinutes: heldMin,
@@ -312,6 +327,8 @@ export function evaluatePrzmCallLedger(
       closedPrice: clampedClosed,
       closedTimeFormatted: pos.closedTs ? formatPrzmTime(pos.closedAt, pos.closedTs) : pos.closedAt,
       pnlOptionPct: typeof pos.pnlOptionPct === "number" ? pos.pnlOptionPct : undefined,
+      btoOptionPrice: btoOpt,
+      stcOptionPrice: stcOpt,
       status,
       delta,
       heldMinutes: heldMin,
@@ -354,6 +371,12 @@ export function evaluatePrzmCallLedger(
       type,
       contractType: isCall ? "CALL" : "PUT",
       entryPrice: clampedBto,
+      btoOptionPrice:
+        typeof pos.btoOptionMid === "number" && pos.btoOptionMid > 0
+          ? pos.btoOptionMid
+          : typeof pos.btoPrice === "number" && pos.btoPrice > 0
+            ? pos.btoPrice
+            : undefined,
       status: "OPEN",
       delta,
       heldMinutes: heldMin,
@@ -1231,6 +1254,13 @@ export const PrzmCallLogDeck: React.FC<{
                       title={entry.contractLabel}
                     >
                       {shortContract}
+                    </span>
+                  )}
+                  {typeof entry.btoOptionPrice === "number" && entry.btoOptionPrice > 0 && (
+                    <span className="text-slate-300 font-mono text-[11px] tabular-nums shrink-0">
+                      {typeof entry.stcOptionPrice === "number" && entry.stcOptionPrice > 0 && entry.status !== "OPEN"
+                        ? "$" + entry.btoOptionPrice.toFixed(2) + " → $" + entry.stcOptionPrice.toFixed(2)
+                        : "@ $" + entry.btoOptionPrice.toFixed(2)}
                     </span>
                   )}
                   <span className={`tabular-nums tracking-wide text-right flex-1 ${statusColor}`}>
