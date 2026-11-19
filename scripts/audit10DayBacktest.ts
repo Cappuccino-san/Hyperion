@@ -40,6 +40,7 @@ import {
   DEFAULT_HARD_OPTION_STOP_LOSS_PCT,
   evaluateOptionRiskStop,
 } from "../lib/bracketOrderEngine";
+import { evaluateOptionProfitRatchet } from "../lib/execution/profitRatchet";
 import { MAX_OPTION_DELTA, resolveMinOptionDelta } from "../lib/positionSizer";
 import { getSessionBoundsEt } from "../lib/gaiaSessionGuards";
 import { computeAdaptiveQuantMetrics } from "../lib/gaiaSignalFsm";
@@ -166,6 +167,21 @@ function selectRegimeAdaptiveBacktestContract(params: {
     for (let step = 0; step <= 14; step++) {
       const strike = Number((isCall ? baseStrike + step * strikeStep : baseStrike - step * strikeStep).toFixed(2));
       if (Math.abs(strike - spot) > maxOtmDist) break;
+      // Exact parity with production contractRouter.ts:
+      // 12:30-13:29 ET bans >ceil/<floor OTM 0DTE; >= 13:30 ET (<2.5h to expiry) bans ALL OTM 0DTE.
+      if (
+        etMins >= 750 &&
+        dteDays === 0 &&
+        (etMins >= 810
+          ? isCall
+            ? strike > spot
+            : strike < spot
+          : isCall
+            ? strike > Math.ceil(spot)
+            : strike < Math.floor(spot))
+      ) {
+        continue;
+      }
       const quote = priceOptionWithSkew({
         spot,
         strike,
@@ -175,8 +191,9 @@ function selectRegimeAdaptiveBacktestContract(params: {
       });
       const absDelta = Math.abs(quote.delta);
       const spreadPct = quote.ask > 0 ? (quote.ask - quote.bid) / quote.ask : 1;
+      const minAskFloor = dteDays === 0 ? 0.45 : 0.15;
       if (
-        quote.ask >= 0.15 &&
+        quote.ask >= minAskFloor &&
         quote.ask <= 0.99 &&
         absDelta >= minOptionDelta &&
         absDelta <= MAX_OPTION_DELTA &&
@@ -751,8 +768,22 @@ async function run10DaySniperAudit() {
           const lower1SExit = exitFlow?.lower1Sigma ?? 0;
 
           const curRemYears = computeRemainingYearsToExpiration(bar.ts * 1000, activePosition.dteDays);
+          const openBarQuote = priceOptionWithSkew({
+            spot: bar.open,
+            strike: activePosition.strike,
+            direction: isCall ? "LONG" : "SHORT",
+            remainingYears: curRemYears,
+            atmIv: activePosition.iv,
+          });
           const curCloseQuote = priceOptionWithSkew({
             spot: bar.close,
+            strike: activePosition.strike,
+            direction: isCall ? "LONG" : "SHORT",
+            remainingYears: curRemYears,
+            atmIv: activePosition.iv,
+          });
+          const advBarQuote = priceOptionWithSkew({
+            spot: isCall ? bar.low : bar.high,
             strike: activePosition.strike,
             direction: isCall ? "LONG" : "SHORT",
             remainingYears: curRemYears,
@@ -765,24 +796,51 @@ async function run10DaySniperAudit() {
             remainingYears: curRemYears,
             atmIv: activePosition.iv,
           });
+          const openOptPnlPct =
+            ((Math.max(0.05, openBarQuote.bid) - activePosition.entryAsk) /
+              Math.max(0.01, activePosition.entryAsk)) *
+            100;
           const curOptPnlPct =
             ((Math.max(0.05, curCloseQuote.bid) - activePosition.entryAsk) /
+              Math.max(0.01, activePosition.entryAsk)) *
+            100;
+          const advOptPnlPct =
+            ((Math.max(0.05, advBarQuote.bid) - activePosition.entryAsk) /
               Math.max(0.01, activePosition.entryAsk)) *
             100;
           const favOptPnlPct =
             ((Math.max(0.05, favBarQuote.bid) - activePosition.entryAsk) /
               Math.max(0.01, activePosition.entryAsk)) *
             100;
-          activePosition.peakOptionPnlPct = Math.max(activePosition.peakOptionPnlPct, favOptPnlPct);
-          if (!activePosition.optBeArmed && (curOptPnlPct >= 25 || activePosition.peakOptionPnlPct >= 30)) {
-            activePosition.optBeArmed = true;
-          }
+
+          // Strict pessimistic intrabar ordering: evaluate existing standing stops & profit ratchet
+          // armed strictly BEFORE bar t (`prevPeakOptionPnlPct`) against bar t's adverse extreme FIRST.
+          const prevPeakOptionPnlPct = activePosition.peakOptionPnlPct;
+          const exitChi = exitFlow?.ceilingShareChi ?? 0.5;
+          const exitFlux = exitFlow?.netFluxJ ?? 0;
+          const fluxFlippedAgainst = isCall ? exitFlux < 0 : exitFlux > 0;
           const optStopEval = evaluateOptionRiskStop({
             entryPrice: activePosition.entryAsk,
-            currentPrice: curCloseQuote.bid,
+            currentPrice: advBarQuote.bid,
             heldMinutes,
-            peakPnlPct: activePosition.peakOptionPnlPct,
+            peakPnlPct: prevPeakOptionPnlPct,
           });
+          const ratchetEval = evaluateOptionProfitRatchet({
+            isCall,
+            prevPeakOptionPnlPct,
+            adverseOptionPnlPct: advOptPnlPct,
+            closeOptionPnlPct: curOptPnlPct,
+            favorableOptionPnlPct: favOptPnlPct,
+            openOptionPnlPct: openOptPnlPct,
+            chi: exitChi,
+            netFluxJ: exitFlux,
+            hasPostEntryBarElapsed: heldMinutes >= 5,
+            fluxFlippedAgainst,
+          });
+          activePosition.peakOptionPnlPct = ratchetEval.nextPeakOptionPnlPct;
+          if (!activePosition.optBeArmed && activePosition.peakOptionPnlPct >= 30) {
+            activePosition.optBeArmed = true;
+          }
 
           const initialRisk = Math.max(0.1, Math.abs(activePosition.entrySpot - activePosition.initialStopSpot));
           let exitTriggered = false;
@@ -801,7 +859,7 @@ async function run10DaySniperAudit() {
             const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
             outcomeR = Number((dirMove / initialRisk).toFixed(2));
           }
-          // 2. Stop Loss (Conservative adverse extreme check first)
+          // 2. Underlying Stop Loss (Conservative adverse extreme check first)
           else if (
             (isCall && bar.low <= activePosition.stopLossSpot) ||
             (!isCall && bar.high >= activePosition.stopLossSpot)
@@ -812,46 +870,29 @@ async function run10DaySniperAudit() {
             const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
             outcomeR = Number((dirMove / initialRisk).toFixed(2));
           }
-          // 2B. Option-Level Hard -45% Stop or 4-Bar (20m) -25% Theta-Stall Tightener
+          // 2B. Option-Level Hard -45% Stop or 75m -38% Theta-Stall Tightener
           else if (optStopEval.triggered) {
             exitTriggered = true;
             exitSpot = bar.close;
+            limitFillOptionPrice = Number(
+              Math.min(openBarQuote.bid, optStopEval.activeStopPrice).toFixed(2)
+            );
             exitReason =
               optStopEval.reason === "OPTION_STALL_STOP_25"
-                ? "OPTION STALL STOP HIT (-25% 20M THETA CAP)"
+                ? `OPTION STALL STOP HIT (-${optStopEval.activeStopLossPct}% 75M THETA CAP)`
                 : "OPTION HARD STOP HIT (-45% MAX LOSS)";
             const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
             outcomeR = Number((dirMove / initialRisk).toFixed(2));
           }
-          // 2C. OCO Runner Breakeven Protect & Option-Level Limit Targets (+35% TP1 / +80% Flux Runner TP2)
-          else if (activePosition.optBeArmed && curOptPnlPct <= 0 && heldMinutes >= 10) {
+          // 2C. Canonical Progressive Option-% Profit Ratchet & Flux-Flip MFE Harvest (100% live parity)
+          else if (ratchetEval.triggered && ratchetEval.reason) {
             exitTriggered = true;
             exitSpot = bar.close;
-            limitFillOptionPrice = Number((activePosition.entryAsk * 1.02).toFixed(2));
-            exitReason = "OCO BREAKEVEN PROTECT";
-            const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
-            outcomeR = Number((dirMove / initialRisk).toFixed(2));
-          }
-          else if (
-            favOptPnlPct >= 35 &&
-            !(isCall
-              ? (exitFlow?.netFluxJ ?? 0) > 0 && (exitFlow?.impulseChi ?? 0.5) >= 0.68
-              : (exitFlow?.netFluxJ ?? 0) < 0 && (exitFlow?.impulseChi ?? 0.5) <= 0.32)
-          ) {
-            exitTriggered = true;
-            exitSpot = isCall
-              ? Math.min(bar.high, activePosition.entrySpot + initialRisk * 1.1)
-              : Math.max(bar.low, activePosition.entrySpot - initialRisk * 1.1);
-            limitFillOptionPrice = Number(Math.min(favBarQuote.bid, activePosition.entryAsk * 1.35).toFixed(2));
-            exitReason = "OCO TP1 LIMIT (+35%)";
-            const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
-            outcomeR = Number((dirMove / initialRisk).toFixed(2));
-          }
-          else if (favOptPnlPct >= 80) {
-            exitTriggered = true;
-            exitSpot = isCall ? bar.high : bar.low;
-            limitFillOptionPrice = Number(Math.min(favBarQuote.bid, activePosition.entryAsk * 1.8).toFixed(2));
-            exitReason = "OCO TP2 RUNNER (+80%)";
+            const fillPct = ratchetEval.fillPnlPct ?? curOptPnlPct;
+            limitFillOptionPrice = Number(
+              Math.max(0.01, activePosition.entryAsk * (1 + fillPct / 100)).toFixed(2)
+            );
+            exitReason = ratchetEval.reason;
             const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;
             outcomeR = Number((dirMove / initialRisk).toFixed(2));
           }
@@ -982,21 +1023,10 @@ async function run10DaySniperAudit() {
             const optionPnlPct = Number(
               (((exitOptionPrice - activePosition.entryAsk) / activePosition.entryAsk) * 100).toFixed(1)
             );
-            const isOptionDrivenExit =
-              exitReason.includes("OPTION HARD STOP") ||
-              exitReason.includes("OPTION STALL STOP") ||
-              exitReason === "OCO BREAKEVEN PROTECT" ||
-              exitReason.includes("OCO TP1 LIMIT") ||
-              exitReason.includes("OCO TP2 RUNNER");
-            if (
-              isOptionDrivenExit ||
-              (optionPnlPct > 0 && outcomeR <= 0) ||
-              (optionPnlPct < 0 && outcomeR >= 0)
-            ) {
-              outcomeR = Number(
-                (optionPnlPct / DEFAULT_HARD_OPTION_STOP_LOSS_PCT).toFixed(2)
-              );
-            }
+            // Canonical small-account 1R = -45% option hard-stop risk across ALL exits
+            outcomeR = Number(
+              (optionPnlPct / DEFAULT_HARD_OPTION_STOP_LOSS_PCT).toFixed(2)
+            );
 
             const pnlDollars = Number(((exitOptionPrice - activePosition.entryAsk) * 100).toFixed(2));
             if (pnlDollars > 0) grossWinDollars += pnlDollars;

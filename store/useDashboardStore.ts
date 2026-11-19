@@ -536,11 +536,19 @@ export interface DashboardState {
   setUiMode: (mode: "signal" | "quant") => void;
   connectionStatus: "LIVE" | "SYNCING" | "RECONNECTING" | "OFFLINE";
   isStaleSnapshot: boolean;
+  cboeSpotLagDollars: number | null;
+  optionsCacheAgeSec: number | null;
+  executionArmState: "PAPER" | "LOCKED";
+  audioAlertsMuted: boolean;
+  setExecutionArmState: (mode: "PAPER" | "LOCKED") => void;
+  toggleExecutionLock: (flattenPaper?: boolean) => Promise<void>;
+  setAudioAlertsMuted: (muted: boolean) => void;
   liveTickPrice: number | null;
   liveTickTimestamp: number;
   liveTickDirection: "up" | "down" | "flat";
   liveTickCount: number;
-  setLiveTick: (ticker: string, price: number, timestamp?: number) => void;
+  liveTickMarketOpen: boolean | null;
+  setLiveTick: (ticker: string, price: number, timestamp?: number, marketOpen?: boolean) => void;
   serverActivePositions: Record<string, any>;
   serverClosedTrades: any[];
   serverTradeAlerts: any[];
@@ -618,11 +626,16 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   dataSource: "CBOE_MARKET_DATA",
   connectionStatus: "SYNCING",
   isStaleSnapshot: false,
+  cboeSpotLagDollars: null,
+  optionsCacheAgeSec: null,
+  executionArmState: "PAPER",
+  audioAlertsMuted: false,
   isLoadingChain: true,
   liveTickPrice: null,
   liveTickTimestamp: 0,
   liveTickDirection: "flat",
   liveTickCount: 0,
+  liveTickMarketOpen: null,
   toastMessage: null,
   lastUpdated: "--:-- ET",
   bookTimestamp: null,
@@ -709,6 +722,9 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
           serverTradeAlerts: data?.alerts ?? [],
           serverTradesLoaded: true,
           supervisorPolicy: data?.supervisorPolicy ?? null,
+          ...(typeof data?.executionLocked === "boolean"
+            ? { executionArmState: data.executionLocked ? "LOCKED" : "PAPER" }
+            : {}),
         });
       }
     } catch {
@@ -788,7 +804,56 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   setGaiaMode: (mode) => set({ gaiaMode: mode }),
   setSetupModalOpen: (open) => set({ isSetupModalOpen: open }),
   hydrateDiscordConfig: () => {
-    set({ discordConfig: getInitialDiscordConfig() });
+    let muted = false;
+    if (typeof window !== "undefined") {
+      try {
+        muted = localStorage.getItem("hyperion_audio_muted") === "true";
+      } catch {}
+    }
+    set({ discordConfig: getInitialDiscordConfig(), audioAlertsMuted: muted });
+  },
+  setExecutionArmState: (mode) => set({ executionArmState: mode }),
+  setAudioAlertsMuted: (muted) => {
+    if (typeof window !== "undefined") {
+      try {
+        localStorage.setItem("hyperion_audio_muted", muted ? "true" : "false");
+      } catch {}
+    }
+    set({ audioAlertsMuted: muted });
+  },
+  toggleExecutionLock: async (flattenPaper = false) => {
+    const current = get().executionArmState;
+    const locking = flattenPaper ? true : current !== "LOCKED";
+    const action = flattenPaper
+      ? "FLATTEN_PAPER_POSITIONS"
+      : locking
+        ? "EMERGENCY_LOCK"
+        : "UNLOCK_EXECUTION";
+    try {
+      const res = await fetch("/api/signals", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const isLocked = Boolean(data?.executionLocked);
+        const flattened = Array.isArray(data?.flattenedTickers) ? data.flattenedTickers : [];
+        set({
+          executionArmState: isLocked ? "LOCKED" : "PAPER",
+          toastMessage: flattenPaper
+            ? flattened.length > 0
+              ? `LOCKED · Paper positions flattened: ${flattened.join(", ")}`
+              : "LOCKED · No open paper positions to flatten"
+            : isLocked
+              ? "EXECUTION LOCKED · Stand-Aside safety engaged (Paper/Shadow)"
+              : "PAPER / SHADOW MODE resumed",
+        });
+        void get().fetchServerTrades(get().activeTicker);
+      }
+    } catch {
+      set({ toastMessage: "Failed to toggle execution lock" });
+    }
   },
   updateDiscordConfig: (cfg) => {
     set((state) => {
@@ -865,10 +930,18 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     });
   },
 
-  setLiveTick: (ticker, price, timestamp = Date.now()) =>
+  setLiveTick: (ticker, price, timestamp = Date.now(), marketOpen) =>
     set((state) => {
       if (ticker.toUpperCase() !== state.activeTicker.toUpperCase()) return state;
       if (!Number.isFinite(price) || price <= 0) return state;
+      const nextMktOpen = typeof marketOpen === "boolean" ? marketOpen : state.liveTickMarketOpen;
+      if (
+        state.liveTickPrice !== null &&
+        Math.abs(price - state.liveTickPrice) < 1e-6 &&
+        state.liveTickMarketOpen === nextMktOpen
+      ) {
+        return { liveTickTimestamp: timestamp };
+      }
       const prev = state.liveTickPrice ?? state.spotPrice;
       const direction: "up" | "down" | "flat" =
         price > prev + 0.001 ? "up" : price < prev - 0.001 ? "down" : state.liveTickDirection;
@@ -878,6 +951,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         liveTickTimestamp: timestamp,
         liveTickDirection: direction,
         liveTickCount: state.liveTickCount + 1,
+        liveTickMarketOpen: nextMktOpen,
       };
     }),
 
@@ -1214,12 +1288,22 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         weeklyDate: filtered.kingNode.weeklyDate,
       };
 
+      const hasFreshTick =
+        state.liveTickPrice !== null &&
+        state.liveTickPrice > 0 &&
+        Date.now() - state.liveTickTimestamp < 3000 &&
+        state.loadedTicker.toUpperCase() === payload.ticker.toUpperCase();
+
       return {
         dataSource: payload.dataSource,
         isLoadingChain: false,
         lastUpdated: payload.lastUpdated,
         bookTimestamp: payload.bookTimestamp ?? null,
-        spotPrice: payload.spotPrice,
+        cboeSpotLagDollars:
+          typeof payload.spotLagDollars === "number" ? payload.spotLagDollars : null,
+        optionsCacheAgeSec:
+          typeof payload.cacheAgeSec === "number" ? payload.cacheAgeSec : 0,
+        spotPrice: hasFreshTick ? state.liveTickPrice! : payload.spotPrice,
         previousClose: payload.previousClose,
         impliedVolatility: payload.impliedVolatility,
         strikeStep: payload.strikeStep,
@@ -1316,7 +1400,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
     // Seamlessly update Flow VWAP during the 5-second polling cycle
     get().fetchFlowGammaVwap(targetTicker).catch(() => {});
-    set({ isLoadingChain: true });
+    // Only flip blocking loading state on cold/empty chain or manual refresh (prevents 5s LIVE->CONNECTING flicker)
+    if (force || get().chainStrikes.length === 0 || get().loadedTicker.toUpperCase() !== targetTicker) {
+      set({ isLoadingChain: true });
+    }
     try {
       const res = await fetch(
         `/api/options?ticker=${encodeURIComponent(targetTicker)}${force ? "&force=true" : ""}`,

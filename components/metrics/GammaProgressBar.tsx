@@ -94,27 +94,27 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
           </div>
         </div>
 
-        {/* PUT WALL (Pink) */}
+        {/* PUT WALL (Standardized Purple) */}
         <div className="px-3">
           <div className="text-[10px] font-mono font-bold uppercase tracking-widest text-slate-400">
             PUT WALL
           </div>
-          <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#e879f9] tabular-nums">
+          <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#c084fc] tabular-nums">
             {hasLiveSpot && putWall > 0 ? putWall.toFixed(putWall % 1 !== 0 ? 2 : 0) : "—"}
           </div>
-          <div className="text-[11px] font-mono text-slate-400">
+          <div className="text-[11px] font-mono text-slate-400 tabular-nums">
             {hasLiveSpot && putWallGex !== undefined && putWallGex !== 0
               ? formatExposure(putWallGex)
               : "Highest -γ ≤ Spot"}
           </div>
         </div>
 
-        {/* ZERO Γ (White) */}
+        {/* ZERO Γ (Standardized Amber) */}
         <div className="pl-3">
           <div className="text-[10px] font-mono font-bold uppercase tracking-widest text-slate-400">
             ZERO Γ
           </div>
-          <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-white tabular-nums">
+          <div className="mt-0.5 text-lg sm:text-xl font-mono font-extrabold text-[#fbbf24] tabular-nums">
             {hasLiveSpot && hasZeroGammaFlip && zeroGamma > 0 ? zeroGamma.toFixed(1) : "—"}
           </div>
           <div className="text-[11px] font-mono text-slate-400">
@@ -136,7 +136,7 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
             ★ {displayKingPhrase}
           </span>
           {hasLiveSpot && hasZeroGammaFlip && zeroGamma > 0 && (
-            <span className="text-slate-400">
+            <span className="text-amber-300 tabular-nums">
               Zero γ: {zeroGamma.toFixed(1)}
             </span>
           )}
@@ -148,17 +148,17 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
             className="absolute top-0 -translate-x-1/2 transition-all duration-300 z-20 pointer-events-none"
             style={{ left: `${percentage}%` }}
           >
-            <div className="rounded-md bg-[#1c223a] border border-[#5e72e4] px-2 py-0.5 text-[10px] font-mono font-bold text-white shadow-[0_0_12px_rgba(94,114,228,0.8)] whitespace-nowrap">
+            <div className="rounded-md bg-[#1c223a] border border-[#5e72e4] px-2 py-0.5 text-[10px] font-mono font-bold text-white tabular-nums shadow-[0_0_12px_rgba(94,114,228,0.8)] whitespace-nowrap">
               {hasLiveSpot ? `$${effectiveSpot.toFixed(2)}` : "—"}
             </div>
           </div>
 
           {/* Purple-to-Teal Gradient Track */}
           <div className="relative h-3 w-full rounded-full bg-gradient-to-r from-[#581c87] via-[#1e293b] to-[#115e59] border border-[#243044] shadow-inner">
-            {/* Zero Gamma Vertical Tick Mark (div.zg) */}
+            {/* Zero Gamma Vertical Tick Mark (Amber) */}
             {showZgTick && (
               <div
-                className="absolute -top-1 -bottom-1 w-0.5 bg-white/85 z-10"
+                className="absolute -top-1 -bottom-1 w-0.5 bg-[#fbbf24] z-10"
                 style={{ left: `${zeroGammaPct}%` }}
                 title={`Zero γ ${zeroGamma.toFixed(1)}`}
               />
@@ -182,10 +182,10 @@ export function GammaProgressBar({ kingPhrase }: GammaProgressBarProps) {
         </div>
 
         {/* Footer: Put wall X | positionMessage | Call wall Z */}
-        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-slate-400 pt-1">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-slate-400 pt-1">
           <span>
             Put wall{" "}
-            <strong className="text-[#e879f9]">
+            <strong className="text-[#c084fc]">
               {hasLiveSpot && putWall > 0 ? putWall.toFixed(putWall % 1 !== 0 ? 2 : 0) : "—"}
             </strong>
           </span>

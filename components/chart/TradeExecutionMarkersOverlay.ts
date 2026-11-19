@@ -395,6 +395,32 @@ export function clampSpotToCandle(spot: number, candle: ChartCandleLike): number
   return Math.max(lo, Math.min(hi, spot));
 }
 
+/**
+ * Anchors the STC PnL badge Y-coordinate directly to `priceToY(closedSpotPrice)`
+ * (clamped to the exit candle's `[low, high]` and chart plot bounds).
+ */
+export function computeStcBadgeY(params: {
+  closedSpotPrice: number;
+  exitCandle: ChartCandleLike;
+  priceToY: (price: number) => number;
+  badgeH?: number;
+  padTop?: number;
+  plotBottomY?: number;
+}): { exitSpot: number; exitSpotY: number; badgeY: number } {
+  const {
+    closedSpotPrice,
+    exitCandle,
+    priceToY,
+    badgeH = 18,
+    padTop = 18,
+    plotBottomY = 9999,
+  } = params;
+  const exitSpot = clampSpotToCandle(closedSpotPrice, exitCandle);
+  const exitSpotY = Math.max(padTop + 4, Math.min(plotBottomY - 4, priceToY(exitSpot)));
+  const badgeY = Math.max(padTop + 2, Math.min(plotBottomY - badgeH - 2, exitSpotY - badgeH / 2));
+  return { exitSpot, exitSpotY, badgeY };
+}
+
 const extractCacheByCtx = new WeakMap<
   CanvasRenderingContext2D,
   {
@@ -445,6 +471,43 @@ export function drawTradeExecutionMarkers(
     extractCacheByCtx.set(ctx, { ticker, serverTrades, fsmSignals, result: trades });
   }
   if (trades.length === 0) return;
+
+  // Track occupied BTO/STC pill rectangles across trades so multi-leg labels never collide
+  const occupiedPillRects: Array<{ x: number; y: number; w: number; h: number }> = [];
+  const placeCanvasPillY = (
+    x: number,
+    rawY: number,
+    w: number,
+    h: number,
+    preferUp: boolean
+  ): number => {
+    const minY = padTop + 2;
+    const maxY = plotBottomY - h - 2;
+    const collides = (cy: number) =>
+      occupiedPillRects.some(
+        (r) => x < r.x + r.w + 3 && x + w + 3 > r.x && cy < r.y + r.h + 2 && cy + h + 2 > r.y
+      );
+    const clamped = Math.max(minY, Math.min(maxY, rawY));
+    if (!collides(clamped)) {
+      occupiedPillRects.push({ x, y: clamped, w, h });
+      return clamped;
+    }
+    const step = h + 4;
+    for (let k = 1; k <= 6; k++) {
+      const first = Math.max(minY, Math.min(maxY, clamped + (preferUp ? -k : k) * step));
+      if (!collides(first)) {
+        occupiedPillRects.push({ x, y: first, w, h });
+        return first;
+      }
+      const second = Math.max(minY, Math.min(maxY, clamped + (preferUp ? k : -k) * step));
+      if (!collides(second)) {
+        occupiedPillRects.push({ x, y: second, w, h });
+        return second;
+      }
+    }
+    occupiedPillRects.push({ x, y: clamped, w, h });
+    return clamped;
+  };
 
   for (const trade of trades) {
     const entryIdx = matchTradeToCandleIndex(
@@ -566,7 +629,7 @@ export function drawTradeExecutionMarkers(
         padLeft + 2,
         Math.min(plotRightX - pillW - 2, entryX - pillW / 2)
       );
-      const pillY = Math.max(padTop + 2, baseY - pillH - 3);
+      const pillY = placeCanvasPillY(pillX, baseY - pillH - 3, pillW, pillH, true);
 
       ctx.fillStyle = "rgba(15, 23, 42, 0.92)";
       ctx.strokeStyle = "#ef4444";
@@ -605,7 +668,7 @@ export function drawTradeExecutionMarkers(
         padLeft + 2,
         Math.min(plotRightX - pillW - 2, entryX - pillW / 2)
       );
-      const pillY = Math.min(plotBottomY - pillH - 2, baseY + 3);
+      const pillY = placeCanvasPillY(pillX, baseY + 3, pillW, pillH, false);
 
       ctx.fillStyle = "rgba(15, 23, 42, 0.92)";
       ctx.strokeStyle = "#10b981";
@@ -666,49 +729,6 @@ export function drawTradeExecutionMarkers(
         ctx.strokeStyle = "#ffffff";
         ctx.lineWidth = 1;
         ctx.stroke();
-
-        // Glowing PnL Badge right next to / below the STC marker
-        ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
-        const textW = ctx.measureText(badgeText).width;
-        const badgeW = Math.max(82, Math.ceil(textW + 16));
-        const badgeH = 18;
-
-        // Place right next to the STC triangle (or centered below if near right edge)
-        let bx = exitX + triHalfW + 5;
-        let by = hasClearanceBelow
-          ? Math.min(plotBottomY - badgeH - 2, tipY)
-          : Math.max(padTop + 2, baseY - 2);
-        if (bx + badgeW > plotRightX - 4) {
-          bx = Math.max(
-            padLeft + 2,
-            Math.min(plotRightX - badgeW - 2, exitX - badgeW / 2)
-          );
-          by = hasClearanceBelow
-            ? Math.min(plotBottomY - badgeH - 2, baseY + 3)
-            : Math.max(padTop + 2, baseY - badgeH - 3);
-        }
-
-        // Dark backing for readability over candles/ribbons, then glowing pill fill
-        ctx.fillStyle = "rgba(9, 13, 22, 0.88)";
-        ctx.beginPath();
-        ctx.roundRect(bx, by, badgeW, badgeH, 5);
-        ctx.fill();
-
-        ctx.fillStyle = stcFillBg;
-        ctx.strokeStyle = stcColor;
-        ctx.lineWidth = 1.4;
-        ctx.shadowColor = isProfit ? "rgba(16, 185, 129, 0.55)" : "rgba(239, 68, 68, 0.55)";
-        ctx.shadowBlur = 8;
-        ctx.beginPath();
-        ctx.roundRect(bx, by, badgeW, badgeH, 5);
-        ctx.fill();
-        ctx.stroke();
-
-        ctx.shadowBlur = 0;
-        ctx.fillStyle = stcColor;
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(badgeText, bx + badgeW / 2, by + badgeH / 2 + 0.5);
       } else {
         const tipY = Math.max(padTop + 20, exitYHigh - 5);
         const baseY = tipY - triH;
@@ -723,44 +743,52 @@ export function drawTradeExecutionMarkers(
         ctx.strokeStyle = "#ffffff";
         ctx.lineWidth = 1;
         ctx.stroke();
-
-        // Glowing PnL Badge right next to / above the STC marker
-        ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
-        const textW = ctx.measureText(badgeText).width;
-        const badgeW = Math.max(82, Math.ceil(textW + 16));
-        const badgeH = 18;
-
-        let bx = exitX + triHalfW + 5;
-        let by = Math.max(padTop + 2, baseY - 2);
-        if (bx + badgeW > plotRightX - 4) {
-          bx = Math.max(
-            padLeft + 2,
-            Math.min(plotRightX - badgeW - 2, exitX - badgeW / 2)
-          );
-          by = Math.max(padTop + 2, baseY - badgeH - 3);
-        }
-
-        ctx.fillStyle = "rgba(9, 13, 22, 0.88)";
-        ctx.beginPath();
-        ctx.roundRect(bx, by, badgeW, badgeH, 5);
-        ctx.fill();
-
-        ctx.fillStyle = stcFillBg;
-        ctx.strokeStyle = stcColor;
-        ctx.lineWidth = 1.4;
-        ctx.shadowColor = isProfit ? "rgba(16, 185, 129, 0.55)" : "rgba(239, 68, 68, 0.55)";
-        ctx.shadowBlur = 8;
-        ctx.beginPath();
-        ctx.roundRect(bx, by, badgeW, badgeH, 5);
-        ctx.fill();
-        ctx.stroke();
-
-        ctx.shadowBlur = 0;
-        ctx.fillStyle = stcColor;
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillText(badgeText, bx + badgeW / 2, by + badgeH / 2 + 0.5);
       }
+
+      // Anchor STC PnL badge Y-coordinate directly to priceToY(closedSpotPrice) clamped to exit bar [low, high]
+      ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
+      const textW = ctx.measureText(badgeText).width;
+      const badgeW = Math.max(82, Math.ceil(textW + 16));
+      const badgeH = 18;
+      const { badgeY } = computeStcBadgeY({
+        closedSpotPrice: trade.closedSpotPrice ?? exitCandle.close,
+        exitCandle,
+        priceToY,
+        badgeH,
+        padTop,
+        plotBottomY,
+      });
+
+      let bx = exitX + triHalfW + 5;
+      if (bx + badgeW > plotRightX - 4) {
+        bx = Math.max(
+          padLeft + 2,
+          Math.min(plotRightX - badgeW - 2, exitX - badgeW - triHalfW - 5)
+        );
+      }
+      const by = placeCanvasPillY(bx, badgeY, badgeW, badgeH, !isPut);
+
+      // Dark backing for readability over candles/ribbons, then glowing pill fill
+      ctx.fillStyle = "rgba(9, 13, 22, 0.88)";
+      ctx.beginPath();
+      ctx.roundRect(bx, by, badgeW, badgeH, 5);
+      ctx.fill();
+
+      ctx.fillStyle = stcFillBg;
+      ctx.strokeStyle = stcColor;
+      ctx.lineWidth = 1.4;
+      ctx.shadowColor = isProfit ? "rgba(16, 185, 129, 0.55)" : "rgba(239, 68, 68, 0.55)";
+      ctx.shadowBlur = 8;
+      ctx.beginPath();
+      ctx.roundRect(bx, by, badgeW, badgeH, 5);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = stcColor;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(badgeText, bx + badgeW / 2, by + badgeH / 2 + 0.5);
       ctx.restore();
     }
   }

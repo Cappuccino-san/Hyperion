@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
 import { readHistoricalSessions, getPersistenceCacheDir } from "@/lib/persistenceStore";
+import { computeTradeRealizedPnl } from "@/lib/execution/pnlAccounting";
+import { optionsMemoryCache } from "@/lib/marketCache";
 
 export const dynamic = "force-dynamic";
 
@@ -92,37 +94,14 @@ async function buildRollingPortfolioSummary(): Promise<PortfolioRecapSummary> {
 
       for (const p of closed) {
         const raw = p as unknown as Record<string, unknown>;
-        const qty = Number(p.contractsQty) || 1;
-        const entryPx =
-          firstPositiveNum(
-            raw.btoOptionAsk,
-            p.optionAsk,
-            raw.btoPrice,
-            p.btoOptionMid,
-            raw.btoMid
-          ) ?? 0.5;
-        const exitPx =
-          firstFiniteNum(raw.closedOptionBid, raw.stcPrice, p.closedOptionMid) ?? 0;
-        const outlay =
-          entryPx > 0
-            ? Number((entryPx * 100 * qty).toFixed(2))
-            : Number(p.totalOutlay ?? 0);
-        const realizedDollarPnl = Number(
-          (
-            firstFiniteNum(raw.realizedPnlDollars, raw.pnlDollars) ??
-            (exitPx - entryPx) * 100 * qty
-          ).toFixed(2)
-        );
-        const pnlOptionPct = Number(
-          (
-            firstFiniteNum(p.pnlOptionPct, raw.realizedPnlPct) ??
-            (entryPx > 0 ? ((exitPx - entryPx) / entryPx) * 100 : 0)
-          ).toFixed(1)
-        );
-        const riskDollars = Math.max(10, outlay * 0.25);
-        const rMultiple = Number(
-          (firstFiniteNum(raw.realizedR) ?? realizedDollarPnl / riskDollars).toFixed(2)
-        );
+        const pnl = computeTradeRealizedPnl(p);
+        const qty = pnl.contractsQty;
+        const entryPx = pnl.entryPrice;
+        const exitPx = pnl.exitPrice;
+        const outlay = pnl.outlay;
+        const realizedDollarPnl = pnl.realizedDollarPnl;
+        const pnlOptionPct = pnl.pnlOptionPct;
+        const rMultiple = pnl.rMultiple;
 
         if (realizedDollarPnl > 0) dayWins++;
         else if (realizedDollarPnl < 0) dayLosses++;
@@ -240,6 +219,151 @@ async function buildRollingPortfolioSummary(): Promise<PortfolioRecapSummary> {
   };
 }
 
+function buildLiveStructuralRecapTickers(dayIso: string, cacheDir: string) {
+  const result: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  const intradayPath = path.join(cacheDir, `intraday-${dayIso}.json`);
+
+  const countMoves = (vals: number[]): number => {
+    let moves = 0;
+    let prev: number | null = null;
+    for (const v of vals) {
+      if (!Number.isFinite(v) || v <= 0) continue;
+      if (prev !== null && Math.abs(v - prev) > 0.01) moves++;
+      prev = v;
+    }
+    return moves;
+  };
+
+  if (fs.existsSync(intradayPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(intradayPath, "utf-8"));
+      const tickersMap = parsed?.tickers ?? {};
+      for (const [symRaw, entry] of Object.entries(tickersMap)) {
+        const sym = symRaw.toUpperCase();
+        const tEntry = entry as {
+          rthHistory?: Array<{ ts: number; spot: number; cw?: number; pw?: number; zg?: number; callWall?: number; putWall?: number; zeroGamma?: number; king?: number }>;
+          history?: Array<{ ts: number; spot: number; cw?: number; pw?: number; zg?: number; callWall?: number; putWall?: number; zeroGamma?: number; king?: number }>;
+        };
+        const pts = (tEntry?.rthHistory?.length ? tEntry.rthHistory : tEntry?.history) ?? [];
+        if (pts.length === 0) continue;
+        seen.add(sym);
+
+        const first = pts[0];
+        const last = pts[pts.length - 1];
+        const cached = optionsMemoryCache.get(sym)?.payload;
+        const cws = pts.map((p) => p.callWall || p.cw || 0).filter((v) => v > 0);
+        const pws = pts.map((p) => p.putWall || p.pw || 0).filter((v) => v > 0);
+        const zgs = pts.map((p) => p.zeroGamma || p.zg || 0).filter((v) => v > 0);
+        const kings = pts.map((p) => p.king || 0).filter((v) => v > 0);
+
+        const closePx = cached?.spotPrice ?? last.spot;
+        const prevClose = cached?.previousClose ?? first.spot;
+        const nextCw = cached?.gammaLevelsByFilter?.["0DTE"]?.callWall ?? cached?.gammaLevels?.callWall ?? (cws[cws.length - 1] || null);
+        const nextPw = cached?.gammaLevelsByFilter?.["0DTE"]?.putWall ?? cached?.gammaLevels?.putWall ?? (pws[pws.length - 1] || null);
+        const nextZg = cached?.gammaLevelsByFilter?.["0DTE"]?.zeroGamma ?? cached?.gammaLevels?.zeroGamma ?? (zgs[zgs.length - 1] || null);
+        const nextGk = cached?.kingNode?.allExpKing ?? (kings[kings.length - 1] || 0);
+        const dailyEm = cached?.expectedMoves?.daily;
+
+        result.push({
+          label: sym,
+          symbol: sym,
+          as_of: dayIso,
+          prev_close: prevClose,
+          open: first.spot,
+          close: closePx,
+          session: {
+            tracked: true,
+            first_ts: first.ts,
+            gk: {
+              start: kings[0] ?? (nextGk || null),
+              end: kings[kings.length - 1] ?? (nextGk || null),
+              moves: countMoves(kings),
+            },
+            cw: {
+              open: cws[0] ?? null,
+              close: cws[cws.length - 1] ?? null,
+              moves: countMoves(cws),
+            },
+            pw: {
+              open: pws[0] ?? null,
+              close: pws[pws.length - 1] ?? null,
+              moves: countMoves(pws),
+            },
+            zg: {
+              open: zgs[0] ?? null,
+              close: zgs[zgs.length - 1] ?? null,
+            },
+          },
+          next: {
+            date: dayIso,
+            ...(nextGk > 0 ? { gk: [nextGk, cached?.kingNode?.kingValue ?? 0] } : {}),
+            cw: nextCw,
+            pw: nextPw,
+            zg: nextZg,
+            ...(dailyEm
+              ? {
+                  em: {
+                    exp: dailyEm.exp,
+                    atm: Math.round(closePx),
+                    move: dailyEm.em,
+                    low: dailyEm.low,
+                    high: dailyEm.high,
+                  },
+                }
+              : {}),
+          },
+        });
+      }
+    } catch {
+      // Non-fatal malformed intraday cache
+    }
+  }
+
+  // Also include warm core tickers from optionsMemoryCache not yet in intraday history
+  for (const sym of ["SPY", "QQQ", "IWM", "SPXW"]) {
+    if (seen.has(sym)) continue;
+    const cached = optionsMemoryCache.get(sym)?.payload;
+    if (!cached || cached.strikes.length === 0) continue;
+    const dailyEm = cached.expectedMoves?.daily;
+    result.push({
+      label: sym,
+      symbol: sym,
+      as_of: dayIso,
+      prev_close: cached.previousClose,
+      open: cached.previousClose,
+      close: cached.spotPrice,
+      session: {
+        tracked: true,
+        gk: { start: cached.kingNode.allExpKing, end: cached.kingNode.allExpKing, moves: 0 },
+        cw: { open: cached.gammaLevels.callWall, close: cached.gammaLevels.callWall, moves: 0 },
+        pw: { open: cached.gammaLevels.putWall, close: cached.gammaLevels.putWall, moves: 0 },
+        zg: { open: cached.gammaLevels.zeroGamma, close: cached.gammaLevels.zeroGamma },
+      },
+      next: {
+        date: dayIso,
+        gk: [cached.kingNode.allExpKing, cached.kingNode.kingValue ?? 0],
+        cw: cached.gammaLevelsByFilter?.["0DTE"]?.callWall ?? cached.gammaLevels.callWall,
+        pw: cached.gammaLevelsByFilter?.["0DTE"]?.putWall ?? cached.gammaLevels.putWall,
+        zg: cached.gammaLevelsByFilter?.["0DTE"]?.zeroGamma ?? cached.gammaLevels.zeroGamma,
+        ...(dailyEm
+          ? {
+              em: {
+                exp: dailyEm.exp,
+                atm: Math.round(cached.spotPrice),
+                move: dailyEm.em,
+                low: dailyEm.low,
+                high: dailyEm.high,
+              },
+            }
+          : {}),
+      },
+    });
+  }
+
+  return result;
+}
+
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
@@ -248,21 +372,20 @@ export async function GET(req: Request) {
 
     const portfolio = await buildRollingPortfolioSummary();
     const cacheDir = getPersistenceCacheDir();
-    const possiblePaths = [
-      ...(requestedDay
-        ? [
-            path.resolve(process.cwd(), `scratch/terrashade/api_recap_${requestedDay}.json`),
-            path.join(cacheDir, `terrashade/api_recap_${requestedDay}.json`),
-          ]
-        : []),
-      path.resolve(process.cwd(), "scratch/terrashade/api_recap.json"),
-      path.join(cacheDir, "terrashade/api_recap.json"),
-      ...(process.env.SESSION_RECAP_PATH ? [path.resolve(process.env.SESSION_RECAP_PATH)] : []),
-    ];
 
-    for (const p of possiblePaths) {
-      if (fs.existsSync(p)) {
-        const parsed = JSON.parse(fs.readFileSync(p, "utf-8"));
+    const latestDay =
+      requestedDay ||
+      portfolio.daysWithTrades[portfolio.daysWithTrades.length - 1] ||
+      new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+
+    // Synthesize live structural recap directly from Hyperion's intraday ledger + closing options book
+    const liveTickers = buildLiveStructuralRecapTickers(latestDay, cacheDir);
+
+    // Optional explicit SESSION_RECAP_PATH override (no silent offline terrashade fallback)
+    if (liveTickers.length === 0 && process.env.SESSION_RECAP_PATH) {
+      const envPath = path.resolve(process.env.SESSION_RECAP_PATH);
+      if (fs.existsSync(envPath)) {
+        const parsed = JSON.parse(fs.readFileSync(envPath, "utf-8"));
         if (!requestedDay || parsed?.day === requestedDay || parsed?.recap?.day === requestedDay) {
           return NextResponse.json(
             { ...parsed, portfolio },
@@ -272,11 +395,6 @@ export async function GET(req: Request) {
       }
     }
 
-    const latestDay =
-      requestedDay ||
-      portfolio.daysWithTrades[portfolio.daysWithTrades.length - 1] ||
-      new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-
     return NextResponse.json(
       {
         days: portfolio.daysWithTrades.length > 0 ? portfolio.daysWithTrades : [latestDay],
@@ -285,7 +403,7 @@ export async function GET(req: Request) {
           day: latestDay,
           built_at: Math.floor(Date.now() / 1000),
           next_date: latestDay,
-          tickers: [],
+          tickers: liveTickers,
         },
         portfolio,
       },

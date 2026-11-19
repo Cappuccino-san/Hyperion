@@ -154,7 +154,7 @@ export function MetricsRow() {
                 "rounded-full px-2 py-0.5 text-[10px] font-mono font-bold",
                 isLongSecond
                   ? "bg-emerald-500/15 text-emerald-300 border border-emerald-400/40"
-                  : "bg-amber-500/15 text-amber-300 border border-amber-400/40"
+                  : "bg-rose-500/15 text-rose-300 border border-rose-400/40"
               )}
             >
               {isLongSecond ? `+${altMetric} Flow` : `-${altMetric} Flow`}
@@ -164,7 +164,7 @@ export function MetricsRow() {
             <div
               className={cn(
                 "text-2xl sm:text-3xl font-mono font-extrabold tabular-nums",
-                isLongSecond ? "text-emerald-400" : "text-amber-400"
+                isLongSecond ? "text-emerald-400" : "text-rose-400"
               )}
             >
               {formatExposure(safeSecondValueM)}
@@ -200,7 +200,7 @@ export function MetricsRow() {
           </div>
 
           {/* 3-King Horizon Reference Row */}
-          <div className="text-[11px] font-mono text-slate-400 truncate">
+          <div className="text-[11px] font-mono tabular-nums text-slate-400 leading-snug break-words">
             {allExpKing > 0 ? (
               <>
                 {firstTierLabel} {fmtStrike(zeroDteKing)} ({zeroDteDate}) · Week{" "}

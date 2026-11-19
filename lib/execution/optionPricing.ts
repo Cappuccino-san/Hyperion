@@ -8,6 +8,8 @@ import {
 } from "@/lib/flowGammaVwap";
 import { getTodayEt, getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
 import { fetchLiveTickQuote } from "@/lib/liveTick";
+import { isMarketOpen } from "@/lib/marketDataService";
+import { computeLocalMtfDivergence } from "@/lib/divergenceDetector";
 import {
   Candle5m,
   DivergenceDirection,
@@ -437,7 +439,11 @@ export function clampOptionPriceToGreekEnvelope(
   const dirSpotMove = (currentSpot - entrySpot) * (isCall ? 1 : -1);
   const effectiveDelta = Math.min(0.8, Math.max(0.25, baseEntry / 1.8));
   const minDelta = Math.min(0.2, effectiveDelta * 0.45);
-  const thetaDecay = Math.min(baseEntry * 0.15, Math.max(0, elapsedMinutes) * 0.0012);
+  const maxThetaAllowance = Math.min(
+    baseEntry * 0.65,
+    Math.max(baseEntry * 0.15, Math.max(0, elapsedMinutes) * 0.0045)
+  );
+  const thetaDecay = Math.min(maxThetaAllowance, Math.max(0, elapsedMinutes) * 0.0045);
   const minMoveEps = Math.max(0.02, Math.max(1, entrySpot) * 0.00003);
   const gammaScale = 750 / Math.max(1, entrySpot);
 
@@ -458,7 +464,7 @@ export function clampOptionPriceToGreekEnvelope(
   const maxGainDelta =
     effectiveDelta * posMove + 0.06 * gammaScale * posMove * posMove + 0.02;
   const minGainDelta = Math.max(
-    -0.08 * baseEntry,
+    -Math.max(0.08 * baseEntry, thetaDecay),
     minDelta * dirSpotMove - thetaDecay
   );
   const rawDeltaV = rawCurrentOptionPrice - baseEntry;
@@ -519,7 +525,11 @@ export async function fetchLiveCboeOptions(
     const data = json?.data;
     if (!data) return cached?.contracts ?? [];
 
-    const cboeSpot = Number(data.current_price ?? data.close ?? 0);
+    const marketOpenNow = isMarketOpen().open;
+    const cboeClose = Number(data.close ?? data.current_price ?? 0);
+    const cboeSpot = marketOpenNow
+      ? Number(data.current_price ?? data.close ?? 0)
+      : cboeClose;
     const tickSym =
       sym === "SPX" || sym === "SPXW"
         ? "SPX"
@@ -527,10 +537,13 @@ export async function fetchLiveCboeOptions(
           ? "NDX"
           : sym;
 
-    const liveQuote = await fetchLiveTickQuote(tickSym).catch(() => null);
+    const liveQuote = marketOpenNow
+      ? await fetchLiveTickQuote(tickSym).catch(() => null)
+      : null;
     if (signal?.aborted) return cached?.contracts ?? [];
 
-    const effectiveSpot = liveQuote && liveQuote.spot > 0 ? liveQuote.spot : cboeSpot;
+    const effectiveSpot =
+      marketOpenNow && liveQuote && liveQuote.spot > 0 ? liveQuote.spot : cboeSpot;
     if (effectiveSpot > 0) {
       setBoundedMapEntry(spotPriceCache, cboeSymbol, effectiveSpot);
       if (cboeSymbol === "_SPX") {
@@ -646,7 +659,7 @@ export async function fetchLive5mCandleAndDivergence(
   const yahooSym = sym === "SPX" || sym === "SPXW" ? "^GSPC" : sym === "NDX" || sym === "NDXP" ? "^NDX" : sym;
   try {
     const res = await fetch(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=5m&range=2d&includePrePost=false`,
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=5m&range=2d&includePrePost=true`,
       {
         headers: {
           Accept: "application/json",
@@ -687,33 +700,27 @@ export async function fetchLive5mCandleAndDivergence(
           }
         }
 
-        if (validBars.length >= 2) {
-          const latest = validBars[validBars.length - 1];
-          const prevClosedBar = validBars[validBars.length - 2];
+        // Strict causal bar hygiene: drop any currently forming 5m candle so BTO signals,
+        // Flow VWAP, SMA34, and 5m/30m divergences evaluate exclusively on closed bars (zero mid-bar leakage).
+        const nowSec = Math.floor(Date.now() / 1000);
+        const closedBars =
+          validBars.length >= 3 && nowSec < validBars[validBars.length - 1].timestamp + 300
+            ? validBars.slice(0, -1)
+            : validBars;
 
-          const tickSym =
-            sym === "SPX" || sym === "SPXW"
-              ? "SPX"
-              : sym === "NDX" || sym === "NDXP"
-                ? "NDX"
-                : sym;
-          const liveQuote = await fetchLiveTickQuote(tickSym).catch(() => null);
-          if (liveQuote && liveQuote.spot > 0) {
-            const liveP = Number(liveQuote.spot.toFixed(2));
-            latest.close = liveP;
-            latest.high = Math.max(latest.high, liveP);
-            latest.low = Math.min(latest.low, liveP);
-          }
+        if (closedBars.length >= 2) {
+          const latest = closedBars[closedBars.length - 1];
+          const prevClosedBar = closedBars[closedBars.length - 2];
 
-          const startIdx = Math.max(0, validBars.length - 34);
+          const startIdx = Math.max(0, closedBars.length - 34);
           let sum = 0;
           let count = 0;
-          for (let k = startIdx; k < validBars.length; k++) {
-            sum += validBars[k].close;
+          for (let k = startIdx; k < closedBars.length; k++) {
+            sum += closedBars[k].close;
             count++;
           }
           const sma34 = Number((sum / Math.max(1, count)).toFixed(2));
-          const sessionSlice = validBars.slice(Math.max(0, validBars.length - 78));
+          const sessionSlice = closedBars.slice(Math.max(0, closedBars.length - 78));
           const flowSeries = computeBarFlowGammaVwapSeries(
             sessionSlice,
             options?.contracts,
@@ -731,6 +738,21 @@ export async function fetchLive5mCandleAndDivergence(
             prevHigh: Number(prevClosedBar.high.toFixed(2)),
             flowSnapshot,
           };
+
+          // Local non-repainting 3L/3R RSI+MACD divergence (zero terrashade.onrender.com dependency)
+          const localDiv = computeLocalMtfDivergence(
+            closedBars.map((b) => ({
+              ts: b.timestamp,
+              open: b.open,
+              high: b.high,
+              low: b.low,
+              close: b.close,
+              volume: b.volume,
+            })),
+            latest.timestamp
+          );
+          divergence5m = localDiv.divergence5m;
+          divergence30m = localDiv.divergence30m;
         }
       }
     }
@@ -740,30 +762,6 @@ export async function fetchLive5mCandleAndDivergence(
 
   if (signal?.aborted) {
     return { candle: null, divergence5m: "NO", divergence30m: "NO" };
-  }
-
-  try {
-    const divSym = sym === "SPX" ? "SPXW" : sym;
-    const divRes = await fetch(`https://terrashade.onrender.com/api/divergence?symbol=${encodeURIComponent(divSym)}`, {
-      headers: { Accept: "application/json" },
-      cache: "no-store",
-      signal,
-    });
-    if (divRes.ok) {
-      const divData = await divRes.json();
-      const row5m = divData?.rows?.find((r: { tf?: string; name?: string }) => r.tf === "5" || r.name === "5m");
-      const row30m = divData?.rows?.find((r: { tf?: string; name?: string }) => r.tf === "30" || r.name === "30m");
-      if (row5m) {
-        if (row5m.state === "BULL" || row5m.signal?.type === "bull") divergence5m = "BULL";
-        else if (row5m.state === "BEAR" || row5m.signal?.type === "bear") divergence5m = "BEAR";
-      }
-      if (row30m) {
-        if (row30m.state === "BULL" || row30m.signal?.type === "bull") divergence30m = "BULL";
-        else if (row30m.state === "BEAR" || row30m.signal?.type === "bear") divergence30m = "BEAR";
-      }
-    }
-  } catch {
-    // Non-fatal
   }
 
   if (candle) {

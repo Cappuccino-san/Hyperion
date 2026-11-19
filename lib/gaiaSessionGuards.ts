@@ -31,6 +31,131 @@ export const EARLY_CLOSES_2026: Readonly<Record<string, number>> = {
   "2026-12-24": 780, // Christmas Eve: 13:00 ET close
 };
 
+function isoDateUtc(year: number, month1Based: number, day: number): string {
+  const dt = new Date(Date.UTC(year, month1Based - 1, day));
+  return dt.toISOString().slice(0, 10);
+}
+
+function nthWeekdayOfMonthUtc(year: number, month1Based: number, weekday: number, nth: number): string {
+  const firstDow = new Date(Date.UTC(year, month1Based - 1, 1)).getUTCDay();
+  const offset = (weekday - firstDow + 7) % 7;
+  const day = 1 + offset + (nth - 1) * 7;
+  return isoDateUtc(year, month1Based, day);
+}
+
+function lastWeekdayOfMonthUtc(year: number, month1Based: number, weekday: number): string {
+  const lastDay = new Date(Date.UTC(year, month1Based, 0));
+  const diff = (lastDay.getUTCDay() - weekday + 7) % 7;
+  return isoDateUtc(year, month1Based, lastDay.getUTCDate() - diff);
+}
+
+/** Anonymous Gregorian Easter algorithm -> returns Good Friday (Easter Sunday - 2 days). */
+function computeGoodFridayIso(year: number): string {
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const easterMonth = Math.floor((h + l - 7 * m + 114) / 31);
+  const easterDay = ((h + l - 7 * m + 114) % 31) + 1;
+  const easterMs = Date.UTC(year, easterMonth - 1, easterDay);
+  return new Date(easterMs - 2 * 86_400_000).toISOString().slice(0, 10);
+}
+
+function observedFixedHolidayIso(year: number, month1Based: number, day: number): string | null {
+  const dt = new Date(Date.UTC(year, month1Based - 1, day));
+  const dow = dt.getUTCDay();
+  if (dow === 6) {
+    // Saturday -> observed Friday (note: Jan 1 on Saturday is observed Dec 31 of prior year on NYSE,
+    // which is handled by checking Dec 31 when year+1 Jan 1 is Saturday)
+    if (month1Based === 1 && day === 1) return null;
+    return new Date(dt.getTime() - 86_400_000).toISOString().slice(0, 10);
+  }
+  if (dow === 0) {
+    return new Date(dt.getTime() + 86_400_000).toISOString().slice(0, 10);
+  }
+  return isoDateUtc(year, month1Based, day);
+}
+
+interface NyseYearCalendar {
+  holidays: Set<string>;
+  earlyCloses: Record<string, number>;
+}
+
+const nyseCalendarCache = new Map<number, NyseYearCalendar>();
+
+/**
+ * Multi-year algorithmic NYSE equity-options holiday & 13:00 ET early-close calendar (works for 2025-2035+).
+ */
+export function getNyseCalendarForYear(year: number): NyseYearCalendar {
+  const cached = nyseCalendarCache.get(year);
+  if (cached) return cached;
+
+  const holidays = new Set<string>();
+  const add = (iso: string | null) => {
+    if (iso) holidays.add(iso);
+  };
+
+  // Fixed / observed holidays
+  add(observedFixedHolidayIso(year, 1, 1)); // New Year's Day
+  // If next year's Jan 1 falls on Saturday, NYSE closes Friday Dec 31 of current year
+  if (new Date(Date.UTC(year + 1, 0, 1)).getUTCDay() === 6) {
+    holidays.add(isoDateUtc(year, 12, 31));
+  }
+  add(nthWeekdayOfMonthUtc(year, 1, 1, 3)); // MLK Jr. Day (3rd Mon Jan)
+  add(nthWeekdayOfMonthUtc(year, 2, 1, 3)); // Presidents' Day (3rd Mon Feb)
+  add(computeGoodFridayIso(year)); // Good Friday
+  add(lastWeekdayOfMonthUtc(year, 5, 1)); // Memorial Day (last Mon May)
+  if (year >= 2022) add(observedFixedHolidayIso(year, 6, 19)); // Juneteenth
+  add(observedFixedHolidayIso(year, 7, 4)); // Independence Day
+  add(nthWeekdayOfMonthUtc(year, 9, 1, 1)); // Labor Day (1st Mon Sep)
+  const thanksgivingIso = nthWeekdayOfMonthUtc(year, 11, 4, 4); // 4th Thu Nov
+  add(thanksgivingIso);
+  add(observedFixedHolidayIso(year, 12, 25)); // Christmas Day
+
+  // 13:00 ET (780m) early closes
+  const earlyCloses: Record<string, number> = {};
+  const maybeAddEarlyClose = (iso: string) => {
+    const [yy, mm, dd] = iso.split("-").map(Number);
+    const dow = new Date(Date.UTC(yy, mm - 1, dd)).getUTCDay();
+    if (dow >= 1 && dow <= 5 && !holidays.has(iso)) {
+      earlyCloses[iso] = 780;
+    }
+  };
+
+  // Day before Independence Day (July 3) if Mon-Fri and not already observed holiday
+  maybeAddEarlyClose(isoDateUtc(year, 7, 3));
+  // Day after Thanksgiving (Black Friday)
+  const blackFridayMs = Date.parse(`${thanksgivingIso}T00:00:00Z`) + 86_400_000;
+  maybeAddEarlyClose(new Date(blackFridayMs).toISOString().slice(0, 10));
+  // Christmas Eve (Dec 24) if Mon-Fri and not already observed holiday
+  maybeAddEarlyClose(isoDateUtc(year, 12, 24));
+
+  const cal: NyseYearCalendar = { holidays, earlyCloses };
+  nyseCalendarCache.set(year, cal);
+  return cal;
+}
+
+export function isNyseHoliday(dateIso: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateIso)) return false;
+  const year = Number(dateIso.slice(0, 4));
+  return getNyseCalendarForYear(year).holidays.has(dateIso);
+}
+
+export function getNyseEarlyCloseMins(dateIso: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateIso)) return null;
+  const year = Number(dateIso.slice(0, 4));
+  const mins = getNyseCalendarForYear(year).earlyCloses[dateIso];
+  return typeof mins === "number" ? mins : null;
+}
+
 export interface SessionBoundsEt {
   sessionDate: string;
   isTradingDay: boolean;
@@ -55,9 +180,9 @@ export function getSessionBoundsEt(etDate?: string): SessionBoundsEt {
     etDate && /^\d{4}-\d{2}-\d{2}$/.test(etDate) ? etDate : getTodayEt();
   const [y, m, d] = sessionDate.split("-").map(Number);
   const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
-  const isHoliday = HOLIDAYS_2026.has(sessionDate);
+  const isHoliday = isNyseHoliday(sessionDate);
   const isTradingDay = dow !== 0 && dow !== 6 && !isHoliday;
-  const earlyCloseMins = EARLY_CLOSES_2026[sessionDate];
+  const earlyCloseMins = getNyseEarlyCloseMins(sessionDate);
   const isEarlyClose = typeof earlyCloseMins === "number";
 
   if (isEarlyClose) {

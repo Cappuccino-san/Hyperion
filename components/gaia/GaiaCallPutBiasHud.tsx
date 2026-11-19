@@ -267,6 +267,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const activeSymbol = (symbol || ticker || "SPY").trim().toUpperCase() || "SPY";
   const storeActiveTicker = useDashboardStore((s) => s.activeTicker);
   const storeSupervisorPolicy = useDashboardStore((s) => s.supervisorPolicy);
+  const executionArmState = useDashboardStore((s) => s.executionArmState);
   const liveTickPrice = useDashboardStore((s) => s.liveTickPrice);
   const liveTickCount = useDashboardStore((s) => s.liveTickCount);
   const gammaLevels = useDashboardStore((s) => s.gammaLevels);
@@ -514,7 +515,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         : 980;
   const svgHeight = 440;
   const padLeft = 24;
-  const padRight = 96; // Room for right Y-axis price labels
+  const padRight = 116; // Matches GaiaView CHART_RIGHT_AXIS_WIDTH for 1:1 gutter alignment
   const padTop = 36;
   const chartBottom = 265;
   const ribbonTop = 290;
@@ -774,9 +775,16 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   }, [enrichedPoints, sigma1Move]);
 
   // STAGE 1: Pure Data-Space Signal Engine (Strictly Viewport-Invariant: S ⊥ V)
-  // Never recomputes when the user zooms or pans the X/Y axes.
+  // Cache closed-bar FSM evaluation so 800ms intra-bar ticks don't re-run full session FSM
+  const closedFsmKey = useMemo(() => {
+    if (!enrichedPoints || enrichedPoints.length < 3) return "";
+    const lastClosedIdx = enrichedPoints.length - 2;
+    const lc = enrichedPoints[lastClosedIdx];
+    return `${activeSymbol}|${storeActiveTicker}|${isReplayMode ? 1 : 0}|${enrichedPoints.length}|${lc?.timestamp ?? 0}|${lc?.close ?? 0}|${activeRegime}|${gammaLevels?.zeroGamma ?? 0}|${gammaLevels?.callWall ?? 0}|${gammaLevels?.putWall ?? 0}|${netMetrics?.netGex ?? 0}`;
+  }, [enrichedPoints, activeSymbol, storeActiveTicker, isReplayMode, activeRegime, gammaLevels?.zeroGamma, gammaLevels?.callWall, gammaLevels?.putWall, netMetrics?.netGex]);
+
   const fsmEvaluation = useMemo(() => {
-    if (!enrichedPoints || enrichedPoints.length < 3) {
+    if (!enrichedPoints || enrichedPoints.length < 3 || !closedFsmKey) {
       return { signals: [], committedState: "STAND_ASIDE" as const };
     }
 
@@ -830,7 +838,10 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       };
     });
 
-    // Causal bar-by-bar evaluation (zero lookahead from future RTH highs/lows or end-of-slice activeRegime)
+    // Use authoritative structural walls from live book whenever available for this symbol (including Replay)
+    const hasMatchingWalls =
+      storeActiveTicker.toUpperCase() === activeSymbol &&
+      Boolean(gammaLevels && (gammaLevels.callWall > 0 || gammaLevels.putWall > 0));
     let causalLow = Infinity;
     let causalHigh = -Infinity;
     const nowEpochSec = Math.floor(Date.now() / 1000);
@@ -845,15 +856,15 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       const refHigh = Number.isFinite(causalHigh) ? causalHigh : pt.high;
       const spotScale = Math.max(0.01, pt.close * 0.002);
       const resolvedPutWall =
-        !isReplayMode && gammaLevels?.putWall && gammaLevels.putWall > 0
+        hasMatchingWalls && gammaLevels?.putWall && gammaLevels.putWall > 0
           ? gammaLevels.putWall
           : Number(refLow.toFixed(2));
       const resolvedCallWall =
-        !isReplayMode && gammaLevels?.callWall && gammaLevels.callWall > 0
+        hasMatchingWalls && gammaLevels?.callWall && gammaLevels.callWall > 0
           ? gammaLevels.callWall
           : Number(((refLow + refHigh) / 2 + spotScale).toFixed(2));
       const resolvedZg =
-        !isReplayMode && gammaLevels?.zeroGamma && gammaLevels.zeroGamma > 0
+        hasMatchingWalls && gammaLevels?.zeroGamma && gammaLevels.zeroGamma > 0
           ? gammaLevels.zeroGamma
           : Number((refHigh + spotScale * 1.5).toFixed(2));
       const disp = computeCausalEquilibriumDispersion(bars, i);
@@ -865,7 +876,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         {
           macroRegime: barRegime,
           callDominancePct: Math.round(pt.chi * 100),
-          netGex: !isReplayMode && typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
+          netGex: hasMatchingWalls && typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
           structuralLevels: {
             zeroGamma: resolvedZg,
             callWall: resolvedCallWall,
@@ -885,21 +896,21 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     const lastRefHigh = Number.isFinite(causalHigh) ? causalHigh : (lastPtRef?.high ?? 0);
     const lastSpotScale = Math.max(0.01, (lastPtRef?.close ?? 0) * 0.002);
     const finalPutWall =
-      !isReplayMode && gammaLevels?.putWall && gammaLevels.putWall > 0
+      hasMatchingWalls && gammaLevels?.putWall && gammaLevels.putWall > 0
         ? gammaLevels.putWall
         : Number(lastRefLow.toFixed(2));
     const finalCallWall =
-      !isReplayMode && gammaLevels?.callWall && gammaLevels.callWall > 0
+      hasMatchingWalls && gammaLevels?.callWall && gammaLevels.callWall > 0
         ? gammaLevels.callWall
         : Number(((lastRefLow + lastRefHigh) / 2 + lastSpotScale).toFixed(2));
     const finalZg =
-      !isReplayMode && gammaLevels?.zeroGamma && gammaLevels.zeroGamma > 0
+      hasMatchingWalls && gammaLevels?.zeroGamma && gammaLevels.zeroGamma > 0
         ? gammaLevels.zeroGamma
         : Number((lastRefHigh + lastSpotScale * 1.5).toFixed(2));
     const snapshot = fsm.getSnapshot(unclosedBar, lastDisp, {
       macroRegime: activeRegime,
       callDominancePct: activeChiPct,
-      netGex: !isReplayMode && typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
+      netGex: hasMatchingWalls && typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
       structuralLevels: {
         zeroGamma: finalZg,
         callWall: finalCallWall,
@@ -1000,7 +1011,8 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
     signals.sort((a, b) => a.barIndex - b.barIndex);
     return { signals, committedState: snapshot.committedState };
-  }, [enrichedPoints, activeRegime, activeChiPct, isReplayMode, gammaLevels?.zeroGamma, gammaLevels?.callWall, gammaLevels?.putWall, netMetrics?.netGex]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [closedFsmKey]);
 
   const { signals: intrinsicSignals, committedState: fsmCommittedState } = fsmEvaluation;
 
@@ -1202,6 +1214,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     const todayEt = getTodayEt();
     if (
       isReplayMode ||
+      executionArmState === "LOCKED" ||
       (sessionDate && sessionDate !== todayEt) ||
       !activeSymbol ||
       effectiveCandles.length === 0 ||
@@ -1245,7 +1258,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       })
       .catch(() => {});
     return () => controller.abort();
-  }, [isReplayMode, sessionDate, activeSymbol, effectiveCandles.length, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, latestPt?.impulseChi, gammaLevels?.zeroGamma]);
+  }, [isReplayMode, executionArmState, sessionDate, activeSymbol, effectiveCandles.length, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, latestPt?.impulseChi, gammaLevels?.zeroGamma]);
 
   const invalidateSvgCtm = useCallback(() => {
     cachedInverseCtmRef.current = null;
@@ -1399,17 +1412,19 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     setHoverIndex(null);
   };
 
-  // De-conflicted right Y-axis badge centers (>= 25px center separation for Spot & Flow VWAP pills)
+  // De-conflicted right Y-axis badge centers (>= 25px center separation even at top/bottom edge clamps)
   const spotBadgeCenterY = Math.max(padTop + 10, Math.min(chartBottom - 10, yForPrice(priceDomain.current)));
   const rawVwapBadgeY = latestPt ? Math.max(padTop + 9, Math.min(chartBottom - 9, yForPrice(latestPt.flowVwap))) : null;
-  const vwapBadgeCenterY =
-    rawVwapBadgeY === null
-      ? null
-      : Math.abs(rawVwapBadgeY - spotBadgeCenterY) < 25
-        ? (rawVwapBadgeY >= spotBadgeCenterY
-            ? Math.min(chartBottom - 9, spotBadgeCenterY + 25)
-            : Math.max(padTop + 9, spotBadgeCenterY - 25))
-        : rawVwapBadgeY;
+  const vwapBadgeCenterY = (() => {
+    if (rawVwapBadgeY === null) return null;
+    if (Math.abs(rawVwapBadgeY - spotBadgeCenterY) >= 25) return rawVwapBadgeY;
+    const preferBelow = rawVwapBadgeY >= spotBadgeCenterY;
+    const belowCand = spotBadgeCenterY + 25;
+    const aboveCand = spotBadgeCenterY - 25;
+    if (preferBelow && belowCand <= chartBottom - 9) return belowCand;
+    if (!preferBelow && aboveCand >= padTop + 9) return aboveCand;
+    return belowCand <= chartBottom - 9 ? belowCand : aboveCand;
+  })();
 
   return (
     <div
@@ -1456,12 +1471,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         title={`${activeSymbol} · EVERY CALL TODAY`}
         className="mb-2.5"
         rightSlot={
-          <div className="flex items-center gap-2">
-            <span
-              className={`w-2 h-2 rounded-full ${
-                activeRegime === "CALL" ? "bg-[#00F5D4] animate-pulse" : "bg-[#FF2A55] animate-pulse"
-              }`}
-            />
+          <div className="flex items-center gap-2 font-mono tabular-nums">
             <span className={activeRegime === "CALL" ? "text-[#00F5D4] font-bold" : "text-[#FF2A55] font-bold"}>
               {activeRegime} (χ={activeChiPct}%)
             </span>
@@ -1858,8 +1868,38 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             );
           })}
 
-          {/* Authoritative Server BTO / STC Execution Markers, Trajectory Line & PnL Pill Badges */}
-          {svgServerTradeMarkers.map((st) => {
+          {/* Authoritative Server BTO / STC Execution Markers, Trajectory Line & De-Collided PnL Pill Badges */}
+          {(() => {
+            const occupiedSvgPills: Array<{ x: number; y: number; w: number; h: number }> = [];
+            const placeSvgPill = (x: number, rawY: number, w: number, h: number, preferUp: boolean): number => {
+              const minY = padTop + 2;
+              const maxY = chartBottom - h - 2;
+              const collides = (cy: number) =>
+                occupiedSvgPills.some(
+                  (r) => x < r.x + r.w + 3 && x + w + 3 > r.x && cy < r.y + r.h + 2 && cy + h + 2 > r.y
+                );
+              const clamped = Math.max(minY, Math.min(maxY, rawY));
+              if (!collides(clamped)) {
+                occupiedSvgPills.push({ x, y: clamped, w, h });
+                return clamped;
+              }
+              const step = h + 4;
+              for (let k = 1; k <= 6; k++) {
+                const first = Math.max(minY, Math.min(maxY, clamped + (preferUp ? -k : k) * step));
+                if (!collides(first)) {
+                  occupiedSvgPills.push({ x, y: first, w, h });
+                  return first;
+                }
+                const second = Math.max(minY, Math.min(maxY, clamped + (preferUp ? k : -k) * step));
+                if (!collides(second)) {
+                  occupiedSvgPills.push({ x, y: second, w, h });
+                  return second;
+                }
+              }
+              occupiedSvgPills.push({ x, y: clamped, w, h });
+              return clamped;
+            };
+            return svgServerTradeMarkers.map((st) => {
             const isPut = st.contractType === "PUT";
             const btoColor = isPut ? "#ef4444" : "#10b981";
             const btoLabel = isPut ? "BTO PUT" : "BTO CALL";
@@ -1875,9 +1915,11 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             const btoTipY = isPut
               ? Math.max(padTop + 18, st.entryHighY - 6)
               : Math.min(chartBottom - 18, st.entryLowY + 6);
-            const btoPillY = isPut
+            const btoPillX = Math.max(padLeft + 2, Math.min(svgWidth - padRight - 62, st.entryX - 30));
+            const rawBtoPillY = isPut
               ? Math.max(padTop + 2, btoTipY - 26)
               : Math.min(chartBottom - 18, btoTipY + 12);
+            const btoPillY = placeSvgPill(btoPillX, rawBtoPillY, 60, 15, isPut);
 
             const stcHasClearanceBelow = st.exitLowY + 22 <= chartBottom;
             const stcTipY = isPut
@@ -1885,11 +1927,19 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                 ? st.exitLowY + 6
                 : Math.max(padTop + 20, st.exitHighY - 6)
               : Math.max(padTop + 20, st.exitHighY - 6);
-            const stcBadgeY = isPut
+            const rawBadgeX = st.exitX + 9;
+            const stcBadgeX =
+              rawBadgeX + stcBadgeW > svgWidth - padRight
+                ? Math.max(padLeft + 4, st.exitX - stcBadgeW - 6)
+                : rawBadgeX;
+            const rawStcBadgeY = isPut
               ? stcHasClearanceBelow
                 ? Math.min(chartBottom - 20, stcTipY + 2)
                 : Math.max(padTop + 4, stcTipY - 20)
               : Math.max(padTop + 4, stcTipY - 20);
+            const stcBadgeY = st.isClosed
+              ? placeSvgPill(stcBadgeX, rawStcBadgeY, stcBadgeW, 18, !isPut || !stcHasClearanceBelow)
+              : rawStcBadgeY;
 
             return (
               <g key={`srv-trade-${st.id}`}>
@@ -1922,49 +1972,34 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                       stroke="#ffffff"
                       strokeWidth="1"
                     />
-                    {(() => {
-                      const btoPillX = Math.max(padLeft + 2, Math.min(svgWidth - padRight - 62, st.entryX - 30));
-                      return (
-                        <>
-                          <rect
-                            x={btoPillX}
-                            y={btoPillY}
-                            width="60"
-                            height="15"
-                            rx="4"
-                            fill="rgba(15, 23, 42, 0.92)"
-                            stroke={btoColor}
-                            strokeWidth="1.2"
-                          />
-                          <text
-                            x={btoPillX + 30}
-                            y={btoPillY + 10.5}
+                    <rect
+                      x={btoPillX}
+                      y={btoPillY}
+                      width="60"
+                      height="15"
+                      rx="4"
+                      fill="rgba(15, 23, 42, 0.92)"
+                      stroke={btoColor}
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x={btoPillX + 30}
+                      y={btoPillY + 10.5}
                       textAnchor="middle"
                       fill={isPut ? "#fca5a5" : "#6ee7b7"}
                       fontSize="9"
                       fontWeight="bold"
                       fontFamily="monospace"
                     >
-                            {btoLabel}
-                          </text>
-                        </>
-                      );
-                    })()}
+                      {btoLabel}
+                    </text>
                   </g>
                 )}
 
                 {/* STC Cover Triangle & Glowing PnL Pill Badge */}
                 {st.isClosed &&
                   st.exitX >= padLeft - 20 &&
-                  st.exitX <= svgWidth - padRight + 20 &&
-                  (() => {
-                    const rawBadgeX = st.exitX + 9;
-                    const stcBadgeX =
-                      rawBadgeX + stcBadgeW > svgWidth - padRight
-                        ? Math.max(padLeft + 4, st.exitX - stcBadgeW - 6)
-                        : rawBadgeX;
-
-                    return (
+                  st.exitX <= svgWidth - padRight + 20 && (
                       <g>
                         <polygon
                           points={
@@ -2006,19 +2041,16 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
                           {stcText}
                         </text>
                       </g>
-                    );
-                  })()}
+                    )}
               </g>
             );
-          })}
+          });
+          })()}
 
-          {/* Live Pulsing Node Head at Curve Tip */}
+          {/* Active Curve Tip Marker (Dark Cockpit steady illumination — no infinite SVG animate) */}
           {latestPt && latestPt.baseX >= padLeft && latestPt.baseX <= padLeft + plotW + 2 && (
             <g transform={`translate(${latestPt.baseX.toFixed(1)}, ${latestPt.baseY.toFixed(1)})`}>
-              <circle r="12" fill="none" stroke="#00F5D4" strokeWidth="1.5" opacity="0.6" filter={`url(#tip-glow-${uid})`}>
-                <animate attributeName="r" values="6;16;6" dur="2s" repeatCount="indefinite" />
-                <animate attributeName="opacity" values="0.8;0.1;0.8" dur="2s" repeatCount="indefinite" />
-              </circle>
+              <circle r="8.5" fill="none" stroke="#00F5D4" strokeWidth="1.2" opacity="0.45" />
               <circle r="4.5" fill="#ffffff" stroke="#00F5D4" strokeWidth="2.2" />
             </g>
           )}
@@ -2217,13 +2249,13 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
 
           {/* Drag & Axis Helper Indicator Labels */}
           <text
-            x={svgWidth - 6}
+            x={svgWidth - 14}
             y={(padTop + chartBottom) / 2}
-            textAnchor="end"
+            textAnchor="middle"
             fill="rgba(255, 255, 255, 0.18)"
             fontSize="9"
             fontFamily="monospace"
-            transform={`rotate(90 ${svgWidth - 6} ${(padTop + chartBottom) / 2})`}
+            transform={`rotate(90 ${svgWidth - 14} ${(padTop + chartBottom) / 2})`}
           >
             DRAG Y TO SCALE PRICE
           </text>

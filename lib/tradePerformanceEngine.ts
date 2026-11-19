@@ -4,6 +4,7 @@ import type { OptionTradePosition } from "./execution/types";
 import { loadTradeStore, saveTradeStore } from "./execution/ledgerCommit";
 import { getTodayEt, getSessionBoundsEt } from "./gaiaSessionGuards";
 import { getNowEtTime } from "./execution/optionPricing";
+import { computeTradeRealizedPnl } from "./execution/pnlAccounting";
 import { getPersistenceCacheDir } from "./persistenceStore";
 
 export interface TradePerformanceItem {
@@ -89,29 +90,13 @@ export function generateDailyPerformanceReport(date?: string): DailyPerformanceR
     store.date === targetDate && Array.isArray(store.closedPositions) ? store.closedPositions : [];
 
   const tradeItems: TradePerformanceItem[] = closedPositions.map((p) => {
-    const raw = p as OptionTradePosition & Record<string, unknown>;
-    // Realistic retail options execution accounting: Buy at Ask, Sell at Bid
-    const entryPrice =
-      firstPositiveNum(
-        raw.btoOptionAsk,
-        raw.optionAsk,
-        raw.btoPrice,
-        raw.btoOptionMid,
-        raw.btoMid
-      ) ?? 0.5;
-    const exitPrice =
-      firstFiniteNum(raw.closedOptionBid, raw.stcPrice, raw.closedOptionMid) ?? 0.0;
-    const qty = p.contractsQty || 1;
-    const totalOutlay = Number((entryPrice * 100 * qty).toFixed(2));
-    const realizedDollarPnl = Number(
-      (
-        firstFiniteNum(raw.realizedPnlDollars, raw.pnlDollars) ??
-        (exitPrice - entryPrice) * 100 * qty
-      ).toFixed(2)
-    );
-    const pnlOptionPct =
-      firstFiniteNum(p.pnlOptionPct, raw.realizedPnlPct) ??
-      Number((((exitPrice - entryPrice) / Math.max(0.01, entryPrice)) * 100).toFixed(2));
+    const pnl = computeTradeRealizedPnl(p);
+    const entryPrice = pnl.entryPrice;
+    const exitPrice = pnl.exitPrice;
+    const qty = pnl.contractsQty;
+    const totalOutlay = pnl.outlay;
+    const realizedDollarPnl = pnl.realizedDollarPnl;
+    const pnlOptionPct = pnl.pnlOptionPct;
     const pnlSpotPct = p.pnlSpotPct ?? 0;
 
     return {
@@ -411,12 +396,55 @@ export async function checkAndSendMarketCloseRecap(
     saveTradeStore(latestStore);
   }
 
-  // Trigger 16:05 ET Post-Market Attribution & Live-vs-Replay Shadow Parity Audit
+  // Trigger 16:05 ET Post-Market Attribution only when real intraday bars exist (never poison with bars: [])
   const isPostAttributionCutoff = etTime.hours > 16 || (etTime.hours === 16 && etTime.minutes >= 5);
   if (isPostAttributionCutoff && !isHistoricalBackfill) {
     try {
-      const { runPostMarketAttribution } = await import("./agenticSupervisor");
-      runPostMarketAttribution({ sessionDate: targetDate || store.date, ticker: "SPY", bars: [] });
+      const sessionTargetDate = targetDate || store.date;
+      const { getMergedIntradayHistory } = await import("./intradayHistory");
+      const ticks = getMergedIntradayHistory("SPY", sessionTargetDate);
+      if (ticks.length >= 6) {
+        const bucketMap = new Map<number, typeof ticks>();
+        for (const tick of ticks) {
+          const bucket = Math.floor(tick.ts / 300) * 300;
+          if (!bucketMap.has(bucket)) bucketMap.set(bucket, []);
+          bucketMap.get(bucket)!.push(tick);
+        }
+        const bars = Array.from(bucketMap.entries())
+          .sort((a, b) => a[0] - b[0])
+          .map(([bucketTs, group]) => ({
+            ts: bucketTs,
+            open: group[0].spot,
+            high: Math.max(...group.map((g) => g.spot)),
+            low: Math.min(...group.map((g) => g.spot)),
+            close: group[group.length - 1].spot,
+          }));
+        if (bars.length >= 6) {
+          const { computeBarFlowGammaVwapSeries } = await import("./flowGammaVwap");
+          const { runPostMarketAttribution } = await import("./agenticSupervisor");
+          const flowSeries = computeBarFlowGammaVwapSeries(
+            bars.map((b) => ({
+              timestamp: b.ts,
+              open: b.open,
+              high: b.high,
+              low: b.low,
+              close: b.close,
+            }))
+          );
+          const lastTick = ticks[ticks.length - 1];
+          await runPostMarketAttribution({
+            sessionDate: sessionTargetDate,
+            ticker: "SPY",
+            bars,
+            flowSeries,
+            callWall: lastTick?.callWall || lastTick?.cw,
+            putWall: lastTick?.putWall || lastTick?.pw,
+            zeroGamma: lastTick?.zeroGamma || lastTick?.zg,
+            zeroDteKing: lastTick?.king,
+            executedTrades: store.closedPositions,
+          });
+        }
+      }
     } catch {
       // Non-fatal post-market attribution
     }

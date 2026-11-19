@@ -454,9 +454,9 @@ export function IntradayChart({
       price: latestPutWall,
       idealY: toY(latestPutWall),
       y: toY(latestPutWall),
-      color: "#f0abfc",
-      bgFill: "#3b0764",
-      borderColor: "#d946ef",
+      color: "#d8b4fe",
+      bgFill: "#2e1065",
+      borderColor: "#c084fc",
     });
   }
 
@@ -467,9 +467,9 @@ export function IntradayChart({
       price: latestZeroGamma,
       idealY: toY(latestZeroGamma),
       y: toY(latestZeroGamma),
-      color: "#fdba74",
-      bgFill: "#431407",
-      borderColor: "#f97316",
+      color: "#fcd34d",
+      bgFill: "#451a03",
+      borderColor: "#f59e0b",
     });
   }
 

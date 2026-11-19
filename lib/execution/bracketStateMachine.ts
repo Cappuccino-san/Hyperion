@@ -5,6 +5,7 @@ import {
   getSessionBoundsEt,
 } from "@/lib/gaiaSessionGuards";
 import { evaluateOptionRiskStop, STALL_STOP_MINUTES } from "@/lib/bracketOrderEngine";
+import { evaluateOptionProfitRatchet } from "@/lib/execution/profitRatchet";
 import type { NormalizedOptionContract } from "@/lib/optionsExposure";
 import type {
   Candle5m,
@@ -16,9 +17,21 @@ import type {
 import {
   clampOptionPriceToGreekEnvelope,
   clampToCandleRange,
+  computeRemainingYearsToExpiration,
   formatTimeEt,
   getContractMidPrice,
+  repriceOptionBS,
+  solveImpliedVol,
 } from "@/lib/execution/optionPricing";
+
+function computeDteDays(expIso: string, sessionIso: string): number {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(expIso) || !/^\d{4}-\d{2}-\d{2}$/.test(sessionIso)) return 0;
+  const [ey, em, ed] = expIso.split("-").map(Number);
+  const [sy, sm, sd] = sessionIso.split("-").map(Number);
+  const expMs = Date.UTC(ey, em - 1, ed, 16, 0, 0);
+  const sesMs = Date.UTC(sy, sm - 1, sd, 16, 0, 0);
+  return Math.max(0, Math.round((expMs - sesMs) / 86_400_000));
+}
 
 export function evaluateActivePositionStepA(input: {
   activePos: OptionTradePosition;
@@ -86,6 +99,7 @@ export function evaluateActivePositionStepA(input: {
   let liveBid: number | undefined = activePos.optionBid;
   let liveAsk: number | undefined = activePos.optionAsk;
 
+  let matchedContract = false;
   if (contracts && contracts.length > 0) {
     const match = contracts.find(
       (c) =>
@@ -94,11 +108,34 @@ export function evaluateActivePositionStepA(input: {
         c.expiration === activePos?.expiration
     );
     if (match) {
+      matchedContract = true;
       const liveMid = getContractMidPrice(match);
       if (liveMid > 0) currentOptionMid = liveMid;
       if (match.bid && match.bid > 0) liveBid = match.bid;
       if (match.ask && match.ask > 0) liveAsk = match.ask;
     }
+  }
+  if (!matchedContract && activePos.strike > 0 && nowTs > (activePos.openedTs || nowTs)) {
+    const dte = computeDteDays(activePos.expiration, sessionDate);
+    const tRemaining = computeRemainingYearsToExpiration(nowTs * 1000, dte);
+    const tEntry =
+      typeof activePos.entryTYears === "number" && activePos.entryTYears > 0
+        ? activePos.entryTYears
+        : computeRemainingYearsToExpiration((activePos.openedTs || nowTs) * 1000, dte);
+    const entryAskRef = activePos.optionAsk || activePos.btoOptionMid || 0.45;
+    const anchorIv =
+      typeof activePos.entryIv === "number" && activePos.entryIv >= 0.04
+        ? activePos.entryIv
+        : solveImpliedVol(entryAskRef, activePos.btoSpotPrice, activePos.strike, tEntry, isCall);
+    const bsEntryCheck = repriceOptionBS(activePos.btoSpotPrice, activePos.strike, tEntry, anchorIv, isCall);
+    const effectiveIv =
+      Math.abs(bsEntryCheck - entryAskRef) > entryAskRef * 0.15
+        ? solveImpliedVol(entryAskRef, activePos.btoSpotPrice, activePos.strike, tEntry, isCall)
+        : anchorIv;
+    const bsMid = repriceOptionBS(posSpotPrice, activePos.strike, tRemaining, effectiveIv, isCall);
+    currentOptionMid = bsMid;
+    liveBid = Math.max(0.01, Number((bsMid - 0.01).toFixed(2)));
+    liveAsk = Number(Math.max(liveBid + 0.01, bsMid + 0.01).toFixed(2));
   }
 
   const rawHeldMin = Math.max(0, (nowTs - (activePos.openedTs || nowTs)) / 60);
@@ -117,12 +154,14 @@ export function evaluateActivePositionStepA(input: {
   const pnlOptionPct = Number(
     (((exitFillPrice - entryFillPrice) / Math.max(0.01, entryFillPrice)) * 100).toFixed(2)
   );
-  activePos.peakOptionPnlPct = Math.max(activePos.peakOptionPnlPct ?? 0, pnlOptionPct);
+  // Strict pessimistic ordering: evaluate existing standing stops/ratchets against prior-bar peak (< t)
+  // BEFORE updating peakOptionPnlPct from the current bar/tick.
+  const prevPeakOptionPnlPct = activePos.peakOptionPnlPct ?? 0;
   const optStopEval = evaluateOptionRiskStop({
     entryPrice: entryFillPrice,
     currentPrice: exitFillPrice,
     heldMinutes: rawHeldMin,
-    peakPnlPct: activePos.peakOptionPnlPct,
+    peakPnlPct: prevPeakOptionPnlPct,
   });
 
   const closePosition = (reason: string) => {
@@ -165,6 +204,19 @@ export function evaluateActivePositionStepA(input: {
 
     const alertTicker = activePos!.ticker || normalizedTicker;
     const stcAlertId = `${activePos!.id}-stc`;
+    const alignedExitBid = clampedExitFill;
+    const alignedExitAsk = Number(
+      Math.max(
+        clampedExitFill + 0.01,
+        typeof liveAsk === "number" &&
+          typeof liveBid === "number" &&
+          liveBid > 0 &&
+          liveAsk >= liveBid &&
+          Math.abs(liveBid - clampedExitFill) <= Math.max(0.15, clampedExitFill * 0.25)
+          ? liveAsk
+          : clampedExitFill + 0.02
+      ).toFixed(2)
+    );
     const alert: TradeLifecycleAlert = {
       id: stcAlertId,
       timestamp: exitTimeStr,
@@ -186,8 +238,8 @@ export function evaluateActivePositionStepA(input: {
       target2Spot: activePos!.target2Spot,
       stopLossSpot: activePos!.stopLossSpot,
       optionMid: clampedExitFill,
-      optionBid: liveBid,
-      optionAsk: liveAsk,
+      optionBid: alignedExitBid,
+      optionAsk: alignedExitAsk,
       btoOptionMid: activePos!.btoOptionMid,
       contractsQty: activePos!.contractsQty,
       remainingQty: 0,
@@ -228,6 +280,39 @@ export function evaluateActivePositionStepA(input: {
     : ((exitFlux < 0 || exitImpChi < 0.28) && (exitChi < 0.15 || exitImpChi < 0.20 || exitPe <= -1.2));
 
   const curBarTs = posCandle?.timestamp ?? 0;
+  const isNewBarAfterEntry =
+    Boolean(posCandle) &&
+    ((curBarTs > 0 && curBarTs > (activePos.lastCandleTs ?? 0)) ||
+      (!activePos.lastCandleTs && nowTs > (activePos.openedTs || nowTs)));
+  const barFavorableSpot =
+    isNewBarAfterEntry && posCandle
+      ? isCall
+        ? Math.max(posSpotPrice, posCandle.high)
+        : Math.min(posSpotPrice, posCandle.low)
+      : posSpotPrice;
+  const barFavSpotMfePct =
+    activePos.btoSpotPrice > 0
+      ? ((isCall
+          ? barFavorableSpot - activePos.btoSpotPrice
+          : activePos.btoSpotPrice - barFavorableSpot) /
+          activePos.btoSpotPrice) *
+        100
+      : 0;
+  activePos.peakFavorableSpotMfePct = Number(
+    Math.max(activePos.peakFavorableSpotMfePct ?? 0, barFavSpotMfePct).toFixed(4)
+  );
+
+  const hasNetFlux =
+    typeof flowSnapExit?.netFluxJ === "number" && Number.isFinite(flowSnapExit.netFluxJ);
+  const hasPeclet =
+    typeof flowSnapExit?.pecletNumber === "number" && Number.isFinite(flowSnapExit.pecletNumber);
+  const fluxFlippedAgainst = isCall
+    ? (hasNetFlux && flowSnapExit!.netFluxJ! < 0) ||
+      ((!hasNetFlux || flowSnapExit!.netFluxJ === 0) && hasPeclet && flowSnapExit!.pecletNumber! < 0)
+    : (hasNetFlux && flowSnapExit!.netFluxJ! > 0) ||
+      ((!hasNetFlux || flowSnapExit!.netFluxJ === 0) && hasPeclet && flowSnapExit!.pecletNumber! > 0);
+  const hasPostEntryBarElapsed = nowTs > (activePos.openedTs || 0) || isNewBarAfterEntry;
+
   const resolvedPrevLow =
     typeof posCandle?.prevLow === "number"
       ? posCandle.prevLow
@@ -329,6 +414,22 @@ export function evaluateActivePositionStepA(input: {
     ((etHours === 10 && etMinutes >= 45) || etHours === 11);
   const isElapsedChopTimeStop = rawHeldMin >= 30 && rawHeldMin <= 90;
 
+  // Strict pessimistic evaluation of progressive option-% profit ratchet (+30%->BE, +60%->+25%, +100%->trail)
+  // and Flux-Flip MFE Harvest (>= +50% MFE + confirmed netFluxJ flip) BEFORE raising peakOptionPnlPct.
+  const ratchetEval = evaluateOptionProfitRatchet({
+    isCall,
+    prevPeakOptionPnlPct,
+    adverseOptionPnlPct: pnlOptionPct,
+    closeOptionPnlPct: pnlOptionPct,
+    favorableOptionPnlPct: pnlOptionPct,
+    openOptionPnlPct: pnlOptionPct,
+    chi: exitChi,
+    netFluxJ: exitFlux,
+    hasPostEntryBarElapsed,
+    fluxFlippedAgainst,
+  });
+  activePos.peakOptionPnlPct = ratchetEval.nextPeakOptionPnlPct;
+
   // 1. STC (15:55 PM ET HARD CUTOFF / 12:55 PM EARLY CLOSE)
   if (isEodCutoff) {
     closePosition(
@@ -336,6 +437,18 @@ export function evaluateActivePositionStepA(input: {
         ? "12:55 PM ET HARD EARLY-CLOSE MARKET CUTOFF"
         : "15:55 PM ET HARD MARKET CLOSE CUTOFF"
     );
+  }
+  // 1B. STC: BOUNDARY_FLUX_REVERSAL_LOCK (>= +0.20% favorable spot MFE + boundary flux flip against position)
+  else if (
+    hasPostEntryBarElapsed &&
+    (activePos.peakFavorableSpotMfePct ?? 0) >= 0.20 &&
+    fluxFlippedAgainst
+  ) {
+    closePosition("BOUNDARY_FLUX_REVERSAL_LOCK");
+  }
+  // 1C. STC: PROGRESSIVE OPTION-% PROFIT RATCHET / FLUX-FLIP MFE HARVEST
+  else if (ratchetEval.triggered && ratchetEval.reason) {
+    closePosition(ratchetEval.reason);
   }
   // 2. STC: MORNING / ELAPSED CHOP TIME STOP
   else if (
@@ -346,7 +459,11 @@ export function evaluateActivePositionStepA(input: {
     ((isCall && posCandle && posCandle.close < posCandle.sma34) ||
       (!isCall && posCandle && posCandle.close > posCandle.sma34))
   ) {
-    closePosition("10:45 AM MOMENTUM CUTOFF (PROTECT PROFITS / AVOID MIDDAY CHOP)");
+    closePosition(
+      isMorningWindowTimeStop
+        ? "10:45 AM MOMENTUM CUTOFF (PROTECT PROFITS / AVOID MIDDAY CHOP)"
+        : "ELAPSED CHOP TIME-STOP (30-90M PROFIT PROTECTION)"
+    );
   }
   // 3. STC (MOMENTUM REVERSAL / DIVERGENCE COVER)
   else if (

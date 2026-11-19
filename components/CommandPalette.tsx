@@ -54,15 +54,23 @@ export function CommandPalette({
   const fetchOptionsChain = useDashboardStore((state) => state.fetchOptionsChain);
   const uiMode = useDashboardStore((state) => state.uiMode);
   const toggleUiMode = useDashboardStore((state) => state.toggleUiMode);
+  const audioAlertsMuted = useDashboardStore((state) => state.audioAlertsMuted);
+  const setAudioAlertsMuted = useDashboardStore((state) => state.setAudioAlertsMuted);
+  const serverActivePositions = useDashboardStore((state) => state.serverActivePositions);
+  const serverClosedTrades = useDashboardStore((state) => state.serverClosedTrades);
+  const isStaleSnapshot = useDashboardStore((state) => state.isStaleSnapshot);
+  const audioAlertsEnabled = !audioAlertsMuted;
 
   const [isOpen, setIsOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
-  const [audioAlertsEnabled, setAudioAlertsEnabled] = useState<boolean>(true);
   const inputRef = useRef<HTMLInputElement>(null);
   const prevKingRef = useRef<number | null>(null);
   const prevZeroGammaRef = useRef<number | null>(null);
+  const prevActiveCountRef = useRef<number | null>(null);
+  const prevClosedCountRef = useRef<number | null>(null);
+  const prevStaleRef = useRef<boolean>(false);
   const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -166,8 +174,50 @@ export function CommandPalette({
     prevZeroGammaRef.current = currentZg;
   }, [kingNode.allExpKing, kingNode.filteredKing, gammaLevels?.zeroGamma, audioAlertsEnabled]);
 
-  // Compute live Dealer Hedging Flow Snapshot
+  // Cockpit acoustic alerts for BTO fill, STC exit, Stale feed, and 15:50-15:55 ET MOC warning
+  useEffect(() => {
+    const activeCount = Object.keys(serverActivePositions || {}).length;
+    const closedCount = (serverClosedTrades || []).length;
+
+    if (audioAlertsEnabled) {
+      if (prevActiveCountRef.current !== null && activeCount > prevActiveCountRef.current) {
+        playTerminalAlertTone("BTO_FILL");
+        showToast("🟢 Paper BTO Position Opened", 4000);
+      } else if (prevClosedCountRef.current !== null && closedCount > prevClosedCountRef.current) {
+        playTerminalAlertTone("STC_EXIT");
+        showToast("🔔 Paper STC Position Closed", 4000);
+      }
+      if (!prevStaleRef.current && isStaleSnapshot) {
+        playTerminalAlertTone("STALE_FEED");
+        showToast("⚠️ Market feed stale / syncing", 4000);
+      }
+      if (activeCount > 0) {
+        try {
+          const parts = new Intl.DateTimeFormat("en-US", {
+            timeZone: "America/New_York",
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false,
+          }).formatToParts(new Date());
+          const h = Number(parts.find((p) => p.type === "hour")?.value ?? 0) % 24;
+          const m = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
+          const etMins = h * 60 + m;
+          if (etMins >= 950 && etMins <= 955) {
+            playTerminalAlertTone("MOC_WARNING");
+            showToast("⚠️ 15:55 ET MOC Hard Cutoff Approaching", 4500);
+          }
+        } catch {}
+      }
+    }
+
+    prevActiveCountRef.current = activeCount;
+    prevClosedCountRef.current = closedCount;
+    prevStaleRef.current = isStaleSnapshot;
+  }, [serverActivePositions, serverClosedTrades, isStaleSnapshot, audioAlertsEnabled]);
+
+  // Compute live Dealer Hedging Flow Snapshot only when palette is open (avoids 800ms 491-strike idle work)
   const liveFlowSnapshot = useMemo(() => {
+    if (!isOpen) return null;
     if (!spotPrice || spotPrice <= 0) return null;
     const strikeSummaries = chainStrikes.map((s) => ({
       strike: s.strike,
@@ -185,7 +235,7 @@ export function CommandPalette({
       putWall: gammaLevels?.putWall ?? null,
       strikes: strikeSummaries,
     });
-  }, [spotPrice, netMetrics.netGex, gammaLevels, kingNode, chainStrikes]);
+  }, [isOpen, spotPrice, netMetrics.netGex, gammaLevels, kingNode, chainStrikes]);
 
   const handleCopyBrief = () => {
     const brief = formatInstitutionalDeskBrief({
@@ -274,7 +324,7 @@ export function CommandPalette({
           : "text-slate-400 border-slate-600 bg-slate-800",
         action: () => {
           const next = !audioAlertsEnabled;
-          setAudioAlertsEnabled(next);
+          setAudioAlertsMuted(!next);
           if (next) playTerminalAlertTone("CONFIRM");
           closePalette();
         },

@@ -27,6 +27,9 @@ export interface GaiaStructuralLevels {
   callWall?: number;
   putWall?: number;
   bookCenter?: number;
+  bookCenterSlope?: number;
+  zeroDteKing?: number;
+  allExpKing?: number;
   priorClose?: number;
   pdh?: number;
   pdl?: number;
@@ -82,6 +85,8 @@ export interface GaiaBarData {
   netGex?: number;
   sigmaMinus1?: number | null;
   sigmaPlus1?: number | null;
+  tf30m?: "BULL" | "BEAR" | "NO";
+  bookCenterSlope?: number;
   flowVwap?: number;
   prevFlowVwap?: number;
   vwapSlope?: number;
@@ -325,9 +330,11 @@ export class GaiaSignalFsm {
     const isNeutralChopZone = effectiveChi > 0.44 && effectiveChi < 0.56;
     const hasValidPeclet = typeof bar.peclet === "number" && Number.isFinite(bar.peclet);
     const isBullMacro = macro
-      ? !isNeutralChopZone && (macro.macroRegime === "CALL" || effectiveChi >= 0.56)
+      ? !isNeutralChopZone && macro.macroRegime === "CALL" && effectiveChi >= 0.56
       : bar.chi >= 0.56;
-    const isBearMacro = !isNeutralChopZone && effectiveChi <= 0.44;
+    const isBearMacro = macro
+      ? !isNeutralChopZone && !isBullMacro && (macro.macroRegime === "PUT" || effectiveChi <= 0.44)
+      : !isNeutralChopZone && effectiveChi <= 0.44;
     const strictBullFlux =
       bar.chi >= 0.56 &&
       bar.netFlux > 0 &&
@@ -627,10 +634,9 @@ export class GaiaSignalFsm {
           (bar.flowVwap === undefined || bar.close < bar.flowVwap) &&
           (bar.sma34 === undefined || bar.close < bar.sma34);
         const negativeFluxConfirm =
-          (bar.peclet <= -1.5 && bar.chi < 0.45 && bar.netFlux < 0) ||
-          bar.netFlux < 0 ||
-          bar.chi < 0.45 ||
-          Boolean(bar.bearDiv5m);
+          (bar.peclet <= -1.5 && bar.chi <= 0.44 && bar.netFlux < 0) ||
+          (bar.netFlux < 0 && bar.chi <= 0.44) ||
+          (Boolean(bar.bearDiv5m) && (bar.netFlux < 0 || bar.chi <= 0.48));
         const downsideTarget = putWall ?? bookCenter ?? bar.close - fallbackTargetDist;
         const downsideRoom = (bar.close - downsideTarget) >= MIN_REWARD_RISK * unitRisk;
 

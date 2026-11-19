@@ -18,6 +18,8 @@ export function SpotDisplay() {
   const isLoadingChain = useDashboardStore((state) => state.isLoadingChain);
   const connectionStatus = useDashboardStore((state) => state.connectionStatus);
   const isStaleSnapshot = useDashboardStore((state) => state.isStaleSnapshot);
+  const cboeSpotLagDollars = useDashboardStore((state) => state.cboeSpotLagDollars);
+  const liveTickMarketOpen = useDashboardStore((state) => state.liveTickMarketOpen);
   const lastUpdated = useDashboardStore((state) => state.lastUpdated);
   const bookTimestamp = useDashboardStore((state) => state.bookTimestamp);
   const extendedQuote = useDashboardStore((state) => state.extendedQuote);
@@ -158,7 +160,7 @@ export function SpotDisplay() {
             {bookTimestamp ? `book ${bookTimestamp}` : lastUpdated || "--:-- ET"}
           </span>
 
-          {/* Green LIVE / Amber SYNCING / Connecting indicator */}
+          {/* Green LIVE / Amber SYNCING / Slate CLOSED indicator */}
           <div
             className={cn(
               "inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 border",
@@ -166,20 +168,20 @@ export function SpotDisplay() {
                 ? "bg-cyan-500/15 border-cyan-400/40"
                 : isSyncing
                   ? "bg-amber-500/15 border-amber-400/40"
-                  : "bg-emerald-500/15 border-emerald-400/40"
+                  : liveTickMarketOpen === false
+                    ? "bg-slate-800/80 border-slate-600/50"
+                    : "bg-emerald-500/15 border-emerald-400/40"
             )}
           >
             <span className="relative flex h-2 w-2">
-              <span
-                className={cn(
-                  "animate-ping absolute inline-flex h-full w-full rounded-full opacity-75",
-                  isLoadingChain
-                    ? "bg-cyan-400"
-                    : isSyncing
-                      ? "bg-amber-400"
-                      : "bg-emerald-400"
-                )}
-              />
+              {(isLoadingChain || liveTickMarketOpen !== false) && !isSyncing && (
+                <span
+                  className={cn(
+                    "animate-ping absolute inline-flex h-full w-full rounded-full opacity-75",
+                    isLoadingChain ? "bg-cyan-400" : "bg-emerald-400"
+                  )}
+                />
+              )}
               <span
                 className={cn(
                   "relative inline-flex rounded-full h-2 w-2",
@@ -187,7 +189,9 @@ export function SpotDisplay() {
                     ? "bg-cyan-400"
                     : isSyncing
                       ? "bg-amber-400"
-                      : "bg-emerald-400"
+                      : liveTickMarketOpen === false
+                        ? "bg-slate-400"
+                        : "bg-emerald-400"
                 )}
               />
             </span>
@@ -198,7 +202,9 @@ export function SpotDisplay() {
                   ? "text-cyan-300"
                   : isSyncing
                     ? "text-amber-300 font-extrabold"
-                    : "text-emerald-300"
+                    : liveTickMarketOpen === false
+                      ? "text-slate-300"
+                      : "text-emerald-300"
               )}
             >
               {isLoadingChain
@@ -206,10 +212,20 @@ export function SpotDisplay() {
                   ? "SYNCING..."
                   : "CONNECTING"
                 : isSyncing
-                  ? "LIVE (SYNCING)"
-                  : "LIVE"}
+                  ? "STALE (SYNCING)"
+                  : liveTickMarketOpen === false
+                    ? "CLOSED"
+                    : "LIVE"}
             </span>
           </div>
+          {cboeSpotLagDollars !== null && Math.abs(cboeSpotLagDollars) >= 0.35 && (
+            <div
+              className="inline-flex items-center gap-1 rounded-full border border-amber-500/45 bg-amber-500/15 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 tabular-nums"
+              title="Difference between live underlying spot and delayed CBOE option chain quote"
+            >
+              <span>CBOE LAG {cboeSpotLagDollars >= 0 ? "+" : ""}${cboeSpotLagDollars.toFixed(2)}</span>
+            </div>
+          )}
 
           {/* Purple / Green Gamma Regime Pill */}
           <div

@@ -45,6 +45,7 @@ interface LiveBotGlobalState {
   inFlightTickPromise: Promise<void> | null;
   activeController: AbortController | null;
   isStopped: boolean;
+  isExecutionHalted?: boolean;
   isEvaluatingLiveBar: boolean;
   lockAcquiredAtMs: number;
   lockToken: number;
@@ -442,6 +443,10 @@ export async function runLiveBotTick(): Promise<void> {
     botState.lastStatus = "OBSERVER_MODE";
     return;
   }
+  if (botState.isExecutionHalted) {
+    botState.lastStatus = "LOCKED_BY_PILOT";
+    return;
+  }
   if (botState.isStopped || botState.isPolling || botState.inFlightTickPromise) return;
 
   const lockToken = acquireBarEvaluationLock();
@@ -718,7 +723,7 @@ export async function runLiveBotTick(): Promise<void> {
             zeroGamma: zgLevel,
             zeroDteKing: resolvedLevels?.kingNode?.zeroDteKing,
             allExpKing: resolvedLevels?.kingNode?.allExpKing ?? resolvedLevels?.tacticalKing,
-            bookCenter: zgLevel,
+            bookCenter: resolvedLevels?.bookCenter ?? zgLevel,
             netGex: resolvedLevels?.netGexMillions,
             flowSnapshot: enrichedCandle?.flowSnapshot ?? null,
             historicalSessions,
@@ -728,6 +733,18 @@ export async function runLiveBotTick(): Promise<void> {
         if (effectivePolicy?.standAsideVetoReason) {
           if (!botState.isStopped) {
             botState.lastStatus = "SUPERVISOR_STAND_ASIDE";
+          }
+          continue;
+        }
+
+        const cboeCachedSpot = getCachedSpotPrice(ticker) ?? 0;
+        const spotLagPct =
+          resolvedSpot > 0 && cboeCachedSpot > 0
+            ? Math.abs(resolvedSpot - cboeCachedSpot) / resolvedSpot
+            : 0;
+        if (contracts.length === 0 || resolvedSpot <= 0 || spotLagPct > 0.015) {
+          if (!botState.isStopped) {
+            botState.lastStatus = "STALE_QUOTE_BTO_BLOCKED";
           }
           continue;
         }
@@ -745,7 +762,7 @@ export async function runLiveBotTick(): Promise<void> {
           kingNode: resolvedLevels?.kingNode,
           filteredKing: resolvedLevels?.tacticalKing,
           allExpKing: resolvedLevels?.kingNode?.allExpKing,
-          bookCenter: resolvedLevels?.zeroGamma ?? 0,
+          bookCenter: resolvedLevels?.bookCenter ?? resolvedLevels?.zeroGamma ?? 0,
           netGex: resolvedLevels?.netGexMillions,
           contracts,
           contractsAlreadyAnchored: true,
@@ -895,6 +912,21 @@ if (
   process.once("SIGINT", () => handleSignal("SIGINT"));
 }
 
+export function isExecutionHalted(): boolean {
+  return Boolean(getBotState().isExecutionHalted);
+}
+
+export function setExecutionHalted(halted: boolean): boolean {
+  const botState = getBotState();
+  botState.isExecutionHalted = halted;
+  if (halted && !botState.isStopped) {
+    botState.lastStatus = "LOCKED_BY_PILOT";
+  } else if (!halted && botState.lastStatus === "LOCKED_BY_PILOT") {
+    botState.lastStatus = "IDLE";
+  }
+  return Boolean(botState.isExecutionHalted);
+}
+
 export function getLiveBotStatus() {
   const botState = getBotState();
   return {
@@ -902,6 +934,7 @@ export function getLiveBotStatus() {
     role: getExecutionRole(),
     isPolling: botState.isPolling,
     isEvaluatingLiveBar: botState.isEvaluatingLiveBar,
+    executionHalted: Boolean(botState.isExecutionHalted),
     startedAtMs: botState.startedAtMs,
     lastPollAtMs: botState.lastPollAtMs,
     lastStatus: botState.lastStatus,

@@ -287,16 +287,17 @@ export function evaluatePrzmCallLedger(
       continue;
     }
 
-    const delta = Number((isCall ? clampedClosed - clampedBto : clampedBto - clampedClosed).toFixed(2));
-    const flatTol = Math.max(0.05, clampedBto * 0.0001);
+    const delta = Number((type === "SHORT" ? clampedBto - clampedClosed : clampedClosed - clampedBto).toFixed(2));
     const hasOptPnl = typeof pos.pnlOptionPct === "number" && Number.isFinite(pos.pnlOptionPct);
-    const isWin = hasOptPnl
-      ? pos.pnlOptionPct > 0
-      : delta > flatTol || (typeof pos.pnlSpotPct === "number" && pos.pnlSpotPct > 0);
     const isLoss = hasOptPnl
-      ? pos.pnlOptionPct < 0
-      : delta < -flatTol || pos.exitReason?.includes("STOP") || (typeof pos.pnlSpotPct === "number" && pos.pnlSpotPct < 0);
-    const status: "RIGHT" | "WRONG" | "FLAT" = isWin ? "RIGHT" : isLoss ? "WRONG" : "FLAT";
+      ? pos.pnlOptionPct < 0 || delta < -0.005
+      : delta < -0.005 || Boolean(pos.exitReason?.includes("STOP")) || (typeof pos.pnlSpotPct === "number" && pos.pnlSpotPct < 0);
+    const isWin = !isLoss && (
+      hasOptPnl
+        ? pos.pnlOptionPct > 0 && delta >= 0
+        : delta > 0.005 || (typeof pos.pnlSpotPct === "number" && pos.pnlSpotPct > 0 && delta >= 0)
+    );
+    const status: "RIGHT" | "WRONG" | "FLAT" = isLoss ? "WRONG" : isWin ? "RIGHT" : "FLAT";
     const heldMin =
       openedSec > 0 && closedSec > openedSec
         ? Math.max(1, Math.round((closedSec - openedSec) / 60))
@@ -443,8 +444,8 @@ export function evaluatePrzmCallLedger(
 
     // Strict Realized P&L Math: (Exit - Entry) * (LONG ? 1 : -1)
     const realizedDelta =
-      sig.type === "LONG" ? finalMarkPrice - sig.price : sig.price - finalMarkPrice;
-    const sigFlatTol = Math.max(0.05, sig.price * 0.0001);
+      sig.type === "SHORT" ? sig.price - finalMarkPrice : finalMarkPrice - sig.price;
+    const sigFlatTol = 0.005;
 
     let status: "OPEN" | "RIGHT" | "FLAT" | "WRONG";
     if (isCurrentlyOpen) {
@@ -565,13 +566,38 @@ export const PrzmTopDeck: React.FC<{
     [signals, series, liveSpot, activeFsmState, serverTrades, displayTicker, replayBarTsSec]
   );
 
-  // Live 1-second clock for "TO THE BELL" radial dial (client-only after mount to prevent SSR/CSR minute-rollover hydration mismatch)
+  // Live 1-second clock during RTH, throttled to 15s off-hours to eliminate idle React churn
   const [nowDate, setNowDate] = useState<Date | null>(null);
   useEffect(() => {
     if (isReplayMode) return;
-    setNowDate(new Date());
-    const id = setInterval(() => setNowDate(new Date()), 1000);
-    return () => clearInterval(id);
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      const now = new Date();
+      setNowDate(now);
+      let isRthTick = true;
+      try {
+        const parts = new Intl.DateTimeFormat("en-US", {
+          timeZone: "America/New_York",
+          weekday: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        }).formatToParts(now);
+        const wd = parts.find((p) => p.type === "weekday")?.value ?? "";
+        const h = Number(parts.find((p) => p.type === "hour")?.value ?? 0) % 24;
+        const m = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
+        const mins = h * 60 + m;
+        isRthTick = wd !== "Sat" && wd !== "Sun" && mins >= 569 && mins <= 961;
+      } catch {}
+      timerId = setTimeout(tick, isRthTick ? 1000 : 15000);
+    };
+    tick();
+    return () => {
+      cancelled = true;
+      if (timerId) clearTimeout(timerId);
+    };
   }, [isReplayMode]);
 
   // Compute RTH (09:30 -> 16:00 ET = 390 mins) progress & countdown
@@ -743,7 +769,7 @@ export const PrzmTopDeck: React.FC<{
       sessionDate: "",
       ticker: displayTicker,
       checkpoint: "INTRADAY" as const,
-      evaluatedAtEt: isReplayMode ? "REPLAY" : "LIVE",
+      evaluatedAtEt: isReplayMode ? "REPLAY" : "SYNCING",
       evaluatedAtTs: 0,
       regime: derivedRegime,
       allowedRegimes: derivedRegime === "LOW_EDGE_CHOP" ? [] : [derivedRegime],
@@ -753,8 +779,8 @@ export const PrzmTopDeck: React.FC<{
           : derivedRegime === "POS_GAMMA_PIN"
             ? ("1-2DTE" as const)
             : ("0DTE" as const),
-      minExpectancyR: 0.35,
-      minWinRatePct: 58,
+      minExpectancyR: 0,
+      minWinRatePct: 0,
       standAsideVetoReason:
         activeFsmState === "STAND_ASIDE"
           ? "FSM Neutral / Compressed Advection Corridor"
@@ -798,12 +824,18 @@ export const PrzmTopDeck: React.FC<{
           <span className="text-slate-600">|</span>
           <span className="text-slate-400">
             MIN E[R]{" "}
-            <strong className="text-emerald-300 tabular-nums">
-              +{effectivePolicy.minExpectancyR.toFixed(2)}R
-            </strong>{" "}
-            <span className="text-slate-500">
-              ({effectivePolicy.minWinRatePct.toFixed(0)}% WR)
-            </span>
+            {effectivePolicy.minExpectancyR > 0 ? (
+              <>
+                <strong className="text-emerald-300 tabular-nums">
+                  +{effectivePolicy.minExpectancyR.toFixed(2)}R
+                </strong>{" "}
+                <span className="text-slate-500 tabular-nums">
+                  ({effectivePolicy.minWinRatePct.toFixed(0)}% WR)
+                </span>
+              </>
+            ) : (
+              <strong className="text-amber-300">UNCALIBRATED</strong>
+            )}
           </span>
           <span className="text-slate-600 hidden sm:inline">|</span>
           <span className="text-slate-400 hidden sm:inline">
@@ -879,6 +911,42 @@ export const PrzmTopDeck: React.FC<{
             </span>
           </div>
         </div>
+
+        {/* Active Server Position Risk Telemetry (Contract · Option P&L % · Stop · Target) */}
+        {(() => {
+          const rawActiveMap = serverTrades?.activePositions || {};
+          const openTrade = Object.values(rawActiveMap).find(
+            (p: any) =>
+              p &&
+              p.status !== "CLOSED" &&
+              (!p.ticker || p.ticker.toUpperCase() === displayTicker)
+          ) as any;
+          if (!openTrade) return null;
+          const optPct = typeof openTrade.pnlOptionPct === "number" ? openTrade.pnlOptionPct : null;
+          return (
+            <div className="mb-2.5 px-2.5 py-1.5 rounded-lg bg-[#0b0d17] border border-cyan-500/35 flex flex-wrap items-center justify-between gap-2 font-mono text-[10.5px] tabular-nums">
+              <span className="font-bold text-amber-300">
+                OPEN {openTrade.ticker || displayTicker} {openTrade.strike}
+                {openTrade.contractType === "CALL" ? "C" : "P"}
+                {typeof openTrade.btoOptionMid === "number" ? ` @ $${openTrade.btoOptionMid.toFixed(2)}` : ""}
+              </span>
+              <div className="flex items-center gap-2.5">
+                {optPct !== null && (
+                  <span className={optPct >= 0 ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>
+                    {optPct >= 0 ? "+" : ""}
+                    {optPct.toFixed(1)}%
+                  </span>
+                )}
+                {typeof openTrade.stopLossSpot === "number" && openTrade.stopLossSpot > 0 && (
+                  <span className="text-rose-300">SL ${openTrade.stopLossSpot.toFixed(2)}</span>
+                )}
+                {typeof openTrade.target1Spot === "number" && openTrade.target1Spot > 0 && (
+                  <span className="text-emerald-300">T1 ${openTrade.target1Spot.toFixed(2)}</span>
+                )}
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Bottom 3-Metric Strip */}
         <div className="pt-2.5 border-t border-slate-800/70 flex items-center justify-between font-mono text-[11px] tracking-[0.08em]">
@@ -1107,37 +1175,30 @@ export const PrzmCallLogDeck: React.FC<{
               let statusBadge = "";
               let statusColor = "text-slate-300";
 
+              const signedDelta =
+                entry.delta > 0
+                  ? `+${entry.delta.toFixed(2)}`
+                  : entry.delta.toFixed(2);
+
               if (entry.status === "OPEN") {
-                const signed =
-                  entry.delta >= 0
-                    ? `+${entry.delta.toFixed(2)}`
-                    : entry.delta.toFixed(2);
-                statusBadge = `OPEN ${signed} pts`;
+                statusBadge = `OPEN ${signedDelta} pts`;
                 statusColor = "text-[#A78BFA] font-bold";
               } else if (entry.status === "RIGHT") {
                 const optPctStr =
                   typeof entry.pnlOptionPct === "number"
                     ? `STC ${entry.pnlOptionPct > 0 ? "+" : ""}${entry.pnlOptionPct.toFixed(1)}% · `
                     : "STC · ";
-                statusBadge = `${optPctStr}+${Math.abs(entry.delta).toFixed(2)} pts · RIGHT`;
+                statusBadge = `${optPctStr}${signedDelta} pts · RIGHT`;
                 statusColor = "text-[#10b981] font-bold";
               } else if (entry.status === "FLAT") {
-                const signed =
-                  entry.delta >= 0
-                    ? `+${entry.delta.toFixed(2)}`
-                    : entry.delta.toFixed(2);
-                statusBadge = `FLAT ${signed} pts`;
+                statusBadge = `FLAT ${signedDelta} pts`;
                 statusColor = "text-slate-400";
               } else {
                 const optPctStr =
                   typeof entry.pnlOptionPct === "number"
-                    ? `STC ${entry.pnlOptionPct.toFixed(1)}% · `
+                    ? `STC ${entry.pnlOptionPct > 0 ? "+" : ""}${entry.pnlOptionPct.toFixed(1)}% · `
                     : "STC · ";
-                const formattedPts =
-                  entry.delta <= 0
-                    ? entry.delta.toFixed(2)
-                    : `-${Math.abs(entry.delta).toFixed(2)}`;
-                statusBadge = `${optPctStr}${formattedPts} pts · WRONG`;
+                statusBadge = `${optPctStr}${signedDelta} pts · WRONG`;
                 statusColor = "text-[#FF2A55] font-bold";
               }
 

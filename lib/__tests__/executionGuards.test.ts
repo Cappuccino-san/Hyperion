@@ -866,3 +866,359 @@ test("universal VWAP stretch cap blocks >0.90x ATR bottom-tick chases and 0DTE e
   });
   assert.equal(oneDteCheapAllowed?.expiration, "2026-11-19");
 });
+
+test("afternoon 0DTE OTM ban (>= 12:30 ET), +2σ target1Spot cap, BOUNDARY_FLUX_REVERSAL_LOCK, and 52m 0DTE theta decay", async () => {
+  const sessionDate = "2026-11-18";
+  // 1. Afternoon 0DTE OTM Ban (1:20 PM ET -> etMins = 800 >= 750)
+  const afternoon120PmEt = new Date("2026-11-18T13:20:00-05:00");
+  const otm0DteCallOnly = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "CALL",
+    spotPrice: 731.12,
+    target1Spot: 733.65,
+    target2Spot: 735.0,
+    stopLossSpot: 729.6,
+    contracts: [
+      {
+        symbol: "SPY261118C00734000",
+        strike: 734,
+        expiration: "2026-11-18",
+        optionType: "C",
+        bid: 0.48,
+        ask: 0.50,
+        last: 0.49,
+        volume: 15000,
+        openInterest: 10000,
+        iv: 0.16,
+        delta: 0.28,
+        gamma: 0.04,
+        vega: 0.05,
+        percentChange: 0,
+      },
+    ],
+    nowEt: afternoon120PmEt,
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.1,
+  });
+  assert.equal(otm0DteCallOnly, null, "1:20 PM ET must ban OTM 0DTE 734C at spot $731.12");
+
+  const afternoon1DteAndAtmAllowed = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "CALL",
+    spotPrice: 731.12,
+    target1Spot: 733.65,
+    target2Spot: 735.0,
+    stopLossSpot: 729.6,
+    contracts: [
+      {
+        symbol: "SPY261118C00734000",
+        strike: 734,
+        expiration: "2026-11-18",
+        optionType: "C",
+        bid: 0.48,
+        ask: 0.50,
+        last: 0.49,
+        volume: 15000,
+        openInterest: 10000,
+        iv: 0.16,
+        delta: 0.28,
+        gamma: 0.04,
+        vega: 0.05,
+        percentChange: 0,
+      },
+      {
+        symbol: "SPY261119C00734000",
+        strike: 734,
+        expiration: "2026-11-19",
+        optionType: "C",
+        bid: 0.80,
+        ask: 0.83,
+        last: 0.82,
+        volume: 15000,
+        openInterest: 10000,
+        iv: 0.16,
+        delta: 0.36,
+        gamma: 0.04,
+        vega: 0.08,
+        percentChange: 0,
+      },
+    ],
+    nowEt: afternoon120PmEt,
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.1,
+  });
+  assert.equal(afternoon1DteAndAtmAllowed?.dte, 1, "1:20 PM ET allows 1DTE OTM 734C");
+
+  const afternoonAtm0DteCall = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "CALL",
+    spotPrice: 731.12,
+    target1Spot: 733.65,
+    target2Spot: 735.0,
+    stopLossSpot: 729.6,
+    contracts: [
+      {
+        symbol: "SPY261118C00732000",
+        strike: 732, // <= Math.ceil(731.12) = 732
+        expiration: "2026-11-18",
+        optionType: "C",
+        bid: 0.78,
+        ask: 0.82,
+        last: 0.80,
+        volume: 15000,
+        openInterest: 10000,
+        iv: 0.16,
+        delta: 0.42,
+        gamma: 0.06,
+        vega: 0.05,
+        percentChange: 0,
+      },
+    ],
+    nowEt: afternoon120PmEt,
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.1,
+  });
+  assert.equal(afternoonAtm0DteCall?.strike, 732, "1:20 PM ET allows ATM 0DTE strike <= Math.ceil(spot)");
+
+  const afternoonOtm0DtePutRejected = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "PUT",
+    spotPrice: 731.12,
+    target1Spot: 728.5,
+    target2Spot: 727.0,
+    stopLossSpot: 732.5,
+    contracts: [
+      {
+        symbol: "SPY261118P00729000",
+        strike: 729, // < Math.floor(731.12) = 731
+        expiration: "2026-11-18",
+        optionType: "P",
+        bid: 0.48,
+        ask: 0.50,
+        last: 0.49,
+        volume: 15000,
+        openInterest: 10000,
+        iv: 0.16,
+        delta: -0.28,
+        gamma: 0.04,
+        vega: 0.05,
+        percentChange: 0,
+      },
+    ],
+    nowEt: afternoon120PmEt,
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.1,
+  });
+  assert.equal(afternoonOtm0DtePutRejected, null, "1:20 PM ET must ban OTM 0DTE 729P at spot $731.12");
+
+  // 2. Cap target1Spot at +2σ Flux Field boundary when tacticalCw is > 1.5 * entryAtr5m away
+  const evalTs = Math.floor(afternoon120PmEt.getTime() / 1000);
+  const store = loadTradeStore(sessionDate);
+  store.date = sessionDate;
+  store.activePositions = {};
+  store.closedPositions = [];
+  store.alerts = [];
+  store.bouncedPutWalls = {};
+
+  const setupWithFarMacroWall = evaluateBtoCandidateSetup({
+    normalizedTicker: "SPY",
+    spotPrice: 731.12,
+    prevSpotPrice: 730.8,
+    params: {
+      ticker: "SPY",
+      spotPrice: 731.12,
+      callWall: 750,
+      putWall: 728,
+      zeroGamma: 730.5,
+      zeroDteCallWall: 750,
+      zeroDtePutWall: 728,
+      priorClose: 730.2,
+      netGex: -1200,
+    },
+    store,
+    latest5mCandle: {
+      open: 730.6,
+      high: 731.25,
+      low: 730.4,
+      close: 731.12,
+      sma34: 730.4,
+      timestamp: evalTs,
+      flowSnapshot: {
+        timestamp: evalTs,
+        spot: 731.12,
+        flowVwap: 730.55,
+        ceilingShareChi: 0.64,
+        impulseChi: 0.68,
+        pecletNumber: 1.6,
+        impulsePeclet: 1.8,
+        netFluxJ: 0.25,
+        deltaChi6Bar: 0.08,
+        deltaImpulseChi6Bar: 0.1,
+        deltaNetFlux6Bar: 0.2,
+        upper1s: 732.1,
+        lower1s: 729.0,
+        upper2s: 733.65,
+        lower2s: 727.45,
+        upper1Sigma: 732.1,
+        lower1Sigma: 729.0,
+        upper2Sigma: 733.65,
+        lower2Sigma: 727.45,
+        sigma: 1.55,
+        variance: 2.4,
+        cumGammaWeight: 100,
+        totalWeight: 100,
+        signedGammaAcceleration: 0,
+        count: 10,
+        bandSignal: null,
+        atr5m: 1.2,
+        gammaRegime: "NEGATIVE_GAMMA",
+      },
+    },
+    divergence5m: "BULL",
+    divergence30m: "NO",
+    etTotalMinutes: 800,
+    nowTs: evalTs,
+    sessionDate,
+    isPhase2ReclaimWindow: false,
+    sameTickerClosedCount: 0,
+  });
+  assert.ok(setupWithFarMacroWall.candidateBto, "Expected valid CALL candidate");
+  assert.ok(
+    setupWithFarMacroWall.candidateBto.target1Spot <= 733.65,
+    `Expected target1Spot capped <= +2σ ($733.65), got ${setupWithFarMacroWall.candidateBto.target1Spot}`
+  );
+
+  // 3. BOUNDARY_FLUX_REVERSAL_LOCK + 52m 0DTE Black-Scholes T_remaining theta decay
+  const { evaluateTradeSignals } = await import("../tradeSignalEngine");
+  const entryTs = Math.floor(new Date("2026-11-18T13:20:00-05:00").getTime() / 1000);
+  const pos: OptionTradePosition = {
+    id: "SPY-CALL-MFE-TEST",
+    ticker: "SPY",
+    contractType: "CALL",
+    contractLabel: "SPY 261118 734C (0 DTE · $0.50)",
+    strike: 734,
+    expiration: sessionDate,
+    setupName: "Zero-Gamma Flip & Flux Reclaim [BTO CALL]",
+    status: "OPEN",
+    btoSpotPrice: 731.12,
+    btoOptionMid: 0.49,
+    optionBid: 0.48,
+    optionAsk: 0.50,
+    contractsQty: 1,
+    remainingQty: 1,
+    totalOutlay: 50,
+    target1Spot: 733.65,
+    target2Spot: 745.0,
+    stopLossSpot: 729.5,
+    tp1Pct: 120,
+    tp2Pct: 250,
+    openedAt: "1:20 PM",
+    openedTs: entryTs,
+    lastCandleTs: entryTs,
+  };
+  saveTradeStore({
+    date: sessionDate,
+    activePositions: { SPY: { ...pos } },
+    closedPositions: [],
+    alerts: [],
+    prevSpotPrices: { SPY: 731.12 },
+  });
+
+  // Bar +15m: SPY rallies +0.22% MFE ($732.73 >= +$1.45) with positive netFluxJ -> stays OPEN, records MFE
+  await evaluateTradeSignals({
+    ticker: "SPY",
+    spotPrice: 732.7,
+    callWall: 750,
+    putWall: 728,
+    zeroGamma: 730.5,
+    contracts: [],
+    nowEt: new Date((entryTs + 900) * 1000),
+    isHistoricalBackfill: true,
+    latest5mCandle: {
+      open: 731.5,
+      high: 732.75,
+      low: 731.4,
+      close: 732.7,
+      sma34: 731.0,
+      timestamp: entryTs + 900,
+      flowSnapshot: {
+        timestamp: entryTs + 900,
+        spot: 732.7,
+        flowVwap: 731.2,
+        ceilingShareChi: 0.65,
+        pecletNumber: 1.5,
+        netFluxJ: 0.18,
+        upper1s: 732.2,
+        lower1s: 730.2,
+        upper2s: 733.65,
+        lower2s: 728.75,
+        upper1Sigma: 732.2,
+        lower1Sigma: 730.2,
+        upper2Sigma: 733.65,
+        lower2Sigma: 728.75,
+        sigma: 1.2,
+        variance: 1.44,
+        cumGammaWeight: 100,
+        totalWeight: 100,
+        signedGammaAcceleration: 0,
+        count: 10,
+      },
+    },
+  });
+  const midStore = loadTradeStore(sessionDate);
+  assert.ok(midStore.activePositions.SPY, "Trade should stay open while boundary flux remains positive");
+  assert.ok(
+    (midStore.activePositions.SPY.peakFavorableSpotMfePct ?? 0) >= 0.2,
+    "Should record >= 0.20% favorable spot MFE"
+  );
+
+  // Bar +52m (2:12 PM ET): spot pulls back to $731.07 (-0.05) and netFluxJ flips negative -> immediate BOUNDARY_FLUX_REVERSAL_LOCK with real BS theta loss
+  const exitRes = await evaluateTradeSignals({
+    ticker: "SPY",
+    spotPrice: 731.07,
+    callWall: 750,
+    putWall: 728,
+    zeroGamma: 730.5,
+    contracts: [],
+    nowEt: new Date((entryTs + 52 * 60) * 1000),
+    isHistoricalBackfill: true,
+    latest5mCandle: {
+      open: 731.8,
+      high: 731.9,
+      low: 731.0,
+      close: 731.07,
+      sma34: 731.1,
+      timestamp: entryTs + 52 * 60,
+      flowSnapshot: {
+        timestamp: entryTs + 52 * 60,
+        spot: 731.07,
+        flowVwap: 731.3,
+        ceilingShareChi: 0.42,
+        pecletNumber: -0.9,
+        netFluxJ: -0.14,
+        upper1s: 732.2,
+        lower1s: 730.4,
+        upper2s: 733.65,
+        lower2s: 729.0,
+        upper1Sigma: 732.2,
+        lower1Sigma: 730.4,
+        upper2Sigma: 733.65,
+        lower2Sigma: 729.0,
+        sigma: 1.2,
+        variance: 1.44,
+        cumGammaWeight: 100,
+        totalWeight: 100,
+        signedGammaAcceleration: 0,
+        count: 10,
+      },
+    },
+  });
+  assert.equal(exitRes.activePosition, null, "BOUNDARY_FLUX_REVERSAL_LOCK must close position immediately");
+  const afterStore = loadTradeStore(sessionDate);
+  const closedTrade = afterStore.closedPositions[0];
+  assert.equal(closedTrade?.exitReason, "BOUNDARY_FLUX_REVERSAL_LOCK");
+  assert.ok(
+    typeof closedTrade?.pnlOptionPct === "number" && closedTrade.pnlOptionPct < -10,
+    `Expected real 52m afternoon 0DTE BS theta loss (< -10%), got ${closedTrade?.pnlOptionPct}%`
+  );
+});

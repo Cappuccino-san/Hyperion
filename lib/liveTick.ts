@@ -1,4 +1,5 @@
 import { BoundedMap, VALID_TICKER_REGEX } from "@/lib/marketCache";
+import { isMarketOpen } from "@/lib/marketDataService";
 
 export interface LiveTickResponse {
   ticker: string;
@@ -11,11 +12,12 @@ export interface LiveTickResponse {
   volume: number;
   timestamp: number;
   source: "cnbc" | "robinhood" | "yahoo";
-  isLive: true;
+  isLive: boolean;
+  marketOpen: boolean;
 }
 
 const TICK_CACHE = new BoundedMap<string, { data: LiveTickResponse; ts: number }>(128);
-const TICK_CACHE_TTL_MS = 400; // 400ms micro-coalescing
+const TICK_CACHE_TTL_MS = 1500; // 1.5s micro-coalescing so /api/options & /api/gaia share identical live ticks
 
 const YAHOO_SYMBOL_MAP: Record<string, string> = {
   SPX: "^GSPC",
@@ -42,7 +44,7 @@ async function fetchCnbcTick(ticker: string): Promise<LiveTickResponse> {
   const res = await fetch(url, {
     headers: { "User-Agent": "Mozilla/5.0" },
     cache: "no-store",
-    signal: AbortSignal.timeout(1100),
+    signal: AbortSignal.timeout(2500),
   });
   if (!res.ok) throw new Error(`CNBC HTTP ${res.status}`);
   const json = await res.json();
@@ -76,7 +78,8 @@ async function fetchCnbcTick(ticker: string): Promise<LiveTickResponse> {
     volume,
     timestamp: Date.now(),
     source: "cnbc",
-    isLive: true,
+    isLive: isMarketOpen().open,
+    marketOpen: isMarketOpen().open,
   };
 }
 
@@ -88,7 +91,7 @@ async function fetchRobinhoodTick(ticker: string): Promise<LiveTickResponse> {
   const res = await fetch(url, {
     headers: { "User-Agent": "Mozilla/5.0" },
     cache: "no-store",
-    signal: AbortSignal.timeout(1100),
+    signal: AbortSignal.timeout(2500),
   });
   if (!res.ok) throw new Error(`RH HTTP ${res.status}`);
   const json = await res.json();
@@ -125,7 +128,8 @@ async function fetchRobinhoodTick(ticker: string): Promise<LiveTickResponse> {
     volume: 0,
     timestamp: Date.now(),
     source: "robinhood",
-    isLive: true,
+    isLive: isMarketOpen().open,
+    marketOpen: isMarketOpen().open,
   };
 }
 
@@ -138,7 +142,7 @@ async function fetchYahooTick(ticker: string): Promise<LiveTickResponse> {
   const res = await fetch(url, {
     headers: { "User-Agent": "Mozilla/5.0" },
     cache: "no-store",
-    signal: AbortSignal.timeout(1200),
+    signal: AbortSignal.timeout(2500),
   });
   if (!res.ok) throw new Error(`Yahoo HTTP ${res.status}`);
   const json = await res.json();
@@ -177,7 +181,8 @@ async function fetchYahooTick(ticker: string): Promise<LiveTickResponse> {
     volume,
     timestamp: Date.now(),
     source: "yahoo",
-    isLive: true,
+    isLive: isMarketOpen().open,
+    marketOpen: isMarketOpen().open,
   };
 }
 

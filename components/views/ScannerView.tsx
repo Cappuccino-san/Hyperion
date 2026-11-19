@@ -26,6 +26,8 @@ interface ScannerRow {
   book?: string;
   contested?: boolean;
   moved?: boolean;
+  dataStatus?: "LIVE" | "SYNCING";
+  isLive?: boolean;
 }
 
 interface ScanSlot {
@@ -76,7 +78,9 @@ const col = (s: number) =>
   s >= 80 ? "#facc15" : s >= 60 ? "#22d3ee" : "#94a3b8";
 
 const hm = (k: string) => {
+  if (k === "LIVE") return "LIVE";
   const [h, m] = k.split(":").map(Number);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return k;
   return (h % 12 || 12) + ":" + String(m).padStart(2, "0") + (h < 12 ? " AM" : " PM");
 };
 
@@ -93,11 +97,12 @@ const dayLab = (d: string) => {
   }
 };
 
-const kind = (k: string) => (k === "15:50" ? "closing scan" : "open scan");
+const kind = (k: string) =>
+  k === "LIVE" ? "live book" : k === "15:50" ? "closing scan" : "open scan";
 
 const whenLabel = (r?: ScanSlot) => {
   if (!r) return "";
-  let t = hm(r.slot) + " ET " + kind(r.slot) + " · " + dayLab(r.day);
+  let t = hm(r.slot) + (r.slot === "LIVE" ? " " : " ET ") + kind(r.slot) + " · " + dayLab(r.day);
   if (r.secs) {
     t += " · " + (r.secs < 90 ? Math.round(r.secs) + "s" : Math.round(r.secs / 60) + " min");
   }
@@ -241,6 +246,9 @@ export function ScannerView() {
     });
 
     return [...filtered].sort((a, b) => {
+      const aLive = a.dataStatus !== "SYNCING";
+      const bLive = b.dataStatus !== "SYNCING";
+      if (aLive !== bLive) return aLive ? -1 : 1;
       if (sortBy === "STRENGTH") return b.str - a.str;
       if (sortBy === "DISTANCE") return Math.abs(a.pct) - Math.abs(b.pct);
       if (sortBy === "XEM") return (a.xem ?? 999) - (b.xem ?? 999);
@@ -516,16 +524,21 @@ export function ScannerView() {
                       <span className="text-slate-400 text-xs font-mono tabular-nums">
                         ${f2(x.px)}
                       </span>
+                      {x.dataStatus === "SYNCING" && (
+                        <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/40">
+                          SYNCING
+                        </span>
+                      )}
                       <div className="flex-1" />
                       <span
                         style={{
-                          color: c,
-                          borderColor: `${c}55`,
-                          backgroundColor: `${c}1a`,
+                          color: x.dataStatus === "SYNCING" ? "#f59e0b" : c,
+                          borderColor: x.dataStatus === "SYNCING" ? "#f59e0b55" : `${c}55`,
+                          backgroundColor: x.dataStatus === "SYNCING" ? "#f59e0b1a" : `${c}1a`,
                         }}
-                        className="border rounded-full px-2.5 py-0.5 text-xs font-extrabold font-mono"
+                        className="border rounded-full px-2.5 py-0.5 text-xs font-extrabold font-mono tabular-nums"
                       >
-                        {x.score}
+                        {x.dataStatus === "SYNCING" ? "…" : x.score}
                       </span>
                     </div>
 
@@ -536,7 +549,7 @@ export function ScannerView() {
                         <small className="block text-[10px] text-slate-500 uppercase tracking-wider font-semibold">
                           King
                         </small>
-                        <span className="text-[#facc15] font-extrabold text-[13px] drop-shadow-[0_0_8px_rgba(250,204,21,0.5)]">
+                        <span className="text-[#facc15] font-extrabold text-[13px] tabular-nums drop-shadow-[0_0_8px_rgba(250,204,21,0.5)]">
                           {k % 1 !== 0 ? f2(k, 1) : k}
                           {flag}
                         </span>

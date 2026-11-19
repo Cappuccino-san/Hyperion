@@ -184,12 +184,17 @@ export async function sendDiscordTradeAlert(
       const emoji = isCalls ? "🟢" : "🟣";
       const mid = alert.btoOptionMid || 0.55;
       const bid = alert.optionBid ?? (mid > 0.05 ? mid - 0.01 : mid);
-      const ask = alert.optionAsk ?? mid + 0.01;
+      const ask = alert.optionAsk ?? mid;
+      const maxChaseLimit = Math.min(
+        0.99,
+        Number((ask + Math.max(0.03, ask * 0.05)).toFixed(2))
+      );
       const qty = alert.contractsQty || 1;
-      const totalOutlay = alert.totalOutlay || mid * 100 * qty;
+      const totalOutlay = alert.totalOutlay || Math.round(ask * 100 * qty);
       const expTabStr = alert.robinhoodTab || alert.robinhoodExp || alert.expHuman || alert.expiration;
+      const optSuffix = alert.contractType === "CALL" ? "C" : "P";
 
-      title = `${emoji} BUY TO OPEN · ${alert.ticker} ${alert.contractType}S (${qty}x @ $${mid.toFixed(2)})`;
+      title = `${emoji} BTO ${qty}x ${alert.ticker} ${alert.strike}${optSuffix} @ Ask $${ask.toFixed(2)} (Max Limit $${maxChaseLimit.toFixed(2)})`;
       description = `**Setup:** ${alert.setupName}\n${
         alert.altContractNote ? `⚠️ *${alert.altContractNote}*\n` : ""
       }**Contract:** \`${alert.contractLabel}\``;
@@ -202,74 +207,64 @@ export async function sendDiscordTradeAlert(
           ).toFixed(2);
 
       const tp1Est = alert.estTp1Mid
-        ? `TP1 ~$${alert.estTp1Mid.toFixed(2)} (+${alert.tp1Pct || 40}%)`
-        : `TP1 (Trim 50%)`;
+        ? `T1 **$${alert.target1Spot.toFixed(2)}** (~$${alert.estTp1Mid.toFixed(2)} / +${alert.tp1Pct ?? 45}%)`
+        : `T1 **$${alert.target1Spot.toFixed(2)}**`;
       const tp2Est = alert.estTp2Mid
-        ? `TP2 ~$${alert.estTp2Mid.toFixed(2)} (+${alert.tp2Pct || 110}%)`
-        : `TP2 (Full Exit)`;
-      const stopLossPct =
-        alert.btoOptionMid && alert.estStopMid && alert.btoOptionMid > 0
-          ? Math.round(((alert.estStopMid - alert.btoOptionMid) / alert.btoOptionMid) * 100)
-          : -25;
-      const stopEst = alert.estStopMid
-        ? `$${alert.estStopMid.toFixed(2)} (${stopLossPct}% max or Spot $${alert.stopLossSpot.toFixed(2)})`
-        : `$${alert.stopLossSpot.toFixed(2)}`;
+        ? `T2 **$${alert.target2Spot.toFixed(2)}** (~$${alert.estTp2Mid.toFixed(2)} / +${alert.tp2Pct ?? 100}%)`
+        : `T2 **$${alert.target2Spot.toFixed(2)}**`;
+      const hardStop45 = Number(Math.max(0.01, ask * 0.55).toFixed(2));
+      const stopEst = `Hard Stop **$${hardStop45.toFixed(2)} (-45%)** or Spot **$${alert.stopLossSpot.toFixed(2)}**\nRatchet: **+30%→BE** · **+60%→+25%** · **+100%→Trail** · **Flux-Flip ≥+50%**`;
+
+      const wallRoomPts =
+        alert.contractType === "CALL" && typeof alert.callWall === "number" && alert.callWall > alert.btoSpotPrice
+          ? `CW $${alert.callWall.toFixed(0)} (+$${(alert.callWall - alert.btoSpotPrice).toFixed(2)})`
+          : alert.contractType === "PUT" && typeof alert.putWall === "number" && alert.putWall > 0 && alert.putWall < alert.btoSpotPrice
+            ? `PW $${alert.putWall.toFixed(0)} (-$${(alert.btoSpotPrice - alert.putWall).toFixed(2)})`
+            : `T1 Room $${Math.abs(alert.target1Spot - alert.btoSpotPrice).toFixed(2)} (${rrStr}:1)`;
+      const regimeTag = alert.entryRegime || (alert.ceilingShareChi !== undefined && alert.ceilingShareChi >= 0.5 ? "BULL_FLUX" : "BEAR_FLUX");
+      const mtfDivTag = `5m:${alert.divergence5m ?? "NO"} / 30m:${alert.divergence30m ?? "NO"}`;
+      const fluxPart =
+        typeof alert.flowVwap === "number" && typeof alert.ceilingShareChi === "number"
+          ? `FVWAP $${alert.flowVwap.toFixed(2)} | χ=${(alert.ceilingShareChi * 100).toFixed(0)}% | Pe=${(alert.pecletNumber ?? 0) >= 0 ? "+" : ""}${(alert.pecletNumber ?? 0).toFixed(2)}`
+          : `Spot $${alert.btoSpotPrice.toFixed(2)} | R:R ${rrStr}:1`;
+      const confluenceThesis = `**${regimeTag}** · ${wallRoomPts} · MTF Div **${mtfDivTag}**\n${fluxPart}`;
 
       fields = [
         {
           name: "🎟️ Contract & Robinhood Tab",
-          value: `**${alert.ticker} $${alert.strike} ${alert.contractType}**\n📅 Exp: **${alert.expHuman || alert.expiration}**\n👉 **Robinhood Tab:** \`${expTabStr}\``,
+          value: `**${alert.ticker} $${alert.strike} ${alert.contractType}**\n📅 Exp: **${alert.expHuman || alert.expiration}**\n👉 **Tab:** \`${expTabStr}\``,
           inline: true,
         },
         {
-          name: "💵 Live Market Quote",
-          value: `Bid: **$${bid.toFixed(2)}** | Ask: **$${ask.toFixed(2)}**\nMid: **$${mid.toFixed(2)}** ($${(mid * 100).toFixed(0)}/contract)`,
+          name: "💵 Executable Quote & Cap",
+          value: `Bid: **$${bid.toFixed(2)}** | Ask: **$${ask.toFixed(2)}**\nMax Chase: **$${maxChaseLimit.toFixed(2)}** · Outlay **$${totalOutlay.toFixed(0)}** (${qty}x)`,
           inline: true,
         },
         {
-          name: "📦 Small Acct Size",
-          value: `**${qty} Contract${qty > 1 ? "s" : ""}** ($${totalOutlay.toFixed(0)} Total Outlay)`,
+          name: "🎯 Spot Entry & Invalidation",
+          value: `Entry: **$${alert.btoSpotPrice.toFixed(2)}**\nSL: **$${alert.stopLossSpot.toFixed(2)}** · R:R **${rrStr}:1**`,
           inline: true,
         },
         {
-          name: "🎯 Underlying Entry",
-          value: `$${alert.btoSpotPrice.toFixed(2)}`,
-          inline: true,
-        },
-        {
-          name: "⚖️ Estimated R:R",
-          value: `**${rrStr}:1**`,
-          inline: true,
-        },
-        {
-          name: "🛑 Underlying Stop",
-          value: `$${alert.stopLossSpot.toFixed(2)}`,
-          inline: true,
-        },
-        {
-          name: "💰 Option TP1 / TP2 Est.",
-          value: `${tp1Est} | ${tp2Est}`,
+          name: "🚀 Spot & Option Targets (T1 / T2)",
+          value: `${tp1Est}\n${tp2Est}`,
           inline: false,
         },
         {
-          name: "🛑 Option Hard Stop",
-          value: `${stopEst}`,
-          inline: true,
+          name: "🛡️ Risk Gate (-45% Stop & Profit Ratchet)",
+          value: stopEst,
+          inline: false,
         },
-        ...(typeof alert.flowVwap === "number" && typeof alert.ceilingShareChi === "number"
-          ? [
-              {
-                name: "🌊 Flow VWAP & Flux Field",
-                value: `FVWAP: **$${alert.flowVwap.toFixed(2)}** | χ: **${(alert.ceilingShareChi * 100).toFixed(1)}%** | Pe: **${(alert.pecletNumber ?? 0) >= 0 ? "+" : ""}${(alert.pecletNumber ?? 0).toFixed(2)}**`,
-                inline: true,
-              },
-            ]
-          : []),
+        {
+          name: "🧭 Confluence Thesis",
+          value: confluenceThesis,
+          inline: false,
+        },
         ...(typeof alert.calibratedWinRate === "number"
           ? [
               {
-                name: "📊 Walk-Forward Edge",
-                value: `Win: **${alert.calibratedWinRate.toFixed(1)}%** | E[R]: **+${(alert.calibratedExpectancyR ?? 0).toFixed(2)}R** | Score: **${alert.dataConvictionScore ?? 75}/100**`,
+                name: "📊 Empirical Bayes Edge",
+                value: `Win: **${alert.calibratedWinRate.toFixed(1)}%** | E[R]: **${(alert.calibratedExpectancyR ?? 0) >= 0 ? "+" : ""}${(alert.calibratedExpectancyR ?? 0).toFixed(2)}R** | Score: **${alert.dataConvictionScore ?? 50}/100**`,
                 inline: true,
               },
             ]
@@ -986,9 +981,6 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         tp2Pct,
         rrRatio: 1.5,
         altContractNote: optimal.altContractNote,
-        calibratedWinRate: 68,
-        calibratedExpectancyR: 0.45,
-        dataConvictionScore: 92,
         isHistoricalBackfill,
         eventId: alertId,
         message: `${isCall ? "🟢" : "🟣"} BUY TO OPEN (${contractsQty}x @ $${entryAsk.toFixed(2)}) · ${positionTicker} [Gaia ${sig.label || sig.type}] @ $${posSigPrice.toFixed(2)} · SL: $${stopLossSpot}, TP1: $${target1Spot}, TP2: $${target2Spot}`,
@@ -1027,9 +1019,6 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         initialRisk: Number(Math.max(0.05, Math.abs(posSigPrice - stopLossSpot)).toFixed(2)),
         atr5m: Number((posSigPrice * 0.0018).toFixed(4)),
         altContractNote: optimal.altContractNote,
-        calibratedWinRate: 68,
-        calibratedExpectancyR: 0.45,
-        dataConvictionScore: 92,
         originBackfill: isHistoricalBackfill,
       };
 

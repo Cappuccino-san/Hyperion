@@ -6,6 +6,7 @@ import {
   scoreSetupExpectancy,
 } from "@/lib/alphaScorer";
 import { FlowGammaVwapSnapshot } from "@/lib/flowGammaVwap";
+import { computeLocalMtfDivergence } from "@/lib/divergenceDetector";
 import { etMinutesOfDay, getTodayEt } from "@/lib/gaiaSessionGuards";
 import {
   AlphaFeatureWeights,
@@ -27,6 +28,7 @@ import {
   writeSupervisorPolicySync,
 } from "@/lib/persistenceStore";
 import type { DailyTradeStore } from "@/lib/execution/types";
+import { computeTradeRealizedPnl } from "@/lib/execution/pnlAccounting";
 
 export interface SessionPlaybookInput {
   sessionDate: string;
@@ -134,10 +136,7 @@ export function computeTrailing5dEquityStats(
 
   for (const s of prior) {
     for (const p of s.closedPositions || []) {
-      const entry = p.optionAsk || p.btoOptionMid || 0.5;
-      const exit = p.closedOptionMid ?? entry;
-      const qty = p.contractsQty || 1;
-      const pnl = Number(((exit - entry) * 100 * qty).toFixed(2));
+      const pnl = computeTradeRealizedPnl(p).realizedDollarPnl;
       equity += pnl;
       if (equity > peak) peak = equity;
       maxDd = Math.max(maxDd, peak - equity);
@@ -503,6 +502,7 @@ export function computeFeatureInformationCoefficients(input: {
         flowSnapshot: flow,
         directionHint: direction,
       });
+      const localDiv = computeLocalMtfDivergence(priorSlice, b.ts);
       const scored = scoreSetupExpectancy({
         direction,
         setupName: isCall ? "Impulse Flux Reclaim" : "Bearish Zero-Gamma Flush",
@@ -514,6 +514,8 @@ export function computeFeatureInformationCoefficients(input: {
         putWall: pw,
         zeroGamma: zg,
         zeroDteKing: input.zeroDteKing,
+        divergence5m: localDiv.divergence5m,
+        divergence30m: localDiv.divergence30m,
         flowSnapshot: flow,
         regimeClassification: regimeInfo,
         priors: input.priors,
@@ -576,15 +578,25 @@ export async function runPostMarketAttribution(
   const atmIv = input.atmIv ?? 0.18;
   const records: CounterfactualEvalRecord[] = [];
 
-  // 1. Score executed closed trades
+  // 1. Score executed closed trades using canonical entry/exit fill and true -45% 1R stop denominator
   for (const pos of input.executedTrades ?? []) {
-    const entryAsk = pos.optionAsk || pos.btoOptionMid || 0.5;
-    const exitBid = pos.closedOptionMid ?? entryAsk;
+    const posAny = pos as unknown as Record<string, unknown>;
+    const entryAsk =
+      (typeof posAny.btoOptionAsk === "number" && posAny.btoOptionAsk > 0 ? posAny.btoOptionAsk : 0) ||
+      pos.optionAsk ||
+      pos.btoOptionMid ||
+      0.5;
+    const exitBid =
+      (typeof posAny.closedOptionBid === "number" && posAny.closedOptionBid > 0
+        ? posAny.closedOptionBid
+        : null) ??
+      pos.closedOptionMid ??
+      entryAsk;
     const pnlPct =
       typeof pos.pnlOptionPct === "number"
         ? pos.pnlOptionPct
         : Number((((exitBid - entryAsk) / Math.max(0.01, entryAsk)) * 100).toFixed(1));
-    const realizedR = Number((pnlPct / 25).toFixed(2));
+    const realizedR = Number((pnlPct / 45).toFixed(2));
     const idx = bars.findIndex((b) => b.ts >= (pos.openedTs || 0));
     const flow = idx >= 0 ? flowSeries[idx] : undefined;
     const regimeInfo = classifyMarketRegime({
@@ -721,6 +733,24 @@ export async function runPostMarketAttribution(
     stat.winRatePct = Number(((stat.wins / n) * 100).toFixed(1));
     stat.lastUpdatedDate = input.sessionDate;
     priors.regimeStats[rec.regime] = stat;
+
+    // Update per-setup Empirical Bayes statistics so setupStats tracks real setup performance
+    const setupKey = rec.setupName.trim() || "UNKNOWN_SETUP";
+    const setupStat = priors.setupStats[setupKey] ?? {
+      wins: 0,
+      losses: 0,
+      sumR: 0,
+      avgR: 0,
+      winRatePct: 50,
+    };
+    if (rec.realizedOptionR > 0) setupStat.wins += 1;
+    else setupStat.losses += 1;
+    setupStat.sumR = Number((setupStat.sumR + rec.realizedOptionR).toFixed(2));
+    const sn = Math.max(1, setupStat.wins + setupStat.losses);
+    setupStat.avgR = Number((setupStat.sumR / sn).toFixed(2));
+    setupStat.winRatePct = Number(((setupStat.wins / sn) * 100).toFixed(1));
+    setupStat.lastUpdatedDate = input.sessionDate;
+    priors.setupStats[setupKey] = setupStat;
   }
 
   // Gentle weight update + Information Coefficient decay:

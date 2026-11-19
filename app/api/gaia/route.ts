@@ -1,9 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   computeBlackScholesGreeks,
+  computeExpirationExpectedMove,
+  computeIntradayExpiryYears,
   getActiveExpirationSelection,
+  NormalizedOptionContract,
   parseOccSymbol,
+  resolveEffectiveOpenInterest,
 } from "@/lib/optionsExposure";
+import { fetchLiveTickQuote } from "@/lib/liveTick";
+import { isMarketOpen } from "@/lib/marketDataService";
+import { reanchorDelayedContractsToSpot } from "@/lib/execution/optionPricing";
+import {
+  detectGlobalPivotSignals,
+  enrichBarsWithRsiAndMacd,
+  evaluateTfStatusAtTimestamp,
+} from "@/lib/divergenceDetector";
 import { getMergedIntradayHistory, getEtMinutesFromTs } from "@/lib/intradayHistory";
 import { BoundedMap, sanitizeTickerSymbol } from "@/lib/marketCache";
 
@@ -277,177 +289,6 @@ async function fetchYahooSeries(
   return bars;
 }
 
-function enrichBarsWithRsiAndMacd(bars: RawYahooBar[]): EnrichedBar[] {
-  const n = bars.length;
-  const rsi14 = new Array<number>(n).fill(50);
-  const period = 14;
-
-  if (n > period) {
-    let avgGain = 0;
-    let avgLoss = 0;
-    for (let i = 1; i <= period; i++) {
-      const diff = bars[i].close - bars[i - 1].close;
-      if (diff > 0) avgGain += diff;
-      else avgLoss -= diff;
-    }
-    avgGain /= period;
-    avgLoss /= period;
-    rsi14[period] =
-      avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
-
-    for (let i = period + 1; i < n; i++) {
-      const diff = bars[i].close - bars[i - 1].close;
-      const gain = diff > 0 ? diff : 0;
-      const loss = diff < 0 ? -diff : 0;
-      avgGain = (avgGain * (period - 1) + gain) / period;
-      avgLoss = (avgLoss * (period - 1) + loss) / period;
-      rsi14[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
-    }
-  }
-
-  const k12 = 2 / 13;
-  const k26 = 2 / 27;
-  const k9 = 2 / 10;
-  let ema12 = bars[0]?.close ?? 0;
-  let ema26 = bars[0]?.close ?? 0;
-  let signal = 0;
-
-  return bars.map((b, i) => {
-    ema12 = b.close * k12 + ema12 * (1 - k12);
-    ema26 = b.close * k26 + ema26 * (1 - k26);
-    const macd = ema12 - ema26;
-    signal = i === 0 ? macd : macd * k9 + signal * (1 - k9);
-    const macdHist = macd - signal;
-    return {
-      ...b,
-      rsi14: rsi14[i],
-      macdHist,
-    };
-  });
-}
-
-/**
- * Non-repainting 3-Left / 3-Right Pivot Divergence Detector.
- * Each pivot requires 3 finished bars on each side; forming bars are never used.
- * A timeframe stays BULL or BEAR for 30 bars after the second pivot.
- */
-function detectGlobalPivotSignals(bars: EnrichedBar[]): DetectedGlobalSignal[] {
-  const n = bars.length;
-  const pivotLows: number[] = [];
-  const pivotHighs: number[] = [];
-
-  for (let i = 3; i <= n - 4; i++) {
-    const l = bars[i].low;
-    const isLow =
-      l <= bars[i - 3].low &&
-      l <= bars[i - 2].low &&
-      l <= bars[i - 1].low &&
-      l <= bars[i + 1].low &&
-      l <= bars[i + 2].low &&
-      l <= bars[i + 3].low &&
-      (l < bars[i - 1].low || l < bars[i + 1].low);
-
-    if (isLow) pivotLows.push(i);
-
-    const h = bars[i].high;
-    const isHigh =
-      h >= bars[i - 3].high &&
-      h >= bars[i - 2].high &&
-      h >= bars[i - 1].high &&
-      h >= bars[i + 1].high &&
-      h >= bars[i + 2].high &&
-      h >= bars[i + 3].high &&
-      (h > bars[i - 1].high || h > bars[i + 1].high);
-
-    if (isHigh) pivotHighs.push(i);
-  }
-
-  const signals: DetectedGlobalSignal[] = [];
-
-  // Consecutive Pivot Lows -> BULL Divergence
-  for (let k = 1; k < pivotLows.length; k++) {
-    const p1 = pivotLows[k - 1];
-    const p2 = pivotLows[k];
-    if (
-      bars[p2].low < bars[p1].low &&
-      bars[p2].rsi14 > bars[p1].rsi14 &&
-      bars[p2].macdHist > bars[p1].macdHist
-    ) {
-      const confIdx = p2 + 3;
-      signals.push({
-        type: "BULL",
-        p1GlobalIdx: p1,
-        p1Price: bars[p1].low,
-        p2GlobalIdx: p2,
-        p2Price: bars[p2].low,
-        confirmedGlobalIdx: confIdx,
-        p2Timestamp: bars[p2].ts,
-        confirmedTimestamp: bars[confIdx].ts,
-      });
-    }
-  }
-
-  // Consecutive Pivot Highs -> BEAR Divergence
-  for (let k = 1; k < pivotHighs.length; k++) {
-    const p1 = pivotHighs[k - 1];
-    const p2 = pivotHighs[k];
-    if (
-      bars[p2].high > bars[p1].high &&
-      bars[p2].rsi14 < bars[p1].rsi14 &&
-      bars[p2].macdHist < bars[p1].macdHist
-    ) {
-      const confIdx = p2 + 3;
-      signals.push({
-        type: "BEAR",
-        p1GlobalIdx: p1,
-        p1Price: bars[p1].high,
-        p2GlobalIdx: p2,
-        p2Price: bars[p2].high,
-        confirmedGlobalIdx: confIdx,
-        p2Timestamp: bars[p2].ts,
-        confirmedTimestamp: bars[confIdx].ts,
-      });
-    }
-  }
-
-  return signals;
-}
-
-function evaluateTfStatusAtTimestamp(
-  bars: EnrichedBar[],
-  signals: DetectedGlobalSignal[],
-  targetTs: number
-): DivergenceStatus {
-  if (bars.length === 0 || signals.length === 0) return "NO";
-
-  // Find the latest bar index at or before targetTs
-  let currentIdx = -1;
-  for (let i = 0; i < bars.length; i++) {
-    if (bars[i].ts <= targetTs) {
-      currentIdx = i;
-    } else {
-      break;
-    }
-  }
-  if (currentIdx < 3) return "NO";
-
-  // Find most recent confirmed signal where currentIdx >= confirmedGlobalIdx
-  // and (currentIdx - p2GlobalIdx) <= 30
-  let activeSignal: DetectedGlobalSignal | null = null;
-  for (const sig of signals) {
-    if (
-      currentIdx >= sig.confirmedGlobalIdx &&
-      currentIdx - sig.p2GlobalIdx <= 30
-    ) {
-      if (!activeSignal || sig.p2GlobalIdx >= activeSignal.p2GlobalIdx) {
-        activeSignal = sig;
-      }
-    }
-  }
-
-  return activeSignal ? activeSignal.type : "NO";
-}
-
 function pairHourlyInto2Hr(bars60m: RawYahooBar[]): RawYahooBar[] {
   const paired: RawYahooBar[] = [];
   for (let i = 0; i < bars60m.length; i += 2) {
@@ -505,53 +346,32 @@ async function fetchLiveOptionsBuckets(
     throw new Error("Live CBOE options feed returned empty option chain");
   }
 
-  let liveSpot = Number(data.current_price ?? data.close ?? referenceSpot);
+  const marketOpenNow = isMarketOpen().open;
+  // Match /api/options identically: outside RTH, anchor frozen 4:00 PM option chain to official RTH close (data.close)
+  const cboeClosePrice = Number(data.close ?? data.current_price ?? referenceSpot);
+  const cboeSpotPrice = marketOpenNow
+    ? Number(data.current_price ?? data.close ?? referenceSpot)
+    : cboeClosePrice;
+  let liveSpot = cboeSpotPrice;
 
-  // Synchronize live spot with sub-second Robinhood exchange quote
-  try {
-    const sym = ticker.trim().toUpperCase();
-    const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym === "NDX" || sym === "NDXP" ? "QQQ" : sym;
-    const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
-      },
-      cache: "no-store",
-      signal,
-    });
-    if (rhRes.ok) {
-      const rhJson = await rhRes.json();
-      const p = Number(rhJson?.results?.[0]?.last_trade_price ?? rhJson?.results?.[0]?.bid_price ?? 0);
-      if (p > 0 && Number.isFinite(p)) {
-        const mult = sym === "SPX" || sym === "SPXW" ? 10 : sym === "NDX" || sym === "NDXP" ? 40 : 1;
-        liveSpot = Number((p * mult).toFixed(2));
+  // During RTH, synchronize live spot identically to /api/options via fetchLiveTickQuote (zero SPY*10 SPXW basis drift)
+  if (marketOpenNow) {
+    try {
+      const sym = ticker.trim().toUpperCase();
+      const mapped = sym === "SPXW" ? "SPX" : sym === "NDXP" ? "NDX" : sym;
+      const tick = await fetchLiveTickQuote(mapped).catch(() => null);
+      if (tick && tick.spot > 0 && Number.isFinite(tick.spot)) {
+        liveSpot = Number(tick.spot.toFixed(2));
       }
+    } catch {
+      // Non-fatal; retains exact CBOE current_price
     }
-  } catch {
-    // Non-fatal
-  }
-  const rawIv30 = Number(data.iv30 ?? 15);
-  const iv30Decimal = rawIv30 > 2 ? rawIv30 / 100 : rawIv30;
-
-  interface RawParsedOpt {
-    expiration: string;
-    optionType: "C" | "P";
-    strike: number;
-    openInterest: number;
-    volume: number;
-    iv: number;
-    gamma: number;
-    delta: number;
-    bid: number;
-    ask: number;
-    lastPrice: number;
   }
 
-  const hasChainOpenInterest = data.options.some(
-    (rawOpt: Record<string, unknown>) => Number(rawOpt?.open_interest ?? 0) > 0
-  );
+  const rawIv30 = Number(data.iv30 ?? 0);
+  const iv30Decimal = rawIv30 > 0 ? (rawIv30 > 2 ? rawIv30 / 100 : rawIv30) : 0.18;
 
-  const allValidRaw: RawParsedOpt[] = [];
+  const rawContracts: NormalizedOptionContract[] = [];
   for (const rawOpt of data.options) {
     const occSymbol = String(rawOpt.option ?? "");
     const parsed = parseOccSymbol(occSymbol);
@@ -559,20 +379,21 @@ async function fetchLiveOptionsBuckets(
 
     const openInterest = Number(rawOpt.open_interest ?? 0);
     const volume = Number(rawOpt.volume ?? 0);
-    if (hasChainOpenInterest ? openInterest <= 0 : openInterest <= 0 && volume <= 0) {
+    // Match lib/optionsExposure.ts: keep all strikes with positive OI or positive intraday volume
+    if (resolveEffectiveOpenInterest(openInterest, volume) <= 0) {
       continue;
     }
 
     const rawIv = Number(rawOpt.iv ?? 0);
-    const iv =
-      rawIv > 0.02 ? (rawIv > 4 ? rawIv / 100 : rawIv) : iv30Decimal;
+    const iv = rawIv > 0.02 ? (rawIv > 4 ? rawIv / 100 : rawIv) : iv30Decimal;
     const gamma = Number(rawOpt.gamma ?? 0);
     const delta = Number(rawOpt.delta ?? 0);
     const bid = Number(rawOpt.bid ?? 0);
     const ask = Number(rawOpt.ask ?? 0);
     const lastPrice = Number(rawOpt.last_trade_price ?? rawOpt.last ?? 0);
 
-    allValidRaw.push({
+    rawContracts.push({
+      symbol: occSymbol,
       expiration: parsed.expiration,
       optionType: parsed.optionType,
       strike: Number(parsed.strike.toFixed(2)),
@@ -581,19 +402,29 @@ async function fetchLiveOptionsBuckets(
       iv,
       gamma: Number.isFinite(gamma) && gamma > 0 ? gamma : 0,
       delta: Number.isFinite(delta) ? delta : 0,
+      vega: Number(rawOpt.vega ?? 0),
+      percentChange: Number(rawOpt.percent_change ?? 0),
       bid: Number.isFinite(bid) && bid > 0 ? bid : 0,
       ask: Number.isFinite(ask) && ask > 0 ? ask : 0,
-      lastPrice: Number.isFinite(lastPrice) && lastPrice > 0 ? lastPrice : 0,
+      last: Number.isFinite(lastPrice) && lastPrice > 0 ? lastPrice : 0,
     });
   }
 
-  if (allValidRaw.length === 0) {
+  if (rawContracts.length === 0) {
     throw new Error("No active option contracts found in live CBOE feed");
   }
 
+  // Re-anchor delayed CBOE contract quotes identically to /api/options so Expected Move & strikes match 100%
+  const anchoredContracts = reanchorDelayedContractsToSpot({
+    contracts: rawContracts,
+    referenceSpot: cboeSpotPrice,
+    liveSpot,
+    fallbackIv: iv30Decimal,
+  });
+
   // Include all valid non-expired expirations from the live CBOE option chain
   const rawExpirations = Array.from(
-    new Set(allValidRaw.map((o) => o.expiration))
+    new Set(anchoredContracts.map((o) => o.expiration))
   ).sort();
 
   const {
@@ -604,7 +435,7 @@ async function fetchLiveOptionsBuckets(
 
   const selectedIsoDates = allExpirations;
   const selectedIsoSet = new Set(selectedIsoDates);
-  const parsedOptions = allValidRaw.filter((o) =>
+  const parsedOptions = anchoredContracts.filter((o) =>
     selectedIsoSet.has(o.expiration)
   );
   const sortedExpirations = selectedIsoDates;
@@ -624,56 +455,27 @@ async function fetchLiveOptionsBuckets(
     .toISOString()
     .slice(0, 10);
 
-  // Compute expected-move 1σ and 2σ cone from 0.85 × ATM Straddle or ATM IV on the nearest active expiration
-  const midRefPrice = liveSpot * 0.65 + priorClose * 0.35;
-  const atmContracts = parsedOptions.filter(
-    (o) =>
-      o.expiration === nextExpIso &&
-      Math.abs(o.strike - midRefPrice) / midRefPrice <= 0.012 &&
-      o.iv > 0.02
-  );
-  const atmIv =
-    atmContracts.length > 0
-      ? atmContracts.reduce((sum, o) => sum + o.iv, 0) / atmContracts.length
-      : iv30Decimal;
-
-  // Exact TerraShade Expected Move: 0.85 × (ATM Call Mid + ATM Put Mid)
-  const atmCall = parsedOptions.find(
-    (o) =>
-      o.expiration === nextExpIso &&
-      o.optionType === "C" &&
-      Math.abs(o.strike - liveSpot) / liveSpot <= 0.015
-  );
-  const atmPut = parsedOptions.find(
-    (o) =>
-      o.expiration === nextExpIso &&
-      o.optionType === "P" &&
-      Math.abs(o.strike - liveSpot) / liveSpot <= 0.015
+  // Exact shared Expected Move (0.85 * ATM Straddle on nearest strike to liveSpot), 100% parity with /api/options
+  const nextExpContracts = parsedOptions.filter((o) => o.expiration === nextExpIso);
+  const nextExpTimeMs = new Date(`${nextExpIso}T00:00:00Z`).getTime();
+  const nextExpDteDays =
+    Number.isFinite(nextExpTimeMs) && Number.isFinite(refTimeMs)
+      ? Math.max(0, (nextExpTimeMs - refTimeMs) / (1000 * 86400))
+      : 1;
+  const sharedDailyEm = computeExpirationExpectedMove(
+    nextExpIso,
+    liveSpot,
+    iv30Decimal,
+    nextExpDteDays,
+    nextExpContracts
   );
 
-  let calculatedMove = 0;
-  if (atmCall && atmPut) {
-    const cMid =
-      atmCall.bid > 0 && atmCall.ask > 0
-        ? (atmCall.bid + atmCall.ask) / 2
-        : atmCall.lastPrice;
-    const pMid =
-      atmPut.bid > 0 && atmPut.ask > 0
-        ? (atmPut.bid + atmPut.ask) / 2
-        : atmPut.lastPrice;
-    if (cMid > 0 && pMid > 0) {
-      calculatedMove = Number((0.85 * (cMid + pMid)).toFixed(2));
-    }
-  }
-
-  const sigma1Move =
-    calculatedMove > 0
-      ? calculatedMove
-      : Number((priorClose * atmIv * Math.sqrt(1 / 252)).toFixed(2));
-  // CANONICAL_SIGMA_FLOOR: Enforce realistic 1-day SPY/index expected move (~0.68% of spot, ~$5.15 on SPY)
-    const sigmaFloor1d = Number(((priorClose || 757) * 0.0068).toFixed(2));
-    const resolvedSigma1 = Math.max(sigma1Move, sigmaFloor1d);
-    const sigma2Move = Number((resolvedSigma1 * 2).toFixed(2));
+  const sigmaFloor1d = Number(((priorClose || liveSpot || 757) * 0.0068).toFixed(2));
+  const resolvedSigma1 =
+    sharedDailyEm && sharedDailyEm.em > 0
+      ? sharedDailyEm.em
+      : Math.max(Number((priorClose * iv30Decimal * Math.sqrt(1 / 252)).toFixed(2)), sigmaFloor1d);
+  const sigma2Move = Number((resolvedSigma1 * 2).toFixed(2));
 
   // Determine strike step near spot
   const atmStrikes = Array.from(
@@ -735,7 +537,7 @@ async function fetchLiveOptionsBuckets(
   >();
 
   for (const opt of parsedOptions) {
-    const oi = hasChainOpenInterest ? opt.openInterest : opt.volume;
+    const oi = resolveEffectiveOpenInterest(opt.openInterest, opt.volume);
     if (oi <= 0) continue;
 
     const key = `${opt.strike}_${opt.expiration}`;
@@ -764,7 +566,7 @@ async function fetchLiveOptionsBuckets(
     }
 
     const days = b.dteDays;
-    const T = Math.max(1 / 365, days / 365);
+    const T = computeIntradayExpiryYears(days);
     const contractIv =
       opt.iv > 0.02
         ? opt.iv > 4
@@ -1142,7 +944,7 @@ export async function GET(request: NextRequest) {
       priorClose: Number(priorClose.toFixed(2)),
       spotPrice: liveBook.spotPrice,
       impliedVolatility: liveBook.impliedVolatility,
-      sigma1Move: Math.max(liveBook.sigma1Move, Number(((priorClose || liveBook.spotPrice || 757) * 0.0068).toFixed(2))),
+      sigma1Move: liveBook.sigma1Move,
       sigma2Move: liveBook.sigma2Move,
       strikeStep: liveBook.strikeStep,
       candles,
@@ -1166,11 +968,29 @@ export async function GET(request: NextRequest) {
   try {
     const result = await pending;
     if (!result.ok) {
+      const staleFallback = gaiaShortCache.get(cacheKey);
+      if (staleFallback) {
+        return NextResponse.json(staleFallback.payload, {
+          headers: {
+            "X-Hyperion-Data-Status": "STALE_SYNCING",
+            "Cache-Control": "no-store, max-age=0",
+          },
+        });
+      }
       return NextResponse.json({ error: result.error }, { status: result.status });
     }
     gaiaShortCache.set(cacheKey, { tsMs: Date.now(), payload: result.payload });
     return NextResponse.json(result.payload);
   } catch (err) {
+    const staleFallback = gaiaShortCache.get(cacheKey);
+    if (staleFallback) {
+      return NextResponse.json(staleFallback.payload, {
+        headers: {
+          "X-Hyperion-Data-Status": "STALE_SYNCING",
+          "Cache-Control": "no-store, max-age=0",
+        },
+      });
+    }
     const message =
       err instanceof Error ? err.message : "Live market feed error";
     return NextResponse.json(

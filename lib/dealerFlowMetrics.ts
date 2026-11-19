@@ -218,7 +218,17 @@ let sharedTerminalAudioCtx: AudioContext | null = null;
 /**
  * Zero-dependency Web Audio API acoustic synthesizer for institutional regime alerts.
  */
-export function playTerminalAlertTone(type: "KING_SHIFT" | "GAMMA_FLIP" | "WALL_BREACH" | "CONFIRM"): void {
+export function playTerminalAlertTone(
+  type:
+    | "KING_SHIFT"
+    | "GAMMA_FLIP"
+    | "WALL_BREACH"
+    | "CONFIRM"
+    | "BTO_FILL"
+    | "STC_EXIT"
+    | "STALE_FEED"
+    | "MOC_WARNING"
+): void {
   if (typeof window === "undefined") return;
   try {
     const AudioCtx =
@@ -279,6 +289,38 @@ export function playTerminalAlertTone(type: "KING_SHIFT" | "GAMMA_FLIP" | "WALL_
       gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
       osc.start(now);
       osc.stop(now + 0.25);
+    } else if (type === "BTO_FILL") {
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(523.25, now); // C5
+      osc.frequency.setValueAtTime(659.25, now + 0.07); // E5
+      osc.frequency.setValueAtTime(783.99, now + 0.14); // G5
+      gain.gain.setValueAtTime(0.08, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+      osc.start(now);
+      osc.stop(now + 0.28);
+    } else if (type === "STC_EXIT") {
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(783.99, now); // G5
+      osc.frequency.setValueAtTime(523.25, now + 0.09); // C5
+      gain.gain.setValueAtTime(0.08, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.26);
+      osc.start(now);
+      osc.stop(now + 0.26);
+    } else if (type === "STALE_FEED") {
+      osc.type = "square";
+      osc.frequency.setValueAtTime(311.13, now); // D#4 caution
+      gain.gain.setValueAtTime(0.04, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+      osc.start(now);
+      osc.stop(now + 0.22);
+    } else if (type === "MOC_WARNING") {
+      osc.type = "sawtooth";
+      osc.frequency.setValueAtTime(622.25, now); // D#5
+      osc.frequency.setValueAtTime(466.16, now + 0.12); // Bb4
+      gain.gain.setValueAtTime(0.06, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.34);
+      osc.start(now);
+      osc.stop(now + 0.34);
     }
   } catch {
     // Graceful fallback if audio context is restricted

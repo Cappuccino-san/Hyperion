@@ -123,9 +123,9 @@ const RETENTION_DAYS = 14;
 const DEFAULT_ALPHA_PRIORS: AlphaPriorsState = {
   version: 1,
   updatedAt: new Date(0).toISOString(),
-  priorStrengthM: 10,
-  baselineWinRate: 0.62,
-  baselineExpectancyR: 0.42,
+  priorStrengthM: 5,
+  baselineWinRate: 0.50,
+  baselineExpectancyR: 0.0,
   featureWeights: {
     fluxAlignment: 1.0,
     flowVwapBand: 1.0,
@@ -135,10 +135,10 @@ const DEFAULT_ALPHA_PRIORS: AlphaPriorsState = {
     regimeFit: 1.0,
   },
   regimeStats: {
-    POS_GAMMA_PIN: { wins: 6, losses: 3, sumR: 4.5, avgR: 0.5, winRatePct: 66.7 },
-    NEG_GAMMA_TREND: { wins: 7, losses: 3, sumR: 5.8, avgR: 0.58, winRatePct: 70.0 },
-    ZERO_GAMMA_FLIP: { wins: 6, losses: 3, sumR: 4.9, avgR: 0.54, winRatePct: 66.7 },
-    LOW_EDGE_CHOP: { wins: 2, losses: 8, sumR: -4.2, avgR: -0.42, winRatePct: 20.0 },
+    POS_GAMMA_PIN: { wins: 0, losses: 0, sumR: 0, avgR: 0, winRatePct: 50.0 },
+    NEG_GAMMA_TREND: { wins: 0, losses: 0, sumR: 0, avgR: 0, winRatePct: 50.0 },
+    ZERO_GAMMA_FLIP: { wins: 0, losses: 0, sumR: 0, avgR: 0, winRatePct: 50.0 },
+    LOW_EDGE_CHOP: { wins: 0, losses: 0, sumR: 0, avgR: 0, winRatePct: 50.0 },
   },
   setupStats: {},
 };
@@ -146,8 +146,8 @@ const DEFAULT_ALPHA_PRIORS: AlphaPriorsState = {
 const globalForPersistence = globalThis as unknown as {
   __hyperionLedgerMemCache?: Map<string, { store: DailyTradeStore; mtimeMs: number }>;
   __hyperionIntradayMemCache?: Map<string, { store: DailyStore; mtimeMs: number }>;
-  __hyperionPolicyMemCache?: Map<string, SessionPlaybookPolicy>;
-  __hyperionPriorsMemCache?: AlphaPriorsState | null;
+  __hyperionPolicyMemCache?: Map<string, { policy: SessionPlaybookPolicy; mtimeMs: number }>;
+  __hyperionPriorsMemCache?: { priors: AlphaPriorsState; mtimeMs: number } | null;
   __hyperionWriteSeq?: number;
   __hyperionCustomAdapter?: DurableKvAdapter | null;
   __hyperionBootHydrated?: boolean;
@@ -165,7 +165,7 @@ function getIntradayMemMap(): Map<string, { store: DailyStore; mtimeMs: number }
   return (globalForPersistence.__hyperionIntradayMemCache ??= new Map());
 }
 
-function getPolicyMemMap(): Map<string, SessionPlaybookPolicy> {
+function getPolicyMemMap(): Map<string, { policy: SessionPlaybookPolicy; mtimeMs: number }> {
   return (globalForPersistence.__hyperionPolicyMemCache ??= new Map());
 }
 
@@ -237,23 +237,23 @@ function atomicWriteJsonSync(filePath: string, payload: unknown): number {
     (globalForPersistence.__hyperionWriteSeq ?? 0) + 1);
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${writeSeq}`;
   try {
-    fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), "utf-8");
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        fs.renameSync(tmpPath, filePath);
-        try {
-          return fs.statSync(filePath).mtimeMs;
-        } catch {
-          return Date.now();
-        }
-      } catch (err: any) {
-        const code = err?.code;
-        if (attempt < 2 && (code === "EPERM" || code === "EACCES" || code === "EBUSY")) {
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
-          continue;
-        }
+    const serialized = JSON.stringify(payload, null, 2);
+    fs.writeFileSync(tmpPath, serialized, "utf-8");
+    try {
+      fs.renameSync(tmpPath, filePath);
+    } catch (err: any) {
+      const code = err?.code;
+      if (code === "EPERM" || code === "EACCES" || code === "EBUSY" || code === "EXDEV") {
+        // Non-blocking fallback for locked Windows bind mounts (avoids Atomics.wait event-loop freeze)
+        fs.writeFileSync(filePath, serialized, "utf-8");
+      } else {
         throw err;
       }
+    }
+    try {
+      return fs.statSync(filePath).mtimeMs;
+    } catch {
+      return Date.now();
     }
   } catch {
     return 0;
@@ -784,21 +784,21 @@ export function readSupervisorPolicySync(
     sessionDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionDate) ? sessionDate : getTodayEt();
   const sym = ticker.trim().toUpperCase();
   const memKey = `${targetDate}:${sym}`;
-  const cached = getPolicyMemMap().get(memKey);
-  if (cached) return cached;
-
   const cacheDir = getPersistenceCacheDir();
   const filePath = path.join(cacheDir, `supervisor-policy-${targetDate}-${sym}.json`);
+  const cached = getPolicyMemMap().get(memKey);
   if (fs.existsSync(filePath)) {
     try {
+      const mtimeMs = fs.statSync(filePath).mtimeMs;
+      if (cached && cached.mtimeMs === mtimeMs) return cached.policy;
       const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8")) as SessionPlaybookPolicy;
       if (parsed && parsed.sessionDate === targetDate) {
-        getPolicyMemMap().set(memKey, parsed);
+        getPolicyMemMap().set(memKey, { policy: parsed, mtimeMs });
         return parsed;
       }
     } catch {}
   }
-  return null;
+  return cached?.policy ?? null;
 }
 
 export function writeSupervisorPolicySync(policy: SessionPlaybookPolicy): void {
@@ -806,8 +806,8 @@ export function writeSupervisorPolicySync(policy: SessionPlaybookPolicy): void {
   const cacheDir = getPersistenceCacheDir();
   reapStaleFiles(cacheDir, "supervisor-policy-", RETENTION_DAYS);
   const filePath = path.join(cacheDir, `supervisor-policy-${policy.sessionDate}-${sym}.json`);
-  atomicWriteJsonSync(filePath, policy);
-  getPolicyMemMap().set(`${policy.sessionDate}:${sym}`, policy);
+  const mtimeMs = atomicWriteJsonSync(filePath, policy);
+  getPolicyMemMap().set(`${policy.sessionDate}:${sym}`, { policy, mtimeMs });
   scheduleRemoteWrite(`${KEY_PREFIX}policy:${policy.sessionDate}:${sym}`, policy);
 }
 
@@ -829,8 +829,8 @@ export async function readSupervisorPolicy(
         const parsed = JSON.parse(raw) as SessionPlaybookPolicy;
         if (parsed && parsed.sessionDate === targetDate) {
           const filePath = path.join(getPersistenceCacheDir(), `supervisor-policy-${targetDate}-${sym}.json`);
-          atomicWriteJsonSync(filePath, parsed);
-          getPolicyMemMap().set(`${targetDate}:${sym}`, parsed);
+          const mtimeMs = atomicWriteJsonSync(filePath, parsed);
+          getPolicyMemMap().set(`${targetDate}:${sym}`, { policy: parsed, mtimeMs });
           return parsed;
         }
       } catch {}
@@ -844,34 +844,35 @@ export async function writeSupervisorPolicy(policy: SessionPlaybookPolicy): Prom
   const cacheDir = getPersistenceCacheDir();
   reapStaleFiles(cacheDir, "supervisor-policy-", RETENTION_DAYS);
   const filePath = path.join(cacheDir, `supervisor-policy-${policy.sessionDate}-${sym}.json`);
-  atomicWriteJsonSync(filePath, policy);
-  getPolicyMemMap().set(`${policy.sessionDate}:${sym}`, policy);
+  const mtimeMs = atomicWriteJsonSync(filePath, policy);
+  getPolicyMemMap().set(`${policy.sessionDate}:${sym}`, { policy, mtimeMs });
   await writeRemoteNow(`${KEY_PREFIX}policy:${policy.sessionDate}:${sym}`, policy);
 }
 
 export function readAlphaPriorsSync(): AlphaPriorsState {
-  if (globalForPersistence.__hyperionPriorsMemCache) {
-    return globalForPersistence.__hyperionPriorsMemCache;
-  }
   const filePath = path.join(getPersistenceCacheDir(), "alpha-priors.json");
+  const cached = globalForPersistence.__hyperionPriorsMemCache;
   if (fs.existsSync(filePath)) {
     try {
+      const mtimeMs = fs.statSync(filePath).mtimeMs;
+      if (cached && cached.mtimeMs === mtimeMs) return cached.priors;
       const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8")) as AlphaPriorsState;
       if (parsed && parsed.regimeStats) {
-        globalForPersistence.__hyperionPriorsMemCache = parsed;
+        globalForPersistence.__hyperionPriorsMemCache = { priors: parsed, mtimeMs };
         return parsed;
       }
     } catch {}
   }
+  if (cached) return cached.priors;
   const def = cloneDefaultAlphaPriors();
-  globalForPersistence.__hyperionPriorsMemCache = def;
+  globalForPersistence.__hyperionPriorsMemCache = { priors: def, mtimeMs: 0 };
   return def;
 }
 
 export function writeAlphaPriorsSync(priors: AlphaPriorsState): void {
   const filePath = path.join(getPersistenceCacheDir(), "alpha-priors.json");
-  atomicWriteJsonSync(filePath, priors);
-  globalForPersistence.__hyperionPriorsMemCache = priors;
+  const mtimeMs = atomicWriteJsonSync(filePath, priors);
+  globalForPersistence.__hyperionPriorsMemCache = { priors, mtimeMs };
   scheduleRemoteWrite(`${KEY_PREFIX}alpha-priors`, priors);
 }
 
@@ -887,8 +888,8 @@ export async function readAlphaPriors(): Promise<AlphaPriorsState> {
       try {
         const parsed = JSON.parse(raw) as AlphaPriorsState;
         if (parsed && parsed.regimeStats) {
-          atomicWriteJsonSync(filePath, parsed);
-          globalForPersistence.__hyperionPriorsMemCache = parsed;
+          const mtimeMs = atomicWriteJsonSync(filePath, parsed);
+          globalForPersistence.__hyperionPriorsMemCache = { priors: parsed, mtimeMs };
           return parsed;
         }
       } catch {}
@@ -899,8 +900,8 @@ export async function readAlphaPriors(): Promise<AlphaPriorsState> {
 
 export async function writeAlphaPriors(priors: AlphaPriorsState): Promise<void> {
   const filePath = path.join(getPersistenceCacheDir(), "alpha-priors.json");
-  atomicWriteJsonSync(filePath, priors);
-  globalForPersistence.__hyperionPriorsMemCache = priors;
+  const mtimeMs = atomicWriteJsonSync(filePath, priors);
+  globalForPersistence.__hyperionPriorsMemCache = { priors, mtimeMs };
   await writeRemoteNow(`${KEY_PREFIX}alpha-priors`, priors);
 }
 
@@ -976,8 +977,8 @@ export async function hydratePersistenceOnBoot(): Promise<{
         try {
           const parsed = JSON.parse(rawPriors) as AlphaPriorsState;
           if (parsed && parsed.regimeStats) {
-            atomicWriteJsonSync(priorsPath, parsed);
-            globalForPersistence.__hyperionPriorsMemCache = parsed;
+            const mtimeMs = atomicWriteJsonSync(priorsPath, parsed);
+            globalForPersistence.__hyperionPriorsMemCache = { priors: parsed, mtimeMs };
             hydratedKeys++;
           }
         } catch {}
@@ -1034,8 +1035,8 @@ export async function hydratePersistenceOnBoot(): Promise<{
             try {
               const parsed = JSON.parse(raw) as SessionPlaybookPolicy;
               if (parsed && parsed.sessionDate === date) {
-                atomicWriteJsonSync(target, parsed);
-                getPolicyMemMap().set(`${date}:${sym.toUpperCase()}`, parsed);
+                const mtimeMs = atomicWriteJsonSync(target, parsed);
+                getPolicyMemMap().set(`${date}:${sym.toUpperCase()}`, { policy: parsed, mtimeMs });
                 hydratedKeys++;
               }
             } catch {}

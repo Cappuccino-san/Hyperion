@@ -11,9 +11,7 @@
  */
 
 import {
-  HOLIDAYS_2026,
-  RTH_OPEN_MINS,
-  RTH_CLOSE_MINS,
+  getSessionBoundsEt,
   getTodayEt,
   etMinutesOfDay,
 } from "@/lib/gaiaSessionGuards";
@@ -85,29 +83,32 @@ export function isMarketOpen(nowEt?: Date): { open: boolean; reason?: string } {
     };
   }
 
-  // 2. US Exchange Holiday check
-  if (dateIso && HOLIDAYS_2026.has(dateIso)) {
+  // 2. Multi-year US Exchange Holiday & Early-Close bounds check
+  const bounds = getSessionBoundsEt(dateIso || undefined);
+  if (!bounds.isTradingDay) {
     return {
       open: false,
-      reason: `MARKET_CLOSED: US equity options markets are closed for scheduled exchange holiday (${dateIso}).`,
+      reason: `MARKET_CLOSED: US equity options markets are closed for scheduled exchange holiday (${bounds.sessionDate}).`,
     };
   }
 
   const totalMins = etMinutesOfDay(d.getTime());
 
   // 3. Premarket check (< 9:30 AM ET = 570 mins)
-  if (totalMins < RTH_OPEN_MINS) {
+  if (totalMins < bounds.rthOpenMins) {
     return {
       open: false,
       reason: "MARKET_CLOSED: Regular options trading commences at 9:30 AM ET.",
     };
   }
 
-  // 4. Post-market check (>= 4:00 PM ET = 960 mins)
-  if (totalMins >= RTH_CLOSE_MINS) {
+  // 4. Post-market / Early-Close check (>= 13:00 ET on early closes, >= 16:00 ET on regular days)
+  if (totalMins >= bounds.rthCloseMins) {
     return {
       open: false,
-      reason: "MARKET_CLOSED: Regular options trading halts strictly at 4:00 PM ET. No post-market fills allowed.",
+      reason: bounds.isEarlyClose
+        ? `MARKET_CLOSED: NYSE early-close session (${bounds.sessionDate}) halted strictly at 1:00 PM ET. No post-market fills allowed.`
+        : "MARKET_CLOSED: Regular options trading halts strictly at 4:00 PM ET. No post-market fills allowed.",
     };
   }
 

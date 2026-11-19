@@ -5,6 +5,7 @@ import {
   GammaLevels,
 } from "@/lib/tickerPresets";
 import { getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
+import { computeDealerFlowSummary } from "@/lib/dealerFlowMetrics";
 
 export type DataSourceType = "TRADIER_LIVE" | "CBOE_MARKET_DATA" | "ROBINHOOD_LIVE";
 
@@ -150,6 +151,9 @@ export interface OptionsAnalyticsPayload {
   }>;
   isStale?: boolean;
   connectionStatus?: "LIVE" | "SYNCING" | "RECONNECTING" | "OFFLINE";
+  cacheAgeSec?: number;
+  cboeSpotPrice?: number;
+  spotLagDollars?: number;
 }
 
 export const normPDF = (x: number): number =>
@@ -463,9 +467,49 @@ function formatExpirationColumn(
 }
 
 /**
+ * Canonical intraday Black-Scholes time-to-expiry T (in years).
+ * Decays 0DTE intraday by remaining RTH minutes down to a 5-minute singularity floor,
+ * ensuring 100% gamma parity across Heatmap, Gaia, and Option Pricer.
+ */
+export function computeIntradayExpiryYears(
+  dteDays: number,
+  todayEtIso?: string,
+  currentEtMinutes?: number
+): number {
+  const safeDays = Number.isFinite(dteDays) ? Math.max(0, dteDays) : 0;
+  if (safeDays <= 0) {
+    const clock =
+      todayEtIso !== undefined && currentEtMinutes !== undefined
+        ? { nowEtIso: todayEtIso, mins: currentEtMinutes }
+        : getEtClockParts();
+    const { rthCloseMins } = getSessionBoundsEt(clock.nowEtIso);
+    const remainingRthMin = Math.max(5, Math.min(390, rthCloseMins - clock.mins));
+    return Math.max(5 / (252 * 390), remainingRthMin / (252 * 390));
+  }
+  return Math.max(1 / 365, safeDays / 365);
+}
+
+/**
+ * Canonical effective Open Interest weighting: uses OI when positive,
+ * otherwise weights intraday volume at 0.35x so newly listed 0DTE strikes contribute accurately.
+ */
+export function resolveEffectiveOpenInterest(
+  openInterest: number,
+  volume: number
+): number {
+  if (Number.isFinite(openInterest) && openInterest > 0) {
+    return openInterest;
+  }
+  if (Number.isFinite(volume) && volume > 0) {
+    return Math.round(volume * 0.35);
+  }
+  return 0;
+}
+
+/**
  * Computes Expected Move (0.85 × ATM Straddle) for a specific expiration date.
  */
-function computeExpirationExpectedMove(
+export function computeExpirationExpectedMove(
   expIso: string,
   spotPrice: number,
   impliedVolatility: number,
@@ -700,12 +744,7 @@ export function computeOptionsAnalytics(params: {
     }
 
     const days = isoToDays.get(contract.expiration) ?? 0;
-    const { rthCloseMins } = getSessionBoundsEt(todayEtIso);
-    const remainingRthMin = Math.max(5, Math.min(390, rthCloseMins - currentEtMinutes));
-    const T =
-      days === 0
-        ? Math.max(5 / (252 * 390), remainingRthMin / (252 * 390))
-        : Math.max(1 / 365, days / 365);
+    const T = computeIntradayExpiryYears(days, todayEtIso, currentEtMinutes);
     const contractIv = resolveSafeIv(contract.iv, safeIv);
 
     // Calibrated Gamma Greeks (r = 0.0460, q = 0.0, calendar T = days / 365)
@@ -729,12 +768,7 @@ export function computeOptionsAnalytics(params: {
       0.012
     );
 
-    const oi =
-      Number.isFinite(contract.openInterest) && contract.openInterest > 0
-        ? contract.openInterest
-        : Number.isFinite(contract.volume) && contract.volume > 0
-          ? Math.round(contract.volume * 0.35)
-          : 0;
+    const oi = resolveEffectiveOpenInterest(contract.openInterest, contract.volume);
     if (oi <= 0) continue;
 
     if (contract.optionType === "C") {
@@ -1089,26 +1123,42 @@ export function computeOptionsAnalytics(params: {
         gridSet.add(Number(item.strike.toFixed(4)));
       }
     }
+    // Precompute per-contract constants outside the spot grid loop (100% exact algebraic identity:
+    // gamma * 100 * s^2 * 0.01 / 1e6 = (discountQ * pdfD1 * s) / (safeContractIv * sqrtT * 1e6))
+    const INV_SQRT_2PI = 0.3989422804014327;
+    const preparedZg: Array<{
+      logK: number;
+      driftT: number;
+      invIvSqrtT: number;
+      coeff: number;
+    }> = [];
+    for (const item of contractsToSolve) {
+      if (!Number.isFinite(item.strike) || item.strike <= 0 || item.oi <= 0) continue;
+      const safeT = Math.max(5 / (252 * 390), Number.isFinite(item.T) ? item.T : 1 / 365);
+      const safeContractIv = resolveSafeIv(item.iv, safeIv);
+      const ivSqrtT = safeContractIv * Math.sqrt(safeT);
+      const discountQ = Math.exp(-zgDividend * safeT);
+      const sign = item.isCall ? 1 : -1;
+      preparedZg.push({
+        logK: Math.log(item.strike),
+        driftT: (zgRate - zgDividend + 0.5 * safeContractIv * safeContractIv) * safeT,
+        invIvSqrtT: 1 / ivSqrtT,
+        coeff: (sign * item.oi * discountQ * INV_SQRT_2PI) / (ivSqrtT * 1e6),
+      });
+    }
+
     const testSpots = Array.from(gridSet).sort((a, b) => a - b);
     const curve: { s: number; netGex: number }[] = [];
+    const nPrepared = preparedZg.length;
     for (const s of testSpots) {
       if (!Number.isFinite(s) || s <= 0) continue;
+      const logS = Math.log(s);
       let totalGexAtS = 0;
-      for (const item of contractsToSolve) {
-        if (!Number.isFinite(item.strike) || item.strike <= 0 || item.oi <= 0) continue;
-        const safeT = Math.max(5 / (252 * 390), Number.isFinite(item.T) ? item.T : 1 / 365);
-        const safeContractIv = resolveSafeIv(item.iv, safeIv);
-        const sqrtT = Math.sqrt(safeT);
-        const d1 =
-          (Math.log(s / item.strike) +
-            (zgRate - zgDividend + 0.5 * safeContractIv * safeContractIv) * safeT) /
-          (safeContractIv * sqrtT);
-        const pdfD1 = normPDF(d1);
-        const discountQ = Math.exp(-zgDividend * safeT);
-        const gamma = (discountQ * pdfD1) / (s * safeContractIv * sqrtT);
-
-        const sign = item.isCall ? 1 : -1;
-        totalGexAtS += (sign * item.oi * gamma * 100 * (s * s) * 0.01) / 1e6;
+      for (let j = 0; j < nPrepared; j++) {
+        const p = preparedZg[j];
+        const d1 = (logS - p.logK + p.driftT) * p.invIvSqrtT;
+        if (d1 > 7.5 || d1 < -7.5) continue;
+        totalGexAtS += p.coeff * s * Math.exp(-0.5 * d1 * d1);
       }
       curve.push({ s, netGex: totalGexAtS });
     }
@@ -1151,7 +1201,13 @@ export function computeOptionsAnalytics(params: {
     return { zeroGamma: zgPrice, hasZeroGammaFlip: flip };
   };
 
-  const computeLevelsForCols = (targetCols: ExpirationColumnSpec[]) => {
+  const computeLevelsForCols = (
+    targetCols: ExpirationColumnSpec[],
+    options?: {
+      skipZeroGamma?: boolean;
+      fallbackZeroGamma?: { zeroGamma: number; hasZeroGammaFlip?: boolean };
+    }
+  ) => {
     const targetIsoSet = new Set(targetCols.map((c) => c.isoDate));
 
     let bestCwStrike = safeSpot + detectedStep * 5;
@@ -1176,10 +1232,18 @@ export function computeOptionsAnalytics(params: {
       }
     }
 
-    const subZg = zgContracts.filter((c) => targetIsoSet.has(c.expiration));
-    const contractsToSolve = subZg.length > 0 ? subZg : zgContracts;
-    const { zeroGamma, hasZeroGammaFlip: flip } =
-      solveZeroGamma(contractsToSolve);
+    let zeroGamma: number;
+    let flip: boolean;
+    if (options?.skipZeroGamma && options.fallbackZeroGamma) {
+      zeroGamma = options.fallbackZeroGamma.zeroGamma;
+      flip = Boolean(options.fallbackZeroGamma.hasZeroGammaFlip);
+    } else {
+      const subZg = zgContracts.filter((c) => targetIsoSet.has(c.expiration));
+      const contractsToSolve = subZg.length > 0 ? subZg : zgContracts;
+      const solved = solveZeroGamma(contractsToSolve);
+      zeroGamma = solved.zeroGamma;
+      flip = solved.hasZeroGammaFlip;
+    }
 
     return {
       callWall: bestCwStrike,
@@ -1191,7 +1255,7 @@ export function computeOptionsAnalytics(params: {
     };
   };
 
-  // In TerraShade, primary DATA.levels is computed across all active expirations (All exp)
+  // Primary aggregate levels (ALL, THIS_WEEK, 0DTE, OPEX) always compute exact Zero-Gamma
   const allLevels =
     params.officialLevels && params.officialLevels.callWall > 0
       ? params.officialLevels
@@ -1218,9 +1282,20 @@ export function computeOptionsAnalytics(params: {
     OPEX: opexLevels,
   };
 
-  for (const exp of expirations) {
-    gammaLevelsByFilter[exp.dateLabel] = computeLevelsForCols([exp]);
-    gammaLevelsByFilter[exp.isoDate] = gammaLevelsByFilter[exp.dateLabel];
+  // Run exact per-expiration Zero-Gamma for front 6 expirations (preserving <1.5s SPXW latency);
+  // distant back-month expirations still compute exact Call/Put Walls and inherit aggregate Zero-Gamma.
+  const MAX_EXACT_PER_EXP_ZG = 6;
+  for (let idx = 0; idx < expirations.length; idx++) {
+    const exp = expirations[idx];
+    const expLevel =
+      idx < MAX_EXACT_PER_EXP_ZG
+        ? computeLevelsForCols([exp])
+        : computeLevelsForCols([exp], {
+            skipZeroGamma: true,
+            fallbackZeroGamma: exp.filterGroup === "OPEX" ? opexLevels : allLevels,
+          });
+    gammaLevelsByFilter[exp.dateLabel] = expLevel;
+    gammaLevelsByFilter[exp.isoDate] = expLevel;
   }
 
   // 7. Expected Moves: 0.85 × ATM Straddle for Daily (D), Weekly (W), Monthly (M), and Annual (A)
@@ -1371,6 +1446,7 @@ export interface TacticalStructuralLevels {
   putWall: number;
   zeroGamma: number;
   tacticalKing: number;
+  bookCenter: number;
   dailyExpectedMove: { low: number; high: number } | null;
   netGexMillions: number;
   netVexMillions: number;
@@ -1453,15 +1529,35 @@ export function deriveTacticalStructuralLevels(
       ? zeroDteLevels.zeroGamma
       : gammaLevels.zeroGamma;
 
+  const netGexMillions = Number(((payload.netMetrics?.netGex ?? 0) * 1000).toFixed(2));
+  const dealerFlow = computeDealerFlowSummary({
+    spot: payload.spotPrice,
+    netGexM: netGexMillions,
+    zeroGammaFlip: zeroGamma > 0 ? zeroGamma : null,
+    kingStrike: tacticalKing > 0 ? tacticalKing : null,
+    allExpKingStrike: payload.kingNode?.allExpKing ?? null,
+    callWall: callWall > 0 ? callWall : null,
+    putWall: putWall > 0 ? putWall : null,
+    strikes: (payload.strikes ?? []).map((row) => ({
+      strike: row.strike,
+      netGex: row.totalNetGex,
+    })),
+  });
+  const bookCenter =
+    Number.isFinite(dealerFlow.centerOfGammaMass) && dealerFlow.centerOfGammaMass > 0
+      ? Number(dealerFlow.centerOfGammaMass.toFixed(2))
+      : zeroGamma;
+
   return {
     callWall,
     putWall,
     zeroGamma,
     tacticalKing,
+    bookCenter,
     dailyExpectedMove: payload.expectedMoves?.daily
       ? { low: payload.expectedMoves.daily.low, high: payload.expectedMoves.daily.high }
       : null,
-    netGexMillions: Number(((payload.netMetrics?.netGex ?? 0) * 1000).toFixed(2)),
+    netGexMillions,
     netVexMillions: Number((payload.netMetrics?.netVex ?? 0).toFixed(2)),
   };
 }

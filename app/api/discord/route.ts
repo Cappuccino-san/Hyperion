@@ -127,6 +127,7 @@ export async function POST(req: NextRequest) {
       const setupName = body.setupName || "System Setup";
       const btoSpot = body.btoSpotPrice ?? spot;
       const t1 = body.target1Spot ?? spot;
+      const t2 = body.target2Spot ?? t1;
       const sl = body.stopLossSpot ?? spot;
       const openedAt = body.openedAt || body.timestamp || "Now";
 
@@ -142,21 +143,24 @@ export async function POST(req: NextRequest) {
         body.rrRatio ??
         (Math.abs(t1 - btoSpot) / Math.max(0.01, Math.abs(btoSpot - sl)));
 
+      const bid = body.optionBid ?? (mid > 0.05 ? mid - 0.01 : mid);
+      const ask = body.optionAsk ?? mid;
+      const maxChaseLimit = Math.min(
+        0.99,
+        Number((ask + Math.max(0.03, ask * 0.05)).toFixed(2))
+      );
+      const hardStop45 = Number(Math.max(0.01, ask * 0.55).toFixed(2));
       const estTp1 = body.estTp1Mid
-        ? `TP1 ~$${body.estTp1Mid.toFixed(2)} (+${body.tp1Pct ?? 45}%)`
-        : `TP1 ~$${(mid * 1.5).toFixed(2)} (+50%)`;
+        ? `T1 **$${t1.toFixed(2)}** (~$${body.estTp1Mid.toFixed(2)} / +${body.tp1Pct ?? 45}%)`
+        : `T1 **$${t1.toFixed(2)}**`;
 
       const estTp2 = body.estTp2Mid
-        ? `TP2 ~$${body.estTp2Mid.toFixed(2)} (+${body.tp2Pct ?? 110}%)`
-        : `TP2 ~$${(mid * 2.2).toFixed(2)} (+120%)`;
+        ? `T2 **$${t2.toFixed(2)}** (~$${body.estTp2Mid.toFixed(2)} / +${body.tp2Pct ?? 100}%)`
+        : `T2 **$${t2.toFixed(2)}**`;
 
-      const estStop = body.estStopMid
-        ? `$${body.estStopMid.toFixed(2)} (-25% max or Spot $${sl.toFixed(2)})`
-        : `$${(mid * 0.75).toFixed(2)} (-25% max or Spot $${sl.toFixed(2)})`;
-
-      const bid = body.optionBid ?? (mid > 0.05 ? mid - 0.01 : mid);
-      const ask = body.optionAsk ?? mid + 0.01;
+      const estStop = `Hard Stop **$${hardStop45.toFixed(2)} (-45%)** or Spot **$${sl.toFixed(2)}** · Ratchet: +30%→BE, +60%→+25%, +100%→Trail`;
       const expTabStr = body.robinhoodTab || body.robinhoodExp || body.expHuman || body.expiration;
+      const optSuffix = isCalls ? "C" : "P";
 
       payload = {
         username: "Hyperion Terminal",
@@ -165,7 +169,7 @@ export async function POST(req: NextRequest) {
             author: {
               name: "Hyperion Sub-$1.00 Options Engine (1 Contract Max)",
             },
-            title: `${emoji} BUY TO OPEN · ${ticker} ${contractType}S (${qty}x @ $${mid.toFixed(2)})`,
+            title: `${emoji} BTO ${qty}x ${ticker} ${body.strike ?? ""}${optSuffix} @ Ask $${ask.toFixed(2)} (Max Limit $${maxChaseLimit.toFixed(2)})`,
             description: `**Setup:** ${setupName}\n${
               body.altContractNote ? `⚠️ *${body.altContractNote}*\n` : ""
             }**Contract:** \`${contractLabel}\``,
@@ -445,20 +449,42 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const discordRes = await fetch(webhookUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(8_000),
-    });
+    // Post to Discord with HTTP 429 Retry-After backoff (max 2 retries)
+    let discordRes: Response | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      discordRes = await fetch(webhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (discordRes.status !== 429 || attempt === 2) {
+        break;
+      }
+      const headerRetry = Number(discordRes.headers.get("retry-after") ?? 0);
+      let bodyRetryMs = 0;
+      try {
+        const rateJson = await discordRes.json();
+        if (typeof rateJson?.retry_after === "number" && Number.isFinite(rateJson.retry_after)) {
+          bodyRetryMs = rateJson.retry_after > 50 ? rateJson.retry_after : rateJson.retry_after * 1000;
+        }
+      } catch {
+        // Fallback to exponential backoff
+      }
+      const waitMs = Math.min(
+        4000,
+        Math.max(300, bodyRetryMs || (headerRetry > 0 ? headerRetry * 1000 : 500 * Math.pow(2, attempt)))
+      );
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
 
-    if (!discordRes.ok) {
-      const errText = await discordRes.text();
+    if (!discordRes || !discordRes.ok) {
+      const errText = discordRes ? await discordRes.text() : "No response";
       return NextResponse.json(
-        { error: `Discord Webhook error: ${errText || discordRes.statusText}` },
-        { status: discordRes.status }
+        { error: `Discord Webhook error: ${errText || discordRes?.statusText || "HTTP error"}` },
+        { status: discordRes?.status ?? 502 }
       );
     }
 

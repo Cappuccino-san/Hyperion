@@ -703,8 +703,8 @@ export function RecapView() {
                     const win = t.realizedDollarPnl >= 0;
                     return (
                       <tr key={t.id} className="hover:bg-slate-800/30">
-                        <td className="py-1.5 pr-3 text-slate-400 whitespace-nowrap">{t.date}</td>
-                        <td className="py-1.5 pr-3">
+                        <td className="py-1.5 pr-2 text-slate-400 whitespace-nowrap">{t.date}</td>
+                        <td className="py-1.5 pr-2">
                           <button
                             type="button"
                             onClick={() => openTickerInGaia(t.ticker)}
@@ -713,16 +713,18 @@ export function RecapView() {
                             {t.ticker}
                           </button>
                         </td>
-                        <td className="py-1.5 pr-3 text-slate-200 whitespace-nowrap">{t.contractLabel}</td>
-                        <td className="py-1.5 pr-3 text-slate-400 whitespace-nowrap">
+                        <td className="py-1.5 pr-2 text-slate-200 truncate max-w-[190px]" title={t.contractLabel}>
+                          {t.contractLabel}
+                        </td>
+                        <td className="py-1.5 pr-2 text-slate-400 whitespace-nowrap">
                           {t.openedAt} → {t.closedAt}
                         </td>
-                        <td className="py-1.5 pr-3 text-right text-slate-300 whitespace-nowrap">
+                        <td className="py-1.5 pr-2 text-right text-slate-300 whitespace-nowrap">
                           ${t.entryOptionPrice.toFixed(2)} → ${t.exitOptionPrice.toFixed(2)}
                         </td>
                         <td
                           className={cn(
-                            "py-1.5 pr-3 text-right font-bold whitespace-nowrap",
+                            "py-1.5 pr-2 text-right font-bold whitespace-nowrap",
                             win ? "text-emerald-400" : "text-rose-400"
                           )}
                         >
@@ -730,14 +732,14 @@ export function RecapView() {
                         </td>
                         <td
                           className={cn(
-                            "py-1.5 pr-3 text-right font-bold whitespace-nowrap",
+                            "py-1.5 pr-2 text-right font-bold whitespace-nowrap",
                             t.rMultiple >= 0 ? "text-emerald-400" : "text-rose-400"
                           )}
                         >
                           {t.rMultiple >= 0 ? "+" : ""}
                           {t.rMultiple.toFixed(2)}R
                         </td>
-                        <td className="py-1.5 text-slate-400 truncate max-w-[260px]" title={t.exitReason}>
+                        <td className="py-1.5 text-slate-400 truncate max-w-[220px]" title={t.exitReason}>
                           {t.exitReason}
                         </td>
                       </tr>

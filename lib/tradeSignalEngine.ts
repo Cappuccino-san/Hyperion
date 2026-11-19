@@ -23,6 +23,7 @@ import {
 } from "@/lib/execution/types";
 import {
   clampToCandleRange,
+  computeRemainingYearsToExpiration,
   fetchLive5mCandleAndDivergence,
   fetchLiveCboeOptions,
   formatEtIsoDate,
@@ -30,8 +31,13 @@ import {
   getCachedSpotPrice,
   getContractMidPrice,
   getNowEtTime,
+  repriceOptionBS,
+  solveImpliedVol,
 } from "@/lib/execution/optionPricing";
-import { selectSmallAccountContract } from "@/lib/execution/contractRouter";
+import {
+  formatExpirationHuman,
+  selectSmallAccountContract,
+} from "@/lib/execution/contractRouter";
 import {
   calibrateWalkForwardExpectancy,
   evaluateBtoCandidateSetup,
@@ -329,22 +335,62 @@ async function backfillIntradaySessionSignals(
         let ask = c.ask ?? 0;
         let last = c.last ?? 0;
 
+        const expStr =
+          typeof c.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(c.expiration)
+            ? c.expiration
+            : latestSessionDate;
+        const dte = Math.max(0, formatExpirationHuman(expStr, latestSessionDate).dte);
+        const tRemaining = computeRemainingYearsToExpiration(barDate.getTime(), dte);
+        const rawChainIv =
+          typeof c.iv === "number" && Number.isFinite(c.iv) && c.iv > 0
+            ? c.iv > 4
+              ? c.iv / 100
+              : c.iv
+            : 0;
+
         if (
           openPos &&
           c.strike === openPos.strike &&
           c.expiration === openPos.expiration &&
           isCallOpt === (openPos.contractType === "CALL")
         ) {
-          const entryRef = openPos.btoSpotPrice;
-          const moveFromEntry = (refSpotForChain - entryRef) * sign;
-          const baseEntryAsk = openPos.optionAsk || openPos.btoOptionMid || 0.45;
-          const curEstMid = Math.max(0.05, Number((baseEntryAsk + moveFromEntry * 0.22).toFixed(2)));
-          bid = Math.max(0.04, Number((curEstMid - 0.01).toFixed(2)));
-          ask = Number((curEstMid + 0.01).toFixed(2));
+          const entryAskRef = openPos.optionAsk || openPos.btoOptionMid || 0.45;
+          const tEntry =
+            typeof openPos.entryTYears === "number" && openPos.entryTYears > 0
+              ? openPos.entryTYears
+              : computeRemainingYearsToExpiration((openPos.openedTs || bar.ts) * 1000, dte);
+          const anchorIv =
+            typeof openPos.entryIv === "number" && openPos.entryIv >= 0.04
+              ? openPos.entryIv
+              : rawChainIv >= 0.04 && rawChainIv <= 2.5
+                ? rawChainIv
+                : solveImpliedVol(entryAskRef, openPos.btoSpotPrice, openPos.strike, tEntry, isCallOpt);
+          const bsEntryCheck = repriceOptionBS(
+            openPos.btoSpotPrice,
+            openPos.strike,
+            tEntry,
+            anchorIv,
+            isCallOpt
+          );
+          const effectiveIv =
+            Math.abs(bsEntryCheck - entryAskRef) > entryAskRef * 0.15
+              ? solveImpliedVol(entryAskRef, openPos.btoSpotPrice, openPos.strike, tEntry, isCallOpt)
+              : anchorIv;
+          const curEstMid = repriceOptionBS(refSpotForChain, openPos.strike, tRemaining, effectiveIv, isCallOpt);
+          const halfSpread =
+            c.bid && c.ask && c.ask > c.bid
+              ? Math.max(0.01, Number(((c.ask - c.bid) / 2).toFixed(2)))
+              : 0.01;
+          bid = Math.max(0.01, Number((curEstMid - halfSpread).toFixed(2)));
+          ask = Number(Math.max(bid + 0.01, curEstMid + halfSpread).toFixed(2));
           last = curEstMid;
         } else {
           const rawMid = getContractMidPrice(c);
-          const shiftedMid = rawMid > 0 ? rawMid + dSpot * estDelta * sign : 0;
+          const hasLiveIv = rawChainIv >= 0.04 && rawChainIv <= 2.5;
+          const bsBarMid = hasLiveIv
+            ? repriceOptionBS(refSpotForChain, c.strike, tRemaining, rawChainIv, isCallOpt)
+            : 0;
+          const shiftedMid = bsBarMid > 0 ? bsBarMid : rawMid > 0 ? rawMid + dSpot * estDelta * sign : 0;
           if (shiftedMid >= 0.20 && shiftedMid <= 0.95) {
             bid = Number(Math.max(0.18, shiftedMid - 0.02).toFixed(2));
             ask = Number(Math.min(0.98, shiftedMid + 0.02).toFixed(2));
@@ -438,7 +484,10 @@ export async function evaluateTradeSignals(
 
   const isSpxw = normalizedTicker === "SPXW" || normalizedTicker === "SPX";
   const positionKey = isSpxw ? "SPY" : normalizedTicker;
-  let store = loadTradeStore();
+  const preFetchDate = params.nowEt ?? new Date();
+  const preFetchSessionDate = formatEtIsoDate(preFetchDate);
+  const loadSessionStore = () => loadTradeStore(preFetchSessionDate);
+  let store = loadSessionStore();
 
   if (params.signal?.aborted) {
     return {
@@ -449,8 +498,6 @@ export async function evaluateTradeSignals(
     };
   }
 
-  const preFetchDate = params.nowEt ?? new Date();
-  const preFetchSessionDate = formatEtIsoDate(preFetchDate);
   const preFetchBounds = getSessionBoundsEt(preFetchSessionDate);
   const preFetchEt = getNowEtTime(preFetchDate);
   const hasStoredPos = Boolean(store.activePositions[normalizedTicker] || store.activePositions[positionKey]);
@@ -478,12 +525,12 @@ export async function evaluateTradeSignals(
   let divergence5m = params.divergence5m ?? null;
   let divergence30m = params.divergence30m ?? null;
 
-  if (!params.contracts || params.contracts.length === 0) {
+  if ((!params.contracts || params.contracts.length === 0) && !(params.isHistoricalBackfill && params.nowEt)) {
     params.contracts = await fetchLiveCboeOptions(normalizedTicker, params.signal);
     if (params.signal?.aborted) {
-      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadTradeStore().alerts };
+      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadSessionStore().alerts };
     }
-    store = loadTradeStore();
+    store = loadSessionStore();
     store.prevSpotPrices[normalizedTicker] = spotPrice;
   }
   if (spotPrice <= 0) {
@@ -551,13 +598,13 @@ export async function evaluateTradeSignals(
           }
         : undefined;
     const fetched = await fetchLive5mCandleAndDivergence(normalizedTicker, params.signal, {
-      contracts: params.contracts,
+      contracts: params.contracts ?? undefined,
       structuralNodes,
     });
     if (params.signal?.aborted) {
-      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadTradeStore().alerts };
+      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadSessionStore().alerts };
     }
-    store = loadTradeStore();
+    store = loadSessionStore();
     store.prevSpotPrices[normalizedTicker] = spotPrice;
     if (!latest5mCandle) latest5mCandle = fetched.candle;
     if (!divergence5m || divergence5m === "NO") divergence5m = fetched.divergence5m;
@@ -578,9 +625,9 @@ export async function evaluateTradeSignals(
   if (!params.nowEt && !hasTickerHistoryToday && !store.backfilledTickers?.[normalizedTicker]) {
     const completedBackfill = await backfillIntradaySessionSignals(normalizedTicker, params, store, spotPrice);
     if (params.signal?.aborted) {
-      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadTradeStore().alerts };
+      return { ticker: normalizedTicker, activePosition: null, emittedAlerts: [], allAlerts: loadSessionStore().alerts };
     }
-    store = loadTradeStore();
+    store = loadSessionStore();
     if (completedBackfill) {
       store.backfilledTickers = { ...(store.backfilledTickers || {}), [normalizedTicker]: true };
       saveTradeStore(store);
@@ -644,7 +691,7 @@ export async function evaluateTradeSignals(
   ) {
     const spyChain = await fetchLiveCboeOptions("SPY", params.signal);
     if (params.signal?.aborted) {
-      const latestAbortStore = loadTradeStore();
+      const latestAbortStore = loadSessionStore();
       return {
         ticker: normalizedTicker,
         activePosition:
@@ -656,7 +703,7 @@ export async function evaluateTradeSignals(
       };
     }
     if (spyChain.length > 0) params.contracts = spyChain;
-    store = loadTradeStore();
+    store = loadSessionStore();
     store.prevSpotPrices[normalizedTicker] = spotPrice;
     activePos = store.activePositions[normalizedTicker] ?? store.activePositions[positionKey] ?? null;
   }
@@ -789,7 +836,7 @@ export async function evaluateTradeSignals(
         const calibration = await calibrateWalkForwardExpectancy(normalizedTicker, sessionDate, params.signal);
         const passesExpectancy = calibration.passesGate && alphaScore.passesGate;
         if (params.signal?.aborted || !passesExpectancy) {
-          const freshAbortStore = loadTradeStore();
+          const freshAbortStore = loadSessionStore();
           if (store.bookCenterHistoryByTicker || store.bouncedPutWalls) {
             if (store.bookCenterHistoryByTicker) {
               freshAbortStore.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
@@ -815,11 +862,17 @@ export async function evaluateTradeSignals(
         }
 
         const absImpulsePeclet = Math.abs(flowSnap?.impulsePeclet ?? flowSnap?.pecletNumber ?? 0);
+        const remainingSessionMins = Math.max(15, sessionBounds.rthCloseMins - etTime.totalMinutes);
         const remainingExpectedMove =
           params.remainingExpectedMove ??
           (params.dailyExpectedMove &&
           params.dailyExpectedMove.high > params.dailyExpectedMove.low
-            ? Number(((params.dailyExpectedMove.high - params.dailyExpectedMove.low) / 2).toFixed(2))
+            ? Number(
+                (
+                  ((params.dailyExpectedMove.high - params.dailyExpectedMove.low) / 2) *
+                  Math.sqrt(remainingSessionMins / 390)
+                ).toFixed(2)
+              )
             : undefined);
 
         const optimalContract = await selectSmallAccountContract({
@@ -845,7 +898,7 @@ export async function evaluateTradeSignals(
         });
 
         if (params.signal?.aborted || !optimalContract) {
-          const freshAbortStore = loadTradeStore();
+          const freshAbortStore = loadSessionStore();
           if (store.bouncedPutWalls) {
             freshAbortStore.bouncedPutWalls = {
               ...(freshAbortStore.bouncedPutWalls || {}),
@@ -873,7 +926,7 @@ export async function evaluateTradeSignals(
             postAwaitEt.totalMinutes < postAwaitBounds.entryStartMins ||
             postAwaitEt.totalMinutes > postAwaitBounds.entryCutoffMins
           ) {
-            const freshAbortStore = loadTradeStore();
+            const freshAbortStore = loadSessionStore();
             return {
               ticker: normalizedTicker,
               activePosition:
@@ -945,12 +998,20 @@ export async function evaluateTradeSignals(
           atr5m: Number(setupEval.entryAtr5m.toFixed(4)),
           lastPrevClose: latest5mCandle?.close,
           altContractNote: optimalContract.altContractNote,
-          calibratedWinRate: calibration.winRate,
-          calibratedExpectancyR: calibration.expectancyR,
-          dataConvictionScore: calibration.dataConvictionScore,
+          entryIv: optimalContract.entryIv,
+          entryTYears: optimalContract.entryTYears,
+          calibratedWinRate: alphaScore.calibratedWinRate,
+          calibratedExpectancyR: alphaScore.calibratedExpectancyR,
+          dataConvictionScore: alphaScore.dataConvictionScore,
           flowVwap: flowSnap?.flowVwap,
           ceilingShareChi: flowSnap?.ceilingShareChi,
           pecletNumber: flowSnap?.pecletNumber,
+          entryRegime: regimeClassification.regime,
+          divergence5m: divergence5m ?? "NO",
+          divergence30m: divergence30m ?? "NO",
+          callWall: setupEval.tacticalCw,
+          putWall: setupEval.tacticalPw,
+          zeroGamma: setupEval.effectiveZeroGamma,
           originBackfill: Boolean(params.isHistoricalBackfill),
         };
 
@@ -1006,16 +1067,22 @@ export async function evaluateTradeSignals(
           altContractNote: optimalContract.altContractNote,
           isHistoricalBackfill: Boolean(params.isHistoricalBackfill),
           eventId: `${positionId}-bto`,
-          calibratedWinRate: calibration.winRate,
-          calibratedExpectancyR: calibration.expectancyR,
-          dataConvictionScore: calibration.dataConvictionScore,
+          calibratedWinRate: alphaScore.calibratedWinRate,
+          calibratedExpectancyR: alphaScore.calibratedExpectancyR,
+          dataConvictionScore: alphaScore.dataConvictionScore,
           flowVwap: flowSnap?.flowVwap,
           ceilingShareChi: flowSnap?.ceilingShareChi,
           pecletNumber: flowSnap?.pecletNumber,
+          entryRegime: regimeClassification.regime,
+          divergence5m: divergence5m ?? "NO",
+          divergence30m: divergence30m ?? "NO",
+          callWall: setupEval.tacticalCw,
+          putWall: setupEval.tacticalPw,
+          zeroGamma: setupEval.effectiveZeroGamma,
           message: msg,
         };
 
-        const latestStoreBeforeCommit = loadTradeStore();
+        const latestStoreBeforeCommit = loadSessionStore();
         latestStoreBeforeCommit.prevSpotPrices[normalizedTicker] = spotPrice;
         if (store.bookCenterHistoryByTicker) {
           latestStoreBeforeCommit.bookCenterHistoryByTicker = store.bookCenterHistoryByTicker;
@@ -1046,7 +1113,7 @@ export async function evaluateTradeSignals(
   }
 
   if (emittedAlerts.length === 0 && !hadActivePositionAtStart) {
-    const latestIdleStore = loadTradeStore();
+    const latestIdleStore = loadSessionStore();
     if (
       latestIdleStore.prevSpotPrices[normalizedTicker] !== spotPrice ||
       Boolean(store.bookCenterHistoryByTicker?.[normalizedTicker]?.length) ||
@@ -1070,7 +1137,7 @@ export async function evaluateTradeSignals(
 
   const realNowTs = Math.floor(Date.now() / 1000);
   if (!params.isHistoricalBackfill) {
-    const preDiscordStore = loadTradeStore();
+    const preDiscordStore = loadSessionStore();
     const unsentTodayAlerts = preDiscordStore.alerts.filter(
       (a) =>
         (a.ticker === normalizedTicker || a.ticker === positionKey) &&
@@ -1091,7 +1158,7 @@ export async function evaluateTradeSignals(
         }
       }
       if (sentIds.length > 0) {
-        const afterDiscordStore = loadTradeStore();
+        const afterDiscordStore = loadSessionStore();
         afterDiscordStore.dispatchedAlertIds = afterDiscordStore.dispatchedAlertIds || {};
         for (const id of sentIds) {
           afterDiscordStore.dispatchedAlertIds[id] = true;
@@ -1102,7 +1169,7 @@ export async function evaluateTradeSignals(
     }
   }
 
-  const finalStore = loadTradeStore();
+  const finalStore = loadSessionStore();
   return {
     ticker: normalizedTicker,
     activePosition: activePos,

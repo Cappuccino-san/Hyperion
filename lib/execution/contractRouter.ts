@@ -210,6 +210,12 @@ export async function selectSmallAccountContract(params: {
       if (Math.abs(c.strike - effectiveSpot) > maxOtmDistance) continue;
 
       const { expHuman, robinhoodExp, robinhoodTab, dte } = formatExpirationHuman(c.expiration, todayEt);
+      // Institutional liquidity firewall: reject ghost contracts with OI < 100 (unless 0DTE volume >= 250)
+      const contractOi = Number(c.openInterest ?? 0);
+      const contractVol = Number(c.volume ?? 0);
+      if (contractOi < 100 && !(dte === 0 && contractVol >= 250)) {
+        continue;
+      }
       const minAskFloor = dte === 0 ? 0.45 : 0.15;
       if (askPrice < minAskFloor) {
         continue;
@@ -219,6 +225,19 @@ export async function selectSmallAccountContract(params: {
         dte < 0 ||
         c.expiration < todayEt ||
         ((Boolean(nowEt) || hasFutureExpirations) && etTime.totalMinutes >= sessionBounds.rthCloseMins && dte <= 0)
+      ) {
+        continue;
+      }
+      if (
+        etTime.totalMinutes >= 750 &&
+        dte === 0 &&
+        (etTime.totalMinutes >= 810
+          ? isCall
+            ? c.strike > effectiveSpot
+            : c.strike < effectiveSpot
+          : isCall
+            ? c.strike > Math.ceil(effectiveSpot)
+            : c.strike < Math.floor(effectiveSpot))
       ) {
         continue;
       }

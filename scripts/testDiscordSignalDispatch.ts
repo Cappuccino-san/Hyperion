@@ -290,6 +290,15 @@ async function main(): Promise<void> {
           assert.ok(last.url.includes("?wait=true") || last.url.includes("&wait=true"), `${sc.label} must attach wait=true`);
           assert.ok(last.payload?.embeds?.[0]?.title, `${sc.label} embed title missing`);
           assert.ok(Array.isArray(last.payload?.embeds?.[0]?.fields) && last.payload.embeds[0].fields.length >= 6, `${sc.label} embed fields incomplete`);
+          if (sc.alert.action === "BUY_TO_OPEN") {
+            const embed = last.payload.embeds[0];
+            const fieldsText = embed.fields.map((f: any) => `${f.name}: ${f.value}`).join("\n");
+            assert.match(embed.title, /Ask \$\d+\.\d{2} \(Max Limit \$\d+\.\d{2}\)/, `${sc.label} title must include Ask + Max Limit`);
+            assert.match(fieldsText, /T1 \*\*\$\d+\.\d{2}\*\*[\s\S]*T2 \*\*\$\d+\.\d{2}\*\*/, `${sc.label} must include Spot T1 and T2`);
+            assert.match(fieldsText, /-45%[\s\S]*Ratchet:/, `${sc.label} must include -45% hard stop and ratchet rules`);
+            assert.match(fieldsText, /Confluence Thesis/, `${sc.label} must include Confluence Thesis`);
+            assert.ok(!fieldsText.includes("-25%"), `${sc.label} must NOT contain stale -25% hard stop text`);
+          }
           console.log(`✅ [PASS] ${sc.label} -> "${last.payload.embeds[0].title}"`);
         } else {
           console.log(`✅ [LIVE 200 OK] ${sc.label}`);

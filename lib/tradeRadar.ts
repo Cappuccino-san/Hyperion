@@ -247,6 +247,7 @@ export async function getPreTradeRadarData(options?: {
   const signal = options?.signal;
   const tickers = ["SPY", "QQQ"];
   const setups: PreTradeSetupIdea[] = [];
+  let primaryNetGexB = 0;
 
   for (const ticker of tickers) {
     if (signal?.aborted) break;
@@ -272,6 +273,9 @@ export async function getPreTradeRadarData(options?: {
         impliedVolatility: 0.18,
         contracts,
       });
+      if (ticker === "SPY" || primaryNetGexB === 0) {
+        primaryNetGexB = analytics.netMetrics?.netGex ?? 0;
+      }
 
       const zeroDteLevels = analytics.gammaLevelsByFilter?.["0DTE"] ?? analytics.gammaLevelsByFilter?.["THIS_WEEK"];
       const callWall =
@@ -418,11 +422,18 @@ export async function getPreTradeRadarData(options?: {
     minute: "2-digit",
   });
 
+  const marketRegime =
+    primary && primary.zeroGamma > 0 && Math.abs(primary.spotPrice - primary.zeroGamma) / primary.spotPrice <= 0.0025
+      ? `Zero-Gamma Flip Transition · Near $${primary.zeroGamma.toFixed(2)} Pivot`
+      : primaryNetGexB < -0.15 || (primary && primary.zeroGamma > 0 && primary.spotPrice < primary.zeroGamma)
+        ? `Negative Gamma Expansion (${primaryNetGexB.toFixed(2)}B Net GEX) · Directional Momentum Below Zero-Γ`
+        : `Positive Gamma Pinning (+${primaryNetGexB.toFixed(2)}B Net GEX) · Mean-Reverting Between Put Wall & Call Wall`;
+
   return {
     timestamp: `${timeStr} ET`,
     chartUrl,
     setups,
-    marketRegime: "Positive Gamma Pinning · Rangebound between Put Wall & Call Wall",
+    marketRegime,
   };
 }
 

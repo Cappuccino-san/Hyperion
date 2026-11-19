@@ -31,7 +31,14 @@ import {
   registerActiveTrackedTicker,
   getEtClockNow,
   getLiveBotStatus,
+  isExecutionHalted,
+  setExecutionHalted,
 } from "@/lib/liveBotDaemon";
+import {
+  loadTradeStore,
+  purgeZombieToClosed,
+  saveTradeStore,
+} from "@/lib/execution/ledgerCommit";
 import { sanitizeTickerSymbol } from "@/lib/marketCache";
 import {
   readAlphaPriors,
@@ -543,6 +550,8 @@ export async function GET(req: NextRequest) {
       supervisorPolicy,
       postMarketAttribution,
       alphaPriors,
+      executionMode: "PAPER_SHADOW",
+      executionLocked: isExecutionHalted(),
       sessionDate: todayEt,
       timestamp: new Date().toISOString(),
     });
@@ -563,6 +572,50 @@ export async function POST(req: NextRequest) {
       );
     }
     const validWebhookUrl = webhookValidation.url;
+
+    if (body.action === "EMERGENCY_LOCK" || body.action === "UNLOCK_EXECUTION" || body.action === "FLATTEN_PAPER_POSITIONS") {
+      if (body.action === "UNLOCK_EXECUTION") {
+        setExecutionHalted(false);
+        return NextResponse.json({
+          success: true,
+          executionMode: "PAPER_SHADOW",
+          executionLocked: false,
+          flattenedTickers: [],
+        });
+      }
+
+      setExecutionHalted(true);
+      const flattenedTickers: string[] = [];
+      if (body.action === "FLATTEN_PAPER_POSITIONS") {
+        const lockToken = await acquireBarEvaluationLockWithWait(2500, req.signal);
+        if (!lockToken) {
+          return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
+        }
+        try {
+          const store = loadTradeStore();
+          const openTickers = Object.keys(store.activePositions || {});
+          for (const sym of openTickers) {
+            const closed = purgeZombieToClosed(
+              store,
+              sym,
+              "PILOT EMERGENCY FLATTEN (PAPER/SHADOW)"
+            );
+            if (closed) flattenedTickers.push(sym);
+          }
+          if (flattenedTickers.length > 0) {
+            saveTradeStore(store);
+          }
+        } finally {
+          releaseBarEvaluationLock(lockToken);
+        }
+      }
+      return NextResponse.json({
+        success: true,
+        executionMode: "PAPER_SHADOW",
+        executionLocked: true,
+        flattenedTickers,
+      });
+    }
 
     if (body.action === "REGISTER_TRACKED_TICKER") {
       const trackedTickers = registerActiveTrackedTicker(body.ticker);
@@ -592,6 +645,9 @@ export async function POST(req: NextRequest) {
       const syncClock = getEtClockNow();
       if (!backfill && !syncClock.isWeekday) {
         return NextResponse.json({ success: true, skipped: true, reason: "Market closed (weekend)" });
+      }
+      if (!backfill && isExecutionHalted()) {
+        return NextResponse.json({ success: true, skipped: true, executionLocked: true, reason: "Execution locked by pilot" });
       }
       const lockToken = await acquireBarEvaluationLockWithWait(2500, req.signal);
       if (!lockToken) {

@@ -26,6 +26,11 @@ export interface LiveTickerTelemetry {
   vexKing: number;
   kingStrength: number;
   strikeStep: number;
+  callWall?: number;
+  putWall?: number;
+  zeroGamma?: number;
+  pecletNumber?: number;
+  ceilingShareChi?: number;
 }
 
 const f2 = (v: number): number => Number(v.toFixed(2));
@@ -124,8 +129,16 @@ export function generateCallPick(telemetry: LiveTickerTelemetry): PlaybookPick {
   // Target 2: Terminal Expected Move upper boundary (D↑ edge)
   const target2 = edgeHigh;
 
-  // Target 1: Entry + 0.45 * (Edge_high - Entry)
-  const target1 = f2(entryPrice + 0.45 * (target2 - entryPrice));
+  // Target 1: Anchor to Call Wall or Zero-Gamma when structurally positioned inside (entry, target2),
+  // otherwise use 45% EM bridge (strictly preserving stopLoss < entry < target1 < target2).
+  const defaultT1 = f2(entryPrice + 0.45 * (target2 - entryPrice));
+  const callWallAnchor =
+    typeof telemetry.callWall === "number" &&
+    telemetry.callWall > entryPrice + 0.05 &&
+    telemetry.callWall < target2 - 0.05
+      ? f2(telemetry.callWall)
+      : null;
+  const target1 = callWallAnchor ?? defaultT1;
 
   // Determine if King node sits between Entry and Target 2
   const kingBetween = gexKing >= entryPrice && gexKing <= target2;
@@ -133,8 +146,14 @@ export function generateCallPick(telemetry: LiveTickerTelemetry): PlaybookPick {
   // Compute Flux Field Péclet number Pe = mu_delta * W / Gamma and Ceiling Share chi
   const channelW = Math.max(spotPrice * 0.0005, edgeHigh - edgeLow);
   const driftNorm = (spotPrice - previousClose) / Math.max(spotPrice * 0.0005, expectedMoveDaily);
-  const pecletNumber = f2(Math.max(-12, Math.min(12, driftNorm * 2.4 + (netGex >= 0 ? 0.55 : -0.35))));
-  const ceilingShareChi = computeCeilingShareChi(pecletNumber);
+  const pecletNumber =
+    typeof telemetry.pecletNumber === "number" && Number.isFinite(telemetry.pecletNumber)
+      ? f2(telemetry.pecletNumber)
+      : f2(Math.max(-12, Math.min(12, driftNorm * 2.4 + (netGex >= 0 ? 0.55 : -0.35))));
+  const ceilingShareChi =
+    typeof telemetry.ceilingShareChi === "number" && Number.isFinite(telemetry.ceilingShareChi)
+      ? telemetry.ceilingShareChi
+      : computeCeilingShareChi(pecletNumber);
 
   // Score bullish conviction
   let score = 50;
@@ -218,8 +237,16 @@ export function generatePutPick(telemetry: LiveTickerTelemetry): PlaybookPick {
   // Target 2: Terminal Expected Move lower boundary (D↓ edge)
   const target2 = edgeLow;
 
-  // Target 1: Entry - 0.45 * (Entry - Edge_low)
-  const target1 = f2(entryPrice - 0.45 * (entryPrice - target2));
+  // Target 1: Anchor to Put Wall when structurally positioned inside (target2, entry),
+  // otherwise use 45% EM bridge (strictly preserving stopLoss > entry > target1 > target2).
+  const defaultT1 = f2(entryPrice - 0.45 * (entryPrice - target2));
+  const putWallAnchor =
+    typeof telemetry.putWall === "number" &&
+    telemetry.putWall < entryPrice - 0.05 &&
+    telemetry.putWall > target2 + 0.05
+      ? f2(telemetry.putWall)
+      : null;
+  const target1 = putWallAnchor ?? defaultT1;
 
   // Determine if King node sits between Entry and Target 2 (below entry)
   const kingBetween = gexKing <= entryPrice && gexKing >= target2;
@@ -227,8 +254,14 @@ export function generatePutPick(telemetry: LiveTickerTelemetry): PlaybookPick {
   // Compute Flux Field Péclet number Pe and Ceiling Share chi
   const channelW = Math.max(spotPrice * 0.0005, edgeHigh - edgeLow);
   const driftNorm = (spotPrice - previousClose) / Math.max(spotPrice * 0.0005, expectedMoveDaily);
-  const pecletNumber = f2(Math.max(-12, Math.min(12, driftNorm * 2.4 + (netGex < 0 ? -0.65 : 0.25))));
-  const ceilingShareChi = computeCeilingShareChi(pecletNumber);
+  const pecletNumber =
+    typeof telemetry.pecletNumber === "number" && Number.isFinite(telemetry.pecletNumber)
+      ? f2(telemetry.pecletNumber)
+      : f2(Math.max(-12, Math.min(12, driftNorm * 2.4 + (netGex < 0 ? -0.65 : 0.25))));
+  const ceilingShareChi =
+    typeof telemetry.ceilingShareChi === "number" && Number.isFinite(telemetry.ceilingShareChi)
+      ? telemetry.ceilingShareChi
+      : computeCeilingShareChi(pecletNumber);
   const floorShare = f2(1 - ceilingShareChi);
 
   // Score bearish conviction

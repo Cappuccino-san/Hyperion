@@ -121,16 +121,16 @@ export function SignalClarityBanner() {
         <div className="lg:col-span-5 bg-slate-900/70 border border-slate-800/80 rounded-lg px-3 py-2">
           <div className="flex items-center justify-between text-[11px] mb-1">
             <div className="flex items-center gap-1.5">
-              <span className="text-rose-400 font-semibold uppercase text-[10px] tracking-wider">
+              <span className="text-purple-400 font-semibold uppercase text-[10px] tracking-wider">
                 Put Floor
               </span>
-              <span className="font-mono font-bold text-white text-xs">
+              <span className="font-mono font-bold text-white text-xs tabular-nums">
                 {gammaLevels?.putWall ?? "—"}
               </span>
             </div>
 
             <div className="flex items-center gap-1.5">
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-mono text-[11px] font-bold">
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-yellow-500/15 border border-yellow-500/35 text-[#facc15] font-mono text-[11px] font-bold tabular-nums">
                 <Magnet className="w-3 h-3" />
                 King {kingNode.filteredKing ?? kingNode.allExpKing ?? "—"}
               </span>
@@ -138,7 +138,7 @@ export function SignalClarityBanner() {
                 kingNode.filteredKing &&
                 kingNode.allExpKing !== kingNode.filteredKing && (
                   <span
-                    className="hidden sm:inline-flex items-center px-1.5 py-0.5 rounded bg-yellow-500/10 border border-yellow-500/25 text-yellow-300/90 font-mono text-[10px]"
+                    className="hidden sm:inline-flex items-center px-1.5 py-0.5 rounded bg-yellow-500/10 border border-yellow-500/25 text-yellow-300/90 font-mono text-[10px] tabular-nums"
                     title="Macro King Strike"
                   >
                     Macro {kingNode.allExpKing}
@@ -147,10 +147,10 @@ export function SignalClarityBanner() {
             </div>
 
             <div className="flex items-center gap-1.5">
-              <span className="font-mono font-bold text-white text-xs">
+              <span className="font-mono font-bold text-white text-xs tabular-nums">
                 {gammaLevels?.callWall ?? "—"}
               </span>
-              <span className="text-emerald-400 font-semibold uppercase text-[10px] tracking-wider">
+              <span className="text-cyan-400 font-semibold uppercase text-[10px] tracking-wider">
                 Call Ceiling
               </span>
             </div>

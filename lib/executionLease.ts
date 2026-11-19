@@ -103,15 +103,6 @@ export function acquireCrossProcessExecutionLease(params?: {
     };
   }
 
-  // If expired or held by us, remove/refresh atomically
-  if (existing && (existing.instanceId === instanceId || existing.expiresAtMs <= nowMs)) {
-    try {
-      fs.unlinkSync(leasePath);
-    } catch {
-      // Another contender may have unlinked simultaneously
-    }
-  }
-
   const payload: ExecutionLeasePayload = {
     instanceId,
     pid: process.pid,
@@ -120,6 +111,32 @@ export function acquireCrossProcessExecutionLease(params?: {
     heartbeatAtMs: nowMs,
     expiresAtMs: nowMs + ttlMs,
   };
+
+  // Same-owner refresh via temp file + atomic renameSync (zero unlinkSync TOCTOU window)
+  if (existing && existing.instanceId === instanceId) {
+    const tmpLease = `${leasePath}.tmp.${process.pid}.${nowMs}`;
+    try {
+      fs.writeFileSync(tmpLease, JSON.stringify(payload, null, 2), "utf-8");
+      fs.renameSync(tmpLease, leasePath);
+      return {
+        acquired: true,
+        holderInstanceId: instanceId,
+        role,
+      };
+    } catch {
+      try {
+        if (fs.existsSync(tmpLease)) fs.unlinkSync(tmpLease);
+      } catch {
+        // Ignore cleanup failure
+      }
+    }
+  } else if (existing && existing.expiresAtMs <= nowMs) {
+    try {
+      fs.unlinkSync(leasePath);
+    } catch {
+      // Another contender may have unlinked simultaneously
+    }
+  }
 
   try {
     const fd = fs.openSync(

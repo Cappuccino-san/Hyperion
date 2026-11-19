@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
-import { normPDF } from "@/lib/optionsExposure";
+import { computeIntradayExpiryYears, normPDF } from "@/lib/optionsExposure";
 import {
   computeBarFlowGammaVwapSeries,
   FlowGammaVwapSnapshot,
@@ -141,7 +141,7 @@ function prepareGaiaBucket(
 ): PreparedGaiaBucket | null {
   if (bucket.callOI <= 0 && bucket.putOI <= 0) return null;
   const days = bucket.dteDays;
-  const T = Math.max(1 / 365, days / 365);
+  const T = computeIntradayExpiryYears(days);
   const sqrtT = Math.sqrt(T);
   const T_vex = Math.max(1 / 365, (days + 0.5) / 365);
   const sqrtT_vex = Math.sqrt(T_vex);
@@ -263,6 +263,16 @@ function getCandleEtMinutes(c: { timestamp?: number; timeLabel?: string }): numb
   }
   return null;
 }
+
+/**
+ * Closed-bar Black-Scholes column cache: prevents 800ms live ticks on the active candle
+ * from re-evaluating ~150 closed historical bars x 5,700+ buckets on every tick (~99% CPU reduction).
+ */
+let closedBarColumnsCache: {
+  key: string;
+  columns: StrikeExposureColumn[];
+  extraStrikes: number[];
+} | null = null;
 
 /**
  * Computes the complete Gaia chart view dataset strictly from the live API payload.
@@ -393,11 +403,29 @@ function buildLiveGaiaDataset(
     if (p) preparedAll.push(p);
   }
 
+  const closedCacheKey =
+    candles.length >= 2
+      ? `${ticker}|${sessionDate}|${exposureMode}|${expFilter}|${optionBuckets.length}|${candles.length}|${candles[0]?.timestamp ?? 0}|${candles[candles.length - 2]?.timestamp ?? 0}|${candles[candles.length - 2]?.close ?? 0}|${baseVisibleStrikes.length}|${baseVisibleStrikes[0] ?? 0}`
+      : "";
+  const canReuseClosedBars =
+    closedCacheKey.length > 0 &&
+    closedBarColumnsCache !== null &&
+    closedBarColumnsCache.key === closedCacheKey &&
+    closedBarColumnsCache.columns.length === candles.length - 1;
+  if (canReuseClosedBars && closedBarColumnsCache) {
+    for (const s of closedBarColumnsCache.extraStrikes) {
+      visibleStrikeSet.add(s);
+    }
+  }
+
   // Evaluate Black-Scholes exposure in a single pass across prepared buckets per bar
   const columnsByBar: StrikeExposureColumn[] = candles.map((candle, idx) => {
+    if (canReuseClosedBars && idx < candles.length - 1 && closedBarColumnsCache) {
+      return closedBarColumnsCache.columns[idx];
+    }
     const spot =
       isLatestSession && idx === candles.length - 1
-        ? payload.spotPrice
+        ? (candle.close > 0 ? candle.close : payload.spotPrice)
         : candle.close;
     const logSpot = Math.log(Math.max(1e-4, spot));
 
@@ -575,6 +603,16 @@ function buildLiveGaiaDataset(
     };
   });
 
+  if (closedCacheKey.length > 0 && columnsByBar.length >= 2) {
+    const baseSet = new Set(baseVisibleStrikes);
+    const extraStrikes = Array.from(visibleStrikeSet).filter((s) => !baseSet.has(s));
+    closedBarColumnsCache = {
+      key: closedCacheKey,
+      columns: columnsByBar.slice(0, columnsByBar.length - 1),
+      extraStrikes,
+    };
+  }
+
   const visibleStrikes = Array.from(visibleStrikeSet).sort((a, b) => b - a);
 
   // Include visible strikes, candles, both King strikes, and full ±2σ Expected-Move Cone bounds + padding
@@ -682,7 +720,7 @@ export function GaiaView() {
 
   // Chart Layout Metrics (Unified constants across canvas draw & pointer projection)
   const CHART_PAD_LEFT = 24;
-  const CHART_RIGHT_AXIS_WIDTH = 96;
+  const CHART_RIGHT_AXIS_WIDTH = 116;
   const CHART_PAD_TOP = 18;
   const CHART_PAD_BOTTOM = 32;
 
@@ -692,6 +730,7 @@ export function GaiaView() {
   const [isReplayFrozen, setIsReplayFrozen] = useState<boolean>(false);
   const [replaySpeed, setReplaySpeed] = useState<1 | 2 | 4>(1);
   const isHistoricalOrReplay = isReplaying || isReplayFrozen || Boolean(selectedSessionIso);
+  const replayFrozenTradesRef = useRef<ServerTradesState | null>(null);
   const effectiveServerTrades: ServerTradesState = useMemo(() => {
     if (selectedSessionIso) {
       return {
@@ -701,13 +740,21 @@ export function GaiaView() {
         loaded: Boolean(serverTrades.loaded),
       };
     }
-    return {
+    const liveSnapshot: ServerTradesState = {
       activePositions: storeActivePositions,
       closedPositions: storeClosedTrades,
       alerts: storeTradeAlerts,
       loaded: storeServerTradesLoaded,
     };
-  }, [selectedSessionIso, serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts, storeServerTradesLoaded]);
+    if (isReplaying || isReplayFrozen) {
+      if (!replayFrozenTradesRef.current) {
+        replayFrozenTradesRef.current = liveSnapshot;
+      }
+      return replayFrozenTradesRef.current;
+    }
+    replayFrozenTradesRef.current = null;
+    return liveSnapshot;
+  }, [selectedSessionIso, isReplaying, isReplayFrozen, serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts, storeServerTradesLoaded]);
   const storeHeatmapKingNode = useDashboardStore((s) => s.kingNode);
   const storeHeatmapTicker = useDashboardStore((s) => s.activeTicker);
   const isReplayingRef = useRef<boolean>(false);
@@ -833,7 +880,9 @@ export function GaiaView() {
           setActiveBarIndex(Math.max(0, lastAllowed));
         }
         }
-        setHoverBarIndex(null);
+        if (!isReplayingRef.current && !isReplayFrozenRef.current) {
+          setHoverBarIndex(null);
+        }
       } catch (err) {
         if (controller.signal.aborted || reqSeq !== gaiaReqSeqRef.current) return;
         if (!silent) {
@@ -956,7 +1005,7 @@ export function GaiaView() {
         return prev;
       }
       const relDiff = Math.abs(liveTickPrice - lastCandle.close) / Math.max(1, lastCandle.close);
-      if (relDiff > 0.005) return prev;
+      if (relDiff > 0.05) return prev;
 
       const updatedCandles = [...candles];
       const last = { ...updatedCandles[updatedCandles.length - 1] };
@@ -967,6 +1016,7 @@ export function GaiaView() {
 
       return {
         ...prev,
+        spotPrice: liveTickPrice,
         candles: updatedCandles,
       };
     });
@@ -1891,15 +1941,15 @@ export function GaiaView() {
       });
     }
 
-    // 4. Zero Gamma
+    // 4. Zero Gamma (Standardized Amber semantic polarity)
     if (zeroGammaLevel > 0) {
       structuralSpecs.push({
         price: zeroGammaLevel,
-        stroke: "rgba(248, 250, 252, 0.70)",
+        stroke: "rgba(245, 158, 11, 0.78)",
         dash: [5, 4],
         lineWidth: 1.15,
         label: `ZERO Γ ${zeroGammaLevel.toFixed(1)}`,
-        textColor: "#f8fafc",
+        textColor: "#fbbf24",
         priority: 90,
       });
     }
@@ -2002,11 +2052,18 @@ export function GaiaView() {
       ) {
         targetCenterY = ln.y <= spotCenterY ? spotCenterY - spotHalfH - 7 : spotCenterY + spotHalfH + 7;
       }
-      // Enforce strict top-to-bottom ordering (>= 13px below previous higher-priced label)
-      if (targetCenterY < prevLabelCenterY + 13) {
-        targetCenterY = prevLabelCenterY + 13;
+      // Enforce strict top-to-bottom ordering (>= MIN_LABEL_SEP_PX below previous higher-priced label)
+      if (targetCenterY < prevLabelCenterY + MIN_LABEL_SEP_PX) {
+        targetCenterY = prevLabelCenterY + MIN_LABEL_SEP_PX;
+      }
+      if (hasYCollision(occupiedLevelBoxes, targetCenterY, 5)) {
+        const belowSpot = spotCenterY + spotHalfH + MIN_LABEL_SEP_PX;
+        if (belowSpot >= prevLabelCenterY + MIN_LABEL_SEP_PX) {
+          targetCenterY = belowSpot;
+        }
       }
       if (targetCenterY > height - padBottom - 16) continue;
+      occupiedLevelBoxes.push({ centerY: targetCenterY, halfH: 5 });
 
       const deltaFromLine = targetCenterY - ln.y;
       if (Math.abs(deltaFromLine) > 10) {
@@ -2318,16 +2375,38 @@ export function GaiaView() {
       }
     });
 
-    // Pinned right-axis indicator if All-Exp King or Filtered King is outside vertical price bounds
+    // Pinned right-axis horizon indicators if King, Call Wall, Put Wall, or Zero-Γ sit off-axis
     const pinnedKing = expFilter === "ALL" ? allExpKingStrike : (filteredKingStrike || allExpKingStrike);
+    const offAxisHorizonNodes: Array<{ price: number; text: string; color: string; bold?: boolean }> = [];
     if (pinnedKing > 0) {
-      const yMacro = priceToY(pinnedKing);
+      const pct = expFilter === "ALL"
+        ? (structuralBookCol ?? activeBookCol)!.allExpKingConcPct
+        : (structuralBookCol ?? activeBookCol)!.filteredKingConcPct;
+      offAxisHorizonNodes.push({
+        price: pinnedKing,
+        text: `${pinnedKing} · ${expFilter === "ALL" ? "King" : canvasFilterBadgePrefix} ${pct}%`,
+        color: atlasPalette === "ice" ? "#ffffff" : "#facc15",
+        bold: true,
+      });
+    }
+    if (callWallStrike > 0 && callWallStrike !== pinnedKing) {
+      offAxisHorizonNodes.push({ price: callWallStrike, text: `CW ${callWallStrike}`, color: "#22d3ee" });
+    }
+    if (putWallStrike > 0 && putWallStrike !== pinnedKing) {
+      offAxisHorizonNodes.push({ price: putWallStrike, text: `PW ${putWallStrike}`, color: "#c084fc" });
+    }
+    if (zeroGammaLevel > 0) {
+      offAxisHorizonNodes.push({ price: zeroGammaLevel, text: `0Γ ${zeroGammaLevel.toFixed(1)}`, color: "#fbbf24" });
+    }
+
+    for (const node of offAxisHorizonNodes) {
+      const yMacro = priceToY(node.price);
       if (yMacro < padTop + 6 || yMacro > height - padBottom - 6) {
         const isBelow = yMacro > height - padBottom - 6;
         const basePinY = isBelow ? height - padBottom - 10 : padTop + 10;
         const dir = isBelow ? -1 : 1;
         let pinY: number | null = null;
-        for (let step = 0; step < 5; step++) {
+        for (let step = 0; step < 6; step++) {
           const cand = basePinY + dir * step * MIN_LABEL_SEP_PX;
           if (
             cand >= padTop + 7 &&
@@ -2340,13 +2419,10 @@ export function GaiaView() {
         }
         if (pinY !== null) {
           const arrow = isBelow ? "▼ " : "▲ ";
-          ctx.font = "bold 10px ui-monospace, SFMono-Regular, Menlo, monospace";
-          ctx.fillStyle = atlasPalette === "ice" ? "#ffffff" : "#facc15";
-          const pct = expFilter === "ALL"
-            ? (structuralBookCol ?? activeBookCol)!.allExpKingConcPct
-            : (structuralBookCol ?? activeBookCol)!.filteredKingConcPct;
-          ctx.fillText(`${arrow}${pinnedKing} · ${expFilter === "ALL" ? "King" : canvasFilterBadgePrefix} ${pct}%`, outlookRightX + 7, pinY);
-          occupiedGutterBoxes.push({ centerY: pinY, halfH: 5, strike: pinnedKing });
+          ctx.font = `${node.bold ? "bold " : ""}10px ui-monospace, SFMono-Regular, Menlo, monospace`;
+          ctx.fillStyle = node.color;
+          ctx.fillText(`${arrow}${node.text}`, outlookRightX + 7, pinY);
+          occupiedGutterBoxes.push({ centerY: pinY, halfH: 5, strike: node.price });
         }
       }
     }
@@ -3369,8 +3445,8 @@ export function GaiaView() {
               <span>King</span>
             </span>
             <span className="inline-flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#f8fafc] inline-block" />
-              <span>Center</span>
+              <span className="w-2.5 h-2.5 rounded-full bg-[#fbbf24] inline-block" />
+              <span>Zero Γ</span>
             </span>
             {expFilter !== "ALL" && (
               <span className="inline-flex items-center gap-1.5">
@@ -3383,88 +3459,14 @@ export function GaiaView() {
         );
       })()}
 
-      {/* 2E. Live Gaia Call/Put Bias & Every Call Today HUD */}
-      {(() => {
-        const replayBar = dataset?.candles?.[safeActiveIdx];
-        const replayTsRaw = Number(replayBar?.timestamp ?? 0);
-        const replayBarTsSec = replayTsRaw > 0 ? toEpochSec(replayTsRaw) : 0;
-        return (
-      <GaiaCallPutBiasHud
-        symbol={loadedTicker}
-        candles={dataset?.candles?.slice(0, safeActiveIdx + 1).map((c) => ({
-          timestamp: c.timestamp,
-          open: c.open,
-          high: c.high,
-          low: c.low,
-          close: c.close,
-          volume: (c as GaiaIntradayCandle & { volume?: number }).volume,
-          timeLabel: c.timeLabel,
-        }))}
-        flowVwapPoints={flowVwapPoints.slice(0, safeActiveIdx + 1)}
-        sigma1Move={dataset?.sigma1Move}
-        liveSpot={activeCandle ? activeCandle.close : null}
-        serverTrades={effectiveServerTrades}
-        supervisorPolicy={
-          selectedSessionIso
-            ? historicalSupervisorPolicy
-            : loadedTicker.toUpperCase() === storeTicker.toUpperCase()
-              ? storeSupervisorPolicy
-              : null
-        }
-        sessionDate={chartSessionDate}
-        dividerRatio={dividerRatio}
-        isReplayMode={isHistoricalOrReplay}
-        replayBarTsSec={replayBarTsSec > 0 ? replayBarTsSec : undefined}
-        replayBarClose={replayBar?.close}
-        startHour={startHour}
-        xScale={xScale}
-        xPanOffset={xPanOffset}
-        containerWidthPx={canvasWidth}
-        onXViewportChange={(s, p) => {
-          setXScale(s);
-          setXPanOffset(p);
-        }}
-        onResetViewport={() => {
-          setStartHour(9);
-          setXScale(1.0);
-          setXPanOffset(0);
-          setYScale(1.0);
-          setYPanOffset(0);
-          setDividerRatio(fluxFocusMode ? 0.88 : 0.76);
-          setScopePreset("cone");
-        }}
-        onSignalsEvaluated={setPrzmHudSignals}
-        onSymbolChange={(sym) => {
-          const cleaned = sym.trim().toUpperCase() || "SPY";
-          prevStoreTickerRef.current = cleaned;
-          setTickerInput(cleaned);
-          setStoreTicker(cleaned);
-          isReplayingRef.current = false;
-          setIsReplaying(false);
-          isReplayFrozenRef.current = false;
-          setIsReplayFrozen(false);
-          setSelectedSessionIso("");
-          resetViewportTo24H();
-          syncTickerUrlParam(cleaned);
-          if (cleaned !== loadedTicker) {
-            setLivePayload(null);
-            setLoadedTicker(cleaned);
-          } else {
-            void fetchLiveGaia(cleaned, "", startHour);
-          }
-        }}
-      />
-        );
-      })()}
-
-      {/* 3 & 4A. Core Chart Canvas Card + Interactive Session Replay Bar */}
+      {/* 3 & 4A. Core Chart Canvas Card + Interactive Session Replay Bar (Above the fold on 1280x720 & 1920x1080) */}
       <div
         ref={containerRef}
         className="bg-[#0d111a] border border-[#1e2638] rounded-2xl p-4 space-y-3 relative transition-all"
         style={{
           width: chartWidth ? `${chartWidth}px` : "100%",
           maxWidth: "100%",
-          minWidth: "640px",
+          minWidth: 0,
         }}
       >
         {/* Right Edge Horizontal Resize Handle */}
@@ -3741,7 +3743,7 @@ export function GaiaView() {
               />
               <input
                 type="range"
-                min={0}
+                min={minBarIdx}
                 max={maxBarIdx}
                 value={safeActiveIdx}
                 aria-label="Session replay scrubber"
@@ -3781,6 +3783,80 @@ export function GaiaView() {
           </div>
         )}
       </div>
+
+      {/* 4A-2. Live Gaia Call/Put Bias & PRZM Tactical HUD */}
+      {(() => {
+        const replayBar = dataset?.candles?.[safeActiveIdx];
+        const replayTsRaw = Number(replayBar?.timestamp ?? 0);
+        const replayBarTsSec = replayTsRaw > 0 ? toEpochSec(replayTsRaw) : 0;
+        return (
+      <GaiaCallPutBiasHud
+        symbol={loadedTicker}
+        candles={dataset?.candles?.slice(0, safeActiveIdx + 1).map((c) => ({
+          timestamp: c.timestamp,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          volume: (c as GaiaIntradayCandle & { volume?: number }).volume,
+          timeLabel: c.timeLabel,
+        }))}
+        flowVwapPoints={flowVwapPoints.slice(0, safeActiveIdx + 1)}
+        sigma1Move={dataset?.sigma1Move}
+        liveSpot={activeCandle ? activeCandle.close : null}
+        serverTrades={effectiveServerTrades}
+        supervisorPolicy={
+          selectedSessionIso
+            ? historicalSupervisorPolicy
+            : loadedTicker.toUpperCase() === storeTicker.toUpperCase()
+              ? storeSupervisorPolicy
+              : null
+        }
+        sessionDate={chartSessionDate}
+        dividerRatio={dividerRatio}
+        isReplayMode={isHistoricalOrReplay}
+        replayBarTsSec={replayBarTsSec > 0 ? replayBarTsSec : undefined}
+        replayBarClose={replayBar?.close}
+        startHour={startHour}
+        xScale={xScale}
+        xPanOffset={xPanOffset}
+        containerWidthPx={canvasWidth}
+        onXViewportChange={(s, p) => {
+          setXScale(s);
+          setXPanOffset(p);
+        }}
+        onResetViewport={() => {
+          setStartHour(9);
+          setXScale(1.0);
+          setXPanOffset(0);
+          setYScale(1.0);
+          setYPanOffset(0);
+          setDividerRatio(fluxFocusMode ? 0.88 : 0.76);
+          setScopePreset("cone");
+        }}
+        onSignalsEvaluated={setPrzmHudSignals}
+        onSymbolChange={(sym) => {
+          const cleaned = sym.trim().toUpperCase() || "SPY";
+          prevStoreTickerRef.current = cleaned;
+          setTickerInput(cleaned);
+          setStoreTicker(cleaned);
+          isReplayingRef.current = false;
+          setIsReplaying(false);
+          isReplayFrozenRef.current = false;
+          setIsReplayFrozen(false);
+          setSelectedSessionIso("");
+          resetViewportTo24H();
+          syncTickerUrlParam(cleaned);
+          if (cleaned !== loadedTicker) {
+            setLivePayload(null);
+            setLoadedTicker(cleaned);
+          } else {
+            void fetchLiveGaia(cleaned, "", startHour);
+          }
+        }}
+      />
+        );
+      })()}
 
       {/* 4B. Range Outlook Summary Card */}
       {dataset && (

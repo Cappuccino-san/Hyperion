@@ -4,9 +4,17 @@ import {
   LiveTickerTelemetry,
   PLAYBOOK_TICKER_UNIVERSE,
 } from "@/lib/playbookEngine";
-import { optionsMemoryCache } from "@/lib/marketCache";
-import { fetchLiveCboeOptions } from "@/lib/tradeSignalEngine";
-import { computeOptionsAnalytics } from "@/lib/optionsExposure";
+import { optionsMemoryCache, setBoundedMapEntry } from "@/lib/marketCache";
+import {
+  fetchLiveCboeOptions,
+  getCachedSpotPrice,
+  reanchorDelayedContractsToSpot,
+} from "@/lib/tradeSignalEngine";
+import {
+  computeOptionsAnalytics,
+  deriveTacticalStructuralLevels,
+  globalContractsCache,
+} from "@/lib/optionsExposure";
 
 export const dynamic = "force-dynamic";
 
@@ -52,19 +60,27 @@ export async function GET() {
         const sUpper = ticker.toUpperCase();
         let payload = optionsMemoryCache.get(sUpper)?.payload;
 
-        // If not cached, dynamically ingest live CBOE chain for today's session:
+        // If not cached, dynamically ingest live CBOE chain and re-anchor delayed contracts before caching:
         if (!payload || payload.strikes.length === 0) {
           try {
             const contracts = await fetchLiveCboeOptions(sUpper, AbortSignal.timeout(6000));
-            const liveSpot = telemetryOverrides[sUpper]?.spotPrice;
+            const cboeRefSpot = getCachedSpotPrice(sUpper) ?? 0;
+            const liveSpot = telemetryOverrides[sUpper]?.spotPrice ?? cboeRefSpot;
             const prevClose = telemetryOverrides[sUpper]?.previousClose ?? liveSpot;
             if (contracts.length > 0 && liveSpot && liveSpot > 0) {
+              const anchored = reanchorDelayedContractsToSpot({
+                contracts,
+                referenceSpot: cboeRefSpot > 0 ? cboeRefSpot : liveSpot,
+                liveSpot,
+                fallbackIv: 0.22,
+              });
+              setBoundedMapEntry(globalContractsCache, sUpper, anchored, 64);
               payload = computeOptionsAnalytics({
                 ticker: sUpper,
                 dataSource: "CBOE_MARKET_DATA",
                 spotPrice: liveSpot,
                 previousClose: prevClose ?? liveSpot,
-                contracts,
+                contracts: anchored,
               });
               optionsMemoryCache.set(sUpper, { timestamp: Date.now(), payload });
             }
@@ -74,7 +90,8 @@ export async function GET() {
         }
 
         if (payload && payload.strikes.length > 0) {
-          // Find true VEX King across all active expirations dynamically
+          const tactical = deriveTacticalStructuralLevels(payload);
+          // Find true VEX King across front 0DTE / active expirations dynamically
           let vexKing = payload.kingNode.zeroDteKing ?? payload.kingNode.allExpKing;
           let maxVexAbs = -1;
           for (const row of payload.strikes) {
@@ -95,10 +112,13 @@ export async function GET() {
             expectedMoveDaily: payload.expectedMoves?.daily?.em,
             netGex: payload.netMetrics.netGex,
             netVex: payload.netMetrics.netVex,
-            gexKing: payload.kingNode.allExpKing,
+            gexKing: payload.kingNode.zeroDteKing ?? payload.kingNode.allExpKing,
             vexKing,
             kingStrength: payload.kingNode.kingStrength,
             strikeStep: payload.strikeStep,
+            callWall: tactical.callWall,
+            putWall: tactical.putWall,
+            zeroGamma: tactical.zeroGamma,
           };
         }
       })

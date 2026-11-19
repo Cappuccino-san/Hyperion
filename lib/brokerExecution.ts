@@ -12,10 +12,162 @@
 
 import { NbboQuote, executeNbboOrder, ExecutionFillResult, isMarketOpen } from "@/lib/marketDataService";
 import { calculateSmallAccountSize } from "@/lib/positionSizer";
+import { etMinutesOfDay, getSessionBoundsEt, getTodayEt, toEpochSec } from "@/lib/gaiaSessionGuards";
 
-function validateLiveBrokerOrder(request: BrokerOrderRequest): string | null {
+export type ExecutionMode = "PAPER_SHADOW" | "LIVE";
+export type OrderLifecycleState = "SUBMITTED" | "PARTIAL" | "FILLED" | "CANCELLED" | "REJECTED";
+
+export interface PreTradeRiskGateResult {
+  allowed: boolean;
+  reason?: string;
+  executionMode: ExecutionMode;
+  clientOrderId: string;
+}
+
+export interface BrokerReconciliationReport {
+  broker: SupportedBroker;
+  checkedAtMs: number;
+  inSync: boolean;
+  discrepancies: Array<{
+    symbol: string;
+    ledgerQty: number;
+    brokerQty: number;
+    issue: "MISSING_AT_BROKER" | "PHANTOM_AT_BROKER" | "QTY_MISMATCH";
+  }>;
+}
+
+export interface ExecutionAdapter {
+  readonly broker: SupportedBroker;
+  isConfigured(): boolean;
+  executeOrder(request: BrokerOrderRequest): Promise<BrokerFillSlip>;
+  pollOrderStatus(brokerOrderId: string): Promise<{
+    brokerOrderId: string;
+    status: OrderLifecycleState;
+    filledQty: number;
+    avgFillPrice: number;
+  }>;
+  reconcileBrokerPositions(
+    ledgerPositions: Array<{ symbol: string; qty: number }>
+  ): Promise<BrokerReconciliationReport>;
+}
+
+const submittedClientOrderIds = new Set<string>();
+const MAX_IDEMPOTENCY_KEYS = 2000;
+
+export function resetOrderIdempotencyCacheForTests(): void {
+  submittedClientOrderIds.clear();
+}
+
+/**
+ * Fail-closed execution mode resolver.
+ * Strictly defaults to PAPER_SHADOW even when broker API credentials exist in env.
+ * Live routing requires BOTH explicit HYPERION_EXECUTION_MODE=LIVE and a >=16-char HYPERION_LIVE_ARM_TOKEN.
+ */
+export function resolveExecutionMode(
+  env: Record<string, string | undefined> = process.env
+): ExecutionMode {
+  const mode = (env.HYPERION_EXECUTION_MODE ?? "PAPER_SHADOW").trim().toUpperCase();
+  const armToken = (env.HYPERION_LIVE_ARM_TOKEN ?? "").trim();
+  if (mode === "LIVE" && armToken.length >= 16) {
+    return "LIVE";
+  }
+  return "PAPER_SHADOW";
+}
+
+function isKillSwitchHalted(): boolean {
+  const g = globalThis as unknown as {
+    __hyperionLiveBotState?: { executionHalted?: boolean };
+  };
+  return Boolean(g.__hyperionLiveBotState?.executionHalted);
+}
+
+export function buildDeterministicClientOrderId(request: BrokerOrderRequest): string {
+  if (request.clientOrderId?.trim()) return request.clientOrderId.trim();
+  const tsBucket = Math.floor((request.nowEt?.getTime() ?? Date.now()) / 1000);
+  return `HYP-${request.action}-${request.symbol}-${request.contractsQty}-${tsBucket}`;
+}
+
+/**
+ * Fail-Closed Pre-Trade Risk Gate (SignalIntent -> PreTradeRiskGate -> ExecutionAdapter).
+ * Enforces kill-switch, market hours, 09:35-14:30 ET BTO cutoff, quote freshness TTL (<= 30s),
+ * 1-contract / <= $100 sniper outlay ceiling, spread <= 25%, and clientOrderId idempotency.
+ */
+export function evaluatePreTradeRiskGate(
+  request: BrokerOrderRequest,
+  options?: {
+    executionHalted?: boolean;
+    maxQuoteAgeSec?: number;
+    env?: Record<string, string | undefined>;
+    enforceIdempotency?: boolean;
+  }
+): PreTradeRiskGateResult {
+  const executionMode = resolveExecutionMode(options?.env);
+  const clientOrderId = buildDeterministicClientOrderId(request);
+  const halted = options?.executionHalted ?? isKillSwitchHalted();
+
+  if (halted) {
+    return {
+      allowed: false,
+      reason: "EXECUTION_HALTED: Emergency kill-switch / cockpit lock is active.",
+      executionMode,
+      clientOrderId,
+    };
+  }
+
+  if (options?.enforceIdempotency !== false && request.clientOrderId?.trim()) {
+    if (submittedClientOrderIds.has(clientOrderId)) {
+      return {
+        allowed: false,
+        reason: `DUPLICATE_CLIENT_ORDER_ID: Order ${clientOrderId} was already submitted.`,
+        executionMode,
+        clientOrderId,
+      };
+    }
+  }
+
   const mkt = isMarketOpen(request.nowEt);
-  if (!mkt.open) return mkt.reason || "MARKET_CLOSED";
+  if (!mkt.open) {
+    return {
+      allowed: false,
+      reason: mkt.reason || "MARKET_CLOSED",
+      executionMode,
+      clientOrderId,
+    };
+  }
+
+  // Enforce strict RTH entry window (09:35 - 14:30 ET, or 09:35 - 11:30 ET on early-close days) for BTO
+  const refDate = request.nowEt ?? new Date();
+  const refDateIso = getTodayEt(refDate);
+  const bounds = getSessionBoundsEt(refDateIso);
+  const etMins = etMinutesOfDay(refDate.getTime());
+  if (
+    request.action === "BUY_TO_OPEN" &&
+    (etMins < bounds.entryStartMins || etMins > bounds.entryCutoffMins)
+  ) {
+    return {
+      allowed: false,
+      reason: `OUTSIDE_BTO_ENTRY_WINDOW: etMins=${etMins} outside [${bounds.entryStartMins}, ${bounds.entryCutoffMins}] on ${refDateIso}`,
+      executionMode,
+      clientOrderId,
+    };
+  }
+
+  // Quote freshness TTL gate (default 30s)
+  const maxQuoteAgeSec = options?.maxQuoteAgeSec ?? 30;
+  if (typeof request.quote.timestamp === "number" && request.quote.timestamp > 0) {
+    const quoteSec = toEpochSec(request.quote.timestamp);
+    const refSec = Math.floor(refDate.getTime() / 1000);
+    const ageSec = refSec - quoteSec;
+    if (ageSec > maxQuoteAgeSec) {
+      return {
+        allowed: false,
+        reason: `STALE_QUOTE_TTL_EXCEEDED: Quote age ${ageSec}s > ${maxQuoteAgeSec}s limit.`,
+        executionMode,
+        clientOrderId,
+      };
+    }
+  }
+
   if (
     !Number.isFinite(request.quote.ask) ||
     request.quote.ask <= 0 ||
@@ -28,16 +180,53 @@ function validateLiveBrokerOrder(request: BrokerOrderRequest): string | null {
     const spreadLabel = Number.isFinite(request.quote.spreadPct)
       ? (request.quote.spreadPct * 100).toFixed(1)
       : "NaN";
-    return `ILLIQUID_OR_INVALID_QUOTE: spread=${spreadLabel}%`;
+    return {
+      allowed: false,
+      reason: `ILLIQUID_OR_INVALID_QUOTE: spread=${spreadLabel}%`,
+      executionMode,
+      clientOrderId,
+    };
   }
+
   if (request.action === "BUY_TO_OPEN") {
     if (request.contractsQty !== 1) {
-      return `CONTRACT_QTY_VIOLATION: Attempted ${request.contractsQty} (strictly 1 allowed)`;
+      return {
+        allowed: false,
+        reason: `CONTRACT_QTY_VIOLATION: Attempted ${request.contractsQty} (strictly 1 allowed)`,
+        executionMode,
+        clientOrderId,
+      };
     }
     const sizing = calculateSmallAccountSize(request.quote.ask);
-    if (!sizing.allowed) return sizing.rejectionReason || "BUDGET_EXCEEDED";
+    if (!sizing.allowed) {
+      return {
+        allowed: false,
+        reason: sizing.rejectionReason || "BUDGET_EXCEEDED",
+        executionMode,
+        clientOrderId,
+      };
+    }
   }
-  return null;
+
+  return {
+    allowed: true,
+    executionMode,
+    clientOrderId,
+  };
+}
+
+function recordSubmittedClientOrderId(clientOrderId: string): void {
+  if (!clientOrderId) return;
+  submittedClientOrderIds.add(clientOrderId);
+  if (submittedClientOrderIds.size > MAX_IDEMPOTENCY_KEYS) {
+    const oldest = submittedClientOrderIds.values().next().value;
+    if (oldest) submittedClientOrderIds.delete(oldest);
+  }
+}
+
+function validateLiveBrokerOrder(request: BrokerOrderRequest): string | null {
+  const gate = evaluatePreTradeRiskGate(request, { enforceIdempotency: false });
+  return gate.allowed ? null : (gate.reason ?? "PRE_TRADE_RISK_GATE_REJECTED");
 }
 
 function buildRejectedSlip(
@@ -83,12 +272,15 @@ export interface BrokerOrderRequest {
   timeInForce?: "GFD" | "IOC";
   quote: NbboQuote;
   nowEt?: Date;
+  clientOrderId?: string;
 }
 
 export interface BrokerFillSlip {
   fillSlipId: string;
   broker: SupportedBroker;
   brokerOrderId: string;
+  clientOrderId?: string;
+  executionMode?: ExecutionMode;
   timestamp: number;
   timeEt: string;
   ticker: string;
@@ -101,7 +293,7 @@ export interface BrokerFillSlip {
   nbboAsk: number;
   effectiveSpread: number;
   slippage: number;
-  status: "FILLED" | "REJECTED" | "CANCELLED";
+  status: OrderLifecycleState;
   rejectionReason?: string;
   ledgerSignature: string;
 }
@@ -271,27 +463,40 @@ class RobinhoodApiClient {
         );
       }
 
-      const filledPrice = Number(json.price || price);
-      const totalOutlayOrProceeds = Number((filledPrice * 100 * request.contractsQty).toFixed(2));
+      const submittedPrice = Number(json.price || price);
+      const totalOutlayOrProceeds = Number((submittedPrice * 100 * request.contractsQty).toFixed(2));
+      const rawState = String(json.state || "submitted").toLowerCase();
+      const lifecycleStatus: OrderLifecycleState =
+        rawState === "filled"
+          ? "FILLED"
+          : rawState === "partially_filled"
+            ? "PARTIAL"
+            : rawState === "cancelled" || rawState === "canceled"
+              ? "CANCELLED"
+              : rawState === "rejected" || rawState === "failed"
+                ? "REJECTED"
+                : "SUBMITTED";
 
       return {
         fillSlipId: `SLIP-RH-${json.id || nowTs}`,
         broker: "ROBINHOOD",
         brokerOrderId: json.id || `RH-${nowTs}`,
+        clientOrderId: request.clientOrderId,
+        executionMode: "LIVE",
         timestamp: nowTs,
         timeEt,
         ticker: request.ticker,
         symbol: request.symbol,
         action: request.action,
         filledQty: request.contractsQty,
-        filledPrice,
+        filledPrice: submittedPrice,
         totalOutlayOrProceeds,
         nbboBid: request.quote.bid,
         nbboAsk: request.quote.ask,
         effectiveSpread: request.quote.spread,
-        slippage: Number(Math.abs(filledPrice - (isBuy ? request.quote.ask : request.quote.bid)).toFixed(2)),
-        status: "FILLED",
-        ledgerSignature: `ROBINHOOD_CONFIRMED:${json.id}:${filledPrice}`,
+        slippage: Number(Math.abs(submittedPrice - (isBuy ? request.quote.ask : request.quote.bid)).toFixed(2)),
+        status: lifecycleStatus,
+        ledgerSignature: `ROBINHOOD_${lifecycleStatus}:${json.id}:${submittedPrice}`,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Robinhood connection failed";
@@ -395,27 +600,40 @@ class TradierApiClient {
       }
 
       const orderId = String(json?.order?.id || nowTs);
-      const filledPrice = price;
-      const totalOutlayOrProceeds = Number((filledPrice * 100 * request.contractsQty).toFixed(2));
+      const submittedPrice = price;
+      const totalOutlayOrProceeds = Number((submittedPrice * 100 * request.contractsQty).toFixed(2));
+      const rawStatus = String(json?.order?.status || "submitted").toLowerCase();
+      const lifecycleStatus: OrderLifecycleState =
+        rawStatus === "filled"
+          ? "FILLED"
+          : rawStatus === "partially_filled"
+            ? "PARTIAL"
+            : rawStatus === "canceled" || rawStatus === "cancelled"
+              ? "CANCELLED"
+              : rawStatus === "rejected"
+                ? "REJECTED"
+                : "SUBMITTED";
 
       return {
         fillSlipId: `SLIP-TRAD-${orderId}`,
         broker: "TRADIER",
         brokerOrderId: orderId,
+        clientOrderId: request.clientOrderId,
+        executionMode: "LIVE",
         timestamp: nowTs,
         timeEt,
         ticker: request.ticker,
         symbol: request.symbol,
         action: request.action,
         filledQty: request.contractsQty,
-        filledPrice,
+        filledPrice: submittedPrice,
         totalOutlayOrProceeds,
         nbboBid: request.quote.bid,
         nbboAsk: request.quote.ask,
         effectiveSpread: request.quote.spread,
         slippage: 0,
-        status: "FILLED",
-        ledgerSignature: `TRADIER_CONFIRMED:${orderId}:${filledPrice}`,
+        status: lifecycleStatus,
+        ledgerSignature: `TRADIER_${lifecycleStatus}:${orderId}:${submittedPrice}`,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Tradier connection failed";
@@ -449,16 +667,91 @@ export const robinhoodBroker = new RobinhoodApiClient();
 export const tradierBroker = new TradierApiClient();
 
 /**
- * Universal Broker Dispatcher:
- * Automatically routes to live Robinhood or Tradier if configured,
- * otherwise routes to the Institutional Simulated Broker.
+ * Reconciles Hyperion's internal active ledger positions against broker-reported positions.
+ * Any discrepancy returns `inSync: false` so an autonomous supervisor can immediately halt execution.
  */
-export async function dispatchBrokerOrder(request: BrokerOrderRequest): Promise<BrokerFillSlip> {
-  if (robinhoodBroker.isConfigured()) {
-    return robinhoodBroker.executeOrder(request);
+export function reconcileLedgerVsBrokerPositions(
+  broker: SupportedBroker,
+  ledgerPositions: Array<{ symbol: string; qty: number }>,
+  brokerPositions: Array<{ symbol: string; qty: number }>
+): BrokerReconciliationReport {
+  const ledgerMap = new Map<string, number>();
+  for (const p of ledgerPositions) {
+    ledgerMap.set(p.symbol, (ledgerMap.get(p.symbol) ?? 0) + p.qty);
   }
-  if (tradierBroker.isConfigured()) {
-    return tradierBroker.executeOrder(request);
+  const brokerMap = new Map<string, number>();
+  for (const p of brokerPositions) {
+    brokerMap.set(p.symbol, (brokerMap.get(p.symbol) ?? 0) + p.qty);
   }
-  return simBroker.executeOrder(request);
+
+  const discrepancies: BrokerReconciliationReport["discrepancies"] = [];
+  const allSymbols = new Set<string>([
+    ...Array.from(ledgerMap.keys()),
+    ...Array.from(brokerMap.keys()),
+  ]);
+  for (const symbol of Array.from(allSymbols)) {
+    const lQty = ledgerMap.get(symbol) ?? 0;
+    const bQty = brokerMap.get(symbol) ?? 0;
+    if (lQty > 0 && bQty === 0) {
+      discrepancies.push({ symbol, ledgerQty: lQty, brokerQty: bQty, issue: "MISSING_AT_BROKER" });
+    } else if (lQty === 0 && bQty > 0) {
+      discrepancies.push({ symbol, ledgerQty: lQty, brokerQty: bQty, issue: "PHANTOM_AT_BROKER" });
+    } else if (lQty !== bQty) {
+      discrepancies.push({ symbol, ledgerQty: lQty, brokerQty: bQty, issue: "QTY_MISMATCH" });
+    }
+  }
+
+  return {
+    broker,
+    checkedAtMs: Date.now(),
+    inSync: discrepancies.length === 0,
+    discrepancies,
+  };
+}
+
+/**
+ * Fail-Closed Universal Broker Dispatcher:
+ * 1. Always evaluates PreTradeRiskGate (kill-switch, RTH entry window, quote TTL, <= $100/1-contract, idempotency).
+ * 2. Defaults strictly to PAPER_SHADOW (InstitutionalSimulatedBroker) even if live broker env keys exist.
+ * 3. Only routes to Robinhood / Tradier when HYPERION_EXECUTION_MODE=LIVE AND HYPERION_LIVE_ARM_TOKEN (>=16 chars) are explicitly armed.
+ */
+export async function dispatchBrokerOrder(
+  request: BrokerOrderRequest,
+  options?: { executionHalted?: boolean; maxQuoteAgeSec?: number; env?: Record<string, string | undefined> }
+): Promise<BrokerFillSlip> {
+  const gate = evaluatePreTradeRiskGate(request, options);
+  if (!gate.allowed) {
+    return buildRejectedSlip(
+      request,
+      "INSTITUTIONAL_SIMULATOR",
+      gate.reason || "PRE_TRADE_RISK_GATE_REJECTED",
+      "RISK_GATE_BLOCKED",
+      "PRE_TRADE_RISK_GATE_REJECTED"
+    );
+  }
+
+  const normalizedReq: BrokerOrderRequest = {
+    ...request,
+    clientOrderId: gate.clientOrderId,
+  };
+
+  if (request.clientOrderId?.trim()) {
+    recordSubmittedClientOrderId(gate.clientOrderId);
+  }
+
+  if (gate.executionMode === "LIVE") {
+    if (robinhoodBroker.isConfigured()) {
+      return robinhoodBroker.executeOrder(normalizedReq);
+    }
+    if (tradierBroker.isConfigured()) {
+      return tradierBroker.executeOrder(normalizedReq);
+    }
+  }
+
+  const simSlip = await simBroker.executeOrder(normalizedReq);
+  return {
+    ...simSlip,
+    clientOrderId: gate.clientOrderId,
+    executionMode: "PAPER_SHADOW",
+  };
 }

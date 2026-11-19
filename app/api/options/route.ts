@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
   computeOptionsAnalytics,
+  deriveTacticalStructuralLevels,
   ExtendedQuoteInfo,
   globalContractsCache,
   NormalizedOptionContract,
@@ -16,6 +17,7 @@ import {
   reanchorDelayedContractsToSpot,
 } from "@/lib/tradeSignalEngine";
 import { fetchLiveTickQuote } from "@/lib/liveTick";
+import { isMarketOpen } from "@/lib/marketDataService";
 import {
   ensureLiveBotRunning,
   acquireBarEvaluationLock,
@@ -42,73 +44,11 @@ const CACHE_TTL_MS = 10_000;
 
 const NO_EXT_SET = new Set(["SPX", "^SPX", "NDX", "^NDX", "SPXW", "NDXP"]);
 
-const openGexCache = new BoundedMap<
-  string,
-  { day: string; map: Map<string, number> }
->(64);
-
 async function fetchOpenGexMap(
-  ticker: string
+  _ticker: string
 ): Promise<Map<string, number> | null> {
-  const sym = ticker.toUpperCase();
-  const todayEt = getTodayEt();
-  for (const [k, v] of Array.from(openGexCache.entries())) {
-    if (v.day !== todayEt) {
-      openGexCache.delete(k);
-    }
-  }
-  const cached = openGexCache.get(sym);
-  if (cached && cached.day === todayEt && cached.map.size > 0) {
-    return cached.map;
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 2500);
-  try {
-    const res = await fetch(
-      `https://terrashade.onrender.com/api/gexhist?symbol=${encodeURIComponent(
-        sym
-      )}&part=open`,
-      {
-        signal: controller.signal,
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-      }
-    );
-    if (!res.ok) return null;
-    const j = await res.json();
-    const openObj = j?.open;
-    if (
-      !openObj ||
-      !Array.isArray(openObj.strikes) ||
-      !Array.isArray(openObj.expirations) ||
-      !Array.isArray(openObj.gex)
-    ) {
-      return null;
-    }
-
-    const map = new Map<string, number>();
-    openObj.strikes.forEach((s: number, si: number) => {
-      const row = openObj.gex[si];
-      if (!Array.isArray(row)) return;
-      openObj.expirations.forEach((exp: string, ei: number) => {
-        const valDollars = Number(row[ei] ?? 0);
-        if (Number.isFinite(valDollars) && Math.abs(valDollars) >= 1) {
-          map.set(`${Number(s.toFixed(2))}|${exp}`, valDollars / 1e6);
-        }
-      });
-    });
-
-    if (map.size > 0) {
-      openGexCache.set(sym, { day: todayEt, map });
-      return map;
-    }
-    return null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
+  // Zero external terrashade.onrender.com dependency: open GEX is computed purely from local Hyperion history.
+  return null;
 }
 
 async function fetchRealtimeSpotQuote(
@@ -356,16 +296,22 @@ async function fetchCboeOptions(
   const data = json?.data;
   if (!data || !Array.isArray(data.options)) return null;
 
-  const cboeSpotPrice = Number(data.current_price ?? data.close ?? 0);
+  const marketOpenNow = isMarketOpen().open;
+  // Outside RTH, CBOE options quotes are frozen at official 4:00 PM RTH close (data.close), while
+  // data.current_price reflects thin after-hours equity prints. Anchor strictly to data.close when closed.
+  const cboeClosePrice = Number(data.close ?? data.current_price ?? 0);
+  const cboeSpotPrice = marketOpenNow
+    ? Number(data.current_price ?? data.close ?? 0)
+    : cboeClosePrice;
   const cboePrevClose = Number(data.prev_day_close ?? data.close ?? cboeSpotPrice);
   if (!cboeSpotPrice || cboeSpotPrice <= 0) return null;
 
   const [rtQuote, openGexMap] = await Promise.all([
-    fetchRealtimeSpotQuote(ticker),
+    marketOpenNow ? fetchRealtimeSpotQuote(ticker) : Promise.resolve(null),
     fetchOpenGexMap(ticker),
   ]);
 
-  const spotPrice = rtQuote?.spotPrice ?? cboeSpotPrice;
+  const spotPrice = marketOpenNow ? (rtQuote?.spotPrice ?? cboeSpotPrice) : cboeClosePrice;
   const previousClose = rtQuote?.previousClose ?? cboePrevClose;
 
   const rawIv30 = Number(data.iv30 ?? 0);
@@ -413,7 +359,7 @@ async function fetchCboeOptions(
   setBoundedMapEntry(contractsCache, ticker, anchoredContracts, 64);
   const extendedQuote = await fetchExtendedQuote(ticker, spotPrice);
 
-  return computeOptionsAnalytics({
+  const analytics = computeOptionsAnalytics({
     ticker,
     dataSource: "CBOE_MARKET_DATA",
     spotPrice,
@@ -423,13 +369,19 @@ async function fetchCboeOptions(
     extendedQuote,
     openGexMap,
   });
+
+  return {
+    ...analytics,
+    cboeSpotPrice: Number(cboeSpotPrice.toFixed(2)),
+    spotLagDollars: Number((spotPrice - cboeSpotPrice).toFixed(2)),
+  };
 }
 
 async function attachIntraday(
   payload: OptionsAnalyticsPayload
 ): Promise<OptionsAnalyticsPayload> {
   try {
-    const { history, alerts, officialLevels } = await recordIntradaySnapshot({
+    const { history, alerts } = await recordIntradaySnapshot({
       ticker: payload.ticker,
       spotPrice: payload.spotPrice,
       callWall: payload.gammaLevels.callWall,
@@ -438,23 +390,9 @@ async function attachIntraday(
       allExpKing: payload.kingNode.allExpKing,
     });
 
-    let gammaLevels = payload.gammaLevels;
-    let gammaLevelsByFilter = payload.gammaLevelsByFilter;
-    if (
-      officialLevels &&
-      officialLevels.callWall > 0
-    ) {
-      gammaLevels = {
-        ...payload.gammaLevels,
-        ...officialLevels,
-      };
-      if (gammaLevelsByFilter) {
-        gammaLevelsByFilter = {
-          ...gammaLevelsByFilter,
-          ALL: gammaLevels,
-        };
-      }
-    }
+    // Single source of truth: preserve Hyperion's computed gammaLevels (never overwrite from external scrapers)
+    const gammaLevels = payload.gammaLevels;
+    const gammaLevelsByFilter = payload.gammaLevelsByFilter;
 
     // Evaluate stateful BTO / STC long-only options signals
     let mergedAlerts = alerts;
@@ -495,96 +433,37 @@ async function attachIntraday(
       await evaluateAllActivePositions({ signal: evalController.signal });
 
       const contracts = contractsCache.get(payload.ticker);
+      const tacticalLevels = deriveTacticalStructuralLevels(payload);
 
-      const tacticalKing =
-        payload.kingNode?.zeroDteKing ??
-        payload.kingByFilter?.["0DTE"]?.strike ??
-        payload.kingNode?.weeklyKing ??
-        payload.kingByFilter?.ALL?.strike;
+      const spotLagPct =
+        payload.spotPrice > 0 && typeof payload.spotLagDollars === "number"
+          ? Math.abs(payload.spotLagDollars) / payload.spotPrice
+          : 0;
+      const isQuoteFreshForEntry = !payload.isStale && spotLagPct <= 0.015;
 
-      // Tactical 0DTE / Next-Exp walls are the true intraday resistance and support
-      const zeroDteLevels = gammaLevelsByFilter?.["0DTE"] ?? gammaLevelsByFilter?.["THIS_WEEK"];
-      const baseTacticalCallWall =
-        zeroDteLevels?.callWall && zeroDteLevels.callWall > 0
-          ? zeroDteLevels.callWall
-          : (gammaLevels.callWall > 0 && Math.abs(gammaLevels.callWall - payload.spotPrice) / payload.spotPrice < 0.025)
-            ? gammaLevels.callWall
-            : Math.round(payload.spotPrice * 1.008);
-      const tacticalCallWall =
-        tacticalKing &&
-        tacticalKing > baseTacticalCallWall &&
-        (tacticalKing - payload.spotPrice) / payload.spotPrice <= 0.015
-          ? tacticalKing
-          : baseTacticalCallWall;
-
-      const rawTacticalPutWall =
-        zeroDteLevels?.putWall && zeroDteLevels.putWall > 0
-          ? zeroDteLevels.putWall
-          : (gammaLevels.putWall > 0 && Math.abs(payload.spotPrice - gammaLevels.putWall) / payload.spotPrice < 0.025)
-            ? gammaLevels.putWall
-            : Math.round(payload.spotPrice * 0.992);
-
-      // If rawTacticalPutWall is a distant multi-day tail strike (> 0.95% below spot, e.g. $755 when SPY is $766),
-      // find the strongest local negative-gamma support strike within 0.95% below spot (e.g. $762) or Daily EM low
-      let tacticalPutWall = rawTacticalPutWall;
-      if (
-        rawTacticalPutWall > 0 &&
-        (payload.spotPrice - rawTacticalPutWall) / payload.spotPrice > 0.0095 &&
-        Array.isArray(payload.strikes) &&
-        payload.expirations.length > 0
-      ) {
-        const nearExpId = payload.expirations[0].id;
-        let bestNearPutStrike = 0;
-        let minNearPutGex = 0;
-        for (const row of payload.strikes) {
-          if (
-            row.strike < payload.spotPrice - 0.5 &&
-            (payload.spotPrice - row.strike) / payload.spotPrice <= 0.0095
-          ) {
-            const g = row.gex[nearExpId] ?? 0;
-            if (g < minNearPutGex) {
-              minNearPutGex = g;
-              bestNearPutStrike = row.strike;
-            }
-          }
-        }
-        if (bestNearPutStrike > 0) {
-          tacticalPutWall = bestNearPutStrike;
-        } else if (payload.expectedMoves?.daily?.low && payload.expectedMoves.daily.low > rawTacticalPutWall) {
-          tacticalPutWall = Math.round(payload.expectedMoves.daily.low);
-        }
-      }
-
-      const tacticalZeroGamma =
-        zeroDteLevels?.zeroGamma && zeroDteLevels.zeroGamma > 0
-          ? zeroDteLevels.zeroGamma
-          : gammaLevels.zeroGamma;
-
-      const tradeRes = await evaluateTradeSignals({
+      const tradeRes = isQuoteFreshForEntry
+        ? await evaluateTradeSignals({
         ticker: payload.ticker,
         spotPrice: payload.spotPrice,
-        callWall: tacticalCallWall,
-        putWall: tacticalPutWall,
-        zeroGamma: tacticalZeroGamma,
-        zeroDteCallWall: tacticalCallWall,
-        zeroDtePutWall: tacticalPutWall,
-        zeroDteZeroGamma: tacticalZeroGamma,
-        dailyExpectedMove: payload.expectedMoves?.daily
-          ? {
-              low: payload.expectedMoves.daily.low,
-              high: payload.expectedMoves.daily.high,
-            }
-          : null,
+        callWall: tacticalLevels.callWall,
+        putWall: tacticalLevels.putWall,
+        zeroGamma: tacticalLevels.zeroGamma,
+        zeroDteCallWall: tacticalLevels.callWall,
+        zeroDtePutWall: tacticalLevels.putWall,
+        zeroDteZeroGamma: tacticalLevels.zeroGamma,
+        dailyExpectedMove: tacticalLevels.dailyExpectedMove,
         kingNode: payload.kingNode,
-        filteredKing: tacticalKing,
+        filteredKing: tacticalLevels.tacticalKing,
         allExpKing: payload.kingNode?.allExpKing ?? payload.kingByFilter?.ALL?.strike,
-        bookCenter: tacticalZeroGamma,
+        bookCenter: tacticalLevels.bookCenter,
+        netGex: tacticalLevels.netGexMillions,
         contracts,
+        contractsAlreadyAnchored: true,
         dataSource: payload.dataSource,
         referenceSpotPrice: payload.spotPrice,
-        contractsAlreadyAnchored: true,
         signal: evalController.signal,
-      });
+      })
+        : { allAlerts: loadTradeStore().alerts ?? [] };
 
       const tickerAlerts = tradeRes.allAlerts.filter(
         (ta) =>
@@ -643,7 +522,13 @@ export async function GET(request: NextRequest) {
   if (!forceRefresh) {
     const cached = memoryCache.get(ticker);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
-      const enriched = await attachIntraday(cached.payload);
+      const cacheAgeSec = Math.max(0, Math.round((Date.now() - cached.timestamp) / 1000));
+      const enriched = await attachIntraday({
+        ...cached.payload,
+        isStale: cached.payload.isStale ?? false,
+        connectionStatus: cached.payload.connectionStatus ?? "LIVE",
+        cacheAgeSec,
+      });
       return NextResponse.json(enriched);
     }
   }
@@ -654,11 +539,17 @@ export async function GET(request: NextRequest) {
     try {
       const tradierPayload = await fetchTradierOptions(ticker, tradierKey);
       if (tradierPayload) {
+        const taggedTradier: OptionsAnalyticsPayload = {
+          ...tradierPayload,
+          isStale: false,
+          connectionStatus: "LIVE",
+          cacheAgeSec: 0,
+        };
         memoryCache.set(ticker, {
           timestamp: Date.now(),
-          payload: tradierPayload,
+          payload: taggedTradier,
         });
-        const enriched = await attachIntraday(tradierPayload);
+        const enriched = await attachIntraday(taggedTradier);
         return NextResponse.json(enriched);
       }
     } catch {
@@ -670,15 +561,17 @@ export async function GET(request: NextRequest) {
   try {
     const cboePayload = await fetchCboeOptions(ticker);
     if (cboePayload) {
-      memoryCache.set(ticker, {
-        timestamp: Date.now(),
-        payload: cboePayload,
-      });
-      const enriched = await attachIntraday({
+      const taggedCboe: OptionsAnalyticsPayload = {
         ...cboePayload,
         isStale: false,
         connectionStatus: "LIVE",
+        cacheAgeSec: 0,
+      };
+      memoryCache.set(ticker, {
+        timestamp: Date.now(),
+        payload: taggedCboe,
       });
+      const enriched = await attachIntraday(taggedCboe);
       return NextResponse.json(enriched);
     }
   } catch {

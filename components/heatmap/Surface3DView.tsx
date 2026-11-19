@@ -454,6 +454,7 @@ export function Surface3DView({
     window.addEventListener("resize", onResize);
 
     let animFrameId = 0;
+    let lastRenderSig = "";
     const animate = () => {
       animFrameId = requestAnimationFrame(animate);
 
@@ -463,6 +464,12 @@ export function Surface3DView({
 
       const { theta, phi, radius, targetX, targetY, targetZ } =
         cameraStateRef.current;
+      const renderSig = `${theta.toFixed(4)}|${phi.toFixed(4)}|${radius.toFixed(2)}|${targetX.toFixed(2)}|${targetY.toFixed(2)}|${targetZ.toFixed(2)}|${dataGroup.children.length}`;
+      if (renderSig === lastRenderSig) {
+        return;
+      }
+      lastRenderSig = renderSig;
+
       camera.position.x =
         targetX + radius * Math.sin(phi) * Math.sin(theta);
       camera.position.y = targetY + radius * Math.cos(phi);

@@ -14,25 +14,35 @@ import { cn } from "@/lib/utils";
 const QUAD_TICKERS = ["SPY", "QQQ", "SPXW", "IWM"] as const;
 const METRICS: ExposureMetric[] = ["GEX", "VEX", "DEX", "Charm"];
 
-const VIR: [number, number, number][] = [
-  [68, 1, 84],
-  [59, 82, 139],
-  [33, 145, 140],
-  [94, 201, 98],
-  [253, 231, 37],
+const QNEG: [number, number, number][] = [
+  [22, 28, 56],
+  [76, 36, 138],
+  [147, 51, 234],
+];
+const QPOS: [number, number, number][] = [
+  [14, 46, 44],
+  [13, 138, 108],
+  [34, 211, 238],
 ];
 
-function vir(t: number): [number, number, number] {
-  const clamped = Math.max(0, Math.min(1, t)) * 4;
-  const i = Math.min(3, Math.floor(clamped));
-  const f = clamped - i;
-  const a = VIR[i];
-  const b = VIR[i + 1];
-  return [
+function quadColor(val: number, maxAbs: number): { rgb: [number, number, number]; textColor: string } {
+  if (!(maxAbs > 0) || Math.abs(val) < 1) {
+    return { rgb: [15, 23, 42], textColor: "#64748b" };
+  }
+  const norm = Math.min(1, Math.abs(val) / maxAbs);
+  const d = 0.14 + 0.86 * Math.pow(norm, 1.45);
+  const stops = val >= 0 ? QPOS : QNEG;
+  const scaled = Math.max(0, Math.min(1, d)) * 2;
+  const i = Math.min(1, Math.floor(scaled));
+  const f = scaled - i;
+  const a = stops[i];
+  const b = stops[i + 1];
+  const rgb: [number, number, number] = [
     Math.round(a[0] + (b[0] - a[0]) * f),
     Math.round(a[1] + (b[1] - a[1]) * f),
     Math.round(a[2] + (b[2] - a[2]) * f),
   ];
+  return { rgb, textColor: val >= 0 && d > 0.78 ? "#06101c" : "#e6edf6" };
 }
 
 function formatMoney(v: number): string {
@@ -79,7 +89,32 @@ export function QuadView() {
 
   useEffect(() => {
     let active = true;
-    let controller: AbortController | null = null;
+    const inFlightByTicker = new Map<string, AbortController>();
+
+    const fetchTicker = async (sym: string) => {
+      if (!active || inFlightByTicker.has(sym)) return;
+      const controller = new AbortController();
+      inFlightByTicker.set(sym, controller);
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      try {
+        const res = await fetch(`/api/options?ticker=${sym}`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!res.ok || !active || controller.signal.aborted) return;
+        const data: OptionsAnalyticsPayload = await res.json();
+        if (active && !controller.signal.aborted) {
+          setQuadPayloads((prev) => ({ ...prev, [sym]: data }));
+        }
+      } catch {
+        // Fallback handled gracefully
+      } finally {
+        clearTimeout(timeoutId);
+        if (inFlightByTicker.get(sym) === controller) {
+          inFlightByTicker.delete(sym);
+        }
+      }
+    };
 
     const runFetch = () => {
       if (
@@ -88,32 +123,17 @@ export function QuadView() {
       ) {
         return;
       }
-      controller?.abort();
-      controller = new AbortController();
-      const signal = controller.signal;
-
-      QUAD_TICKERS.forEach(async (sym) => {
-        try {
-          const res = await fetch(`/api/options?ticker=${sym}`, {
-            cache: "no-store",
-            signal,
-          });
-          if (!res.ok || !active || signal.aborted) return;
-          const data: OptionsAnalyticsPayload = await res.json();
-          if (active && !signal.aborted) {
-            setQuadPayloads((prev) => ({ ...prev, [sym]: data }));
-          }
-        } catch {
-          // Fallback handled gracefully
-        }
+      QUAD_TICKERS.forEach((sym) => {
+        void fetchTicker(sym);
       });
     };
 
     runFetch();
-    const interval = setInterval(runFetch, 5000);
+    const interval = setInterval(runFetch, 15000);
     return () => {
       active = false;
-      controller?.abort();
+      inFlightByTicker.forEach((ctrl) => ctrl.abort());
+      inFlightByTicker.clear();
       clearInterval(interval);
     };
   }, []);
@@ -209,7 +229,7 @@ export function QuadView() {
         </div>
 
         <span className="text-xs font-mono text-slate-400 hidden sm:inline">
-          Quad Index Matrix · Tap any card header to open full Heatmap
+          Quad Index Matrix · Tap any card header to open Gaia Flow &amp; GEX chart
         </span>
       </div>
 
@@ -351,19 +371,15 @@ export function QuadView() {
             }
           }
 
-          // Format king phrase
+          // Format structured King metadata (safe JSX, zero dangerouslySetInnerHTML)
           const nearLabel = getNearExpLabel(payload);
-          let kingPhrase = `All-exp King <b>${allExpKing}</b>${contested ? " · contested" : ""}`;
-          if (effectiveHorizon !== "ALL") {
-            const pre =
-              effectiveHorizon === "0DTE"
-                ? `${nearLabel} King`
-                : effectiveHorizon === "THIS_WEEK"
-                  ? "Week King"
-                  : `${effectiveHorizon.slice(5)} King`;
-            const day = activeExpDate ? ` (${activeExpDate.slice(5)})` : "";
-            kingPhrase = `${pre} <b>${activeKing}</b>${day} · ${kingPhrase}`;
-          }
+          const horizonKingPrefix =
+            effectiveHorizon === "0DTE"
+              ? `${nearLabel} King`
+              : effectiveHorizon === "THIS_WEEK"
+                ? "Week King"
+                : `${effectiveHorizon.slice(5)} King`;
+          const horizonKingDay = activeExpDate ? ` (${activeExpDate.slice(5)})` : "";
 
           // Sort strikes descending (high to low)
           rows.sort((a, b) => b.strike - a.strike);
@@ -414,8 +430,8 @@ export function QuadView() {
                     type="button"
                     onClick={() => {
                       setTicker(sym);
-                      setActiveView("Heatmap");
-                      router.push("/");
+                      setActiveView("Gaia");
+                      router.push(`/gaia?ticker=${encodeURIComponent(sym)}`);
                     }}
                     className="flex items-baseline gap-2 text-left group cursor-pointer"
                   >
@@ -452,7 +468,7 @@ export function QuadView() {
 
                 {/* Extended Hours Sun/Moon Row (.ext) */}
                 {hasExt && ext && (
-                  <div className="flex items-center gap-1.5 text-[10.5px] font-mono text-slate-400 leading-tight">
+                  <div className="flex items-center gap-1.5 text-[10.5px] font-mono tabular-nums text-slate-400 leading-tight">
                     {ext.type === "pre" ? (
                       <span className="text-[#facc15]" title="Pre-market">
                         ☀
@@ -462,10 +478,10 @@ export function QuadView() {
                         ☾
                       </span>
                     )}
-                    <b className="text-white font-bold">
+                    <b className="text-white font-bold tabular-nums">
                       ${ext.price.toFixed(2)}
                     </b>
-                    <span className={isExtUp ? "text-emerald-400" : "text-rose-400"}>
+                    <span className={cn("tabular-nums", isExtUp ? "text-emerald-400" : "text-rose-400")}>
                       {isExtUp ? "+" : ""}
                       {extDiff.toFixed(2)} ({isExtUp ? "+" : ""}
                       {extPct.toFixed(2)}%)
@@ -508,11 +524,19 @@ export function QuadView() {
                   ))}
                 </select>
 
-                {/* King line (.k) */}
-                <div
-                  className="text-[10px] text-slate-300 leading-snug break-words"
-                  dangerouslySetInnerHTML={{ __html: kingPhrase }}
-                />
+                {/* King line (.k) — safe React JSX with tabular-nums */}
+                <div className="text-[10px] text-slate-300 leading-snug break-words font-mono tabular-nums">
+                  {effectiveHorizon !== "ALL" && (
+                    <>
+                      <span>{horizonKingPrefix} </span>
+                      <b className="text-[#facc15] font-bold">{activeKing}</b>
+                      <span>{horizonKingDay} · </span>
+                    </>
+                  )}
+                  <span>All-exp King </span>
+                  <b className="text-[#facc15] font-bold">{allExpKing}</b>
+                  {contested && <span> · contested</span>}
+                </div>
               </div>
 
               {/* Scrollable Strike Ladder (.qs) */}
@@ -530,22 +554,24 @@ export function QuadView() {
                   rows.map((r) => {
                     const isKing = r.strike === activeKing;
                     const isSpot = r.strike === spotStrike;
-                    const tone = maxVal > 0 ? (r.val / maxVal + 1) / 2 : 0.5;
-                    const rgb = vir(tone);
-                    const textColor = tone > 0.62 ? "#0b1220" : "#e6edf6";
+                    const dailyEm = payload?.expectedMoves?.daily?.em ?? 0;
+                    const isOutsideTwoSigma =
+                      !isKing && !isSpot && dailyEm > 0 && Math.abs(r.strike - spot) > dailyEm * 2;
+                    const { rgb, textColor } = quadColor(r.val, maxVal);
 
                     return (
                       <div
                         key={r.strike}
                         className={cn(
                           "flex h-[32px] items-stretch text-[11px] font-mono tabular-nums relative",
-                          isKing && "z-10"
+                          isKing && "z-10",
+                          isOutsideTwoSigma && "opacity-35"
                         )}
                       >
                         {/* Left Strike Box (.s) */}
                         <div
                           className={cn(
-                            "w-[50px] flex-none flex items-center justify-center font-bold text-[10.5px] border-r border-slate-900/60 select-none",
+                            "w-[50px] flex-none flex items-center justify-center font-bold text-[10.5px] border-r border-slate-900/60 select-none tabular-nums",
                             isSpot
                               ? "s-spot bg-[#13254a] text-[#60a5fa] shadow-[inset_4px_0_0_#3b82f6]"
                               : "bg-[#0b1220] text-slate-400"
@@ -570,32 +596,32 @@ export function QuadView() {
                                 }
                           }
                           className={cn(
-                            "flex-1 relative flex items-center justify-between px-2 font-semibold border-b border-black/20",
+                            "flex-1 relative flex items-center justify-between gap-1.5 px-2 font-semibold border-b border-black/20",
                             isKing && "font-extrabold"
                           )}
                         >
                           {/* Star symbol for King */}
-                          <span className="text-xs">
+                          <span className="text-xs shrink-0">
                             {isKing ? "★" : ""}
                           </span>
 
-                          {/* Delta % badge when GEX */}
-                          {metric === "GEX" && r.pct != null && (
-                            <span
-                              className={cn(
-                                "text-[7.5px] font-extrabold px-1 py-0.5 rounded bg-black/80 leading-none absolute top-1 right-2",
-                                r.pct >= 0 ? "text-[#4ade80]" : "text-[#f87171]"
-                              )}
-                            >
-                              {r.pct >= 0 ? "+" : ""}
-                              {Math.round(r.pct)}%
+                          {/* Right-aligned inline delta badge + Exposure value (zero overlap) */}
+                          <div className="flex items-center gap-1.5 ml-auto min-w-0">
+                            {metric === "GEX" && r.pct != null && (
+                              <span
+                                className={cn(
+                                  "text-[8.5px] font-extrabold px-1 py-0.5 rounded bg-black/75 leading-none tabular-nums shrink-0",
+                                  r.pct >= 0 ? "text-[#4ade80]" : "text-[#f87171]"
+                                )}
+                              >
+                                {r.pct >= 0 ? "+" : ""}
+                                {Math.round(r.pct)}%
+                              </span>
+                            )}
+                            <span className="text-[11px] tabular-nums whitespace-nowrap">
+                              {Math.abs(r.val) < 1 ? "–" : formatMoney(r.val)}
                             </span>
-                          )}
-
-                          {/* Formatted Exposure Value */}
-                          <span className="text-[11px] ml-auto">
-                            {Math.abs(r.val) < 1 ? "–" : formatMoney(r.val)}
-                          </span>
+                          </div>
                         </div>
                       </div>
                     );

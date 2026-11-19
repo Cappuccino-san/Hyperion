@@ -9,6 +9,7 @@ import {
   matchTradeToCandleIndex,
   parseTimeLabelToMinutes,
   clampSpotToCandle,
+  computeStcBadgeY,
 } from "@/components/chart/TradeExecutionMarkersOverlay";
 import { initializeOcoBrackets, evaluateOcoBrackets } from "@/lib/bracketOrderEngine";
 import { NbboQuote } from "@/lib/marketDataService";
@@ -735,5 +736,50 @@ describe("PRZM Viewport & Duration Invariant Verification Suite", () => {
     assert.strictEqual(summary.entries.length, 1, "Future signals & missing-ts/future server trades must be excluded in replay");
     assert.strictEqual(summary.entries[0].id, "sig-past-open-until-later");
     assert.strictEqual(summary.entries[0].status, "OPEN", "Trade whose exit is after replayCursorTs must stay OPEN in replay");
+  });
+
+  it("Signed Spot Delta & STC Badge Y-Anchoring Invariant: $731.12 -> $731.07 LONG logs -0.05 WRONG & anchors STC badge below Flow VWAP", () => {
+    const mockServerTrades = {
+      closedPositions: [
+        {
+          id: "SPY-CALL-20261118-1320",
+          ticker: "SPY",
+          contractType: "CALL" as const,
+          contractLabel: "SPY 261118 734C",
+          btoSpotPrice: 731.12,
+          closedSpotPrice: 731.07,
+          pnlOptionPct: -28.0,
+          pnlSpotPct: -0.01,
+          exitReason: "BOUNDARY_FLUX_REVERSAL_LOCK",
+          openedTs: 1795026000, // 1:20 PM ET
+          closedTs: 1795029120, // 2:12 PM ET
+        },
+      ],
+      activePositions: {},
+      alerts: [],
+      loaded: true,
+    };
+
+    const summary = evaluatePrzmCallLedger([], [], 731.07, "STAND_ASIDE", mockServerTrades, "SPY");
+    assert.strictEqual(summary.entries.length, 1);
+    const entry = summary.entries[0];
+    assert.strictEqual(entry.delta, -0.05, "LONG $731.12 -> $731.07 must log -0.05 pts, never +0.05");
+    assert.strictEqual(entry.status, "WRONG", "LONG $731.12 -> $731.07 must evaluate to WRONG");
+    assert.strictEqual(summary.winRatePct, 0);
+
+    // Even if exit candle high wick (732.40) poked above Flow VWAP (731.90), STC badge Y anchors strictly to closedSpotPrice (731.07)
+    const priceToY = (p: number) => 400 - (p - 728) * 50; // Higher price = smaller Y
+    const flowVwapY = priceToY(731.9);
+    const { exitSpot, exitSpotY, badgeY } = computeStcBadgeY({
+      closedSpotPrice: 731.07,
+      exitCandle: { open: 731.8, high: 732.4, low: 730.9, close: 731.07 },
+      priceToY,
+      badgeH: 18,
+      padTop: 18,
+      plotBottomY: 380,
+    });
+    assert.strictEqual(exitSpot, 731.07);
+    assert.strictEqual(badgeY + 9, exitSpotY, "STC badge vertical center must match priceToY(closedSpotPrice)");
+    assert.ok(badgeY > flowVwapY, "STC badge below Flow VWAP must have Y > flowVwapY (never float above Flow VWAP)");
   });
 });

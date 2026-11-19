@@ -101,7 +101,14 @@ export interface OptionTradePosition {
   flowVwap?: number;
   ceilingShareChi?: number;
   pecletNumber?: number;
+  entryRegime?: string;
+  divergence5m?: DivergenceDirection;
+  divergence30m?: DivergenceDirection;
+  callWall?: number;
+  putWall?: number;
+  zeroGamma?: number;
   peakOptionPnlPct?: number;
+  peakFavorableSpotMfePct?: number;
   originBackfill?: boolean;
 }
 
@@ -152,6 +159,12 @@ export interface TradeLifecycleAlert {
   flowVwap?: number;
   ceilingShareChi?: number;
   pecletNumber?: number;
+  entryRegime?: string;
+  divergence5m?: DivergenceDirection;
+  divergence30m?: DivergenceDirection;
+  callWall?: number;
+  putWall?: number;
+  zeroGamma?: number;
 }
 
 export interface DailyTradeStore {

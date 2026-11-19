@@ -42,6 +42,7 @@ export interface StrikeRowData {
   isCallWall: boolean;
   isPutWall: boolean;
   isZeroGamma: boolean;
+  isOutsideTwoSigma?: boolean;
   emMarker: string | null;
   emMarkers?: EmMarkerTag[];
   kingPeakColId: string;
@@ -56,20 +57,21 @@ export interface StrikeRowData {
 const METRIC_OPTIONS: ExposureMetric[] = ["GEX", "VEX", "DEX", "Charm"];
 
 /**
- * TerraShade Signed Heatmap Color Scale:
- * Negative runs blue to purple (HNEG), positive runs dark green to lime (HPOS), zero is slate (HZERO).
+ * Dark Cockpit Signed Heatmap Color Scale:
+ * Negative runs deep indigo to purple (HNEG), positive runs dark emerald to cyan (HPOS), zero is slate (HZERO).
+ * Gold (#facc15) is reserved exclusively for King Nodes (never used in continuous gradients).
  */
 const HNEG: [number, number, number][] = [
-  [30, 45, 110],
-  [62, 52, 180],
+  [22, 28, 62],
+  [76, 38, 146],
   [147, 51, 234],
 ];
 const HPOS: [number, number, number][] = [
-  [18, 84, 44],
-  [22, 163, 74],
-  [163, 230, 53],
+  [14, 52, 46],
+  [16, 138, 102],
+  [34, 211, 238],
 ];
-const HZERO = "rgb(30, 41, 59)";
+const HZERO = "rgb(18, 25, 38)";
 
 function ramp3(
   stops: [number, number, number][],
@@ -124,14 +126,14 @@ export function getHyperionCellStyle(
     };
   }
 
-  const d =
-    0.22 + 0.78 * Math.min(1, Math.abs(cellValue) / Math.max(0.0001, maxAbsValue));
+  const norm = Math.min(1, Math.abs(cellValue) / Math.max(0.0001, maxAbsValue));
+  const d = 0.14 + 0.86 * Math.pow(norm, 1.45);
   const pos = cellValue > 0;
   const [r, g, b] = ramp3(pos ? HPOS : HNEG, d);
 
   return {
     backgroundColor: `rgb(${r}, ${g}, ${b})`,
-    isBrightYellow: pos && d > 0.62,
+    isBrightYellow: pos && d > 0.78,
     isZeroCell: false,
   };
 }
@@ -168,6 +170,8 @@ export function HeatmapTable() {
     colId: string;
     pinned?: boolean;
   } | null>(null);
+  const pinnedCellKey =
+    inspectedCell?.pinned ? `${inspectedCell.strike}_${inspectedCell.colId}` : null;
 
   useEffect(() => {
     setPickedDateCol("");
@@ -443,17 +447,34 @@ export function HeatmapTable() {
 
         const markers = emMap.get(idx) ?? [];
 
+        const isCallWallRow =
+          Math.abs(sRow.strike - gammaLevels.callWall) < strikeStep * 0.4;
+        const isPutWallRow =
+          Math.abs(sRow.strike - gammaLevels.putWall) < strikeStep * 0.4;
+        const isZeroGammaRow = idx === bestZeroIdx;
+        const isKingRow =
+          Math.abs(sRow.strike - resolvedAllKingStrike) < strikeStep * 0.4;
+        const dailyEmVal = expectedMoves?.daily?.em ?? 0;
+        const isOutsideTwoSigma =
+          dailyEmVal > 0 &&
+          spotPrice > 0 &&
+          Math.abs(sRow.strike - spotPrice) > dailyEmVal * 2 &&
+          !isKingRow &&
+          !isTargetKingRow &&
+          !isCallWallRow &&
+          !isPutWallRow &&
+          !isZeroGammaRow &&
+          idx !== bestAtmIdx;
+
         return {
           strike: sRow.strike,
           isAtm: idx === bestAtmIdx,
-          isKingNode:
-            Math.abs(sRow.strike - resolvedAllKingStrike) < strikeStep * 0.4,
+          isKingNode: isKingRow,
           isFilteredKing: isTargetKingRow,
-          isCallWall:
-            Math.abs(sRow.strike - gammaLevels.callWall) < strikeStep * 0.4,
-          isPutWall:
-            Math.abs(sRow.strike - gammaLevels.putWall) < strikeStep * 0.4,
-          isZeroGamma: idx === bestZeroIdx,
+          isCallWall: isCallWallRow,
+          isPutWall: isPutWallRow,
+          isZeroGamma: isZeroGammaRow,
+          isOutsideTwoSigma,
           emMarker: markers.length > 0 ? markers.map((m) => m.tag).join(" ") : null,
           emMarkers: markers,
           kingPeakColId: peakColId,
@@ -521,6 +542,9 @@ export function HeatmapTable() {
           strike,
           isAtm,
           isFilteredKing,
+          isCallWall,
+          isPutWall,
+          isZeroGamma,
           emMarkers = [],
         } = row.original;
 
@@ -544,6 +568,7 @@ export function HeatmapTable() {
             }}
             className={cn(
               "flex flex-col items-center justify-center px-1.5 h-full font-mono text-[11px] tabular-nums select-none leading-none",
+              row.original.isOutsideTwoSigma && "opacity-35",
               isAtm
                 ? "bg-[#13254a] text-[#60a5fa] font-bold"
                 : isFilteredKing
@@ -552,6 +577,25 @@ export function HeatmapTable() {
             )}
           >
             <span>{formatHeatmapStrike(strike)}</span>
+            {(isCallWall || isPutWall || isZeroGamma) && (
+              <div className="flex items-center justify-center gap-0.5 mt-[1px]">
+                {isCallWall && (
+                  <span className="text-[7.5px] font-extrabold text-[#22d3ee] leading-none" title="Call Wall">
+                    CW
+                  </span>
+                )}
+                {isPutWall && (
+                  <span className="text-[7.5px] font-extrabold text-[#c084fc] leading-none" title="Put Wall">
+                    PW
+                  </span>
+                )}
+                {isZeroGamma && (
+                  <span className="text-[7.5px] font-extrabold text-[#fbbf24] leading-none" title="Zero Gamma">
+                    0Γ
+                  </span>
+                )}
+              </div>
+            )}
             {emMarkers.length > 0 && (
               <div className="flex items-center justify-center gap-0.5 mt-[2px]">
                 {emMarkers.map((m) => (
@@ -646,15 +690,13 @@ export function HeatmapTable() {
                 boxShadows.push(`inset 0 -${2 + idx * 2}px 0 ${m.color}`);
               }
             });
-            const isInspectedCell =
-              inspectedCell?.strike === row.original.strike &&
-              inspectedCell?.colId === expCol.id;
+            const isPinnedCell = pinnedCellKey === `${row.original.strike}_${expCol.id}`;
 
             if (isOneGoldGlowKingCell) {
               boxShadows.push(
                 "0 0 0 1px #facc15, 0 0 8px 1px rgba(250,204,21,0.8)"
               );
-            } else if (isInspectedCell) {
+            } else if (isPinnedCell) {
               boxShadows.push(
                 "inset 0 0 0 2px #38bdf8, 0 0 8px rgba(56,189,248,0.65)"
               );
@@ -684,7 +726,8 @@ export function HeatmapTable() {
                     boxShadows.length > 0 ? boxShadows.join(", ") : undefined,
                 }}
                 className={cn(
-                  "relative flex items-end justify-end pt-[11px] pb-[2px] px-1.5 h-full font-mono text-[11px] tabular-nums transition-colors select-none cursor-pointer leading-none",
+                  "relative flex items-end justify-end pt-[11px] pb-[2px] px-1.5 h-full font-mono text-[11px] tabular-nums transition-colors select-none cursor-pointer leading-none hover:ring-2 hover:ring-inset hover:ring-[#38bdf8] hover:z-10",
+                  row.original.isOutsideTwoSigma && !isOneGoldGlowKingCell && "opacity-30",
                   isOneGoldGlowKingCell
                     ? "text-black font-extrabold z-20"
                     : isZeroCell
@@ -724,7 +767,7 @@ export function HeatmapTable() {
     metric,
     spotPrice,
     topFiveCellKeys,
-    inspectedCell,
+    pinnedCellKey,
   ]);
 
   const table = useReactTable({
@@ -974,7 +1017,7 @@ export function HeatmapTable() {
           </div>
         </div>
 
-        {/* Right Controls: [Export CSV] + [Share to X] */}
+        {/* Right Controls: [Export CSV] */}
         <div className="flex items-center gap-1.5">
           <button
             type="button"
@@ -985,18 +1028,10 @@ export function HeatmapTable() {
             <Download className="h-3 w-3 text-emerald-400" />
             <span>CSV</span>
           </button>
-          <button
-            type="button"
-            onClick={handleShareToX}
-            className="inline-flex items-center gap-1 rounded-full bg-[#0b0d17] hover:bg-[#1c223a] border border-white/15 px-3 py-1 text-[11px] font-mono font-semibold text-slate-200 transition-colors cursor-pointer"
-          >
-            <Share2 className="h-3 w-3 text-[#11cdef]" />
-            <span>Share to X</span>
-          </button>
         </div>
       </div>
 
-      {/* TerraShade Zoom & Replay Control Bar (.zbar): − | + | Reset | Spot | King | Velocity | Live | Scrubber */}
+      {/* Zoom & Velocity Control Bar */}
       <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
         <button
           type="button"
@@ -1033,8 +1068,8 @@ export function HeatmapTable() {
           <span>Jump to King</span>
         </button>
 
-        {/* Heatmap Replay & Velocity Controls */}
-        <div className="flex items-center gap-2 ml-auto flex-1 min-w-[260px] max-w-[440px]">
+        {/* Matrix Velocity & Live Mode Controls */}
+        <div className="flex items-center gap-2 ml-auto">
           <button
             type="button"
             onClick={() =>
@@ -1065,19 +1100,6 @@ export function HeatmapTable() {
           >
             Live
           </button>
-          <input
-            id="heatmap-snapshot-replay"
-            name="heatmapSnapshotReplay"
-            type="range"
-            min={0}
-            max={100}
-            value={replayIndex}
-            disabled
-            aria-label="Heatmap snapshot replay"
-            title="Live matrix only (per-strike historical matrix snapshots are not stored)"
-            onChange={(e) => setReplayIndex(Number(e.target.value))}
-            className="flex-1 accent-[#38bdf8] opacity-50 cursor-not-allowed"
-          />
           <span className="text-[11px] text-slate-400 min-w-[60px] text-right tabular-nums">
             {cellMode === "Velocity" ? "Δ$ Vel" : replayTimeLabel}
           </span>
@@ -1191,15 +1213,15 @@ export function HeatmapTable() {
             )}
           </span>
           <span className="inline-flex items-center gap-1">
-            <span className="h-2.5 w-2.5 rounded-sm bg-[#440154] inline-block" />
+            <span className="h-2.5 w-2.5 rounded-sm bg-[#9333ea] inline-block" />
             <span>Neg γ</span>
           </span>
           <span className="inline-flex items-center gap-1">
-            <span className="h-2.5 w-2.5 rounded-sm bg-[#21918c] inline-block" />
+            <span className="h-2.5 w-2.5 rounded-sm bg-[#121926] border border-slate-700 inline-block" />
             <span>Zero</span>
           </span>
           <span className="inline-flex items-center gap-1">
-            <span className="h-2.5 w-2.5 rounded-sm bg-[#fde725] inline-block" />
+            <span className="h-2.5 w-2.5 rounded-sm bg-[#108a66] inline-block" />
             <span>Pos γ</span>
           </span>
         </div>

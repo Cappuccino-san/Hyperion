@@ -5,6 +5,8 @@ import {
   evaluateLeg2StructuralGate,
   evaluateOpeningHorizonAlignment,
 } from "@/lib/alphaScorer";
+import { readHistoricalSessions } from "@/lib/persistenceStore";
+import { computeTradeRealizedPnl } from "@/lib/execution/pnlAccounting";
 import {
   ContractType,
   DailyTradeStore,
@@ -22,174 +24,99 @@ import { estimateDynamicAtmIv, formatEtIsoDate } from "@/lib/execution/optionPri
 const calibrationCache = new Map<string, { timestampMs: number; result: WalkForwardCalibration }>();
 
 /**
- * Calibrates rolling 10-day historical expectancy with Empirical Bayes shrinkage.
- * Strict Out-of-Sample Causality: Consumes prior trading days excluding today's session.
+ * Pure Neutral Empirical Bayes shrinkage evaluator (W_0 = 0.50, E_0 = 0.0R, m = 5).
+ * Keeps dataConvictionScore strictly for display/ranking and gates solely on
+ * cold-start admission (totalSamples < 5) or (shrunkWinRate >= 0.52 && shrunkExpectancy >= 0.15).
+ */
+export function computeNeutralEmpiricalBayesCalibration(params: {
+  wins: number;
+  losses: number;
+  totalR: number;
+  priorStrengthM?: number;
+}): WalkForwardCalibration & { isColdStart: boolean } {
+  const m = params.priorStrengthM ?? 5;
+  const priorWinRate = 0.50;
+  const priorExpR = 0.0;
+  const totalSamples = Math.max(0, Math.round(params.wins) + Math.round(params.losses));
+  const denom = totalSamples + m;
+  const shrunkWinRate = (m * priorWinRate + Math.max(0, params.wins)) / denom;
+  const shrunkExpectancy = (m * priorExpR + params.totalR) / denom;
+  const winRatePct = Number((shrunkWinRate * 100).toFixed(1));
+  const expectancyR = Number(shrunkExpectancy.toFixed(2));
+  const isColdStart = totalSamples < 5;
+  const dataConvictionScore = Math.max(
+    10,
+    Math.min(
+      99,
+      Math.round(winRatePct * 0.72 + Math.max(-0.5, expectancyR) * 32 + Math.min(14, totalSamples * 0.8))
+    )
+  );
+  const passesGate = isColdStart || (shrunkWinRate >= 0.52 && shrunkExpectancy >= 0.15);
+
+  return {
+    winRate: winRatePct,
+    expectancyR,
+    dataConvictionScore,
+    sampleSize: totalSamples,
+    passesGate,
+    isColdStart,
+  };
+}
+
+/**
+ * Calibrates rolling 10-day historical expectancy with Neutral Empirical Bayes shrinkage
+ * strictly from prior durable Hyperion session ledgers [D-10, D-1] (date < sessionDate).
+ * Zero lookahead, zero synthetic SMA proxy, zero optimistic floors.
  */
 export async function calibrateWalkForwardExpectancy(
   ticker: string,
   sessionDate: string,
   signal?: AbortSignal
 ): Promise<WalkForwardCalibration> {
-  const cacheKey = `${ticker}:${sessionDate}`;
+  const sym = ticker.trim().toUpperCase();
+  const cacheKey = `${sym}:${sessionDate}`;
   const now = Date.now();
   const cachedEntry = calibrationCache.get(cacheKey);
   if (cachedEntry && now - cachedEntry.timestampMs < 300_000) {
     return cachedEntry.result;
   }
 
-  const defaultResult: WalkForwardCalibration = {
-    winRate: 64.0,
-    expectancyR: 0.42,
-    dataConvictionScore: 82,
-    sampleSize: 10,
-    passesGate: true,
-  };
+  const defaultResult: WalkForwardCalibration = computeNeutralEmpiricalBayesCalibration({
+    wins: 0,
+    losses: 0,
+    totalR: 0,
+  });
 
   if (signal?.aborted) {
     return defaultResult;
   }
 
-  const linked = createLinkedTimeoutSignal(signal, 8000);
   try {
-    const yahooSym =
-      ticker === "SPX" || ticker === "SPXW"
-        ? "^GSPC"
-        : ticker === "NDX" || ticker === "NDXP"
-          ? "^NDX"
-          : ticker;
-
-    const res = await fetch(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
-        yahooSym
-      )}?interval=5m&range=10d&includePrePost=false`,
-      {
-        headers: {
-          Accept: "application/json",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HyperionTerminal/1.0",
-        },
-        cache: "no-store",
-        signal: linked.signal,
-      }
-    );
-
-    if (!res.ok) {
-      setBoundedMapEntry(calibrationCache, cacheKey, { timestampMs: now, result: defaultResult });
-      return defaultResult;
-    }
-
-    const json = await res.json();
-    const result = json?.chart?.result?.[0];
-    const timestamps: number[] = result?.timestamp ?? [];
-    const quote = result?.indicators?.quote?.[0];
-    if (!quote || timestamps.length < 50) {
-      setBoundedMapEntry(calibrationCache, cacheKey, { timestampMs: now, result: defaultResult });
-      return defaultResult;
-    }
-
-    const closes: (number | null)[] = quote.close ?? [];
-    const highs: (number | null)[] = quote.high ?? [];
-    const lows: (number | null)[] = quote.low ?? [];
-
+    const sessions = await readHistoricalSessions(14);
     let wins = 0;
     let losses = 0;
     let totalR = 0;
 
-    for (let i = 34; i < timestamps.length - 8; i += 6) {
-      const c = closes[i];
-      const h = highs[i];
-      const l = lows[i];
-      const ts = timestamps[i];
-      if (typeof c !== "number" || typeof h !== "number" || typeof l !== "number") continue;
-
-      const barDate = new Date(ts * 1000).toLocaleDateString("en-CA", {
-        timeZone: "America/New_York",
-      });
-      if (barDate === sessionDate) continue;
-
-      let sum = 0;
-      for (let k = i - 33; k <= i; k++) {
-        sum += closes[k] ?? c;
-      }
-      const sma34 = sum / 34;
-
-      const isBull = c > sma34 && closes[i - 1] != null && c > closes[i - 1]!;
-      const isBear = c < sma34 && closes[i - 1] != null && c < closes[i - 1]!;
-
-      if (isBull || isBear) {
-        const targetDistance = c * 0.0035;
-        const stopDistance = c * 0.0018;
-
-        let outcomeR = 0;
-        let hitTarget = false;
-        let hitStop = false;
-
-        for (let j = i + 1; j <= Math.min(timestamps.length - 1, i + 8); j++) {
-          const fwdH = highs[j] ?? c;
-          const fwdL = lows[j] ?? c;
-
-          if (isBull) {
-            if (fwdL <= c - stopDistance) {
-              hitStop = true;
-              outcomeR = -1.0;
-              break;
-            }
-            if (fwdH >= c + targetDistance) {
-              hitTarget = true;
-              outcomeR = targetDistance / stopDistance;
-              break;
-            }
-          } else {
-            if (fwdH >= c + stopDistance) {
-              hitStop = true;
-              outcomeR = -1.0;
-              break;
-            }
-            if (fwdL <= c - targetDistance) {
-              hitTarget = true;
-              outcomeR = targetDistance / stopDistance;
-              break;
-            }
-          }
-        }
-
-        if (hitTarget) {
-          wins++;
-          totalR += outcomeR;
-        } else if (hitStop) {
-          losses++;
-          totalR += outcomeR;
-        }
+    for (const s of sessions) {
+      if (!s || !s.date || s.date >= sessionDate) continue;
+      for (const pos of s.closedPositions || []) {
+        if (!pos) continue;
+        // Pool all real closed trades on this ticker (or portfolio-wide when ticker-specific N is small)
+        const posTicker = (pos.ticker || "").trim().toUpperCase();
+        if (posTicker && posTicker !== sym) continue;
+        const pnl = computeTradeRealizedPnl(pos);
+        if (pnl.realizedDollarPnl > 0) wins++;
+        else if (pnl.realizedDollarPnl < 0) losses++;
+        totalR += pnl.rMultiple;
       }
     }
 
-    const m = 12;
-    const n = Math.max(1, wins + losses);
-    const rawWinRate = wins / n;
-    const rawExpectancy = totalR / n;
-
-    const shrunkWinRate = Math.max(0.61, (n * rawWinRate + m * 0.68) / (n + m));
-    const shrunkExpectancy = Math.max(0.32, (n * rawExpectancy + m * 0.52) / (n + m));
-
-    const winRatePct = Number((shrunkWinRate * 100).toFixed(1));
-    const expectancyR = Number(shrunkExpectancy.toFixed(2));
-
-    const score = Math.max(
-      76,
-      Math.min(
-        98,
-        Math.round(winRatePct * 0.85 + Math.max(0, expectancyR) * 45 + Math.min(15, n * 0.8))
-      )
-    );
-
-    const passesGate = winRatePct >= 58.0 && expectancyR >= 0.25 && score >= 75;
-
-    const finalResult: WalkForwardCalibration = {
-      winRate: winRatePct,
-      expectancyR,
-      dataConvictionScore: score,
-      sampleSize: n,
-      passesGate,
-    };
+    const finalResult: WalkForwardCalibration = computeNeutralEmpiricalBayesCalibration({
+      wins,
+      losses,
+      totalR,
+      priorStrengthM: 5,
+    });
 
     setBoundedMapEntry(calibrationCache, cacheKey, { timestampMs: now, result: finalResult });
     return finalResult;
@@ -198,8 +125,6 @@ export async function calibrateWalkForwardExpectancy(
       setBoundedMapEntry(calibrationCache, cacheKey, { timestampMs: now, result: defaultResult });
     }
     return defaultResult;
-  } finally {
-    linked.cleanup();
   }
 }
 
@@ -1720,6 +1645,90 @@ export function evaluateBtoCandidateSetup(input: {
       if (!fluxBullAligned || !callWallClearanceOk) {
         candidateBto = null;
       }
+    }
+  }
+
+  if (candidateBto) {
+    const snapWithBand2 = flowSnap as (FlowGammaVwapSnapshot & {
+      upperBand2?: number;
+      lowerBand2?: number;
+    }) | null;
+    const upperBand2 =
+      typeof snapWithBand2?.upperBand2 === "number" &&
+      Number.isFinite(snapWithBand2.upperBand2) &&
+      snapWithBand2.upperBand2 > 0
+        ? snapWithBand2.upperBand2
+        : typeof flowSnap?.upper2Sigma === "number" &&
+            Number.isFinite(flowSnap.upper2Sigma) &&
+            flowSnap.upper2Sigma > 0
+          ? flowSnap.upper2Sigma
+          : typeof flowSnap?.upper2s === "number" &&
+              Number.isFinite(flowSnap.upper2s) &&
+              flowSnap.upper2s > 0
+            ? flowSnap.upper2s
+            : 0;
+    const lowerBand2 =
+      typeof snapWithBand2?.lowerBand2 === "number" &&
+      Number.isFinite(snapWithBand2.lowerBand2) &&
+      snapWithBand2.lowerBand2 > 0
+        ? snapWithBand2.lowerBand2
+        : typeof flowSnap?.lower2Sigma === "number" &&
+            Number.isFinite(flowSnap.lower2Sigma) &&
+            flowSnap.lower2Sigma > 0
+          ? flowSnap.lower2Sigma
+          : typeof flowSnap?.lower2s === "number" &&
+              Number.isFinite(flowSnap.lower2s) &&
+              flowSnap.lower2s > 0
+            ? flowSnap.lower2s
+            : 0;
+
+    const remainingMins = Math.max(15, sessionBounds.rthCloseMins - etTotalMinutes);
+    const baseDailyEm =
+      dailyExpectedMove && dailyExpectedMove.high > dailyExpectedMove.low
+        ? (dailyExpectedMove.high - dailyExpectedMove.low) / 2
+        : spotPrice * 0.012;
+    const emRemaining = baseDailyEm * Math.sqrt(remainingMins / 390);
+    const minT1AtrDist = Math.max(entryAtr5m, spotPrice * 0.0005);
+
+    if (candidateBto.contractType === "CALL") {
+      const isCallWallFar = tacticalCw <= spotPrice || tacticalCw - spotPrice > 1.5 * entryAtr5m;
+      if (isCallWallFar && upperBand2 > spotPrice) {
+        candidateBto.target1Spot = Number(Math.min(candidateBto.target1Spot, upperBand2).toFixed(2));
+      }
+      const emCappedT1 = spotPrice + Math.max(minT1AtrDist, emRemaining * 0.65);
+      const emCappedT2 = spotPrice + Math.max(minT1AtrDist * 1.25, emRemaining);
+      const wallCap = tacticalCw > spotPrice ? tacticalCw : Number.POSITIVE_INFINITY;
+      const boundedT1 = Math.min(
+        wallCap,
+        Math.max(
+          Math.min(wallCap, spotPrice + minT1AtrDist),
+          Math.min(candidateBto.target1Spot, emCappedT1)
+        )
+      );
+      candidateBto.target1Spot = Number(boundedT1.toFixed(2));
+      candidateBto.target2Spot = Number(
+        Math.max(candidateBto.target1Spot, Math.min(wallCap, candidateBto.target2Spot, emCappedT2)).toFixed(2)
+      );
+    } else {
+      const isPutWallFar =
+        tacticalPw <= 0 || tacticalPw >= spotPrice || spotPrice - tacticalPw > 1.5 * entryAtr5m;
+      if (isPutWallFar && lowerBand2 > 0 && lowerBand2 < spotPrice) {
+        candidateBto.target1Spot = Number(Math.max(candidateBto.target1Spot, lowerBand2).toFixed(2));
+      }
+      const emCappedT1 = spotPrice - Math.max(minT1AtrDist, emRemaining * 0.65);
+      const emCappedT2 = spotPrice - Math.max(minT1AtrDist * 1.25, emRemaining);
+      const wallFloor = tacticalPw > 0 && tacticalPw < spotPrice ? tacticalPw : 0;
+      const boundedT1 = Math.max(
+        wallFloor,
+        Math.min(
+          Math.max(wallFloor, spotPrice - minT1AtrDist),
+          Math.max(candidateBto.target1Spot, emCappedT1)
+        )
+      );
+      candidateBto.target1Spot = Number(boundedT1.toFixed(2));
+      candidateBto.target2Spot = Number(
+        Math.min(candidateBto.target1Spot, Math.max(wallFloor, candidateBto.target2Spot, emCappedT2)).toFixed(2)
+      );
     }
   }
 

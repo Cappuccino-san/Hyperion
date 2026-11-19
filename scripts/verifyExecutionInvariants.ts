@@ -487,6 +487,7 @@ async function runTestSuite() {
     target2Spot: 760.0, // 0DTE Put Wall
     stopLossSpot: 771.5, // Stop above 0DTE Call Wall (770)
     contracts: mockPuts,
+    nowEt: new Date(`${activeExpDate}T10:30:00-05:00`),
     zeroDteCallWall: 770.0,
     zeroDtePutWall: 760.0,
   });
@@ -1228,7 +1229,11 @@ async function runTestSuite() {
     const callCount10D = allQqqTrades.filter((p) => p.contractType === "CALL").length;
     const putCount10D = allQqqTrades.filter((p) => p.contractType === "PUT").length;
     const microReversalScalps10D = finalStore10D.closedPositions.filter(
-      (p) => p.ticker === "QQQ" && (p.exitReason || "").includes("REVERSAL") && (p.pnlOptionPct ?? 0) < 10
+      (p) =>
+        p.ticker === "QQQ" &&
+        (p.exitReason || "").includes("REVERSAL") &&
+        !(p.exitReason || "").includes("BOUNDARY_FLUX_REVERSAL_LOCK") &&
+        (p.pnlOptionPct ?? 0) < 10
     );
 
     assert(allQqqTrades.length <= 2, `78-bar RTH session total trades <= 2 (got ${allQqqTrades.length})`);
@@ -1437,16 +1442,16 @@ async function runTestSuite() {
       deltaChi6Bar: dFlux6,
       deltaImpulseChi6Bar: dFlux6,
       deltaNetFlux6Bar: dFlux6,
-      upper1s: vwap + 1,
-      lower1s: vwap - 1,
-      upper2s: vwap + 2,
-      lower2s: vwap - 2,
-      upper1Sigma: vwap + 1,
-      lower1Sigma: vwap - 1,
-      upper2Sigma: vwap + 2,
-      lower2Sigma: vwap - 2,
-      sigma: 1,
-      variance: 1,
+      upper1s: vwap + 1.5,
+      lower1s: vwap - 1.5,
+      upper2s: vwap + 3.0,
+      lower2s: vwap - 3.0,
+      upper1Sigma: vwap + 1.5,
+      lower1Sigma: vwap - 1.5,
+      upper2Sigma: vwap + 3.0,
+      lower2Sigma: vwap - 3.0,
+      sigma: 1.5,
+      variance: 2.25,
       cumGammaWeight: 100,
       totalWeight: 100,
       signedGammaAcceleration: 0,

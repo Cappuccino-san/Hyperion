@@ -931,7 +931,7 @@ export function scoreSetupExpectancy(
     }
   }
 
-  const m = Math.max(12, priors.priorStrengthM || 15);
+  const m = Math.max(5, priors.priorStrengthM || 5);
   const rawW = sampleTotal > 0 ? sampleWins / sampleTotal : priors.baselineWinRate;
   const rawE = sampleTotal > 0 ? sampleSumR / sampleTotal : priors.baselineExpectancyR;
 
@@ -961,6 +961,7 @@ export function scoreSetupExpectancy(
     flowSnapshot &&
       (typeof flowSnapshot.pecletNumber === "number" || typeof flowSnapshot.impulsePeclet === "number")
   );
+  const isColdStart = sampleTotal < 5;
   let rejectionReason: string | null = null;
   if (regimeClassification.shouldStandAside || regimeClassification.regime === "LOW_EDGE_CHOP") {
     rejectionReason = `REGIME_VETO: ${regimeClassification.reason}`;
@@ -968,6 +969,8 @@ export function scoreSetupExpectancy(
     rejectionReason = `RR_BELOW_1_5: ${rrRatio.toFixed(2)} < 1.50`;
   } else if (hasLiveFlow && (fluxScore < 0.45 || compositeFeatureScore < 0.55)) {
     rejectionReason = `WEAK_ALPHA_CONFLUENCE: flux=${fluxScore.toFixed(2)}, score=${compositeFeatureScore.toFixed(2)}`;
+  } else if (isColdStart) {
+    // Cold start (< 5 real trades): admit on standard physics/structural confluence above until posterior Bayes activates
   } else if (calibratedWinRate < minWinRatePct) {
     rejectionReason = `LOW_WIN_RATE: ${calibratedWinRate.toFixed(1)}% < ${minWinRatePct.toFixed(1)}%`;
   } else if (calibratedExpectancyR < minExpectancyR) {
@@ -1049,6 +1052,7 @@ export function selectOptimalSmallAccountContract(params: {
   const effectiveMinDelta = resolveMinOptionDelta({
     regime: regime ?? (preferredDte === "1-2DTE" ? "POS_GAMMA_PIN" : undefined),
     absImpulsePeclet,
+    etMins: params.etMins,
   });
 
   // Compute median ATM IV across valid candidates for IV-skew evaluation
@@ -1122,6 +1126,11 @@ export function selectOptimalSmallAccountContract(params: {
       continue;
     }
     if (Math.abs(c.strike - spotPrice) > maxOtmDist) {
+      continue;
+    }
+    const oi = Number(c.openInterest ?? 0);
+    const vol = Number(c.volume ?? 0);
+    if (oi < 100 && !(dte === 0 && vol >= 250)) {
       continue;
     }
 
