@@ -825,6 +825,31 @@ async function run10DaySniperAudit() {
             heldMinutes,
             peakPnlPct: prevPeakOptionPnlPct,
           });
+          const exitVwapBt = exitFlow?.flowVwap ?? 0;
+          const onFavorableSideOfVwap =
+            exitVwapBt > 0
+              ? isCall
+                ? bar.close > exitVwapBt
+                : bar.close < exitVwapBt
+              : isCall
+                ? bar.close > bar.sma34
+                : bar.close < bar.sma34;
+          const btWallDist = isCall
+            ? causalCallWall > bar.close
+              ? causalCallWall - bar.close
+              : 0
+            : causalPutWall > 0 && bar.close > causalPutWall
+              ? bar.close - causalPutWall
+              : 0;
+          const isAlignedTrendRegime = isCall
+            ? (causalZeroGamma > 0 && bar.close > causalZeroGamma) &&
+              onFavorableSideOfVwap &&
+              (exitChi > 0.55 || exitFlux > 0) &&
+              (causalCallWall <= 0 || btWallDist >= 3.0)
+            : (causalZeroGamma > 0 && bar.close < causalZeroGamma) &&
+              onFavorableSideOfVwap &&
+              (exitChi < 0.45 || exitFlux < 0) &&
+              (causalPutWall <= 0 || btWallDist >= 3.0);
           const ratchetEval = evaluateOptionProfitRatchet({
             isCall,
             prevPeakOptionPnlPct,
@@ -836,6 +861,10 @@ async function run10DaySniperAudit() {
             netFluxJ: exitFlux,
             hasPostEntryBarElapsed: heldMinutes >= 5,
             fluxFlippedAgainst,
+            isAlignedTrendRegime,
+            heldMinutes,
+            onFavorableSideOfVwap,
+            evaluateOnCloseOnly: true,
           });
           activePosition.peakOptionPnlPct = ratchetEval.nextPeakOptionPnlPct;
           if (!activePosition.optBeArmed && activePosition.peakOptionPnlPct >= 30) {

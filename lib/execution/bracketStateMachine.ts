@@ -40,6 +40,8 @@ export function evaluateActivePositionStepA(input: {
   isSpxw: boolean;
   spotPrice: number;
   putWall: number;
+  callWall?: number;
+  zeroGamma?: number;
   latest5mCandle: Candle5m | null;
   divergence5m: DivergenceDirection | null;
   contracts?: NormalizedOptionContract[] | null;
@@ -59,6 +61,8 @@ export function evaluateActivePositionStepA(input: {
     isSpxw,
     spotPrice,
     putWall,
+    callWall = 0,
+    zeroGamma = 0,
     latest5mCandle,
     divergence5m,
     contracts,
@@ -94,6 +98,8 @@ export function evaluateActivePositionStepA(input: {
         }
       : latest5mCandle;
   const posPutWall = isPosSpyScaled && putWall > 0 ? Number((putWall / 10).toFixed(2)) : putWall;
+  const posCallWall = isPosSpyScaled && callWall > 0 ? Number((callWall / 10).toFixed(2)) : callWall;
+  const posZeroGamma = isPosSpyScaled && zeroGamma > 0 ? Number((zeroGamma / 10).toFixed(2)) : zeroGamma;
 
   let currentOptionMid: number = activePos.btoOptionMid;
   let liveBid: number | undefined = activePos.optionBid;
@@ -375,6 +381,68 @@ export function evaluateActivePositionStepA(input: {
   const favMove = isCall ? posSpotPrice - activePos.btoSpotPrice : activePos.btoSpotPrice - posSpotPrice;
   const currentR = favMove / initialRisk;
   const progressToWall = distToWall > 0 ? favMove / distToWall : 0;
+  const closeRefSpot = posCandle ? posCandle.close : posSpotPrice;
+  const exitFlowVwap =
+    typeof flowSnapExit?.flowVwap === "number" && flowSnapExit.flowVwap > 0
+      ? isPosSpyScaled
+        ? Number((flowSnapExit.flowVwap / 10).toFixed(2))
+        : flowSnapExit.flowVwap
+      : typeof activePos.flowVwap === "number" && activePos.flowVwap > 0
+        ? activePos.flowVwap
+        : 0;
+  const onFavorableSideOfVwap =
+    exitFlowVwap > 0
+      ? isCall
+        ? closeRefSpot > exitFlowVwap
+        : closeRefSpot < exitFlowVwap
+      : Boolean(posCandle && posCandle.sma34 > 0 && (isCall ? closeRefSpot > posCandle.sma34 : closeRefSpot < posCandle.sma34));
+  const remainingWallDist = isCall
+    ? posCallWall > closeRefSpot
+      ? posCallWall - closeRefSpot
+      : 0
+    : posPutWall > 0 && closeRefSpot > posPutWall
+      ? closeRefSpot - posPutWall
+      : 0;
+  const isAlignedTrendRegime = isCall
+    ? (posZeroGamma > 0 && closeRefSpot > posZeroGamma) &&
+      onFavorableSideOfVwap &&
+      (exitChi > 0.55 || exitFlux > 0) &&
+      (posCallWall <= 0 || remainingWallDist >= 3.0)
+    : (posZeroGamma > 0 && closeRefSpot < posZeroGamma) &&
+      onFavorableSideOfVwap &&
+      (exitChi < 0.45 || exitFlux < 0) &&
+      (posPutWall <= 0 || remainingWallDist >= 3.0);
+  const isTrendRunnerActive = isRunnerSetup || isAlignedTrendRegime;
+
+  // Trend Runner Mode: Structural Flow VWAP / SMA34 / Prior-5m-Bar trailing stops (evaluated strictly on 5m close)
+  if (activePos.status === "OPEN" && isAlignedTrendRegime && posCandle) {
+    if (prevPeakOptionPnlPct >= 65 || progressToWall >= 0.40) {
+      const vwapCap = isCall
+        ? Number((activePos.btoSpotPrice - 0.15 * exitAtr5m).toFixed(2))
+        : Number((activePos.btoSpotPrice + 0.15 * exitAtr5m).toFixed(2));
+      const stage1Stop =
+        exitFlowVwap > 0
+          ? isCall
+            ? Number(Math.max(vwapCap, exitFlowVwap).toFixed(2))
+            : Number(Math.min(vwapCap, exitFlowVwap).toFixed(2))
+          : vwapCap;
+      if ((isCall && stage1Stop > activePos.stopLossSpot) || (!isCall && stage1Stop < activePos.stopLossSpot)) {
+        activePos.stopLossSpot = stage1Stop;
+      }
+    }
+    if (prevPeakOptionPnlPct >= 120 || progressToWall >= 0.65) {
+      const barTrail = isCall
+        ? Number(((resolvedPrevLow ?? posCandle.low) - 0.15).toFixed(2))
+        : Number(((resolvedPrevHigh ?? posCandle.high) + 0.15).toFixed(2));
+      const stage2Candidates = [barTrail];
+      if (exitFlowVwap > 0) stage2Candidates.push(exitFlowVwap);
+      if (typeof posCandle.sma34 === "number" && posCandle.sma34 > 0) stage2Candidates.push(posCandle.sma34);
+      const stage2Stop = Number((isCall ? Math.max(...stage2Candidates) : Math.min(...stage2Candidates)).toFixed(2));
+      if ((isCall && stage2Stop > activePos.stopLossSpot) || (!isCall && stage2Stop < activePos.stopLossSpot)) {
+        activePos.stopLossSpot = stage2Stop;
+      }
+    }
+  }
   if (activePos.status === "OPEN" && progressToWall >= 0.50) {
     const beFloor = isCall
       ? Number((activePos.btoSpotPrice + initialRisk * 0.10).toFixed(2))
@@ -427,6 +495,10 @@ export function evaluateActivePositionStepA(input: {
     netFluxJ: exitFlux,
     hasPostEntryBarElapsed,
     fluxFlippedAgainst,
+    isAlignedTrendRegime,
+    heldMinutes: rawHeldMin,
+    onFavorableSideOfVwap,
+    evaluateOnCloseOnly: true,
   });
   activePos.peakOptionPnlPct = ratchetEval.nextPeakOptionPnlPct;
 
@@ -438,17 +510,27 @@ export function evaluateActivePositionStepA(input: {
         : "15:55 PM ET HARD MARKET CLOSE CUTOFF"
     );
   }
-  // 1B. STC: BOUNDARY_FLUX_REVERSAL_LOCK (>= +0.20% favorable spot MFE + boundary flux flip against position)
+  // 1B. STC: BOUNDARY_FLUX_REVERSAL_LOCK (confirmed 5m bar close; shielded during opening 15m aligned trend)
   else if (
+    (!posCandle || isNewBarAfterEntry) &&
     hasPostEntryBarElapsed &&
+    !(isAlignedTrendRegime && onFavorableSideOfVwap && rawHeldMin < 15) &&
     (activePos.peakFavorableSpotMfePct ?? 0) >= 0.20 &&
     fluxFlippedAgainst
   ) {
     closePosition("BOUNDARY_FLUX_REVERSAL_LOCK");
   }
-  // 1C. STC: PROGRESSIVE OPTION-% PROFIT RATCHET / FLUX-FLIP MFE HARVEST
-  else if (ratchetEval.triggered && ratchetEval.reason) {
+  // 1C. STC: PROGRESSIVE OPTION-% PROFIT RATCHET / FLUX-FLIP MFE HARVEST (confirmed 5m bar close only)
+  else if ((!posCandle || isNewBarAfterEntry) && ratchetEval.triggered && ratchetEval.reason) {
     closePosition(ratchetEval.reason);
+  }
+  // 1D. STC: STAGE 3 STRUCTURAL WALL HARVEST (PUT WALL / CALL WALL within $0.35)
+  else if (
+    pnlOptionPct >= 25 &&
+    ((!isCall && posPutWall > 0 && posPutWall < activePos.btoSpotPrice && posSpotPrice <= posPutWall + 0.35) ||
+      (isCall && posCallWall > activePos.btoSpotPrice && posSpotPrice >= posCallWall - 0.35))
+  ) {
+    closePosition("STRUCTURAL WALL TARGET HARVEST");
   }
   // 2. STC: MORNING / ELAPSED CHOP TIME STOP
   else if (
@@ -468,7 +550,7 @@ export function evaluateActivePositionStepA(input: {
   // 3. STC (MOMENTUM REVERSAL / DIVERGENCE COVER)
   else if (
     activePos.status === "OPEN" &&
-    !(isRunnerSetup && solidFluxAligned) &&
+    !(isTrendRunnerActive && (solidFluxAligned || isAlignedTrendRegime)) &&
     rawHeldMin >= 10 &&
     pnlOptionPct >= 10 &&
     ((!isCall &&
@@ -511,7 +593,7 @@ export function evaluateActivePositionStepA(input: {
   // 5. STC (TARGET 1 HIT · 1 CONTRACT SNIPER FULL EXIT)
   else if (
     activePos.status === "OPEN" &&
-    !(isRunnerSetup && solidFluxAligned) &&
+    !(isTrendRunnerActive && (solidFluxAligned || isAlignedTrendRegime)) &&
     !activePos.setupName.includes("Bearish Zero-Gamma Flush") &&
     ((isCall && posSpotPrice >= activePos.target1Spot) ||
       (!isCall && posSpotPrice <= activePos.target1Spot) ||

@@ -129,6 +129,7 @@ export interface Leg2StructuralGateInput {
     closedSpotPrice?: number;
     pnlOptionPct?: number;
     realizedPnl?: number;
+    exitReason?: string;
   };
   testedPutWallOrMinus1Sigma: boolean;
   testedCallWallOrPlus1Sigma: boolean;
@@ -183,6 +184,56 @@ export function evaluateLeg2StructuralGate(
     timeZone: "America/New_York",
   });
   const { entryCutoffMins } = getSessionBoundsEt(sessionDateEt);
+  const leg1PnlPre =
+    typeof leg1Trade.realizedPnl === "number" && Number.isFinite(leg1Trade.realizedPnl)
+      ? leg1Trade.realizedPnl
+      : typeof leg1Trade.pnlOptionPct === "number" && Number.isFinite(leg1Trade.pnlOptionPct)
+        ? leg1Trade.pnlOptionPct
+        : 0;
+  const isRatchetShakeout =
+    leg1PnlPre >= 0 &&
+    leg1PnlPre < 25 &&
+    /RATCHET|BREAKEVEN/i.test(leg1Trade.exitReason || "");
+
+  if (direction === leg1Trade.contractType) {
+    const shakeoutCutoff = Math.min(840, entryCutoffMins);
+    const shakeoutCooldownOk =
+      typeof leg1Trade.closedTs === "number" && nowTsSec - leg1Trade.closedTs >= 900;
+    const isCallDir = direction === "CALL";
+    const hasVwap = typeof flowVwap === "number" && flowVwap > 0;
+    const hasSma = typeof sma34 === "number" && sma34 > 0;
+    const continuationConfirmed = isCallDir
+      ? hasVwap &&
+        spotPrice > flowVwap &&
+        hasSma &&
+        spotPrice > sma34 &&
+        (zeroGamma <= 0 || spotPrice > zeroGamma) &&
+        impulseChi >= 0.55 &&
+        impulsePeclet >= 1.0
+      : hasVwap &&
+        spotPrice < flowVwap &&
+        hasSma &&
+        spotPrice < sma34 &&
+        (zeroGamma <= 0 || spotPrice < zeroGamma) &&
+        impulseChi <= 0.45 &&
+        impulsePeclet <= -1.0;
+
+    if (isRatchetShakeout && shakeoutCooldownOk && etMins <= shakeoutCutoff && continuationConfirmed) {
+      return {
+        allowed: true,
+        requiredMinExpectancyR: 0.40,
+        reason: null,
+      };
+    }
+    return {
+      allowed: false,
+      requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
+      reason: isRatchetShakeout
+        ? `LEG2_SHAKEOUT_RECOVERY_BLOCKED: cooldown=${shakeoutCooldownOk}, etMins=${etMins}, continuation=${continuationConfirmed}`
+        : `LEG2_SAME_DIRECTION_BLOCKED: Leg-1 was already ${leg1Trade.contractType}`,
+    };
+  }
+
   if (etMins < 630 || etMins > entryCutoffMins) {
     return {
       allowed: false,
@@ -196,14 +247,6 @@ export function evaluateLeg2StructuralGate(
       allowed: false,
       requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
       reason: "LEG2_COOLDOWN_NOT_MET: < 30m elapsed since Leg-1 exit",
-    };
-  }
-
-  if (direction === leg1Trade.contractType) {
-    return {
-      allowed: false,
-      requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
-      reason: `LEG2_SAME_DIRECTION_BLOCKED: Leg-1 was already ${leg1Trade.contractType}`,
     };
   }
 

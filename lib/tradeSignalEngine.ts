@@ -719,6 +719,8 @@ export async function evaluateTradeSignals(
       isSpxw,
       spotPrice,
       putWall: params.putWall,
+      callWall: params.callWall,
+      zeroGamma: params.zeroGamma,
       latest5mCandle,
       divergence5m,
       contracts: params.contracts,
@@ -750,13 +752,25 @@ export async function evaluateTradeSignals(
     sameTickerClosed.length === 1 &&
     typeof lastClosed?.closedTs === "number" &&
     nowTs - lastClosed.closedTs >= 1800;
+  const isLeg1RatchetShakeout =
+    sameTickerClosed.length === 1 &&
+    typeof lastClosed?.pnlOptionPct === "number" &&
+    lastClosed.pnlOptionPct >= 0 &&
+    lastClosed.pnlOptionPct < 25 &&
+    /RATCHET|BREAKEVEN/i.test(lastClosed.exitReason || "");
+  const isShakeoutRecoveryWindow =
+    isLeg1RatchetShakeout &&
+    typeof lastClosed?.closedTs === "number" &&
+    nowTs - lastClosed.closedTs >= 900 &&
+    etTime.totalMinutes <= Math.min(840, sessionBounds.entryCutoffMins);
   const isPhase2ReclaimWindow =
     sameTickerClosed.length === 1 &&
     isPhase2CooldownMet &&
     etTime.totalMinutes >= 630 &&
     etTime.totalMinutes <= sessionBounds.entryCutoffMins;
   const hasCompletedTradeToday =
-    sameTickerClosed.length >= 2 || (sameTickerClosed.length >= 1 && !isPhase2ReclaimWindow);
+    sameTickerClosed.length >= 2 ||
+    (sameTickerClosed.length >= 1 && !isPhase2ReclaimWindow && !isShakeoutRecoveryWindow);
   const hasActiveTrade = Boolean(
     activePos ||
       hadActivePositionAtStart ||
@@ -782,7 +796,8 @@ export async function evaluateTradeSignals(
       etTotalMinutes: etTime.totalMinutes,
       nowTs,
       sessionDate,
-      isPhase2ReclaimWindow,
+      isPhase2ReclaimWindow: isPhase2ReclaimWindow || isShakeoutRecoveryWindow,
+      isShakeoutRecoveryWindow,
       lastClosed,
       sameTickerClosedCount: sameTickerClosed.length,
     });

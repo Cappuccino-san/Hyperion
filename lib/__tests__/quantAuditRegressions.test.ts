@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 
+import { evaluateLeg2StructuralGate } from "../alphaScorer";
 import {
   computeExpirationExpectedMove,
   computeIntradayExpiryYears,
@@ -692,4 +693,111 @@ test("Broker Seam: reconcileLedgerVsBrokerPositions flags missing, phantom, and 
   assert.equal(bySym.get("SPY261118C00752000"), "MISSING_AT_BROKER");
   assert.equal(bySym.get("QQQ261118P00600000"), "QTY_MISMATCH");
   assert.equal(bySym.get("IWM261118C00250000"), "PHANTOM_AT_BROKER");
+});
+
+
+// ============================================================================
+// 6. 2026-11-19 TREND-HOLD RATCHET, 15M OPENING SHIELD & SHAKEOUT RECOVERY
+// ============================================================================
+
+test("2026-11-19 Trend-Hold Ratchet: 9:41 AM intra-bar bounce (+8.5% after +54.9% peak) under Flow VWAP in neg-gamma does NOT exit", () => {
+  const res = evaluateOptionProfitRatchet({
+    isCall: false,
+    prevPeakOptionPnlPct: 54.88,
+    adverseOptionPnlPct: 8.54,
+    closeOptionPnlPct: 18.2,
+    favorableOptionPnlPct: 45.0,
+    openOptionPnlPct: 40.0,
+    chi: 0.22,
+    netFluxJ: -1.8,
+    hasPostEntryBarElapsed: true,
+    fluxFlippedAgainst: false,
+    isAlignedTrendRegime: true,
+    heldMinutes: 6,
+    onFavorableSideOfVwap: true,
+    evaluateOnCloseOnly: true,
+  });
+
+  assert.equal(res.triggered, false, "Aligned negative-gamma trend runner must NOT trigger +30%->BE ratchet at 9:41 AM");
+  assert.equal(res.armedTier, "NONE");
+});
+
+test("Profit Ratchet: Chop/Counter-Trend regime (isAlignedTrendRegime=false) still locks profit on confirmed 5m close after +60% MFE", () => {
+  const res = evaluateOptionProfitRatchet({
+    isCall: true,
+    prevPeakOptionPnlPct: 64.0,
+    adverseOptionPnlPct: 12.0,
+    closeOptionPnlPct: 22.0,
+    favorableOptionPnlPct: 40.0,
+    openOptionPnlPct: 35.0,
+    chi: 0.52,
+    netFluxJ: 0.1,
+    hasPostEntryBarElapsed: true,
+    fluxFlippedAgainst: false,
+    isAlignedTrendRegime: false,
+    heldMinutes: 25,
+    onFavorableSideOfVwap: false,
+    evaluateOnCloseOnly: true,
+  });
+
+  assert.equal(res.triggered, true, "Chop scalp must lock profit on 5m close <= +25% floor");
+  assert.equal(res.armedTier, "PROFIT_LOCK_60");
+  assert.equal(res.fillPnlPct, 22.0);
+});
+
+test("Shakeout Recovery: < +25% ratchet exit unlocks same-direction continuation after 15m when Flow VWAP + SMA34 breakdown confirms", () => {
+  const closedTs = 1795099278; // 9:41:18 AM ET
+  const tooEarly = evaluateLeg2StructuralGate({
+    direction: "PUT",
+    etMins: 590, // 9:50 AM ET (only 9m elapsed)
+    nowTsSec: closedTs + 540,
+    spotPrice: 733.5,
+    prevSpotPrice: 734.2,
+    zeroGamma: 752.1,
+    flowVwap: 737.0,
+    sma34: 735.1,
+    leg1Trade: {
+      contractType: "PUT",
+      closedTs,
+      btoSpotPrice: 737.2,
+      closedSpotPrice: 736.73,
+      pnlOptionPct: 8.54,
+      exitReason: "OPTION PROFIT RATCHET (+30% -> BREAKEVEN LOCK)",
+    },
+    testedPutWallOrMinus1Sigma: false,
+    testedCallWallOrPlus1Sigma: false,
+    has5mBullDiv: false,
+    has5mBearDiv: false,
+    impulseChi: 0.25,
+    deltaChi6Bar: -0.06,
+    impulsePeclet: -2.1,
+  });
+  assert.equal(tooEarly.allowed, false, "Must wait >= 15m cooldown before shakeout recovery");
+
+  const confirmed = evaluateLeg2StructuralGate({
+    direction: "PUT",
+    etMins: 615, // 10:15 AM ET (34m elapsed)
+    nowTsSec: closedTs + 2040,
+    spotPrice: 732.8,
+    prevSpotPrice: 733.9,
+    zeroGamma: 752.1,
+    flowVwap: 736.8,
+    sma34: 734.6,
+    leg1Trade: {
+      contractType: "PUT",
+      closedTs,
+      btoSpotPrice: 737.2,
+      closedSpotPrice: 736.73,
+      pnlOptionPct: 8.54,
+      exitReason: "OPTION PROFIT RATCHET (+30% -> BREAKEVEN LOCK)",
+    },
+    testedPutWallOrMinus1Sigma: false,
+    testedCallWallOrPlus1Sigma: false,
+    has5mBullDiv: false,
+    has5mBearDiv: false,
+    impulseChi: 0.24,
+    deltaChi6Bar: -0.08,
+    impulsePeclet: -2.4,
+  });
+  assert.equal(confirmed.allowed, true, "Confirmed Flow VWAP + SMA34 breakdown after < +25% ratchet shakeout must unlock continuation PUT");
 });

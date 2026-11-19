@@ -428,6 +428,7 @@ export function evaluateBtoCandidateSetup(input: {
   nowTs: number;
   sessionDate: string;
   isPhase2ReclaimWindow: boolean;
+  isShakeoutRecoveryWindow?: boolean;
   lastClosed?: OptionTradePosition;
   sameTickerClosedCount: number;
 }): BtoCandidateSetupResult {
@@ -444,6 +445,7 @@ export function evaluateBtoCandidateSetup(input: {
     nowTs,
     sessionDate,
     isPhase2ReclaimWindow,
+    isShakeoutRecoveryWindow = false,
     lastClosed,
     sameTickerClosedCount,
   } = input;
@@ -1060,7 +1062,7 @@ export function evaluateBtoCandidateSetup(input: {
     (deltaChi6 >= 0.03 || deltaImpulseChi6 >= 0.06 || deltaFlux6 > 0 || spotPrice >= effectiveFlowVwap || spotPrice >= effectiveSma34) &&
     (deltaFlux6 > 0 || impPe >= 0.40 || spotPrice >= effectiveFlowVwap || spotPrice >= effectiveSma34) &&
     barBody <= maxSignalBarBody &&
-    (!isPhase2ReclaimWindow || (testedPutWallOrMinus1Sigma && leg2CallRoom >= entryMetrics.minWallRoom)) &&
+    (!isPhase2ReclaimWindow || (isShakeoutRecoveryWindow && leg2CallRoom >= Math.max(2.25, entryMetrics.minWallRoom)) || (testedPutWallOrMinus1Sigma && leg2CallRoom >= entryMetrics.minWallRoom)) &&
     (divergence5m === "BULL" ||
       divergence30m === "BULL" ||
       reclaimedSmaAndVwapOrCenter ||
@@ -1076,7 +1078,7 @@ export function evaluateBtoCandidateSetup(input: {
     (deltaChi6 <= -0.03 || deltaImpulseChi6 <= -0.06 || deltaFlux6 < 0 || spotPrice <= effectiveFlowVwap || spotPrice <= effectiveSma34) &&
     (deltaFlux6 < 0 || impPe <= -0.40 || spotPrice <= effectiveFlowVwap || spotPrice <= effectiveSma34) &&
     -barBody <= maxSignalBarBody &&
-    (!isPhase2ReclaimWindow || (testedCallWallOrPlus1Sigma && leg2PutRoom >= entryMetrics.minWallRoom)) &&
+    (!isPhase2ReclaimWindow || (isShakeoutRecoveryWindow && leg2PutRoom >= Math.max(2.25, entryMetrics.minWallRoom)) || (testedCallWallOrPlus1Sigma && leg2PutRoom >= entryMetrics.minWallRoom)) &&
     (divergence5m === "BEAR" ||
       divergence30m === "BEAR" ||
       lostSmaAndVwapOrCenter ||
@@ -1195,7 +1197,7 @@ export function evaluateBtoCandidateSetup(input: {
 
   // SETUP 2B: Resistance Rejection / Bearish Reversal
   const prevClosedTrade = lastClosed;
-  if (candidateBto && sameTickerClosedCount === 1 && prevClosedTrade && candidateBto.contractType === prevClosedTrade.contractType) {
+  if (candidateBto && sameTickerClosedCount === 1 && prevClosedTrade && candidateBto.contractType === prevClosedTrade.contractType && !isShakeoutRecoveryWindow) {
     candidateBto = null;
   }
   if (!candidateBto) {
@@ -1560,6 +1562,7 @@ export function evaluateBtoCandidateSetup(input: {
         btoSpotPrice: lastClosed.btoSpotPrice,
         closedSpotPrice: lastClosed.closedSpotPrice,
         pnlOptionPct: lastClosed.pnlOptionPct,
+        exitReason: lastClosed.exitReason,
       },
       testedPutWallOrMinus1Sigma,
       testedCallWallOrPlus1Sigma,
@@ -1569,10 +1572,13 @@ export function evaluateBtoCandidateSetup(input: {
       deltaChi6Bar: effectiveDeltaChi6,
       impulsePeclet: impPe,
     });
+    const requiredLeg2Room = isShakeoutRecoveryWindow
+      ? Math.max(2.25, entryMetrics.minWallRoom)
+      : entryMetrics.minWallRoom;
     const minLeg2RoomOk =
       candidateBto.contractType === "CALL"
-        ? leg2CallRoom >= entryMetrics.minWallRoom
-        : leg2PutRoom >= entryMetrics.minWallRoom;
+        ? leg2CallRoom >= requiredLeg2Room
+        : leg2PutRoom >= requiredLeg2Room;
     if (!leg2Gate.allowed || !minLeg2RoomOk) {
       candidateBto = null;
     }
