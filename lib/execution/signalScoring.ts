@@ -1197,8 +1197,38 @@ export function evaluateBtoCandidateSetup(input: {
 
   // SETUP 2B: Resistance Rejection / Bearish Reversal
   const prevClosedTrade = lastClosed;
-  if (candidateBto && sameTickerClosedCount === 1 && prevClosedTrade && candidateBto.contractType === prevClosedTrade.contractType && !isShakeoutRecoveryWindow) {
-    candidateBto = null;
+  const tickerClosedHistory = (store.closedPositions || []).filter((p) => p.ticker === normalizedTicker);
+  const callClosedCountToday = tickerClosedHistory.filter((p) => p.contractType === "CALL").length;
+  const putClosedCountToday = tickerClosedHistory.filter((p) => p.contractType === "PUT").length;
+  const isWinningTrendContinuation = Boolean(
+    prevClosedTrade &&
+      sameTickerClosedCount >= 1 &&
+      sameTickerClosedCount < 4 &&
+      typeof prevClosedTrade.pnlOptionPct === "number" &&
+      prevClosedTrade.pnlOptionPct >= 25 &&
+      typeof prevClosedTrade.closedTs === "number" &&
+      nowTs - prevClosedTrade.closedTs >= 900 &&
+      etTotalMinutes >= 630 &&
+      !isPositiveGammaRegime &&
+      !(callClosedCountToday >= 1 && putClosedCountToday >= 1) &&
+      Math.abs(impPe) >= 1.8 &&
+      (prevClosedTrade.contractType === "PUT"
+        ? putClosedCountToday < 2 && impChi <= 0.35 && spotPrice < effectiveFlowVwap && spotPrice < effectiveSma34 && (effectiveZeroGamma <= 0 || spotPrice < effectiveZeroGamma)
+        : callClosedCountToday < 2 && impChi >= 0.65 && spotPrice > effectiveFlowVwap && spotPrice > effectiveSma34 && (effectiveZeroGamma <= 0 || spotPrice > effectiveZeroGamma))
+  );
+  if (candidateBto) {
+    const dirCapHit =
+      (candidateBto.contractType === "CALL" && callClosedCountToday >= 2) ||
+      (candidateBto.contractType === "PUT" && putClosedCountToday >= 2);
+    const sameDirBlocked =
+      sameTickerClosedCount >= 1 &&
+      prevClosedTrade &&
+      candidateBto.contractType === prevClosedTrade.contractType &&
+      !isShakeoutRecoveryWindow &&
+      !isWinningTrendContinuation;
+    if (dirCapHit || sameDirBlocked) {
+      candidateBto = null;
+    }
   }
   if (!candidateBto) {
     const baseCallRejectRef =
@@ -1536,7 +1566,7 @@ export function evaluateBtoCandidateSetup(input: {
   }
 
   // Asymmetric Leg-2 Structural Gating & Anti-Whipsaw Firewall (10:30-cutoff ET, >= 30m cooldown, opposite dir)
-  if (candidateBto && isPhase2ReclaimWindow && lastClosed) {
+  if (candidateBto && isPhase2ReclaimWindow && lastClosed && !(isWinningTrendContinuation && candidateBto.contractType === lastClosed.contractType)) {
     const effectiveDeltaChi6 =
       deltaChi6 !== 0
         ? deltaChi6

@@ -674,6 +674,10 @@ async function run10DaySniperAudit() {
       } | null = null;
 
       let tradeCountToday = 0;
+      let callCountToday = 0;
+      let putCountToday = 0;
+      let lossesToday = 0;
+      let realizedPnlDollarsToday = 0;
       let firstTradeType: "CALL" | "PUT" | null = null;
       let lastExitTs: number | null = null;
       let lastClosedTrade: OptionTradePosition | null = null;
@@ -1131,6 +1135,10 @@ async function run10DaySniperAudit() {
             };
             dayClosedPositions.push(closedRecord);
             lastClosedTrade = closedRecord;
+            if (activePosition.type === "CALL") callCountToday++; else putCountToday++;
+            const closedPnlPct = typeof closedRecord.pnlOptionPct === "number" ? closedRecord.pnlOptionPct : 0;
+            if (closedPnlPct < 0) lossesToday++;
+            realizedPnlDollarsToday += activePosition.entryAsk * closedPnlPct;
 
             causalPriorSamples.push({
               regime: activePosition.regime as AlphaSetupRegime,
@@ -1144,23 +1152,44 @@ async function run10DaySniperAudit() {
         }
 
         // --- STEP 2: EVALUATE ENTRY (Leg 1 or Symmetric Gated Leg-2 >= 10:30 AM ET, >= 30m cooldown) ---
+        const chopKillSwitchHit = lossesToday >= 2 || realizedPnlDollarsToday <= -75;
         const cooldownMet = lastExitTs !== null && bar.ts - lastExitTs >= 1800;
+        const contCooldownMet = lastExitTs !== null && bar.ts - lastExitTs >= 900;
+        const canTrendContWin =
+          !chopKillSwitchHit &&
+          tradeCountToday >= 1 &&
+          tradeCountToday < 4 &&
+          contCooldownMet &&
+          !(callCountToday >= 1 && putCountToday >= 1) &&
+          (sessionPolicy?.regime === "NEG_GAMMA_TREND" || sessionPolicy?.regime === "ZERO_GAMMA_FLIP") &&
+          (lastClosedTrade?.pnlOptionPct ?? 0) >= 25 &&
+          bar.totalMinutes >= 630 &&
+          bar.totalMinutes <= sessionBounds.entryCutoffMins &&
+          ((lastClosedTrade?.contractType === "CALL" && callCountToday < 2) ||
+            (lastClosedTrade?.contractType === "PUT" && putCountToday < 2));
         const canPhase2CallReclaim =
-          tradeCountToday === 1 &&
-          firstTradeType === "PUT" &&
+          !chopKillSwitchHit &&
+          tradeCountToday >= 1 &&
+          tradeCountToday < 4 &&
+          callCountToday < 2 &&
+          lastClosedTrade?.contractType === "PUT" &&
           cooldownMet &&
           bar.totalMinutes >= 630 &&
           bar.totalMinutes <= sessionBounds.entryCutoffMins;
         const canPhase2PutReject =
-          tradeCountToday === 1 &&
-          firstTradeType === "CALL" &&
+          !chopKillSwitchHit &&
+          tradeCountToday >= 1 &&
+          tradeCountToday < 4 &&
+          putCountToday < 2 &&
+          lastClosedTrade?.contractType === "CALL" &&
           cooldownMet &&
           bar.totalMinutes >= 630 &&
           bar.totalMinutes <= sessionBounds.entryCutoffMins;
 
         if (
           !activePosition &&
-          (tradeCountToday === 0 || canPhase2CallReclaim || canPhase2PutReject) &&
+          !chopKillSwitchHit &&
+          (tradeCountToday === 0 || canPhase2CallReclaim || canPhase2PutReject || canTrendContWin) &&
           bar.totalMinutes >= sessionBounds.entryStartMins &&
           bar.totalMinutes <= sessionBounds.entryCutoffMins
         ) {
@@ -1210,7 +1239,7 @@ async function run10DaySniperAudit() {
           const zVwap = (bar.close - fvwap) / Math.max(0.05, sigma);
           const impPe = flowSnap?.impulsePeclet ?? 0;
 
-          if (tradeCountToday === 0) {
+          if (tradeCountToday === 0 || canTrendContWin) {
             const candidate = evaluateUnifiedSniperSetup(unifiedBars, idx, explicitKing);
             if (candidate) {
               const isCall = candidate.direction === "LONG";
@@ -1404,7 +1433,14 @@ async function run10DaySniperAudit() {
           }
 
           // Asymmetric Leg-2 Structural Gating & Post-Loss Anti-Whipsaw Firewall (10:30-14:30 ET)
-          if (candDir && tradeCountToday === 1 && lastClosedTrade) {
+          if (candDir && canTrendContWin && lastClosedTrade && candDir === lastClosedTrade.contractType) {
+            const contAligned =
+              Math.abs(impPe) >= 1.8 &&
+              (candDir === "PUT"
+                ? impChi <= 0.35 && bar.close < (flowSnap?.flowVwap ?? bar.close) && bar.close < bar.sma34
+                : impChi >= 0.65 && bar.close > (flowSnap?.flowVwap ?? bar.close) && bar.close > bar.sma34);
+            if (!contAligned) candDir = null;
+          } else if (candDir && tradeCountToday >= 1 && lastClosedTrade) {
             const intradayPw = Math.floor(Math.min(...priorBars.map((b) => b.low)));
             const intradayCw = Math.ceil(Math.max(...priorBars.map((b) => b.high)));
             const testedPutWallOrMinus1S =
@@ -1576,7 +1612,7 @@ async function run10DaySniperAudit() {
 
             if (tradeCountToday === 0) firstTradeType = candDir;
             tradeCountToday++;
-            if (tradeCountToday > 2) totalMultiTradeViolations++;
+            if (tradeCountToday > 4 || callCountToday > 2 || putCountToday > 2) totalMultiTradeViolations++;
           }
         }
       }

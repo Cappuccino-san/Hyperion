@@ -1,3 +1,5 @@
+import path from "path";
+import fs from "fs";
 import {
   classifyMarketRegime,
   computeDailyOptionTheta,
@@ -560,6 +562,162 @@ export function computeFeatureInformationCoefficients(input: {
  * Replays the day's 5m bars, evaluates executed + skipped setups with pessimistic fills
  * and theta decay, computes rolling Feature ICs, and adapts Empirical Bayes priors for [D+1].
  */
+
+export interface IdealBenchmarkSwing {
+  direction: "CALL" | "PUT";
+  entryTs: number;
+  entryTimeEt: string;
+  entrySpot: number;
+  exitTs: number;
+  exitTimeEt: string;
+  exitSpot: number;
+  stopLossSpot: number;
+  target1Spot: number;
+  mfeR: number;
+  maeR: number;
+  spotMovePts: number;
+  regime: string;
+  chi?: number;
+  peclet?: number;
+  netFluxJ?: number;
+  flowVwap?: number;
+}
+
+function getBarEtMinutes(tsSec: number): number {
+  const str = new Date(tsSec * 1000).toLocaleTimeString("en-US", {
+    timeZone: "America/New_York",
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const [h, m] = str.split(":").map(Number);
+  return (h % 24) * 60 + (m || 0);
+}
+
+/**
+ * Dynamically mines a completed session's 5m RTH bars for top non-overlapping >= 2.0R
+ * directional swings (up to 2 CALL + 2 PUT) with zero hardcoded prices or dates.
+ */
+export function discoverIdealSessionSwings(params: {
+  bars: AttributionBar[];
+  flowSeries: Array<FlowGammaVwapSnapshot | undefined>;
+  callWall?: number;
+  putWall?: number;
+  zeroGamma?: number;
+  zeroDteKing?: number;
+}): IdealBenchmarkSwing[] {
+  const { bars, flowSeries, callWall, putWall, zeroGamma, zeroDteKing } = params;
+  if (bars.length < 12) return [];
+
+  const rawSwings: Array<IdealBenchmarkSwing & { entryIdx: number; exitIdx: number }> = [];
+
+  for (let i = 3; i < bars.length - 4; i++) {
+    const b = bars[i];
+    const etMins = getBarEtMinutes(b.ts);
+    if (etMins < 575 || etMins > 870) continue; // Strict 09:35 - 14:30 ET entry window
+
+    const atrSlice = bars.slice(Math.max(0, i - 13), i + 1);
+    const atr5m =
+      atrSlice.reduce((acc, x) => acc + Math.max(0.05, x.high - x.low), 0) /
+      Math.max(1, atrSlice.length);
+    const risk = Math.max(0.25, b.close * 0.0016, atr5m * 1.0);
+    const flow = flowSeries[i];
+    const flowVwap = typeof flow?.flowVwap === "number" && flow.flowVwap > 0 ? flow.flowVwap : undefined;
+
+    const dirs: Array<"CALL" | "PUT"> = [];
+    if (b.close < b.open && (!flowVwap || b.close <= flowVwap * 1.0015)) dirs.push("PUT");
+    if (b.close > b.open && (!flowVwap || b.close >= flowVwap * 0.9985)) dirs.push("CALL");
+
+    for (const dir of dirs) {
+      const isCall = dir === "CALL";
+      const stopSpot = Number((isCall ? b.close - risk : b.close + risk).toFixed(2));
+      let bestFav = 0;
+      let bestExitIdx = i;
+      let bestExitSpot = b.close;
+      let worstAdvBeforePeak = 0;
+      let curWorstAdv = 0;
+
+      const maxJ = Math.min(bars.length - 1, i + 36);
+      for (let j = i + 1; j <= maxJ; j++) {
+        const fb = bars[j];
+        if (getBarEtMinutes(fb.ts) > 955) break;
+        const adv = isCall ? Math.max(0, b.close - fb.low) : Math.max(0, fb.high - b.close);
+        curWorstAdv = Math.max(curWorstAdv, adv);
+        if (curWorstAdv >= risk) break; // Stopped out before reaching target
+
+        const fav = isCall ? fb.high - b.close : b.close - fb.low;
+        if (fav > bestFav) {
+          bestFav = fav;
+          bestExitIdx = j;
+          bestExitSpot = isCall ? fb.high : fb.low;
+          worstAdvBeforePeak = curWorstAdv;
+        }
+      }
+
+      const mfeR = bestFav / risk;
+      const maeR = worstAdvBeforePeak / risk;
+      if (mfeR >= 2.0 && maeR <= 0.85 && bestExitIdx > i) {
+        const regimeInfo = classifyMarketRegime({
+          spotPrice: b.close,
+          callWall: callWall ?? Math.ceil(b.high + risk * 3),
+          putWall: putWall ?? Math.floor(b.low - risk * 3),
+          zeroGamma: zeroGamma ?? flowVwap ?? b.close,
+          zeroDteKing,
+          flowSnapshot: flow,
+          directionHint: dir,
+        });
+        const flowAny = flow as Record<string, unknown> | undefined;
+        rawSwings.push({
+          entryIdx: i,
+          exitIdx: bestExitIdx,
+          direction: dir,
+          entryTs: b.ts,
+          entryTimeEt: formatEtTimeShort(b.ts),
+          entrySpot: Number(b.close.toFixed(2)),
+          exitTs: bars[bestExitIdx].ts,
+          exitTimeEt: formatEtTimeShort(bars[bestExitIdx].ts),
+          exitSpot: Number(bestExitSpot.toFixed(2)),
+          stopLossSpot: stopSpot,
+          target1Spot: Number((isCall ? b.close + risk * 2.0 : b.close - risk * 2.0).toFixed(2)),
+          mfeR: Number(mfeR.toFixed(2)),
+          maeR: Number(maeR.toFixed(2)),
+          spotMovePts: Number((isCall ? bestExitSpot - b.close : b.close - bestExitSpot).toFixed(2)),
+          regime: regimeInfo.regime,
+          chi: typeof flowAny?.ceilingShareChi === "number" ? Number((flowAny.ceilingShareChi as number).toFixed(3)) : undefined,
+          peclet: typeof flow?.pecletNumber === "number" ? Number(flow.pecletNumber.toFixed(2)) : undefined,
+          netFluxJ: typeof flowAny?.netFluxJ === "number" ? Number((flowAny.netFluxJ as number).toFixed(3)) : undefined,
+          flowVwap: flowVwap ? Number(flowVwap.toFixed(2)) : undefined,
+        });
+      }
+    }
+  }
+
+  rawSwings.sort((a, b) => b.mfeR - a.mfeR);
+  const selected: Array<IdealBenchmarkSwing & { entryIdx: number; exitIdx: number }> = [];
+  let callCount = 0;
+  let putCount = 0;
+
+  for (const s of rawSwings) {
+    if (selected.length >= 4) break;
+    if (s.direction === "CALL" && callCount >= 2) continue;
+    if (s.direction === "PUT" && putCount >= 2) continue;
+    const overlaps = selected.some(
+      (x) =>
+        Math.abs(x.entryIdx - s.entryIdx) < 6 ||
+        (s.entryIdx >= x.entryIdx && s.entryIdx <= x.exitIdx) ||
+        (x.entryIdx >= s.entryIdx && x.entryIdx <= s.exitIdx)
+    );
+    if (overlaps) continue;
+    selected.push(s);
+    if (s.direction === "CALL") callCount++;
+    else putCount++;
+  }
+
+  return selected
+    .sort((a, b) => a.entryTs - b.entryTs)
+    .map(({ entryIdx: _ei, exitIdx: _xi, ...rest }) => rest);
+}
+
 export async function runPostMarketAttribution(
   input: RunPostMarketAttributionInput
 ): Promise<PostMarketAttributionReport> {
@@ -638,6 +796,39 @@ export async function runPostMarketAttribution(
     });
   }
 
+  // 1B. Dynamically discover session's ideal >= 2.0R benchmark swings (up to 2C / 2P) & feed missed moves into learning loop
+  const idealSwings = discoverIdealSessionSwings({
+    bars,
+    flowSeries,
+    callWall: input.callWall,
+    putWall: input.putWall,
+    zeroGamma: input.zeroGamma,
+    zeroDteKing: input.zeroDteKing,
+  });
+  if (!input.priorsOverride && idealSwings.length > 0) {
+    try {
+      const cacheDir = path.join(process.cwd(), ".cache");
+      if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+      const benchFile = path.join(cacheDir, `ideal-benchmark-${input.sessionDate}-${sym}.json`);
+      fs.writeFileSync(
+        benchFile,
+        JSON.stringify(
+          {
+            sessionDate: input.sessionDate,
+            ticker: sym,
+            discoveredAt: new Date().toISOString(),
+            swings: idealSwings,
+          },
+          null,
+          2
+        ),
+        "utf8"
+      );
+    } catch {
+      // Non-fatal benchmark persistence
+    }
+  }
+
   // 2. Evaluate explicit or automatically discovered skipped candidate setups
   const candidates: AttributionCandidateSetup[] = [...(input.candidateSetups ?? [])];
   if (candidates.length === 0 && bars.length >= 12) {
@@ -665,6 +856,27 @@ export async function runPostMarketAttribution(
           stopLossSpot: dir === "CALL" ? b.close - risk : b.close + risk,
           wasExecuted: false,
           skipReason: regimeInfo.reason,
+        });
+      }
+    }
+  }
+
+  if (input.candidateSetups === undefined && idealSwings.length > 0) {
+    for (const sw of idealSwings) {
+      const alreadyTaken = (input.executedTrades ?? []).some(
+        (t) => t.contractType === sw.direction && Math.abs((t.openedTs || 0) - sw.entryTs) <= 1800
+      );
+      if (!alreadyTaken) {
+        candidates.push({
+          timestamp: sw.entryTs,
+          direction: sw.direction,
+          setupName: `Ideal Benchmark Swing [${sw.direction}]`,
+          regime: sw.regime as MarketRegimeId,
+          entrySpot: sw.entrySpot,
+          target1Spot: sw.target1Spot,
+          stopLossSpot: sw.stopLossSpot,
+          wasExecuted: false,
+          skipReason: "MISSED_IDEAL_SWING",
         });
       }
     }

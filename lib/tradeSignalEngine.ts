@@ -748,8 +748,18 @@ export async function evaluateTradeSignals(
     (latest, cur) => (!latest || (cur.closedTs ?? 0) >= (latest.closedTs ?? 0) ? cur : latest),
     undefined
   );
+  const callClosedCount = sameTickerClosed.filter((p) => p.contractType === "CALL").length;
+  const putClosedCount = sameTickerClosed.filter((p) => p.contractType === "PUT").length;
+  const losingClosedCount = sameTickerClosed.filter((p) => typeof p.pnlOptionPct === "number" && p.pnlOptionPct < 0).length;
+  const realizedDailyPnlDollars = sameTickerClosed.reduce((acc, p) => {
+    const outlay = typeof p.totalOutlay === "number" && p.totalOutlay > 0 ? p.totalOutlay : (p.optionAsk || p.btoOptionMid || 0.7) * 100;
+    const pct = typeof p.pnlOptionPct === "number" ? p.pnlOptionPct : 0;
+    return acc + (outlay * pct) / 100;
+  }, 0);
+  const isDailyLossKillSwitchHit = losingClosedCount >= 2 || realizedDailyPnlDollars <= -75;
   const isPhase2CooldownMet =
-    sameTickerClosed.length === 1 &&
+    sameTickerClosed.length >= 1 &&
+    sameTickerClosed.length < 4 &&
     typeof lastClosed?.closedTs === "number" &&
     nowTs - lastClosed.closedTs >= 1800;
   const isLeg1RatchetShakeout =
@@ -759,18 +769,35 @@ export async function evaluateTradeSignals(
     lastClosed.pnlOptionPct < 25 &&
     /RATCHET|BREAKEVEN/i.test(lastClosed.exitReason || "");
   const isShakeoutRecoveryWindow =
+    !isDailyLossKillSwitchHit &&
     isLeg1RatchetShakeout &&
     typeof lastClosed?.closedTs === "number" &&
     nowTs - lastClosed.closedTs >= 900 &&
     etTime.totalMinutes <= Math.min(840, sessionBounds.entryCutoffMins);
+  const isWinningTrendContinuationWindow =
+    !isDailyLossKillSwitchHit &&
+    sameTickerClosed.length >= 1 &&
+    sameTickerClosed.length < 4 &&
+    typeof lastClosed?.closedTs === "number" &&
+    typeof lastClosed?.pnlOptionPct === "number" &&
+    !(callClosedCount >= 1 && putClosedCount >= 1) &&
+    lastClosed.pnlOptionPct >= 25 &&
+    nowTs - lastClosed.closedTs >= 900 &&
+    etTime.totalMinutes >= 630 &&
+    etTime.totalMinutes <= sessionBounds.entryCutoffMins &&
+    ((lastClosed.contractType === "CALL" && callClosedCount < 2) ||
+      (lastClosed.contractType === "PUT" && putClosedCount < 2));
   const isPhase2ReclaimWindow =
-    sameTickerClosed.length === 1 &&
+    !isDailyLossKillSwitchHit &&
+    sameTickerClosed.length >= 1 &&
+    sameTickerClosed.length < 4 &&
     isPhase2CooldownMet &&
     etTime.totalMinutes >= 630 &&
     etTime.totalMinutes <= sessionBounds.entryCutoffMins;
   const hasCompletedTradeToday =
-    sameTickerClosed.length >= 2 ||
-    (sameTickerClosed.length >= 1 && !isPhase2ReclaimWindow && !isShakeoutRecoveryWindow);
+    sameTickerClosed.length >= 4 ||
+    isDailyLossKillSwitchHit ||
+    (sameTickerClosed.length >= 1 && !isPhase2ReclaimWindow && !isShakeoutRecoveryWindow && !isWinningTrendContinuationWindow);
   const hasActiveTrade = Boolean(
     activePos ||
       hadActivePositionAtStart ||
