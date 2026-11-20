@@ -277,6 +277,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const [internalServerTrades, setInternalServerTrades] = useState<ServerTradeData>(
     serverTradesProp || {}
   );
+  const [hasLoadedServerTrades, setHasLoadedServerTrades] = useState<boolean>(serverTradesProp !== undefined);
   const [internalSupervisorPolicy, setInternalSupervisorPolicy] = useState<SessionPlaybookPolicy | null>(
     supervisorPolicyProp ?? null
   );
@@ -284,6 +285,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   useEffect(() => {
     if (serverTradesProp !== undefined) {
       setInternalServerTrades(serverTradesProp);
+      setHasLoadedServerTrades(true);
       return;
     }
     setInternalServerTrades({
@@ -316,6 +318,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         if (!res.ok) return;
         const data = await res.json();
         if (isMounted && !controller.signal.aborted) {
+          setHasLoadedServerTrades(true);
           setInternalServerTrades({
             activePositions: data?.activePositions || {},
             closedPositions: data?.closedPositions || [],
@@ -1094,7 +1097,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     const trades = extractNormalizedTradesForTicker(
       activeSymbol,
       internalServerTrades,
-      przmSignals
+      hasLoadedServerTrades || serverTradesProp !== undefined ? undefined : przmSignals
     ).filter((t) => !String(t.id).startsWith("test-"));
     if (trades.length === 0 || enrichedPoints.length === 0) return [];
     let barStepSec = 300;
@@ -1164,7 +1167,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         };
       })
       .filter((item): item is NonNullable<typeof item> => item !== null);
-  }, [activeSymbol, internalServerTrades, przmSignals, enrichedPoints, xForIdx, yForPrice, effectiveReplayTsSec, isReplayMode]);
+  }, [activeSymbol, internalServerTrades, hasLoadedServerTrades, serverTradesProp, przmSignals, enrichedPoints, xForIdx, yForPrice, effectiveReplayTsSec, isReplayMode]);
 
   // Structural Metrics (Open 9:30 & Straddle Expected Move) - Strictly Viewport-Invariant
   const structuralMetrics = useMemo(() => {
