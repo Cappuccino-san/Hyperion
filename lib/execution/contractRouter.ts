@@ -184,6 +184,13 @@ export async function selectSmallAccountContract(params: {
       absImpulsePeclet,
       etMins: etTime.totalMinutes,
     });
+    const highIvFallbackCandidates: typeof validCandidates = [];
+    const fallbackMinDelta = Math.min(minOptionDelta, 0.18);
+    const target1Dist = Math.abs(effectiveTarget1 - effectiveSpot);
+    const maxFallbackOtmDistance = Math.max(
+      Math.min(3.50, effectiveSpot * 0.0045),
+      Math.min(effectiveSpot * 0.0085, target1Dist > 0 ? target1Dist * 0.85 : effectiveSpot * 0.0085)
+    );
 
     for (const c of contracts) {
       if (c.optionType !== typeLetter) continue;
@@ -196,7 +203,7 @@ export async function selectSmallAccountContract(params: {
       if (askPrice < 0.15 || askPrice > 0.99) continue;
 
       const absDelta = typeof c.delta === "number" && Number.isFinite(c.delta) ? Math.abs(c.delta) : 0;
-      if (absDelta < minOptionDelta || absDelta > MAX_OPTION_DELTA) continue;
+      if (absDelta < fallbackMinDelta || absDelta > MAX_OPTION_DELTA) continue;
 
       const effectiveBid = rawBid ?? (askPrice > 0 ? 0 : -1);
       if (effectiveBid < 0 || askPrice <= 0 || effectiveBid > askPrice) continue;
@@ -207,7 +214,9 @@ export async function selectSmallAccountContract(params: {
       if (!isCall && c.strike > effectiveSpot * 1.002) continue;
 
       const maxOtmDistance = Math.min(3.50, effectiveSpot * 0.0045);
-      if (Math.abs(c.strike - effectiveSpot) > maxOtmDistance) continue;
+      const otmDist = Math.abs(c.strike - effectiveSpot);
+      const passesPrimaryTier = absDelta >= minOptionDelta && otmDist <= maxOtmDistance;
+      if (!passesPrimaryTier && otmDist > maxFallbackOtmDistance) continue;
 
       const { expHuman, robinhoodExp, robinhoodTab, dte } = formatExpirationHuman(c.expiration, todayEt);
       // Institutional liquidity firewall: reject ghost contracts with OI < 100 (unless 0DTE volume >= 250)
@@ -256,7 +265,7 @@ export async function selectSmallAccountContract(params: {
         continue;
       }
 
-      validCandidates.push({
+      (passesPrimaryTier ? validCandidates : highIvFallbackCandidates).push({
         contract: c,
         mid,
         bid: effectiveBid,
@@ -271,7 +280,7 @@ export async function selectSmallAccountContract(params: {
     }
 
     const selection = selectOptimalSmallAccountContract({
-      candidates: validCandidates,
+      candidates: validCandidates.length > 0 ? validCandidates : highIvFallbackCandidates,
       spotPrice: effectiveSpot,
       target1Spot: effectiveTarget1,
       target2Spot: effectiveTarget2,

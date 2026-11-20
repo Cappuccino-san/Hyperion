@@ -567,7 +567,8 @@ export async function fetchLiveCboeOptions(
       const match = occ.match(/^([A-Z0-9_]+?)(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/);
       if (!match) continue;
 
-      const [, , yy, mm, dd, typeChar, strikeRaw] = match;
+      const [, occRoot, yy, mm, dd, typeChar, strikeRaw] = match;
+      if (/\d/.test(occRoot)) continue;
       const expiration = `20${yy}-${mm}-${dd}`;
       const strike = parseInt(strikeRaw, 10) / 1000;
       if (!Number.isFinite(strike) || strike <= 0) continue;

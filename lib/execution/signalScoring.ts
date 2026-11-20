@@ -918,8 +918,8 @@ export function evaluateBtoCandidateSetup(input: {
       spotPrice > flowSnap.flowVwap &&
       latest5mCandle.close > latest5mCandle.sma34 &&
       latest5mCandle.close > latest5mCandle.open &&
-      Math.abs(spotPrice - flowSnap.flowVwap) <= entryAtr5m * 0.75 &&
-      Math.abs(barBody) <= maxSignalBarBody
+      Math.abs(spotPrice - flowSnap.flowVwap) <= entryAtr5m * (latest5mCandle.open <= flowSnap.flowVwap + entryAtr5m * 0.15 ? 1.25 : 0.75) &&
+      Math.abs(barBody) <= maxSignalBarBody * (latest5mCandle.open <= flowSnap.flowVwap + entryAtr5m * 0.15 ? 1.35 : 1.0)
     ) {
       const candleStop = Number(
         Math.min(spotPrice - minRiskFloor, Math.min(flowSnap.flowVwap, latest5mCandle.low) - spotPrice * 0.0005).toFixed(2)
@@ -953,8 +953,8 @@ export function evaluateBtoCandidateSetup(input: {
       spotPrice < flowSnap.flowVwap &&
       latest5mCandle.close < latest5mCandle.sma34 &&
       latest5mCandle.close < latest5mCandle.open &&
-      Math.abs(spotPrice - flowSnap.flowVwap) <= entryAtr5m * 0.75 &&
-      Math.abs(barBody) <= maxSignalBarBody
+      Math.abs(spotPrice - flowSnap.flowVwap) <= entryAtr5m * (latest5mCandle.open >= flowSnap.flowVwap - entryAtr5m * 0.15 ? 1.25 : 0.75) &&
+      Math.abs(barBody) <= maxSignalBarBody * (latest5mCandle.open >= flowSnap.flowVwap - entryAtr5m * 0.15 ? 1.35 : 1.0)
     ) {
       const candleStop = Number(
         Math.max(spotPrice + minRiskFloor, Math.max(flowSnap.flowVwap, latest5mCandle.high) + spotPrice * 0.0005).toFixed(2)
@@ -1603,11 +1603,20 @@ export function evaluateBtoCandidateSetup(input: {
       /Flow Bounce|Flow Rejection|Support Bounce|Resistance Rejection|Extremity Reclaim|Zero-Gamma Flip/i.test(
         candidateBto.setupName
       );
+    const isFreshVwapPolarityFlip = Boolean(
+      latest5mCandle &&
+        flowSnap &&
+        flowSnap.flowVwap > 0 &&
+        (candidateBto.contractType === "PUT"
+          ? latest5mCandle.open >= flowSnap.flowVwap - entryAtr5m * 0.15 && latest5mCandle.close < flowSnap.flowVwap
+          : latest5mCandle.open <= flowSnap.flowVwap + entryAtr5m * 0.15 && latest5mCandle.close > flowSnap.flowVwap)
+    );
+    const maxVwapStretchMult = isFreshVwapPolarityFlip ? 1.25 : 0.90;
     const vwapStretchOverExtended =
       !isExplicitReversionOrBounceSetup &&
       flowSnap &&
       flowSnap.flowVwap > 0 &&
-      Math.abs(spotPrice - flowSnap.flowVwap) > entryAtr5m * 0.90;
+      Math.abs(spotPrice - flowSnap.flowVwap) > entryAtr5m * maxVwapStretchMult;
     if (vwapStretchOverExtended) {
       candidateBto = null;
     }

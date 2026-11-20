@@ -34,7 +34,7 @@ import {
 } from "@/lib/executionLease";
 
 const POLL_INTERVAL_MS = 20_000; // 20 seconds during RTH
-const DEFAULT_WATCH_TICKERS = ["SPY"] as const;
+const DEFAULT_WATCH_TICKERS = ["SPY", "QQQ"] as const;
 const MAX_TRACKED_TICKERS = 8;
 const TRACKED_TICKER_TTL_MS = 4 * 60 * 60_000;
 
@@ -127,10 +127,10 @@ function getBotState(): LiveBotGlobalState {
       pollCount: 0,
       sessionDateEt: getEtDateString(),
       dispatchedCount: 0,
-      activeTrackedTickers: new Map<string, number>([["SPY", now]]),
+      activeTrackedTickers: new Map<string, number>(DEFAULT_WATCH_TICKERS.map((t) => [t, now])),
     };
   } else if (!globalThis.__hyperionLiveBotState.activeTrackedTickers) {
-    globalThis.__hyperionLiveBotState.activeTrackedTickers = new Map<string, number>([["SPY", now]]);
+    globalThis.__hyperionLiveBotState.activeTrackedTickers = new Map<string, number>(DEFAULT_WATCH_TICKERS.map((t) => [t, now]));
   }
   return globalThis.__hyperionLiveBotState;
 }
@@ -182,19 +182,19 @@ export function registerActiveTrackedTicker(rawTicker?: string): string[] {
   const botState = getBotState();
   const now = Date.now();
   if (!botState.activeTrackedTickers) {
-    botState.activeTrackedTickers = new Map([["SPY", now]]);
+    botState.activeTrackedTickers = new Map(DEFAULT_WATCH_TICKERS.map((t) => [t, now]));
   }
   if (sym) {
     botState.activeTrackedTickers.set(sym, now);
   }
   const openTickers = new Set(Object.keys(loadTradeStore().activePositions || {}));
   for (const [k, ts] of Array.from(botState.activeTrackedTickers.entries())) {
-    if (k !== "SPY" && !openTickers.has(k) && now - ts > TRACKED_TICKER_TTL_MS) {
+    if (!(DEFAULT_WATCH_TICKERS as readonly string[]).includes(k) && !openTickers.has(k) && now - ts > TRACKED_TICKER_TTL_MS) {
       botState.activeTrackedTickers.delete(k);
     }
   }
   const nonPinned = Array.from(botState.activeTrackedTickers.entries())
-    .filter(([k]) => k !== "SPY" && !openTickers.has(k))
+    .filter(([k]) => !(DEFAULT_WATCH_TICKERS as readonly string[]).includes(k) && !openTickers.has(k))
     .sort((a, b) => b[1] - a[1]);
   for (const [k] of nonPinned.slice(Math.max(0, MAX_TRACKED_TICKERS - DEFAULT_WATCH_TICKERS.length))) {
     botState.activeTrackedTickers.delete(k);
@@ -207,7 +207,7 @@ export function getActiveTrackedTickers(): string[] {
   const now = Date.now();
   const store = loadTradeStore();
   if (!botState.activeTrackedTickers) {
-    botState.activeTrackedTickers = new Map([["SPY", now]]);
+    botState.activeTrackedTickers = new Map(DEFAULT_WATCH_TICKERS.map((t) => [t, now]));
   }
   const ordered = new Set<string>(DEFAULT_WATCH_TICKERS);
   for (const k of Object.keys(store.activePositions || {})) {
@@ -215,7 +215,7 @@ export function getActiveTrackedTickers(): string[] {
     if (norm) ordered.add(norm);
   }
   const recent = Array.from(botState.activeTrackedTickers.entries())
-    .filter(([k, ts]) => k === "SPY" || now - ts <= TRACKED_TICKER_TTL_MS)
+    .filter(([k, ts]) => (DEFAULT_WATCH_TICKERS as readonly string[]).includes(k) || now - ts <= TRACKED_TICKER_TTL_MS)
     .sort((a, b) => b[1] - a[1]);
   for (const [k] of recent) ordered.add(k);
   return Array.from(ordered);
