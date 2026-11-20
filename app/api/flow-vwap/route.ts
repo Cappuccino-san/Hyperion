@@ -154,15 +154,17 @@ async function getOrFetchOptionContracts(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 6000);
   try {
-    const url = `https://cdn.cboe.com/api/global/delayed_quotes/options/${cboeSymbol}.json`;
+    const url = `https://cdn-api.cboe.com/api/global/delayed_quotes/options/${cboeSymbol}.json`;
 
     const res = await fetch(url, {
       signal: controller.signal,
       headers: {
-        Accept: "application/json",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-      },
+      Accept: "application/json, text/plain, */*",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      Referer: "https://www.cboe.com/",
+      Origin: "https://www.cboe.com",
+    },
       cache: "no-store",
     });
 

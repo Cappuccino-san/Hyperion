@@ -1773,7 +1773,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
             const isCall = m.isCall;
             const isPending = (m as any).isPending ?? false;
             const isOpen = (m as any).isOpen ?? false;
-            const hasAuthoritativeTradeOverlay = svgServerTradeMarkers.length > 0;
+            const hasAuthoritativeTradeOverlay = svgServerTradeMarkers.length > 0 || serverTradesProp !== undefined || hasLoadedServerTrades;
             const showBadgeCallout = isPending || (isOpen && !hasAuthoritativeTradeOverlay);
             const markerColor = isCall ? "#00F5D4" : "#FF2A55";
             const excursionText = m.mfePoints >= 0.2 ? ` +$${m.mfePoints.toFixed(1)}` : "";
