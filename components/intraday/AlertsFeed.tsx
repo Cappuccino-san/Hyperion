@@ -207,10 +207,15 @@ export function AlertsFeed() {
     try {
       setRadarSending(true);
       const customUrl = discordConfig?.webhookUrl?.trim();
-      const qs = customUrl ? `&webhookUrl=${encodeURIComponent(customUrl)}` : "";
-      await fetch(
-        `/api/signals?action=send_radar&ticker=${encodeURIComponent(activeTicker)}${qs}`
-      );
+      await fetch("/api/signals", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "send_radar",
+          ticker: activeTicker,
+          ...(customUrl ? { webhookUrl: customUrl } : {}),
+        }),
+      });
       await fetchServerTrades(activeTicker);
     } catch {
       // ignore

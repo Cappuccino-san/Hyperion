@@ -48,11 +48,6 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
 
   const handleSendTest = async () => {
     const targetUrl = url.trim();
-    if (!targetUrl) {
-      setTestState("error");
-      setTestMessage("Please enter a Discord Webhook URL first.");
-      return;
-    }
 
     setTestState("sending");
     setTestMessage(null);
@@ -62,7 +57,7 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          webhookUrl: targetUrl,
+          ...(targetUrl ? { webhookUrl: targetUrl } : {}),
           ticker: activeTicker,
           spotPrice,
           eventType: "test",
@@ -135,7 +130,7 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
               <input
                 id="discord-webhook-url"
                 type="url"
-                placeholder="https://discord.com/api/webhooks/... (Hyperion Alerts)"
+                placeholder="Leave blank to use server DISCORD_WEBHOOK_URL"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
                 className="w-full rounded-xl bg-[#0b0d17] border border-white/15 px-3.5 py-2.5 font-mono text-xs text-white placeholder-slate-600 focus:outline-none focus:border-[#5e72e4] focus:ring-1 focus:ring-[#5e72e4] transition-all"
@@ -212,7 +207,7 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
               <button
                 type="button"
                 onClick={handleSendTest}
-                disabled={testState === "sending" || !url.trim()}
+                disabled={testState === "sending"}
                 className="inline-flex items-center gap-1.5 rounded-xl bg-[#1c223a] border border-[#5e72e4]/50 px-4 py-2 font-mono font-bold text-slate-200 hover:text-white hover:border-[#5e72e4] transition-all disabled:opacity-40 disabled:pointer-events-none cursor-pointer"
               >
                 {testState === "sending" ? (

@@ -94,8 +94,8 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 │   ├── heatmap/                   # Virtualized 2D HeatmapTable & Three.js Surface3DView
 │   ├── intraday/                  # IntradayChart & real-time AlertsFeed
 │   ├── metrics/                   # MetricsRow summary cards & GammaProgressBar
-│   ├── modals/                    # GuideModal, CheatCodesModal & SetupModal
-│   └── views/                     # GaiaView (AntaeusView), QuadView, ScannerView, RecapView, ChartsView
+│   ├── modals/                    # GuideModal & SetupModal
+│   └── views/                     # GaiaView, QuadView, ScannerView, RecapView
 ├── lib/
 │   ├── optionsExposure.ts         # Black-Scholes Greeks & GEX/VEX/DEX/Charm engine
 │   └── utils.ts                   # Classname & formatting utilities

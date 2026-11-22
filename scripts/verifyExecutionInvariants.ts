@@ -1013,9 +1013,9 @@ async function runTestSuite() {
       positionSizeViolations++;
     }
 
-    // Now attempt BTO evaluation on SPY via syncGaiaSpySignalsToDiscord
-    const { syncGaiaSpySignalsToDiscord } = await import("../lib/tradeSignalEngine");
-    const syncRes = await syncGaiaSpySignalsToDiscord({
+    // Now attempt BTO evaluation on SPY via syncGaiaTickerSignalsToDiscord
+    const { syncGaiaTickerSignalsToDiscord } = await import("../lib/tradeSignalEngine");
+    const syncRes = await syncGaiaTickerSignalsToDiscord({
       ticker: "SPY",
       spotPrice: 764.5,
       sessionDate: currentTestDate,
@@ -1114,8 +1114,8 @@ async function runTestSuite() {
       prevSpotPrices: { SPY: 764.5 },
     };
     saveTradeStore(maxCapStore);
-    const { syncGaiaSpySignalsToDiscord } = await import("../lib/tradeSignalEngine");
-    const capRes = await syncGaiaSpySignalsToDiscord({
+    const { syncGaiaTickerSignalsToDiscord } = await import("../lib/tradeSignalEngine");
+    const capRes = await syncGaiaTickerSignalsToDiscord({
       ticker: "SPY",
       spotPrice: 764.5,
       sessionDate: currentTestDate,

@@ -35,7 +35,6 @@ export interface GaiaSessionOption {
   isoDate: string;
   bookLabel: string;
 }
-export type AntaeusSessionOption = GaiaSessionOption;
 
 export interface GaiaIntradayCandle {
   index: number;
@@ -52,7 +51,6 @@ export interface GaiaIntradayCandle {
   rsi14: number;
   macdHist: number;
 }
-export type AntaeusIntradayCandle = GaiaIntradayCandle;
 
 export interface GaiaPivotSignal {
   type: "BULL" | "BEAR";
@@ -62,7 +60,6 @@ export interface GaiaPivotSignal {
   p2Price: number;
   confirmedAtIndex: number;
 }
-export type AntaeusPivotSignal = GaiaPivotSignal;
 
 export interface GaiaMtfRow {
   tf5m: DivergenceStatus;
@@ -71,7 +68,6 @@ export interface GaiaMtfRow {
   tfDaily: DivergenceStatus;
   tfWeekly: DivergenceStatus;
 }
-export type AntaeusMtfRow = GaiaMtfRow;
 
 export interface GaiaStrikeExpBucket {
   strike: number;
@@ -87,7 +83,6 @@ export interface GaiaStrikeExpBucket {
   callDelta: number;
   putDelta: number;
 }
-export type AntaeusStrikeExpBucket = GaiaStrikeExpBucket;
 
 export interface GaiaExpirationInfo {
   isoDate: string;
@@ -96,7 +91,6 @@ export interface GaiaExpirationInfo {
   isNextExp: boolean;
   isThisWeek: boolean;
 }
-export type AntaeusExpirationInfo = GaiaExpirationInfo;
 
 export interface GaiaLivePayload {
   ticker: string;
@@ -117,7 +111,6 @@ export interface GaiaLivePayload {
   mtfByBar: GaiaMtfRow[];
   optionBuckets: GaiaStrikeExpBucket[];
 }
-export type AntaeusLivePayload = GaiaLivePayload;
 
 interface RawYahooBar {
   ts: number;
@@ -321,8 +314,8 @@ async function fetchLiveOptionsBuckets(
   sigma2Move: number;
   strikeStep: number;
   has0DteActive: boolean;
-  expirations: AntaeusExpirationInfo[];
-  buckets: AntaeusStrikeExpBucket[];
+  expirations: GaiaExpirationInfo[];
+  buckets: GaiaStrikeExpBucket[];
 }> {
   const cboeSymbol = mapCboeSymbol(ticker);
   const url = `https://cdn-api.cboe.com/api/global/delayed_quotes/options/${cboeSymbol}.json`;
@@ -503,7 +496,7 @@ async function fetchLiveOptionsBuckets(
   }
 
   // Build expiration metadata list across all active expirations
-  const expirations: AntaeusExpirationInfo[] = sortedExpirations.map(
+  const expirations: GaiaExpirationInfo[] = sortedExpirations.map(
     (iso, idx) => {
       const expTimeMs = new Date(`${iso}T00:00:00Z`).getTime();
       const dteDays = Math.max(
@@ -604,7 +597,7 @@ async function fetchLiveOptionsBuckets(
     }
   }
 
-  const buckets: AntaeusStrikeExpBucket[] = [];
+  const buckets: GaiaStrikeExpBucket[] = [];
   for (const b of Array.from(bucketMap.values())) {
     buckets.push({
       strike: b.strike,
@@ -701,7 +694,7 @@ export async function GET(request: NextRequest) {
       .reverse()
       .slice(0, 10);
 
-    const sessions: AntaeusSessionOption[] = sessionDatesDesc.map((iso) => ({
+    const sessions: GaiaSessionOption[] = sessionDatesDesc.map((iso) => ({
       isoDate: iso,
       bookLabel: formatBookLabel(iso),
     }));
@@ -800,7 +793,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Build session 5-minute candles with exact SMA 34 (5m) and stepped Daily MAs
-    const candles: AntaeusIntradayCandle[] = sessionGlobalIndices.map(
+    const candles: GaiaIntradayCandle[] = sessionGlobalIndices.map(
       (gIdx, localIdx) => {
         const b = enriched5m[gIdx];
         const close = b.close;
@@ -845,8 +838,8 @@ export async function GET(request: NextRequest) {
 
     // Multi-Timeframe Divergence Detection (SPY, QQQ, SPX, SPXW, IWM)
     const isDivergenceSupported = DIVERGENCE_SUPPORTED_TICKERS.has(ticker);
-    let pivotSignals5m: AntaeusPivotSignal[] = [];
-    let mtfByBar: AntaeusMtfRow[] = candles.map(() => ({
+    let pivotSignals5m: GaiaPivotSignal[] = [];
+    let mtfByBar: GaiaMtfRow[] = candles.map(() => ({
       tf5m: "NO",
       tf30m: "NO",
       tf2h: "NO",
@@ -936,7 +929,7 @@ export async function GET(request: NextRequest) {
       controller.signal
     );
 
-    const payload: AntaeusLivePayload = {
+    const payload: GaiaLivePayload = {
       ticker,
       dataSource: liveBook.dataSource,
       sessionDate: activeSessionDate,
@@ -997,7 +990,7 @@ export async function GET(request: NextRequest) {
     const message =
       err instanceof Error ? err.message : "Live market feed error";
     return NextResponse.json(
-      { error: `Live Antaeus feed unavailable for ${ticker}: ${message}` },
+      { error: `Live Gaia feed unavailable for ${ticker}: ${message}` },
       { status: 502 }
     );
   } finally {

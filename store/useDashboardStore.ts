@@ -15,11 +15,8 @@ export type ActiveView =
   | "Heatmap"
   | "Quad"
   | "Gaia"
-  | "Atlas"
-  | "Antaeus" // backward-compatible alias
   | "Scanner"
-  | "Recap"
-  | "Charts";
+  | "Recap";
 export * from "@/lib/tickerPresets";
 import {
   type NetMetrics,
@@ -530,7 +527,6 @@ export interface DashboardState {
   flowGammaVwapData: FlowGammaVwapData | null;
   discordConfig: DiscordConfig;
   isSetupModalOpen: boolean;
-  gaiaMode: "classic" | "atlas";
   uiMode: "signal" | "quant";
   toggleUiMode: () => void;
   setUiMode: (mode: "signal" | "quant") => void;
@@ -567,7 +563,6 @@ export interface DashboardState {
   fetchPlaybook: () => Promise<void>;
   updatePlaybookWithSpot: (ticker: string, newSpot: number) => void;
   setActiveView: (view: ActiveView) => void;
-  setGaiaMode: (mode: "classic" | "atlas") => void;
   setToastMessage: (msg: string | null) => void;
   setTicker: (ticker: string) => void;
   setFlowGammaVwapData: (data: FlowGammaVwapData | null) => void;
@@ -664,7 +659,6 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   flowGammaVwapData: null,
   discordConfig: DEFAULT_DISCORD_CONFIG,
   isSetupModalOpen: false,
-  gaiaMode: "classic",
   uiMode: "signal",
   toggleUiMode: () =>
     set((state) => ({ uiMode: state.uiMode === "signal" ? "quant" : "signal" })),
@@ -794,14 +788,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     }
   },
 
-  setActiveView: (view) => {
-    if (view === "Atlas") {
-      set({ activeView: "Gaia" });
-    } else {
-      set({ activeView: view });
-    }
-  },
-  setGaiaMode: (mode) => set({ gaiaMode: mode }),
+  setActiveView: (view) => set({ activeView: view }),
   setSetupModalOpen: (open) => set({ isSetupModalOpen: open }),
   hydrateDiscordConfig: () => {
     let muted = false;

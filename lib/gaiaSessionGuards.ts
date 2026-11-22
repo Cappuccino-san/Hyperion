@@ -13,19 +13,6 @@ export const ENTRY_CUTOFF_MINS = 870; // 14:30 ET (no late-day chasing)
 export const EOD_FORCE_FLAT_MINS = 955; // 15:55 ET (hard MOC flat)
 export const RTH_CLOSE_MINS = 960; // 16:00 ET (after-hours firewall)
 
-export const HOLIDAYS_2026: ReadonlySet<string> = new Set([
-  "2026-01-01",
-  "2026-01-19",
-  "2026-02-16",
-  "2026-04-03",
-  "2026-05-25",
-  "2026-06-19",
-  "2026-07-03",
-  "2026-09-07",
-  "2026-11-26",
-  "2026-12-25",
-]);
-
 export const EARLY_CLOSES_2026: Readonly<Record<string, number>> = {
   "2026-11-27": 780, // Day after Thanksgiving: 13:00 ET close
   "2026-12-24": 780, // Christmas Eve: 13:00 ET close

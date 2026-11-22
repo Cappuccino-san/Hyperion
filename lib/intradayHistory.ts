@@ -43,7 +43,6 @@ export interface TickerIntradayData {
   rthHistory?: IntradayHistoryPoint[];
   extHistory?: IntradayHistoryPoint[];
   alerts: IntradayAlert[];
-  lastBackfillAttempt?: number;
   officialLevels?: {
     callWall: number;
     callWallGex?: number;
@@ -164,15 +163,6 @@ function saveStore(store: DailyStore): void {
   appendIntradaySnapshotSync(store.date, store);
 }
 
-async function backfillFromTerraShade(
-  _ticker: string,
-  _initialStore: DailyStore
-): Promise<void> {
-  // Zero external terrashade.onrender.com dependency: intraday history and structural walls
-  // are persisted exclusively from Hyperion's own live CBOE/Yahoo/CNBC feeds.
-  return;
-}
-
 export async function recordIntradaySnapshot(params: {
   ticker: string;
   spotPrice: number;
@@ -197,23 +187,13 @@ export async function recordIntradaySnapshot(params: {
 }> {
   const { ticker, spotPrice, callWall, putWall, zeroGamma, allExpKing } = params;
   const sym = ticker.trim().toUpperCase();
-  let store = loadStore();
-
-  if (
-    !store.tickers[sym] ||
-    store.tickers[sym].history.length < 2 ||
-    Date.now() - (store.tickers[sym].lastBackfillAttempt ?? 0) > 300_000
-  ) {
-    await backfillFromTerraShade(sym, store);
-    store = loadStore();
-  }
+  const store = loadStore();
 
   const tickerData = store.tickers[sym] ?? {
     history: [],
     rthHistory: [],
     extHistory: [],
     alerts: [],
-    lastBackfillAttempt: 0,
   };
   const { rth, ext } = ensurePartitionedHistory(tickerData);
 

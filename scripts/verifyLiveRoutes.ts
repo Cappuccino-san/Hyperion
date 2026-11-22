@@ -1,7 +1,7 @@
 /**
  * Hyperion Headless Live Route & API Smoke Verifier
  *
- * Verifies all 6 App Router pages and 5 JSON API endpoints return HTTP 200
+ * Verifies all 5 App Router pages and 5 JSON API endpoints return HTTP 200
  * with live, non-mock payloads.
  *
  * Usage:
@@ -125,7 +125,7 @@ async function checkApiRoute(
 async function main() {
   console.log(`[ROUTE-SMOKE] Target: ${BASE_URL}`);
 
-  const pageRoutes = ["/", "/quad", "/gaia", "/atlas", "/scanner", "/recap"];
+  const pageRoutes = ["/", "/quad", "/gaia", "/scanner", "/recap"];
   const pageChecks = pageRoutes.map((route) => checkPageRoute(route));
 
   const apiChecks = [

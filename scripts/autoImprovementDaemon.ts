@@ -209,9 +209,11 @@ function auditDiscordGatewayGuards() {
   log("Step 4: Auditing Discord Gateway & Replay Silencing Guards...");
   const criticalFiles = [
     "lib/tradeSignalEngine.ts",
+    "lib/execution/discordGateway.ts",
     "lib/liveBotDaemon.ts",
     "lib/tradeRadar.ts",
     "lib/tradePerformanceEngine.ts",
+    "app/api/discord/route.ts",
   ];
 
   for (const relPath of criticalFiles) {

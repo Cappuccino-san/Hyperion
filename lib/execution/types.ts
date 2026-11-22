@@ -376,7 +376,6 @@ export interface SyncGaiaTickerResult {
   dispatchedCount: number;
   keys: string[];
 }
-export type SyncGaiaSpyResult = SyncGaiaTickerResult;
 
 export interface SyncGaiaTickerParams {
   ticker: string;
@@ -392,4 +391,3 @@ export interface SyncGaiaTickerParams {
   isHistoricalBackfill?: boolean;
   signal?: AbortSignal;
 }
-export type SyncGaiaSpyParams = SyncGaiaTickerParams;

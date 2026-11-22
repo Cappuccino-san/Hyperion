@@ -40,6 +40,7 @@ import {
   saveTradeStore,
 } from "@/lib/execution/ledgerCommit";
 import { sanitizeTickerSymbol } from "@/lib/marketCache";
+import { sanitizeDiscordWebhookUrl } from "@/lib/discordWebhook";
 import {
   readAlphaPriors,
   readPostMarketAttribution,
@@ -92,15 +93,6 @@ function authorizeAdminRequest(req: NextRequest): NextResponse | null {
     }
   }
   return null;
-}
-
-function sanitizeWebhookUrl(raw: unknown): { url?: string; invalid: boolean } {
-  if (raw == null) return { url: undefined, invalid: false };
-  if (typeof raw !== "string") return { url: undefined, invalid: true };
-  const trimmed = raw.trim();
-  if (!trimmed) return { url: undefined, invalid: false };
-  if (!/^https:\/\//i.test(trimmed)) return { url: undefined, invalid: true };
-  return { url: trimmed, invalid: false };
 }
 
 function parseIsoDateParam(raw: unknown): string | undefined {
@@ -180,14 +172,6 @@ export async function GET(req: NextRequest) {
     }
     const requestedDate = rawDate || undefined;
     const testAction = searchParams.get("test");
-    const webhookValidation = sanitizeWebhookUrl(searchParams.get("webhookUrl"));
-    if (webhookValidation.invalid) {
-      return NextResponse.json(
-        { error: "Invalid Discord Webhook URL protocol; HTTPS required." },
-        { status: 400 }
-      );
-    }
-    const webhookUrl = webhookValidation.url;
 
     // Manual inspection endpoint (Does NOT post simulations to Discord)
     if (testAction === "bto_call" || testAction === "bto_put") {
@@ -446,7 +430,7 @@ export async function GET(req: NextRequest) {
         return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
       }
       const radarController = new AbortController();
-      const work = sendPreTradeRadarDiscordCard(webhookUrl, {
+      const work = sendPreTradeRadarDiscordCard(undefined, {
         signal: radarController.signal,
       }).finally(() => releaseBarEvaluationLock(lockToken));
       const sent = await withBoundedWait(work, 15_000, radarController);
@@ -475,7 +459,6 @@ export async function GET(req: NextRequest) {
       const recapController = new AbortController();
       const work = checkAndSendMarketCloseRecap({
         force: true,
-        webhookUrl,
         date: recapDate,
         signal: recapController.signal,
       }).finally(() => releaseBarEvaluationLock(lockToken));
@@ -520,12 +503,12 @@ export async function GET(req: NextRequest) {
       const evalController = new AbortController();
       const evalTimeout = setTimeout(() => evalController.abort(), 12_000);
       try {
-        await evaluateAllActivePositions({ webhookUrl, signal: evalController.signal });
+        await evaluateAllActivePositions({ signal: evalController.signal });
       } finally {
         const clock = getEtClockNow();
         const bounds = getSessionBoundsEt(clock.etDate);
         if (clock.etMins >= bounds.eodFlatMins) {
-          await ensureMocCutoffForRemainingPositions(webhookUrl, clock).catch(() => {});
+          await ensureMocCutoffForRemainingPositions(undefined, clock).catch(() => {});
         }
         clearTimeout(evalTimeout);
         releaseBarEvaluationLock(getLockToken);
@@ -564,10 +547,10 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const webhookValidation = sanitizeWebhookUrl(body.webhookUrl);
+    const webhookValidation = sanitizeDiscordWebhookUrl(body.webhookUrl);
     if (webhookValidation.invalid) {
       return NextResponse.json(
-        { error: "Invalid Discord Webhook URL protocol; HTTPS required." },
+        { error: "Invalid Discord Webhook URL; official HTTPS discord.com webhook required." },
         { status: 400 }
       );
     }
@@ -622,7 +605,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: true, trackedTickers });
     }
 
-    if (body.action === "SYNC_GAIA_TICKER_SIGNALS" || body.action === "SYNC_GAIA_SPY_SIGNALS") {
+    if (body.action === "SYNC_GAIA_TICKER_SIGNALS") {
       const sessionDate = parseIsoDateParam(body.sessionDate);
       const backfill = isHistoricalBackfillRequest({
         explicitFlag: body.isHistoricalBackfill,

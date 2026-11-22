@@ -97,7 +97,6 @@ export {
   isAlertDispatchEligible,
   flushPendingDiscordAlerts,
   syncGaiaTickerSignalsToDiscord,
-  syncGaiaSpySignalsToDiscord,
 } from "@/lib/execution/discordGateway";
 export * from "./tradePerformanceEngine";
 

@@ -60,9 +60,7 @@ export default function DashboardPage() {
 
         {activeView === "Quad" && <QuadView />}
 
-        {(activeView === "Gaia" || activeView === "Antaeus" || activeView === "Atlas") && (
-          <GaiaView />
-        )}
+        {activeView === "Gaia" && <GaiaView />}
 
         {activeView === "Scanner" && <ScannerView />}
         {activeView === "Recap" && <RecapView />}

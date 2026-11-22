@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { isValidDiscordWebhookUrl } from "@/lib/discordWebhook";
 
 interface CachedEvent {
   timestamp: number;
@@ -92,9 +93,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (webhookUrl && !/^https:\/\//i.test(webhookUrl)) {
+    if (webhookUrl && !isValidDiscordWebhookUrl(webhookUrl)) {
       return NextResponse.json(
-        { error: "Invalid Discord Webhook URL protocol; HTTPS required." },
+        { error: "Invalid Discord Webhook URL; official HTTPS discord.com webhook required." },
         { status: 400 }
       );
     }

@@ -6,11 +6,10 @@ import { useRouter, usePathname } from "next/navigation";
 import { Lock, OctagonX, Unlock, Volume2, VolumeX } from "lucide-react";
 import { ActiveView, useDashboardStore } from "@/store/useDashboardStore";
 import { GuideModal } from "@/components/modals/GuideModal";
-import { CheatCodesModal } from "@/components/modals/CheatCodesModal";
 import { SetupModal } from "@/components/modals/SetupModal";
 import { CommandPalette } from "@/components/CommandPalette";
 import { ExpectedMovesBadges } from "@/components/header/ExpectedMovesBadges";
-import { HOLIDAYS_2026 } from "@/lib/gaiaSessionGuards";
+import { isNyseHoliday, getNyseEarlyCloseMins } from "@/lib/gaiaSessionGuards";
 import { cn } from "@/lib/utils";
 
 const VIEW_TABS: ActiveView[] = ["Heatmap", "Quad", "Gaia", "Scanner", "Recap"];
@@ -19,14 +18,9 @@ const TAB_ROUTES: Record<ActiveView, string> = {
   Heatmap: "/",
   Quad: "/quad",
   Gaia: "/gaia",
-  Antaeus: "/gaia",
-  Atlas: "/gaia",
   Scanner: "/scanner",
-  Charts: "/",
   Recap: "/recap",
 };
-
-const EARLY_CLOSE_2026 = new Set(["2026-11-27", "2026-12-24"]);
 
 interface MarketStatusInfo {
   state: "open" | "pre" | "after" | "closed";
@@ -70,7 +64,7 @@ function getEtParts(d: Date) {
 
 function isTradingDay(d: Date): boolean {
   const p = getEtParts(d);
-  return p.wd >= 1 && p.wd <= 5 && !HOLIDAYS_2026.has(p.ymd);
+  return p.wd >= 1 && p.wd <= 5 && !isNyseHoliday(p.ymd);
 }
 
 function formatDuration(totalSec: number): string {
@@ -89,8 +83,8 @@ function computeMarketStatus(): MarketStatusInfo {
   const p = getEtParts(now);
   const secOfDay = p.h * 3600 + p.m * 60 + p.s;
   const openSec = 9 * 3600 + 30 * 60; // 9:30 AM ET
-  const closeHr = EARLY_CLOSE_2026.has(p.ymd) ? 13 : 16;
-  const closeSec = closeHr * 3600;
+  const earlyCloseMins = getNyseEarlyCloseMins(p.ymd);
+  const closeSec = (earlyCloseMins ?? 16 * 60) * 60;
   const preSec = 4 * 3600; // 4:00 AM ET
   const afterEndSec = 20 * 3600; // 8:00 PM ET
   const todayTrades = isTradingDay(now);
@@ -333,7 +327,6 @@ export function TopNavBar() {
   const isSetupModalOpen = useDashboardStore((state) => state.isSetupModalOpen);
   const setSetupModalOpen = useDashboardStore((state) => state.setSetupModalOpen);
   const [guideOpen, setGuideOpen] = useState(false);
-  const [cheatCodesOpen, setCheatCodesOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   const openPositionsList = Object.values(serverActivePositions || {}).filter(Boolean) as any[];
@@ -347,7 +340,7 @@ export function TopNavBar() {
       router.push("/");
     } else if (tab === "Quad") {
       router.push("/quad");
-    } else if (tab === "Gaia" || tab === "Antaeus" || tab === "Atlas") {
+    } else if (tab === "Gaia") {
       router.push("/gaia");
     } else if (tab === "Scanner") {
       router.push("/scanner");
@@ -361,11 +354,7 @@ export function TopNavBar() {
       return activeView === tab;
     }
     if (pathname === "/quad") return tab === "Quad";
-    if (
-      pathname === "/gaia" ||
-      pathname === "/atlas" ||
-      pathname === "/antaeus"
-    ) {
+    if (pathname === "/gaia") {
       return tab === "Gaia";
     }
     if (pathname === "/scanner") return tab === "Scanner";
@@ -652,7 +641,6 @@ export function TopNavBar() {
       </header>
 
       <GuideModal open={guideOpen} onOpenChange={setGuideOpen} />
-      <CheatCodesModal open={cheatCodesOpen} onOpenChange={setCheatCodesOpen} />
       <SetupModal open={isSetupModalOpen} onOpenChange={setSetupModalOpen} />
       <CommandPalette
         externalOpen={paletteOpen}

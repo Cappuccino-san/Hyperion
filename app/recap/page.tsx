@@ -36,9 +36,6 @@ export default function RecapPage() {
             <a href="/gaia" className="hover:text-white transition-colors">
               Gaia
             </a>
-            <a href="/atlas" className="hover:text-white transition-colors">
-              Atlas
-            </a>
             <a href="/scanner" className="hover:text-white transition-colors">
               Scanner
             </a>

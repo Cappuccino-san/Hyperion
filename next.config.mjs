@@ -17,6 +17,11 @@ const nextConfig = {
         destination: "/gaia",
         permanent: true,
       },
+      {
+        source: "/atlas",
+        destination: "/gaia",
+        permanent: true,
+      },
     ];
   },
 };

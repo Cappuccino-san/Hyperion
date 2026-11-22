@@ -4,6 +4,7 @@ import {
   getCachedSpotPrice,
 } from "./tradeSignalEngine";
 import { computeOptionsAnalytics } from "./optionsExposure";
+import { isValidDiscordWebhookUrl } from "./discordWebhook";
 
 export interface PreTradeSetupIdea {
   ticker: string;
@@ -453,8 +454,8 @@ export async function sendPreTradeRadarDiscordCard(
     console.warn("[TradeRadar] Skipping radar Discord dispatch: DISCORD_WEBHOOK_URL is not configured.");
     return false;
   }
-  if (!/^https:\/\//i.test(webhookUrl)) {
-    console.warn("[TradeRadar] Rejecting non-HTTPS Discord webhook URL.");
+  if (!isValidDiscordWebhookUrl(webhookUrl)) {
+    console.warn("[TradeRadar] Rejecting invalid Discord webhook URL.");
     return false;
   }
   if (options?.signal?.aborted) {

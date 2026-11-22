@@ -592,7 +592,6 @@ export function computeOptionsAnalytics(params: {
   extendedQuote?: ExtendedQuoteInfo | null;
   bookTimestamp?: string;
   officialLevels?: GammaLevels | null;
-  openGexMap?: Map<string, number> | null;
 }): OptionsAnalyticsPayload {
   const {
     ticker,
@@ -604,7 +603,6 @@ export function computeOptionsAnalytics(params: {
     activeExpirationFilter = "0DTE",
     extendedQuote = null,
     bookTimestamp,
-    openGexMap = null,
   } = params;
 
   const safeSpot = Number.isFinite(spotPrice) && spotPrice > 0 ? spotPrice : 0;
@@ -855,15 +853,7 @@ export function computeOptionsAnalytics(params: {
       charm[exp.id] = Number(cellCharmM.toFixed(4));
 
       let avgPct = 0;
-      if (openGexMap && openGexMap.size > 0) {
-        const openValM = openGexMap.get(`${strike}|${exp.isoDate}`);
-        if (openValM !== undefined && Math.abs(openValM) >= 0.000001) {
-          const rawPct = ((cellGexM - openValM) / Math.abs(openValM)) * 100;
-          if (Number.isFinite(rawPct)) {
-            avgPct = Math.round(rawPct);
-          }
-        }
-      } else if (
+      if (
         (exp.id === "exp_0" || exp.id === "exp_1") &&
         cell.totalWeight > 0
       ) {

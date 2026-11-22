@@ -6,6 +6,7 @@ import { getTodayEt, getSessionBoundsEt } from "./gaiaSessionGuards";
 import { getNowEtTime } from "./execution/optionPricing";
 import { computeTradeRealizedPnl } from "./execution/pnlAccounting";
 import { getPersistenceCacheDir } from "./persistenceStore";
+import { isValidDiscordWebhookUrl } from "./discordWebhook";
 
 export interface TradePerformanceItem {
   id: string;
@@ -246,8 +247,8 @@ export async function sendDailyPerformanceDiscordRecap(
     console.warn("[TradePerformanceEngine] Skipping daily recap Discord dispatch: DISCORD_WEBHOOK_URL is not configured.");
     return false;
   }
-  if (!/^https:\/\//i.test(webhookUrl)) {
-    console.warn("[TradePerformanceEngine] Rejecting non-HTTPS Discord webhook URL.");
+  if (!isValidDiscordWebhookUrl(webhookUrl)) {
+    console.warn("[TradePerformanceEngine] Rejecting invalid Discord webhook URL.");
     return false;
   }
   if (options?.signal?.aborted) {

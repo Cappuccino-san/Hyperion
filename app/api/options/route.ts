@@ -25,7 +25,6 @@ import {
   ensureMocCutoffForRemainingPositions,
   getEtClockNow,
 } from "@/lib/liveBotDaemon";
-import { globalTelemetry } from "@/lib/telemetry";
 import {
   getSessionBoundsEt,
   getTodayEt,
@@ -43,13 +42,6 @@ const contractsCache = globalContractsCache;
 const CACHE_TTL_MS = 10_000;
 
 const NO_EXT_SET = new Set(["SPX", "^SPX", "NDX", "^NDX", "SPXW", "NDXP"]);
-
-async function fetchOpenGexMap(
-  _ticker: string
-): Promise<Map<string, number> | null> {
-  // Zero external terrashade.onrender.com dependency: open GEX is computed purely from local Hyperion history.
-  return null;
-}
 
 async function fetchRealtimeSpotQuote(
   ticker: string
@@ -245,9 +237,6 @@ async function fetchCboeOptions(
   const backoffDelays = [1000, 2000, 4000]; // 1s, 2s, 4s exponential backoff
   const maxAttempts = 3;
 
-  globalTelemetry.recordAttempt(ticker);
-  const startFetchTime = performance.now();
-
   const fetchWithTimeout = async (attempt = 1): Promise<Response | null> => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
@@ -285,14 +274,7 @@ async function fetchCboeOptions(
   };
 
   const response = await fetchWithTimeout();
-  if (!response) {
-    const latencyMs = Math.round(performance.now() - startFetchTime);
-    globalTelemetry.recordFailure(ticker, "CBOE upstream unreachable or timeout", latencyMs);
-    return null;
-  }
-
-  const latencyMs = Math.round(performance.now() - startFetchTime);
-  globalTelemetry.recordSuccess(ticker, latencyMs);
+  if (!response) return null;
 
   const json = await response.json();
   const data = json?.data;
@@ -308,10 +290,7 @@ async function fetchCboeOptions(
   const cboePrevClose = Number(data.prev_day_close ?? data.close ?? cboeSpotPrice);
   if (!cboeSpotPrice || cboeSpotPrice <= 0) return null;
 
-  const [rtQuote, openGexMap] = await Promise.all([
-    marketOpenNow ? fetchRealtimeSpotQuote(ticker) : Promise.resolve(null),
-    fetchOpenGexMap(ticker),
-  ]);
+  const rtQuote = marketOpenNow ? await fetchRealtimeSpotQuote(ticker) : null;
 
   const spotPrice = marketOpenNow ? (rtQuote?.spotPrice ?? cboeSpotPrice) : cboeClosePrice;
   const previousClose = rtQuote?.previousClose ?? cboePrevClose;
@@ -369,7 +348,6 @@ async function fetchCboeOptions(
     impliedVolatility,
     contracts: anchoredContracts,
     extendedQuote,
-    openGexMap,
   });
 
   return {

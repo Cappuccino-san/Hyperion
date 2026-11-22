@@ -1,4 +1,5 @@
 import { computeAdaptiveQuantMetrics } from "@/lib/gaiaSignalFsm";
+import { isValidDiscordWebhookUrl } from "@/lib/discordWebhook";
 import {
   capExitTsToEodFlat,
   etMinutesOfDay,
@@ -12,8 +13,6 @@ import {
   DailyTradeStore,
   GaiaSpySignalSyncInput,
   OptionTradePosition,
-  SyncGaiaSpyParams,
-  SyncGaiaSpyResult,
   SyncGaiaTickerParams,
   SyncGaiaTickerResult,
   TradeLifecycleAlert,
@@ -167,6 +166,10 @@ export async function sendDiscordTradeAlert(
   const webhookUrl = (customWebhookUrl || process.env.DISCORD_WEBHOOK_URL)?.trim() || "";
   if (!webhookUrl) {
     console.warn("[DiscordTradeAlert] Skipping dispatch: DISCORD_WEBHOOK_URL is not configured.");
+    return false;
+  }
+  if (!isValidDiscordWebhookUrl(webhookUrl)) {
+    console.warn("[DiscordTradeAlert] Rejecting invalid Discord webhook URL.");
     return false;
   }
 
@@ -1195,5 +1198,3 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
 
   return { dispatchedCount: newlyDispatched.length, keys: newlyDispatched };
 }
-
-export const syncGaiaSpySignalsToDiscord = syncGaiaTickerSignalsToDiscord;
