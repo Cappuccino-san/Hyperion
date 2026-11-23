@@ -129,14 +129,15 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
               </label>
               <input
                 id="discord-webhook-url"
-                type="url"
-                placeholder="Leave blank to use server DISCORD_WEBHOOK_URL"
+                type="password"
+                autoComplete="off"
+                placeholder="Leave blank to use server DISCORD_WEBHOOK_URL (recommended)"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
                 className="w-full rounded-xl bg-[#0b0d17] border border-white/15 px-3.5 py-2.5 font-mono text-xs text-white placeholder-slate-600 focus:outline-none focus:border-[#5e72e4] focus:ring-1 focus:ring-[#5e72e4] transition-all"
               />
               <p className="text-[11px] font-mono text-slate-400">
-                In Discord: Server Settings → Integrations → Webhooks → New Webhook (&quot;Hyperion Alerts&quot;) → Copy Webhook URL.
+                Recommended: set <code className="text-slate-300">DISCORD_WEBHOOK_URL</code> in server <code className="text-slate-300">.env.local</code>. Any URL entered here stays in memory only (never saved to localStorage) and is disabled in production.
               </p>
             </div>
 

@@ -224,7 +224,7 @@ export function AlertsFeed() {
     }
   };
 
-  const isConfigured = Boolean(discordConfig?.enabled && discordConfig?.webhookUrl);
+  const isConfigured = Boolean(discordConfig?.enabled);
 
   // Combine execution signal alerts from /api/signals with structural wall alerts from store
   const combinedAlerts = React.useMemo(() => {

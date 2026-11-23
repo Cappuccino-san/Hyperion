@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { authorizeAdminRequest } from "@/lib/adminAuth";
 import { isValidDiscordWebhookUrl } from "@/lib/discordWebhook";
 
 interface CachedEvent {
@@ -60,6 +61,9 @@ interface DiscordAlertRequestBody {
 
 export async function POST(req: NextRequest) {
   try {
+    const authError = authorizeAdminRequest(req);
+    if (authError) return authError;
+
     const body: DiscordAlertRequestBody = await req.json();
 
     // 1. Strict Backfill Firewall: NEVER dispatch historical replay/backfill signals to Discord
@@ -81,9 +85,18 @@ export async function POST(req: NextRequest) {
         });
       }
     }
+    const rawCustomWebhook =
+      typeof body.webhookUrl === "string" ? body.webhookUrl.trim() : "";
+    if (process.env.NODE_ENV === "production" && rawCustomWebhook.length > 0) {
+      return NextResponse.json(
+        { error: "Client-supplied webhookUrl overrides are disabled in production; configure DISCORD_WEBHOOK_URL on the server." },
+        { status: 403 }
+      );
+    }
+
     const webhookUrl =
-      (body.webhookUrl && body.webhookUrl.trim().length > 0
-        ? body.webhookUrl.trim()
+      (process.env.NODE_ENV !== "production" && rawCustomWebhook.length > 0
+        ? rawCustomWebhook
         : process.env.DISCORD_WEBHOOK_URL?.trim()) || "";
 
     if (!body.dryRun && !webhookUrl) {

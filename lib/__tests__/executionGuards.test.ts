@@ -36,6 +36,8 @@ import { evaluateBtoCandidateSetup } from "../execution/signalScoring";
 import { selectSmallAccountContract } from "../execution/contractRouter";
 import { GaiaSignalFsm, computeCausalEquilibriumDispersion, type GaiaBarData } from "../gaiaSignalFsm";
 import { GET as getSignalsRoute, POST as postSignalsRoute } from "../../app/api/signals/route";
+import { POST as postDiscordRoute } from "../../app/api/discord/route";
+import { authorizeAdminRequest } from "../adminAuth";
 import type { OptionTradePosition } from "../execution/types";
 
 const tempCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "hyperion-guards-test-"));
@@ -360,6 +362,82 @@ test("/api/signals clear endpoints require HYPERION_ADMIN_TOKEN when configured"
     })
   );
   assert.equal(validPost.status, 200);
+});
+
+test("authorizeAdminRequest fails closed in production even with spoofed loopback headers", () => {
+  const prevNodeEnv = process.env.NODE_ENV;
+  delete process.env.HYPERION_ADMIN_TOKEN;
+  (process.env as Record<string, string | undefined>).NODE_ENV = "production";
+  try {
+    const spoofedReq = new NextRequest("http://localhost:3000/api/signals", {
+      headers: {
+        host: "localhost:3000",
+        "x-forwarded-for": "127.0.0.1",
+      },
+    });
+    const res = authorizeAdminRequest(spoofedReq);
+    assert.ok(res, "Expected 403 NextResponse when HYPERION_ADMIN_TOKEN is unset in production");
+    assert.equal(res.status, 403);
+  } finally {
+    (process.env as Record<string, string | undefined>).NODE_ENV = prevNodeEnv;
+  }
+});
+
+test("privileged /api/signals actions and /api/discord require admin auth and block prod webhookUrl overrides", async () => {
+  process.env.HYPERION_ADMIN_TOKEN = "super-secret-admin-token-42";
+
+  for (const action of [
+    "EMERGENCY_LOCK",
+    "UNLOCK_EXECUTION",
+    "FLATTEN_PAPER_POSITIONS",
+    "send_daily_recap",
+    "send_radar",
+  ]) {
+    const res = await postSignalsRoute(
+      new NextRequest("http://localhost:3000/api/signals", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      })
+    );
+    assert.equal(res.status, 401, `Expected 401 for unauthenticated POST /api/signals action=${action}`);
+  }
+
+  const unauthScan = await getSignalsRoute(
+    new NextRequest("http://localhost:3000/api/signals?scan=true")
+  );
+  assert.equal(unauthScan.status, 401);
+
+  const unauthDiscord = await postDiscordRoute(
+    new NextRequest("http://localhost:3000/api/discord", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dryRun: true, eventType: "test" }),
+    })
+  );
+  assert.equal(unauthDiscord.status, 401);
+
+  const prevNodeEnv = process.env.NODE_ENV;
+  (process.env as Record<string, string | undefined>).NODE_ENV = "production";
+  try {
+    const prodOverrideRes = await postDiscordRoute(
+      new NextRequest("http://localhost:3000/api/discord", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer super-secret-admin-token-42",
+        },
+        body: JSON.stringify({
+          dryRun: true,
+          eventType: "test",
+          webhookUrl: "https://discord.com/api/webhooks/123456789012345678/abc123",
+        }),
+      })
+    );
+    assert.equal(prodOverrideRes.status, 403);
+  } finally {
+    (process.env as Record<string, string | undefined>).NODE_ENV = prevNodeEnv;
+  }
 });
 
 test("cross-process execution lease guarantees mutual exclusion and observer role safety", () => {

@@ -1,5 +1,6 @@
-import crypto from "crypto";
 import { NextRequest, NextResponse } from "next/server";
+import { authorizeAdminRequest } from "@/lib/adminAuth";
+import { GET as getOptionsRoute } from "@/app/api/options/route";
 import {
   evaluateTradeSignals,
   evaluateAllActivePositions,
@@ -52,48 +53,6 @@ export const dynamic = "force-dynamic";
 const globalForSignals = globalThis as unknown as {
   __hyperionLastGetEvalAtMs?: number;
 };
-
-function isLoopbackHostname(host: string): boolean {
-  const clean = host.trim().toLowerCase().replace(/^\[|\]$/g, "").split(":")[0];
-  return clean === "localhost" || clean === "127.0.0.1" || clean === "::1";
-}
-
-function authorizeAdminRequest(req: NextRequest): NextResponse | null {
-  const configuredToken = process.env.HYPERION_ADMIN_TOKEN?.trim();
-  if (configuredToken) {
-    const headerToken = req.headers.get("x-hyperion-admin-token")?.trim();
-    const authHeader = req.headers.get("authorization")?.trim() ?? "";
-    const bearerToken = authHeader.toLowerCase().startsWith("bearer ")
-      ? authHeader.slice(7).trim()
-      : "";
-    const provided = headerToken || bearerToken;
-    if (!provided) {
-      return NextResponse.json({ error: "Unauthorized admin request" }, { status: 401 });
-    }
-    const providedBuf = Buffer.from(provided, "utf-8");
-    const expectedBuf = Buffer.from(configuredToken, "utf-8");
-    if (
-      providedBuf.length !== expectedBuf.length ||
-      !crypto.timingSafeEqual(providedBuf, expectedBuf)
-    ) {
-      return NextResponse.json({ error: "Unauthorized admin request" }, { status: 401 });
-    }
-    return null;
-  }
-
-  if (process.env.NODE_ENV === "production") {
-    const reqHost = req.headers.get("host") ?? req.nextUrl.hostname ?? "";
-    const forwardedFor = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "";
-    const isLocalHost = isLoopbackHostname(reqHost) && (!forwardedFor || isLoopbackHostname(forwardedFor));
-    if (!isLocalHost) {
-      return NextResponse.json(
-        { error: "HYPERION_ADMIN_TOKEN is required for non-loopback admin actions in production." },
-        { status: 403 }
-      );
-    }
-  }
-  return null;
-}
 
 function parseIsoDateParam(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
@@ -348,18 +307,21 @@ export async function GET(req: NextRequest) {
     }
 
     if (searchParams.get("scan") === "true" || searchParams.get("poll") === "all") {
-      const baseUrl = req.nextUrl.origin || "http://localhost:3000";
+      const authError = authorizeAdminRequest(req);
+      if (authError) return authError;
       const tickers = Array.from(new Set([...getActiveTrackedTickers(), "SPY", "QQQ", "IWM"]));
       const scanController = new AbortController();
       const scanTimeout = setTimeout(() => scanController.abort(), 12_000);
       try {
         for (const sym of tickers) {
           if (scanController.signal.aborted) break;
+          const cleanSym = sanitizeTickerSymbol(sym, "");
+          if (!cleanSym) continue;
           try {
-            await fetch(`${baseUrl}/api/options?ticker=${sym}&force=true`, {
-              cache: "no-store",
-              signal: scanController.signal,
-            }).then((r) => r.json());
+            const internalReq = new NextRequest(
+              `http://127.0.0.1/api/options?ticker=${encodeURIComponent(cleanSym)}&force=true`
+            );
+            await getOptionsRoute(internalReq);
           } catch {
             // Non-fatal
           }
@@ -409,61 +371,6 @@ export async function GET(req: NextRequest) {
       } finally {
         clearTimeout(radarTimeout);
       }
-    }
-
-    if (searchParams.get("action") === "send_radar") {
-      if (
-        isHistoricalBackfillRequest({
-          explicitFlag: searchParams.get("isHistoricalBackfill"),
-          requestedDate: requestedDate ?? parseIsoDateParam(searchParams.get("sessionDate")),
-          nowEt: searchParams.get("nowEt"),
-        })
-      ) {
-        return NextResponse.json({
-          success: false,
-          suppressed: true,
-          reason: "DISCORD_SILENCED_HISTORICAL_BACKFILL",
-        });
-      }
-      const lockToken = acquireBarEvaluationLock();
-      if (!lockToken) {
-        return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
-      }
-      const radarController = new AbortController();
-      const work = sendPreTradeRadarDiscordCard(undefined, {
-        signal: radarController.signal,
-      }).finally(() => releaseBarEvaluationLock(lockToken));
-      const sent = await withBoundedWait(work, 15_000, radarController);
-      return NextResponse.json({ success: sent, message: "Pre-trade radar dispatched to Discord." });
-    }
-
-    if (searchParams.get("action") === "send_recap") {
-      const recapDate = requestedDate ?? parseIsoDateParam(searchParams.get("sessionDate"));
-      if (
-        isHistoricalBackfillRequest({
-          explicitFlag: searchParams.get("isHistoricalBackfill"),
-          requestedDate: recapDate,
-          nowEt: searchParams.get("nowEt"),
-        })
-      ) {
-        return NextResponse.json({
-          success: false,
-          suppressed: true,
-          reason: "DISCORD_SILENCED_HISTORICAL_BACKFILL",
-        });
-      }
-      const lockToken = acquireBarEvaluationLock();
-      if (!lockToken) {
-        return NextResponse.json({ error: "Evaluation lock busy" }, { status: 409 });
-      }
-      const recapController = new AbortController();
-      const work = checkAndSendMarketCloseRecap({
-        force: true,
-        date: recapDate,
-        signal: recapController.signal,
-      }).finally(() => releaseBarEvaluationLock(lockToken));
-      const report = await withBoundedWait(work, 15_000, recapController);
-      return NextResponse.json({ success: true, message: "Daily recap sent to Discord.", report });
     }
 
     // Continuously evaluate all open positions across all tickers against live CBOE quotes
@@ -554,9 +461,12 @@ export async function POST(req: NextRequest) {
         { status: 400 }
       );
     }
-    const validWebhookUrl = webhookValidation.url;
+    const validWebhookUrl =
+      process.env.NODE_ENV === "production" ? undefined : webhookValidation.url;
 
     if (body.action === "EMERGENCY_LOCK" || body.action === "UNLOCK_EXECUTION" || body.action === "FLATTEN_PAPER_POSITIONS") {
+      const authError = authorizeAdminRequest(req);
+      if (authError) return authError;
       if (body.action === "UNLOCK_EXECUTION") {
         setExecutionHalted(false);
         return NextResponse.json({
@@ -684,6 +594,8 @@ export async function POST(req: NextRequest) {
     }
 
     if (body.action === "send_daily_recap") {
+      const authError = authorizeAdminRequest(req);
+      if (authError) return authError;
       const recapDate = parseIsoDateParam(body.date ?? body.sessionDate);
       if (
         isHistoricalBackfillRequest({
@@ -714,6 +626,8 @@ export async function POST(req: NextRequest) {
     }
 
     if (body.action === "send_radar") {
+      const authError = authorizeAdminRequest(req);
+      if (authError) return authError;
       if (
         isHistoricalBackfillRequest({
           explicitFlag: body.isHistoricalBackfill,

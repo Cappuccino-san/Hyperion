@@ -1,5 +1,8 @@
 import { computeAdaptiveQuantMetrics } from "@/lib/gaiaSignalFsm";
-import { isValidDiscordWebhookUrl } from "@/lib/discordWebhook";
+import {
+  buildDiscordWebhookDispatchUrl,
+  isValidDiscordWebhookUrl,
+} from "@/lib/discordWebhook";
 import {
   capExitTsToEodFlat,
   etMinutesOfDay,
@@ -435,9 +438,7 @@ export async function sendDiscordTradeAlert(
       ],
     };
 
-    const targetUrl = webhookUrl.includes("?")
-      ? `${webhookUrl}&wait=true`
-      : `${webhookUrl}?wait=true`;
+    const targetUrl = buildDiscordWebhookDispatchUrl(webhookUrl, { wait: true });
 
     let lastStatus = 0;
 

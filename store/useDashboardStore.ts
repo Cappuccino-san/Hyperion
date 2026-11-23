@@ -478,10 +478,15 @@ function getInitialDiscordConfig(): DiscordConfig {
       localStorage.getItem(LEGACY_DISCORD_STORAGE_KEY);
     if (saved) {
       const parsed = JSON.parse(saved);
-      const savedUrl = typeof parsed.webhookUrl === "string" ? parsed.webhookUrl.trim() : "";
+      const enabled = typeof parsed.enabled === "boolean" ? parsed.enabled : false;
+      // Scrub any legacy plaintext webhookUrl persisted in browser storage
+      if (typeof parsed.webhookUrl === "string" && parsed.webhookUrl.trim().length > 0) {
+        localStorage.setItem(DISCORD_STORAGE_KEY, JSON.stringify({ enabled }));
+        localStorage.removeItem(LEGACY_DISCORD_STORAGE_KEY);
+      }
       return {
-        webhookUrl: savedUrl || DEFAULT_DISCORD_WEBHOOK_URL,
-        enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : Boolean(savedUrl),
+        webhookUrl: DEFAULT_DISCORD_WEBHOOK_URL,
+        enabled,
       };
     }
   } catch {}
@@ -847,7 +852,12 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       const next = { ...state.discordConfig, ...cfg };
       if (typeof window !== "undefined") {
         try {
-          localStorage.setItem(DISCORD_STORAGE_KEY, JSON.stringify(next));
+          // Never persist Discord webhook URLs (bearer credentials) in browser localStorage
+          localStorage.setItem(
+            DISCORD_STORAGE_KEY,
+            JSON.stringify({ enabled: next.enabled })
+          );
+          localStorage.removeItem(LEGACY_DISCORD_STORAGE_KEY);
         } catch {}
       }
       return { discordConfig: next };

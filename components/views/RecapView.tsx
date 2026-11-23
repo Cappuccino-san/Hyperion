@@ -203,13 +203,14 @@ export function RecapView() {
     setPostingDiscord(true);
     setDiscordStatus(null);
     try {
+      const customUrl = discordWebhookUrl?.trim();
       const res = await fetch("/api/signals", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "send_daily_recap",
           date: selectedDay || undefined,
-          webhookUrl: discordWebhookUrl,
+          ...(customUrl ? { webhookUrl: customUrl } : {}),
         }),
       });
       const json = await res.json();
