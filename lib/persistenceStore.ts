@@ -65,6 +65,9 @@ export interface SessionPlaybookPolicy {
   wallCorridorPct: number;
   absPeclet: number;
   summary: string;
+  zeroMode?: "FOLLOW" | "FADE" | "SIT_OUT";
+  zeroModeReason?: string;
+  tollShieldActive?: boolean;
 }
 
 export interface CounterfactualEvalRecord {

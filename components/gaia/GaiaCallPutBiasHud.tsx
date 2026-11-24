@@ -3,13 +3,12 @@
 import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import {
+  classifyDominanceTriState,
   computeBarFlowGammaVwapSeries,
   FlowGammaVwapSnapshot,
 } from "@/lib/flowGammaVwap";
 import {
   PrzmTopDeck,
-  PrzmAsciiHeader,
-  PrzmTheCallStrip,
   PrzmCallLogDeck,
   PrzmCandlePoint,
   PrzmSignalPoint,
@@ -21,9 +20,12 @@ import {
   computeCausalEquilibriumDispersion,
 } from "@/lib/gaiaSignalFsm";
 import type { SessionPlaybookPolicy } from "@/lib/persistenceStore";
+import type { ZeroShadowReadout } from "@/lib/zeroShadowLedger";
 import {
   RTH_OPEN_MINS as GUARD_RTH_OPEN_MINS,
   RTH_CLOSE_MINS as GUARD_RTH_CLOSE_MINS,
+  etMinutesOfDay,
+  getSessionBoundsEt,
   getTodayEt,
   toEpochSec,
 } from "@/lib/gaiaSessionGuards";
@@ -266,14 +268,30 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
   const uid = useId().replace(/:/g, "");
   const activeSymbol = (symbol || ticker || "SPY").trim().toUpperCase() || "SPY";
   const storeActiveTicker = useDashboardStore((s) => s.activeTicker);
+  const storeLoadedTicker = useDashboardStore((s) => s.loadedTicker);
+  const storeSpotPrice = useDashboardStore((s) => s.spotPrice);
+  const storePreviousClose = useDashboardStore((s) => s.previousClose);
+  const storeExtendedQuote = useDashboardStore((s) => s.extendedQuote);
   const storeSupervisorPolicy = useDashboardStore((s) => s.supervisorPolicy);
-  const executionArmState = useDashboardStore((s) => s.executionArmState);
   const liveTickPrice = useDashboardStore((s) => s.liveTickPrice);
   const liveTickCount = useDashboardStore((s) => s.liveTickCount);
   const liveTickMarketOpen = useDashboardStore((s) => s.liveTickMarketOpen);
   const gammaLevels = useDashboardStore((s) => s.gammaLevels);
+  const gammaLevelsByFilter = useDashboardStore((s) => s.gammaLevelsByFilter);
   const netMetrics = useDashboardStore((s) => s.netMetrics);
   const rawLiveSpot = typeof liveSpot === "number" && liveSpot > 0 ? liveSpot : typeof spot === "number" && spot > 0 ? spot : null;
+
+  const isStoreAligned =
+    storeLoadedTicker?.toUpperCase() === activeSymbol ||
+    storeActiveTicker?.toUpperCase() === activeSymbol;
+  const zeroDteLevels = useMemo(() => {
+    if (!isStoreAligned) return null;
+    const raw0 = gammaLevelsByFilter?.["0DTE"];
+    if (raw0 && (raw0.callWall > 0 || raw0.putWall > 0 || raw0.zeroGamma > 0)) {
+      return raw0;
+    }
+    return gammaLevels;
+  }, [isStoreAligned, gammaLevelsByFilter, gammaLevels]);
 
   const [internalServerTrades, setInternalServerTrades] = useState<ServerTradeData>(
     serverTradesProp || {}
@@ -282,6 +300,7 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
   const [internalSupervisorPolicy, setInternalSupervisorPolicy] = useState<SessionPlaybookPolicy | null>(
     supervisorPolicyProp ?? null
   );
+  const [zeroShadow, setZeroShadow] = useState<ZeroShadowReadout | null>(null);
 
   useEffect(() => {
     if (serverTradesProp !== undefined) {
@@ -298,9 +317,8 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
     setInternalSupervisorPolicy(null);
   }, [activeSymbol, sessionDate, serverTradesProp]);
 
-  // Dynamic Trade Signals Engine Hook: Polls /api/signals only when parent does not supply serverTradesProp
+  // Polls /api/signals to hydrate Zero Shadow Ledger telemetry (and serverTrades when parent does not supply serverTradesProp)
   useEffect(() => {
-    if (serverTradesProp !== undefined || isReplayMode) return;
     let isMounted = true;
     const controller = new AbortController();
     async function syncServerTrades() {
@@ -319,27 +337,41 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
         if (!res.ok) return;
         const data = await res.json();
         if (isMounted && !controller.signal.aborted) {
-          setHasLoadedServerTrades(true);
-          setInternalServerTrades({
-            activePositions: data?.activePositions || {},
-            closedPositions: data?.closedPositions || [],
-            alerts: data?.alerts || [],
-            loaded: true,
-          });
-          setInternalSupervisorPolicy(data?.supervisorPolicy ?? null);
+          if (serverTradesProp === undefined && !isReplayMode) {
+            setHasLoadedServerTrades(true);
+            setInternalServerTrades({
+              activePositions: data?.activePositions || {},
+              closedPositions: data?.closedPositions || [],
+              alerts: data?.alerts || [],
+              loaded: true,
+            });
+          }
+          if (data?.supervisorPolicy) {
+            setInternalSupervisorPolicy(data.supervisorPolicy);
+          }
+          if (data?.zeroShadow) {
+            setZeroShadow(data.zeroShadow);
+          }
         }
       } catch {
         // Silent fallback
       }
     }
     void syncServerTrades();
-    const interval = setInterval(syncServerTrades, 5000);
+    if (isReplayMode) {
+      return () => {
+        isMounted = false;
+        controller.abort();
+      };
+    }
+    const pollMs = liveTickMarketOpen ? 8_000 : 30_000;
+    const interval = setInterval(syncServerTrades, pollMs);
     return () => {
       isMounted = false;
       controller.abort();
       clearInterval(interval);
     };
-  }, [activeSymbol, sessionDate, serverTradesProp, isReplayMode]);
+  }, [activeSymbol, sessionDate, serverTradesProp, isReplayMode, liveTickMarketOpen]);
 
   // Chart Container & Dynamic Axis Scaling / Pan State
   const svgWrapperRef = useRef<HTMLDivElement | null>(null);
@@ -491,13 +523,43 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
     return cloned;
   }, [candles, bars, rawLiveSpot, storeActiveTicker, liveTickPrice, liveTickCount, liveTickMarketOpen, activeSymbol, isReplayMode]);
 
-  // 2. Compute Bar-by-Bar Flow VWAP & Spectral Flux Series (preferring canonical parent series)
+  // 2. Compute Bar-by-Bar Flow VWAP & Spectral Flux Series anchored to 0DTE tactical walls & live intra-bar tick
   const pdeSeries = useMemo(() => {
     if (effectiveCandles.length === 0) return [];
-    if (flowVwapPoints && flowVwapPoints.length === effectiveCandles.length) {
+    const lastEffClose = effectiveCandles[effectiveCandles.length - 1]?.close ?? 0;
+    const lastParentSpot = flowVwapPoints?.[flowVwapPoints.length - 1]?.spot ?? 0;
+    const liveTailUpdated =
+      !isReplayMode &&
+      flowVwapPoints &&
+      flowVwapPoints.length === effectiveCandles.length &&
+      Math.abs(lastEffClose - lastParentSpot) >= 0.02;
+    const hasDistinct0DteWalls = Boolean(
+      !isReplayMode &&
+        zeroDteLevels &&
+        gammaLevels &&
+        (zeroDteLevels.callWall !== gammaLevels.callWall ||
+          zeroDteLevels.putWall !== gammaLevels.putWall ||
+          Math.abs((zeroDteLevels.zeroGamma || 0) - (gammaLevels.zeroGamma || 0)) >= 0.25)
+    );
+
+    if (
+      flowVwapPoints &&
+      flowVwapPoints.length === effectiveCandles.length &&
+      !liveTailUpdated &&
+      !hasDistinct0DteWalls
+    ) {
       return flowVwapPoints;
     }
     try {
+      const nodes =
+        !isReplayMode && zeroDteLevels
+          ? {
+              ceilingNode: zeroDteLevels.callWall > 0 ? zeroDteLevels.callWall : undefined,
+              floorNode: zeroDteLevels.putWall > 0 ? zeroDteLevels.putWall : undefined,
+              zeroGamma: zeroDteLevels.zeroGamma > 0 ? zeroDteLevels.zeroGamma : undefined,
+              netGex: typeof netMetrics?.netGex === "number" ? netMetrics.netGex : undefined,
+            }
+          : undefined;
       return computeBarFlowGammaVwapSeries(
         effectiveCandles.map((c) => ({
           timestamp: c.timestamp,
@@ -506,12 +568,16 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
           low: c.low,
           close: c.close,
           volume: c.volume,
-        }))
+        })),
+        undefined,
+        nodes
       );
     } catch {
-      return [];
+      return flowVwapPoints && flowVwapPoints.length === effectiveCandles.length
+        ? flowVwapPoints
+        : [];
     }
-  }, [effectiveCandles, flowVwapPoints]);
+  }, [effectiveCandles, flowVwapPoints, isReplayMode, zeroDteLevels, gammaLevels, netMetrics?.netGex]);
 
   // Dimensions & Coordinates (1:1 CSS Pixel & Left-Anchored Time Domain Parity with GaiaView)
   const svgWidth =
@@ -543,11 +609,22 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
   const axisSpanMins = Math.max(5, axisEndMins - axisStartMins);
   const totalSessionSlots = Math.round(axisSpanMins / 5);
 
-  // Raw Price Extrema & Dynamic Adjusted Y-Domain
+  const fallbackReferenceSpot = useMemo(() => {
+    if (rawLiveSpot && rawLiveSpot > 0) return rawLiveSpot;
+    if (isStoreAligned && storeSpotPrice > 0) return storeSpotPrice;
+    if (isStoreAligned && storePreviousClose > 0) return storePreviousClose;
+    return 0;
+  }, [rawLiveSpot, isStoreAligned, storeSpotPrice, storePreviousClose]);
+
+  // Raw Price Extrema & Dynamic Adjusted Y-Domain (never collapses to $0.00 / $0-$2 off-hours)
   const priceDomain = useMemo(() => {
     if (effectiveCandles.length === 0) {
-      const sp = rawLiveSpot || 0;
-      return { min: Math.max(0, sp - 2), max: sp + 2, current: sp, span: 4 };
+      const sp = fallbackReferenceSpot;
+      if (sp > 0) {
+        const halfPad = Math.max(1.0, Number((sp * 0.006).toFixed(2)));
+        return { min: sp - halfPad, max: sp + halfPad, current: sp, span: halfPad * 2 };
+      }
+      return { min: 98, max: 102, current: 0, span: 4 };
     }
     let min = Infinity;
     let max = -Infinity;
@@ -566,7 +643,7 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
       current,
       span: adjustedSpan,
     };
-  }, [effectiveCandles, rawLiveSpot, activeSymbol, yPanOffset, yScale]);
+  }, [effectiveCandles, fallbackReferenceSpot, activeSymbol, yPanOffset, yScale]);
 
   // Coordinate Projection Helpers (Left-Anchored 1:1 with GaiaView minsToX)
   const xFromEtMins = useCallback(
@@ -704,8 +781,20 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
   }, [effectiveCandles, pdeSeries, xFromEtMins, yForPrice]);
 
   const latestPt = enrichedPoints[enrichedPoints.length - 1];
-  const activeChiPct = Math.round((latestPt?.chi ?? 0.5) * 100);
-  const activeRegime: "CALL" | "PUT" = activeChiPct >= 50 ? "CALL" : "PUT";
+  const dominanceInfo = useMemo(
+    () => classifyDominanceTriState(latestPt?.chi, latestPt?.impulseChi),
+    [latestPt?.chi, latestPt?.impulseChi]
+  );
+  const activeChiPct = dominanceInfo.chiPct;
+  const activeDominance = dominanceInfo.dominance; // "CALL" | "PUT" | "NEUTRAL"
+  const activeRegime: "CALL" | "PUT" =
+    activeDominance === "CALL"
+      ? "CALL"
+      : activeDominance === "PUT"
+        ? "PUT"
+        : (latestPt?.bias ?? 0) >= 0
+          ? "CALL"
+          : "PUT";
   const activePt = hoverIndex !== null && enrichedPoints[hoverIndex] ? enrichedPoints[hoverIndex] : latestPt;
 
   // SVG Paths
@@ -1192,11 +1281,41 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
   const activeSpotPrice =
     isReplayMode && typeof replayBarClose === "number" && replayBarClose > 0
       ? replayBarClose
-      : !isReplayMode && storeActiveTicker.toUpperCase() === activeSymbol && typeof liveTickPrice === "number" && liveTickPrice > 0
-      ? liveTickPrice
-      : !isReplayMode && typeof rawLiveSpot === "number" && rawLiveSpot > 0
-      ? rawLiveSpot
-      : effectiveCandles[effectiveCandles.length - 1]?.close ?? 0;
+      : !isReplayMode &&
+          liveTickMarketOpen === true &&
+          storeActiveTicker.toUpperCase() === activeSymbol &&
+          typeof liveTickPrice === "number" &&
+          liveTickPrice > 0
+        ? liveTickPrice
+        : !isReplayMode && typeof rawLiveSpot === "number" && rawLiveSpot > 0
+          ? rawLiveSpot
+          : effectiveCandles[effectiveCandles.length - 1]?.close &&
+              effectiveCandles[effectiveCandles.length - 1].close > 0
+            ? effectiveCandles[effectiveCandles.length - 1].close
+            : fallbackReferenceSpot;
+
+  const effectiveSessionDate = useMemo(() => {
+    if (sessionDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionDate)) return sessionDate;
+    if (effectiveCandles.length > 0) {
+      const lastSec = toEpochSec(effectiveCandles[effectiveCandles.length - 1].timestamp ?? 0);
+      if (lastSec > 0) return getTodayEt(new Date(lastSec * 1000));
+    }
+    return getTodayEt();
+  }, [sessionDate, effectiveCandles]);
+
+  const sessionBounds = useMemo(
+    () => getSessionBoundsEt(effectiveSessionDate),
+    [effectiveSessionDate]
+  );
+
+  const effectiveSupervisorPolicy = useMemo(
+    () =>
+      supervisorPolicyProp !== undefined
+        ? supervisorPolicyProp
+        : internalSupervisorPolicy ??
+          (storeActiveTicker.toUpperCase() === activeSymbol ? storeSupervisorPolicy : null),
+    [supervisorPolicyProp, internalSupervisorPolicy, storeActiveTicker, activeSymbol, storeSupervisorPolicy]
+  );
 
   const przmSeries: PrzmCandlePoint[] = useMemo(() => {
     return enrichedPoints.map((pt) => ({
@@ -1209,6 +1328,12 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
       volume: effectiveCandles[pt.index]?.volume ?? 0,
       vwap: pt.flowVwap,
       flowVwap: pt.flowVwap,
+      sigma: pt.sigma,
+      chi: pt.chi,
+      impulseChi: pt.impulseChi,
+      pe: pt.pe,
+      impulsePe: pt.impulsePe,
+      deltaNetFlux6Bar: pt.deltaNetFlux6Bar,
       upperBand: pt.flowVwap + pt.sigma,
       lowerBand: pt.flowVwap - pt.sigma,
       boundaryFlux: pt.netFlux,
@@ -1398,15 +1523,15 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
         series={przmSeries}
         signals={przmSignals}
         open930={structuralMetrics.open930}
+        priorClose={isStoreAligned && storePreviousClose > 0 ? storePreviousClose : undefined}
         straddleEm={structuralMetrics.expectedMove}
+        zeroGamma0Dte={zeroDteLevels?.zeroGamma}
+        callWall0Dte={zeroDteLevels?.callWall}
+        putWall0Dte={zeroDteLevels?.putWall}
+        netGex={netMetrics?.netGex}
         activeFsmState={fsmCommittedState}
         serverTrades={internalServerTrades}
-        supervisorPolicy={
-          supervisorPolicyProp !== undefined
-            ? supervisorPolicyProp
-            : internalSupervisorPolicy ??
-              (storeActiveTicker.toUpperCase() === activeSymbol ? storeSupervisorPolicy : null)
-        }
+        supervisorPolicy={effectiveSupervisorPolicy}
         isReplayMode={isReplayMode}
         replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined}
       />
@@ -1421,59 +1546,86 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
         }}
       />
 
-      {/* PRZM / ZERO Hero Section ASCII Header */}
-      <PrzmAsciiHeader
-        title={`${activeSymbol} · EVERY CALL TODAY`}
-        className="mb-2.5"
-        rightSlot={
-          <div className="flex items-center gap-2 font-mono tabular-nums">
-            <span className={activeRegime === "CALL" ? "text-[#00F5D4] font-bold" : "text-[#FF2A55] font-bold"}>
-              {activeRegime} (χ={activeChiPct}%)
-            </span>
-          </div>
-        }
-      />
-
-      {/* Top Header Bar & Interactive Zoom/Pan Controls */}
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-2 relative z-10">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center font-mono text-sm tracking-widest text-slate-300">
-            <span className="text-cyan-400 mr-2 text-base font-bold">+</span>
+      {/* Single Crisp Dark Cockpit Control Rail ([ TICKER · ZERO ] + Mode + Tri-State χ + Viewport + Spot) */}
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-2.5 pb-2 border-b border-slate-800/80 relative z-10">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex items-center font-mono text-sm tracking-widest text-slate-300 tabular-nums">
+            <span className="text-cyan-400 mr-1.5 text-base font-bold">+</span>
             <span className="text-slate-400 mr-1.5">[</span>
             <button
+              type="button"
               onClick={() => {
                 const cycle = ["SPY", "QQQ", "IWM", "NVDA"];
                 const idx = cycle.indexOf(activeSymbol);
                 const nextSym = idx >= 0 ? cycle[(idx + 1) % cycle.length] : "SPY";
                 onSymbolChange?.(nextSym);
               }}
-              className="text-cyan-400 font-bold hover:text-cyan-300 transition-colors uppercase tracking-wider underline decoration-cyan-500/40 decoration-dashed underline-offset-4"
+              className="text-cyan-400 font-bold hover:text-cyan-300 transition-colors uppercase tracking-wider underline decoration-cyan-500/40 decoration-dashed underline-offset-4 cursor-pointer"
               title={`Active ticker: ${activeSymbol} (click to cycle SPY/QQQ/IWM/NVDA)`}
             >
               {activeSymbol}
             </button>
-            <span className="text-slate-400 mx-1.5">,</span>
-            <span className="text-emerald-400 font-bold">EVERY CALL TODAY</span>
+            <span className="text-slate-500 mx-1.5">·</span>
+            <span className="text-emerald-400 font-bold tracking-[0.14em]">ZERO</span>
             <span className="text-slate-400 ml-1.5">]</span>
           </div>
 
-          {/* Live Regime & Péclet Status Badge */}
-          <div className="flex items-center gap-2 text-[11px] font-mono px-2.5 py-1 rounded-full bg-slate-900/90 border border-slate-800">
+          {/* Operating Mode Pill (`FOLLOW | FADE | SIT OUT`) */}
+          {(() => {
+            const zMode =
+              effectiveSupervisorPolicy?.zeroMode ??
+              (effectiveSupervisorPolicy?.standAsideVetoReason
+                ? "SIT_OUT"
+                : effectiveSupervisorPolicy?.regime === "POS_GAMMA_PIN"
+                  ? "FADE"
+                  : fsmCommittedState === "STAND_ASIDE" && activeDominance === "NEUTRAL"
+                    ? "SIT_OUT"
+                    : "FOLLOW");
+            const modeCls =
+              zMode === "FOLLOW"
+                ? "border-emerald-500/40 bg-emerald-500/12 text-emerald-300"
+                : zMode === "FADE"
+                  ? "border-cyan-500/40 bg-cyan-500/12 text-cyan-300"
+                  : "border-amber-500/45 bg-amber-500/12 text-amber-300";
+            return (
+              <span
+                className={`px-2.5 py-0.5 rounded-full border font-mono text-[11px] font-bold tracking-wider tabular-nums ${modeCls}`}
+              >
+                MODE: {zMode === "SIT_OUT" ? "SIT OUT" : zMode}
+              </span>
+            );
+          })()}
+
+          {/* Tri-State Boundary Dominance Pill (`CALL | PUT | NEUTRAL`) */}
+          <div className="flex items-center gap-2 text-[11px] font-mono tabular-nums px-2.5 py-0.5 rounded-full bg-slate-900/90 border border-slate-800">
             <span
               className={`w-2 h-2 rounded-full ${
-                activeRegime === "CALL" ? "bg-[#00F5D4] animate-pulse" : "bg-[#FF2A55] animate-pulse"
+                activeDominance === "CALL"
+                  ? "bg-[#00F5D4]"
+                  : activeDominance === "PUT"
+                    ? "bg-[#FF2A55]"
+                    : "bg-slate-400"
               }`}
             />
             <span className="text-slate-400">REGIME:</span>
-            <span className={activeRegime === "CALL" ? "text-[#00F5D4] font-bold" : "text-[#FF2A55] font-bold"}>
-              {activeRegime} (χ={activeChiPct}%)
+            <span
+              className={
+                activeDominance === "CALL"
+                  ? "text-[#00F5D4] font-bold"
+                  : activeDominance === "PUT"
+                    ? "text-[#FF2A55] font-bold"
+                    : "text-slate-200 font-bold"
+              }
+            >
+              {activeDominance} (χ={activeChiPct}%)
             </span>
           </div>
         </div>
 
         {/* Dynamic Scale & Time Scope Toolbar */}
-        <div className="flex items-center gap-2 font-mono text-xs">
+        <div className="flex flex-wrap items-center gap-2 font-mono text-xs tabular-nums">
           <button
+            type="button"
             onClick={() => handleReset()}
             title="Auto-fit all candles in session"
             className="px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition cursor-pointer text-[11px]"
@@ -1481,9 +1633,11 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
             Fit Data
           </button>
           <button
+            type="button"
             onClick={() => {
-              const rthOpenSlot = Math.max(0, (570 - axisStartMins) / 5);
-              const paddedRthSlots = 82;
+              const rthOpenSlot = Math.max(0, (sessionBounds.rthOpenMins - axisStartMins) / 5);
+              const rthSlotsCount = Math.max(10, (sessionBounds.rthCloseMins - sessionBounds.rthOpenMins) / 5);
+              const paddedRthSlots = rthSlotsCount + 4;
               const nextScale = Math.min(4.0, totalSessionSlots / paddedRthSlots);
               const nextStepX = (plotW / Math.max(1, totalSessionSlots)) * nextScale;
               const nextPan = 2 * nextStepX - rthOpenSlot * nextStepX;
@@ -1496,17 +1650,18 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
               setYScale(1.0);
               setYPanOffset(0);
             }}
-            title="Focus on standard 9:30am – 4:00pm RTH session"
+            title={`Focus on ${sessionBounds.isEarlyClose ? "9:30am – 1:00pm Early Close" : "9:30am – 4:00pm"} RTH session`}
             className="px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition cursor-pointer text-[11px]"
           >
-            RTH (9:30-4:00)
+            {sessionBounds.isEarlyClose ? "RTH (9:30-1:00)" : "RTH (9:30-4:00)"}
           </button>
           <button
+            type="button"
             onClick={() => {
               const latestMins =
                 enrichedPoints.length > 0
                   ? enrichedPoints[enrichedPoints.length - 1].etMins
-                  : RTH_CLOSE_MINS;
+                  : sessionBounds.rthCloseMins;
               const windowSpan = 150;
               const nextScale = Math.min(4.0, axisSpanMins / windowSpan);
               const startFocus = Math.max(axisStartMins, Math.min(axisEndMins - windowSpan, latestMins - 135));
@@ -1528,33 +1683,52 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
 
           <div className="flex items-center bg-slate-900 border border-slate-800 rounded-md overflow-hidden">
             <button
+              type="button"
               onClick={() => setYScale((s) => Math.min(5.0, s * 1.25))}
               title="Expand vertical price scale (Zoom Y+)"
-              className="px-2 py-1 hover:bg-slate-800 text-slate-300 hover:text-cyan-400 border-r border-slate-800"
+              className="px-2 py-1 hover:bg-slate-800 text-slate-300 hover:text-cyan-400 border-r border-slate-800 cursor-pointer"
             >
               Y+
             </button>
             <button
+              type="button"
               onClick={() => setYScale((s) => Math.max(0.4, s * 0.8))}
               title="Compress vertical price scale (Zoom Y-)"
-              className="px-2 py-1 hover:bg-slate-800 text-slate-300 hover:text-cyan-400 border-r border-slate-800"
+              className="px-2 py-1 hover:bg-slate-800 text-slate-300 hover:text-cyan-400 border-r border-slate-800 cursor-pointer"
             >
               Y-
             </button>
             <button
+              type="button"
               onClick={handleReset}
               title="Reset Zoom & Pan to Default (or Double-Click Canvas)"
-              className="px-2 py-1 hover:bg-slate-800 text-slate-300 hover:text-cyan-400"
+              className="px-2 py-1 hover:bg-slate-800 text-slate-300 hover:text-cyan-400 cursor-pointer"
             >
               Reset
             </button>
           </div>
 
-          {/* Live Spot Price Display */}
-          <div className="text-right ml-2">
-            <div className="text-xs text-slate-500 tracking-wider">LIVE TICK</div>
-            <div className="text-base font-bold text-white tracking-wide">
-              ${priceDomain.current.toFixed(2)}
+          {/* Live Spot / Off-Hours Official RTH Close Display (Never $0.00) */}
+          <div className="text-right ml-2 font-mono tabular-nums">
+            <div className="text-[10px] text-slate-400 tracking-wider uppercase">
+              {isReplayMode ? "REPLAY SPOT" : liveTickMarketOpen ? "LIVE TICK" : "RTH CLOSE"}
+            </div>
+            <div className="flex items-baseline justify-end gap-1.5">
+              <span className="text-base font-bold text-white tracking-wide">
+                {activeSpotPrice > 0 ? `$${activeSpotPrice.toFixed(2)}` : "SYNCING"}
+              </span>
+              {!isReplayMode &&
+                !liveTickMarketOpen &&
+                isStoreAligned &&
+                storeExtendedQuote &&
+                storeExtendedQuote.price > 0 && (
+                  <span
+                    className="px-1.5 py-0.5 rounded bg-slate-800/90 border border-slate-700 text-[10px] text-cyan-300 font-semibold"
+                    title={`${storeExtendedQuote.type === "pre" ? "Pre-market" : "After-hours"} extended print`}
+                  >
+                    EXT ${storeExtendedQuote.price.toFixed(2)}
+                  </span>
+                )}
             </div>
           </div>
         </div>
@@ -2013,14 +2187,16 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
           </g>
 
           {/* Right Y-Axis Live Spot Badge */}
-          <g transform={`translate(${svgWidth - padRight + 4}, ${spotBadgeCenterY - 10})`}>
-            <rect width="72" height="20" rx="4" fill="#00F5D4" fillOpacity="0.18" stroke="#00F5D4" strokeWidth="1.2" />
-            <text x="36" y="14" textAnchor="middle" fill="#00F5D4" fontSize="11" fontFamily="monospace" fontWeight="bold">
-              ${priceDomain.current.toFixed(2)}
-            </text>
-          </g>
+          {priceDomain.current > 0 && (
+            <g transform={`translate(${svgWidth - padRight + 4}, ${spotBadgeCenterY - 10})`}>
+              <rect width="72" height="20" rx="4" fill="#00F5D4" fillOpacity="0.18" stroke="#00F5D4" strokeWidth="1.2" />
+              <text x="36" y="14" textAnchor="middle" fill="#00F5D4" fontSize="11" fontFamily="monospace" fontWeight="bold">
+                ${priceDomain.current.toFixed(2)}
+              </text>
+            </g>
+          )}
 
-          {/* Right Y-Axis Flow VWAP Badge (De-conflicted from Spot Badge) */}
+          {/* Right Y-Axis Flow VWAP Badge (De-conflicted >= 15px from Spot Badge) */}
           {latestPt && vwapBadgeCenterY !== null && (
             <g transform={`translate(${svgWidth - padRight + 4}, ${vwapBadgeCenterY - 9})`}>
               <rect width="72" height="18" rx="3" fill="#f59e0b" fillOpacity="0.15" stroke="#f59e0b" strokeWidth="1" />
@@ -2030,7 +2206,7 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
             </g>
           )}
 
-          {/* "THE CALL" Segmented Tick Bar Ribbon */}
+          {/* Canonical X-Axis-Locked "THE CALL" Segmented RTH Ribbon (09:30 -> 16:00 / 13:00 Half-Day) */}
           <g>
             <text
               x={padLeft}
@@ -2048,43 +2224,117 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
               x={svgWidth - padRight}
               y={ribbonTop - 8}
               textAnchor="end"
-              fill={activeRegime === "CALL" ? "#00F5D4" : "#FF2A55"}
+              fill={
+                activeDominance === "CALL"
+                  ? "#00F5D4"
+                  : activeDominance === "PUT"
+                    ? "#FF2A55"
+                    : "#94A3B8"
+              }
               fontSize="10"
               fontFamily="monospace"
               fontWeight="bold"
             >
-              CALL DOMINANCE {activeChiPct}%
+              {dominanceInfo.label}
             </text>
 
             <g clipPath={`url(#plot-clip-${uid})`}>
-            {enrichedPoints.map((pt, i) => {
-              const rawSlotTs = Number((pt as any)?.ts ?? (pt as any)?.timestamp ?? (pt as any)?.startSec ?? 0);
-              const normSlotTs = rawSlotTs > 1e11 ? Math.floor(rawSlotTs / 1000) : rawSlotTs;
-              const latestActualRaw = Array.isArray(enrichedPoints) && enrichedPoints.length > 0 ? Number(enrichedPoints[enrichedPoints.length - 1]?.timestamp ?? 0) : 0;
-              const latestActualSec = latestActualRaw > 1e11 ? Math.floor(latestActualRaw / 1000) : latestActualRaw;
-              const nowSec = effectiveReplayTsSec > 0 ? effectiveReplayTsSec : Math.floor(Date.now() / 1000);
-              const slotIsFuture = normSlotTs > 0 && (normSlotTs > nowSec || (latestActualSec > 0 && normSlotTs > latestActualSec));
-              if (pt.baseX < padLeft || pt.baseX > padLeft + plotW + 2) return null;
-              const slotW = (plotW / Math.max(1, totalSessionSlots)) * currentXScale;
-              const tickW = Math.max(2, slotW - 1.8);
-              const isCall = pt.regime === "CALL";
-              const isExtendedHours = pt.etMins < 570 || pt.etMins >= 960;
-              const col = slotIsFuture ? "rgba(148, 163, 184, 0.25)" : isCall ? "#00F5D4" : "#FF2A55";
-              const baseOp = slotIsFuture ? 0.22 : Math.max(0.4, Math.min(1.0, 0.45 + Math.abs(pt.bias) * 0.55));
-              const op = !slotIsFuture && isExtendedHours ? Number((baseOp * 0.55).toFixed(2)) : baseOp;
-              return (
-                <rect
-                  key={`tick-${i}`}
-                  x={pt.baseX - tickW / 2}
-                  y={ribbonTop}
-                  width={tickW}
-                  height={ribbonHeight}
-                  rx="1"
-                  fill={col}
-                  fillOpacity={op}
-                />
-              );
-            })}
+              {(() => {
+                const nowSec =
+                  effectiveReplayTsSec > 0 ? effectiveReplayTsSec : Math.floor(Date.now() / 1000);
+                const replayCutoffMins =
+                  effectiveReplayTsSec > 0 ? etMinutesOfDay(effectiveReplayTsSec) : Infinity;
+                const isTodaySession = !sessionDate || effectiveSessionDate === getTodayEt();
+                const nowEtMins = isTodaySession ? etMinutesOfDay(nowSec) : Infinity;
+                const latestActualPt =
+                  enrichedPoints.length > 0 ? enrichedPoints[enrichedPoints.length - 1] : null;
+                const latestActualSec = latestActualPt ? toEpochSec(latestActualPt.timestamp) : 0;
+                const latestActualMins = latestActualPt ? latestActualPt.etMins : -1;
+
+                // Map elapsed 5m buckets -> EnrichedPoint
+                const bucketMap = new Map<number, EnrichedPoint>();
+                for (const pt of enrichedPoints) {
+                  const b = Math.floor(pt.etMins / 5) * 5;
+                  bucketMap.set(b, pt);
+                }
+
+                // Allocate full RTH 5-minute slot grid (09:30 -> 16:00 ET, or 13:00 ET on NYSE half-days)
+                const slotStart =
+                  startHour === 0
+                    ? Math.min(
+                        sessionBounds.rthOpenMins,
+                        enrichedPoints.length > 0
+                          ? Math.floor(enrichedPoints[0].etMins / 5) * 5
+                          : sessionBounds.rthOpenMins
+                      )
+                    : sessionBounds.rthOpenMins;
+                const slotEnd = sessionBounds.rthCloseMins;
+                const slotW = (plotW / Math.max(1, totalSessionSlots)) * currentXScale;
+                const tickW = Math.max(2, slotW - 1.8);
+                const rects: React.ReactNode[] = [];
+
+                for (let slotMins = slotStart; slotMins < slotEnd; slotMins += 5) {
+                  const baseX = xFromEtMins(slotMins + 2.5);
+                  if (baseX < padLeft - tickW || baseX > padLeft + plotW + tickW) continue;
+                  const pt = bucketMap.get(slotMins);
+                  const ptSec = pt ? toEpochSec(pt.timestamp) : 0;
+                  const isUnelapsed =
+                    !pt ||
+                    (ptSec > 0 && ptSec > nowSec) ||
+                    (latestActualSec > 0 && ptSec > latestActualSec) ||
+                    slotMins > replayCutoffMins ||
+                    slotMins > nowEtMins ||
+                    (latestActualMins >= 0 && slotMins > latestActualMins);
+
+                  if (isUnelapsed) {
+                    rects.push(
+                      <rect
+                        key={`call-slot-${slotMins}`}
+                        x={baseX - tickW / 2}
+                        y={ribbonTop}
+                        width={tickW}
+                        height={ribbonHeight}
+                        rx="1"
+                        fill="rgba(30, 41, 59, 0.35)"
+                        fillOpacity={1}
+                      />
+                    );
+                    continue;
+                  }
+
+                  const ptDom = classifyDominanceTriState(pt.chi, pt.impulseChi).dominance;
+                  const isExtendedHours =
+                    slotMins < sessionBounds.rthOpenMins || slotMins >= sessionBounds.rthCloseMins;
+                  const col =
+                    ptDom === "CALL"
+                      ? "#00F5D4"
+                      : ptDom === "PUT"
+                        ? "#FF2A55"
+                        : Math.abs(pt.bias) >= 0.14
+                          ? pt.bias > 0
+                            ? "#00F5D4"
+                            : "#FF2A55"
+                          : "#64748B";
+                  const baseOp =
+                    col === "#64748B"
+                      ? 0.55
+                      : Math.max(0.45, Math.min(1.0, 0.45 + Math.abs(pt.bias) * 0.55));
+                  const op = isExtendedHours ? Number((baseOp * 0.55).toFixed(2)) : baseOp;
+                  rects.push(
+                    <rect
+                      key={`call-slot-${slotMins}`}
+                      x={baseX - tickW / 2}
+                      y={ribbonTop}
+                      width={tickW}
+                      height={ribbonHeight}
+                      rx="1"
+                      fill={col}
+                      fillOpacity={op}
+                    />
+                  );
+                }
+                return rects;
+              })()}
             </g>
           </g>
 
@@ -2194,7 +2444,20 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
                   Spot: <tspan fill="#ffffff" fontWeight="bold">${activePt.close.toFixed(2)}</tspan> · VWAP: <tspan fill="#f59e0b">${activePt.flowVwap.toFixed(2)}</tspan>
                 </text>
                 <text x="12" y="49" fill="#94a3b8" fontSize="10" fontFamily="monospace">
-                  Regime: <tspan fill={activePt.regime === "CALL" ? "#00F5D4" : "#FF2A55"} fontWeight="bold">{activePt.regime} (χ={Math.round(activePt.chi * 100)}%)</tspan>
+                  {(() => {
+                    const tipDom = classifyDominanceTriState(activePt.chi, activePt.impulseChi);
+                    const tipFill =
+                      tipDom.dominance === "CALL"
+                        ? "#00F5D4"
+                        : tipDom.dominance === "PUT"
+                          ? "#FF2A55"
+                          : "#CBD5E1";
+                    return (
+                      <>
+                        Regime: <tspan fill={tipFill} fontWeight="bold">{tipDom.dominance} (χ={tipDom.chiPct}%)</tspan>
+                      </>
+                    );
+                  })()}
                 </text>
                 <text x="12" y="64" fill="#94a3b8" fontSize="10" fontFamily="monospace">
                   Péclet: <tspan fill="#38bdf8">{activePt.pe >= 0 ? "+" : ""}{activePt.pe.toFixed(2)}</tspan> · J_net: <tspan fill={activePt.netFlux >= 0 ? "#00F5D4" : "#FF2A55"}>{activePt.netFlux.toFixed(1)}</tspan>
@@ -2228,16 +2491,14 @@ const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
         </svg>
       </div>
 
-      {/* PRZM The Call Continuous Segmented Regime Strip */}
-      <PrzmTheCallStrip series={przmSeries} replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined} />
-
-      {/* PRZM Bottom Deck: Call Log Ledger & 100% Scoreboard */}
+      {/* PRZM Bottom Deck: Call Log Ledger (LIVE | SHADOW) & Public Scoreboard */}
       <PrzmCallLogDeck
         signals={przmSignals}
         series={przmSeries}
         liveSpot={activeSpotPrice}
         activeFsmState={fsmCommittedState}
         serverTrades={internalServerTrades}
+        zeroShadow={zeroShadow}
         ticker={activeSymbol}
         replayBarTsSec={effectiveReplayTsSec > 0 ? effectiveReplayTsSec : undefined}
       />

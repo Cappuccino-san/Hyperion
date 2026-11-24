@@ -8,6 +8,8 @@ import {
   toEpochSec,
 } from "@/lib/gaiaSessionGuards";
 import type { SessionPlaybookPolicy } from "@/lib/persistenceStore";
+import { evaluateZeroFlowFilter } from "@/lib/zeroFlowFilter";
+import type { ZeroShadowReadout } from "@/lib/zeroShadowLedger";
 
 export interface PrzmCandlePoint {
   time: string;
@@ -19,6 +21,12 @@ export interface PrzmCandlePoint {
   volume?: number;
   vwap?: number;
   flowVwap?: number;
+  sigma?: number;
+  chi?: number;
+  impulseChi?: number;
+  pe?: number;
+  impulsePe?: number;
+  deltaNetFlux6Bar?: number;
   upperBand?: number;
   lowerBand?: number;
   boundaryFlux?: number;
@@ -82,6 +90,7 @@ export interface PrzmLedgerSummary {
   flatCount: number;
   decisiveCount: number;
   winRatePct: number;
+  avgR: number;
 }
 
 /**
@@ -397,6 +406,7 @@ export function evaluatePrzmCallLedger(
       flatCount: 0,
       decisiveCount: 0,
       winRatePct: 0,
+      avgR: 0,
     };
   }
 
@@ -528,7 +538,23 @@ export function evaluatePrzmCallLedger(
   }
 
   const openEntry = mergedEntries.find((e) => e.status === "OPEN") ?? null;
-  const activeCall = activeFsmState === "STAND_ASIDE" ? null : openEntry;
+  const activeCall = openEntry?.isServerTrade
+    ? openEntry
+    : activeFsmState === "STAND_ASIDE"
+      ? null
+      : openEntry;
+  const closedWithPct = mergedEntries.filter(
+    (e) => e.status !== "OPEN" && typeof e.pnlOptionPct === "number" && Number.isFinite(e.pnlOptionPct)
+  );
+  const avgR =
+    closedWithPct.length > 0
+      ? Number(
+          (
+            closedWithPct.reduce((acc, e) => acc + (e.pnlOptionPct ?? 0) / 45, 0) /
+            closedWithPct.length
+          ).toFixed(2)
+        )
+      : 0;
 
   return {
     entries: [...mergedEntries].reverse(),
@@ -539,6 +565,7 @@ export function evaluatePrzmCallLedger(
     flatCount,
     decisiveCount,
     winRatePct,
+    avgR,
   };
 }
 
@@ -576,13 +603,35 @@ export const PrzmTopDeck: React.FC<{
   series: PrzmCandlePoint[];
   signals: PrzmSignalPoint[];
   open930?: number;
+  priorClose?: number;
   straddleEm?: number;
+  zeroGamma0Dte?: number;
+  callWall0Dte?: number;
+  putWall0Dte?: number;
+  netGex?: number;
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
   serverTrades?: ServerTradeData;
   supervisorPolicy?: SessionPlaybookPolicy | null;
   isReplayMode?: boolean;
   replayBarTsSec?: number;
-}> = ({ ticker, liveSpot, series, signals, open930, straddleEm, activeFsmState, serverTrades, supervisorPolicy, isReplayMode = false, replayBarTsSec }) => {
+}> = ({
+  ticker,
+  liveSpot,
+  series,
+  signals,
+  open930,
+  priorClose,
+  straddleEm,
+  zeroGamma0Dte,
+  callWall0Dte,
+  putWall0Dte,
+  netGex,
+  activeFsmState,
+  serverTrades,
+  supervisorPolicy,
+  isReplayMode = false,
+  replayBarTsSec,
+}) => {
   const displayTicker = (ticker || "SPY").trim().toUpperCase() || "SPY";
   const ledger = useMemo(
     () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, displayTicker, replayBarTsSec),
@@ -707,95 +756,96 @@ export const PrzmTopDeck: React.FC<{
     }
   }, [nowDate, isReplayMode, replayBarTsSec]);
 
-  // Compute the 5 multi-timeframe Drivers (SES, 30M, 10M, STDY, PX)
-  const drivers = useMemo(() => {
-    const n = series.length;
-    if (n === 0) {
-      return [
-        { key: "SES", value: 0, display: "0", isPct: false },
-        { key: "30M", value: 0, display: "0", isPct: false },
-        { key: "10M", value: 0, display: "0", isPct: false },
-        { key: "STDY", value: 75, display: "75%", isPct: true },
-        { key: "PX", value: 0, display: "0", isPct: false },
-      ];
-    }
-
-    const last = series[n - 1];
-    const spot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : last.close;
-    const em = Math.max(Math.max(0.05, spot * 0.0005), straddleEm || spot * 0.0048);
-
-    // 1. SES: Session bias relative to 9:30 Open
-    const baseOpen = open930 || series[0]?.open || spot;
-    const sesRaw = ((spot - baseOpen) / em) * 65;
-    const ses = Math.max(-99, Math.min(99, Math.round(sesRaw)));
-
-    // 2. 30M: 6-bar (30-min) momentum
-    const bar30m = series[Math.max(0, n - 7)];
-    const m30Raw = ((spot - bar30m.close) / (em * 0.45)) * 75;
-    const m30 = Math.max(-99, Math.min(99, Math.round(m30Raw)));
-
-    // 3. 10M: 2-bar (10-min) micro-impulse
-    const bar10m = series[Math.max(0, n - 3)];
-    const m10Raw = ((spot - bar10m.close) / (em * 0.22)) * 80;
-    const m10 = Math.max(-99, Math.min(99, Math.round(m10Raw)));
-
-    // 4. STDY: 8-bar Kaufman Efficiency Ratio + VWAP stability
-    const lookback = Math.min(8, n - 1);
-    let pathSum = 0;
-    for (let i = n - lookback; i < n; i++) {
-      const prevC = series[i - 1]?.close ?? series[i].open;
-      const curC = i === n - 1 ? spot : series[i].close;
-      pathSum += Math.abs(curC - prevC);
-    }
-    const netChange = Math.abs(spot - series[Math.max(0, n - 1 - lookback)].close);
-    const er = pathSum > 1e-5 ? netChange / pathSum : 0.5;
-    const stdy = Math.max(20, Math.min(98, Math.round((0.42 + 0.56 * er) * 100)));
-
-    // 5. PX: Price vs Flow VWAP normalized spread
-    const fVwap = last.flowVwap || last.vwap || spot;
-    const pxRaw = ((spot - fVwap) / (em * 0.35)) * 70;
-    const px = Math.max(-99, Math.min(99, Math.round(pxRaw)));
-
-    const fmtSigned = (v: number) => (v > 0 ? `+${v}` : `${v}`);
-
-    return [
-      { key: "SES", value: ses, display: fmtSigned(ses), isPct: false },
-      { key: "30M", value: m30, display: fmtSigned(m30), isPct: false },
-      { key: "10M", value: m10, display: fmtSigned(m10), isPct: false },
-      { key: "STDY", value: stdy, display: `${stdy}%`, isPct: true },
-      { key: "PX", value: px, display: fmtSigned(px), isPct: false },
-    ];
-  }, [series, liveSpot, open930, straddleEm]);
-
-  // Active call conviction meter score (-99 to +99)
   const activeCall = ledger.activeCall;
-  const activeType = activeCall?.type ?? (drivers[0].value >= 0 ? "LONG" : "SHORT");
-  const convictionScore = useMemo(() => {
-    if (!activeCall) return drivers[2].value;
-    const dir = activeCall.type === "LONG" ? 1 : -1;
-    const deltaPts = (liveSpot - activeCall.entryPrice) * dir;
-    const em = Math.max(Math.max(0.05, liveSpot * 0.0005), straddleEm || liveSpot * 0.0048);
-    const raw = Math.round((deltaPts / (em * 0.4)) * 45) + Math.round(drivers[2].value * 0.35 * dir);
-    return Math.max(-99, Math.min(99, raw === 0 ? 12 : raw));
-  }, [activeCall, liveSpot, straddleEm, drivers]);
 
-  const litSegments = Math.max(3, Math.min(24, Math.round((Math.abs(convictionScore) / 100) * 24)));
+  // 4-Stage @karmaoptions Pre-Vote Flow Laundering + Authoritative Zero Verdict
+  const zeroEval = useMemo(() => {
+    const inferredMode: "FOLLOW" | "FADE" | "SIT_OUT" =
+      supervisorPolicy?.zeroMode ??
+      (supervisorPolicy?.standAsideVetoReason
+        ? "SIT_OUT"
+        : supervisorPolicy?.regime === "POS_GAMMA_PIN"
+          ? "FADE"
+          : "FOLLOW");
+    return evaluateZeroFlowFilter({
+      ticker: displayTicker,
+      candles: series.map((pt) => ({
+        timestamp: pt.timestamp ?? 0,
+        open: pt.open,
+        high: pt.high,
+        low: pt.low,
+        close: pt.close,
+        volume: pt.volume,
+        flowVwap: pt.flowVwap,
+        vwap: pt.vwap,
+        sigma: pt.sigma,
+        chi: pt.chi,
+        impulseChi: pt.impulseChi,
+        pe: pt.pe,
+        impulsePe: pt.impulsePe,
+        netFluxJ: pt.boundaryFlux,
+        deltaNetFlux6Bar: pt.deltaNetFlux6Bar,
+      })),
+      liveSpot,
+      open930: open930 ?? null,
+      priorClose: priorClose ?? null,
+      straddleEm: straddleEm ?? null,
+      zeroGamma0Dte: zeroGamma0Dte ?? null,
+      callWall0Dte: callWall0Dte ?? null,
+      putWall0Dte: putWall0Dte ?? null,
+      netGex: netGex ?? null,
+      activeCallDirection: activeCall?.type ?? null,
+      activeCallEntryPrice: activeCall?.entryPrice ?? null,
+      regimeMode: inferredMode,
+      standAsideVetoReason: supervisorPolicy?.standAsideVetoReason ?? null,
+    });
+  }, [
+    displayTicker,
+    series,
+    liveSpot,
+    open930,
+    priorClose,
+    straddleEm,
+    zeroGamma0Dte,
+    callWall0Dte,
+    putWall0Dte,
+    netGex,
+    activeCall?.type,
+    activeCall?.entryPrice,
+    supervisorPolicy?.zeroMode,
+    supervisorPolicy?.standAsideVetoReason,
+    supervisorPolicy?.regime,
+  ]);
+
+  const drivers = zeroEval.drivers;
+  const convictionScore = zeroEval.compositeScore;
+  const activeVerdict = zeroEval.verdict; // "LONG" | "SHORT" | "STAND_ASIDE"
+  const litSegments =
+    activeVerdict === "STAND_ASIDE"
+      ? Math.max(0, Math.min(24, Math.round((Math.abs(convictionScore) / 100) * 24)))
+      : Math.max(3, Math.min(24, Math.round((Math.abs(convictionScore) / 100) * 24)));
 
   const effectivePolicy = useMemo(() => {
     if (supervisorPolicy) return supervisorPolicy;
     const derivedRegime: SessionPlaybookPolicy["regime"] =
-      activeFsmState === "STAND_ASIDE"
+      activeFsmState === "STAND_ASIDE" && activeVerdict === "STAND_ASIDE"
         ? "LOW_EDGE_CHOP"
-        : Math.abs(drivers[2]?.value ?? 0) >= 45
+        : Math.abs(convictionScore) >= 40
           ? "NEG_GAMMA_TREND"
           : Math.abs(drivers[4]?.value ?? 0) <= 18
             ? "POS_GAMMA_PIN"
             : "ZERO_GAMMA_FLIP";
+    const derivedMode: NonNullable<SessionPlaybookPolicy["zeroMode"]> =
+      derivedRegime === "LOW_EDGE_CHOP"
+        ? "SIT_OUT"
+        : derivedRegime === "POS_GAMMA_PIN"
+          ? "FADE"
+          : "FOLLOW";
     return {
       sessionDate: "",
       ticker: displayTicker,
       checkpoint: "INTRADAY" as const,
-      evaluatedAtEt: isReplayMode ? "REPLAY" : "SYNCING",
+      evaluatedAtEt: isReplayMode ? "REPLAY" : "LIVE",
       evaluatedAtTs: 0,
       regime: derivedRegime,
       allowedRegimes: derivedRegime === "LOW_EDGE_CHOP" ? [] : [derivedRegime],
@@ -808,8 +858,8 @@ export const PrzmTopDeck: React.FC<{
       minExpectancyR: 0,
       minWinRatePct: 0,
       standAsideVetoReason:
-        activeFsmState === "STAND_ASIDE"
-          ? "FSM Neutral / Compressed Advection Corridor"
+        derivedRegime === "LOW_EDGE_CHOP"
+          ? zeroEval.verdictReason
           : null,
       kingDivergencePct: 0,
       trailing5dDrawdownDollars: 0,
@@ -818,8 +868,15 @@ export const PrzmTopDeck: React.FC<{
       wallCorridorPct: 0,
       absPeclet: 0,
       summary: "",
+      zeroMode: derivedMode,
+      zeroModeReason: zeroEval.verdictReason,
+      tollShieldActive: false,
     };
-  }, [supervisorPolicy, activeFsmState, drivers, displayTicker, isReplayMode]);
+  }, [supervisorPolicy, activeFsmState, activeVerdict, convictionScore, drivers, displayTicker, isReplayMode, zeroEval.verdictReason]);
+
+  const effectiveZeroMode =
+    effectivePolicy.zeroMode ??
+    (effectivePolicy.standAsideVetoReason ? "SIT_OUT" : effectivePolicy.regime === "POS_GAMMA_PIN" ? "FADE" : "FOLLOW");
 
   const regimeBadgeStyle =
     effectivePolicy.regime === "POS_GAMMA_PIN"
@@ -828,12 +885,27 @@ export const PrzmTopDeck: React.FC<{
         ? "bg-rose-500/15 text-[#FF2A55] border-rose-500/40"
         : effectivePolicy.regime === "ZERO_GAMMA_FLIP"
           ? "bg-amber-500/15 text-amber-300 border-amber-500/40"
-          : "bg-red-500/20 text-red-300 border-red-500/50";
+          : "bg-slate-800/80 text-slate-300 border-slate-700/80";
+
+  const modeBadgeStyle =
+    effectiveZeroMode === "FOLLOW"
+      ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/40"
+      : effectiveZeroMode === "FADE"
+        ? "bg-cyan-500/15 text-cyan-300 border-cyan-500/40"
+        : "bg-amber-500/15 text-amber-300 border-amber-500/40";
+
+  const launderTag = zeroEval.stageTelemetry.counterTrendBounceDiscounted
+    ? "BOUNCE DAMPED"
+    : zeroEval.stageTelemetry.putSeatbeltDiscounted
+      ? "SEATBELT FILTER"
+      : zeroEval.stageTelemetry.outlierScrubbed
+        ? "SPIKE SCRUBBED"
+        : "4-STAGE CLEAN";
 
   return (
     <>
       {/* SUPERVISOR POLICY STRIP */}
-      <div className="mb-3 rounded-lg bg-[#111322]/95 border border-slate-800/80 px-3.5 py-2 flex flex-wrap items-center justify-between gap-2.5 font-mono text-[11px] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+      <div className="mb-3 rounded-lg bg-[#111322]/95 border border-slate-800/80 px-3.5 py-2 flex flex-wrap items-center justify-between gap-2.5 font-mono text-[11px] tabular-nums shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
         <div className="flex flex-wrap items-center gap-2.5">
           <span className="text-[10px] font-bold tracking-[0.14em] text-slate-400 uppercase">
             SUPERVISOR
@@ -843,9 +915,19 @@ export const PrzmTopDeck: React.FC<{
           >
             {effectivePolicy.regime}
           </span>
+          <span
+            className={`px-2 py-0.5 rounded border text-[10px] font-bold tracking-wider ${modeBadgeStyle}`}
+          >
+            MODE: {effectiveZeroMode === "SIT_OUT" ? "SIT OUT" : effectiveZeroMode}
+          </span>
           <span className="text-slate-400">
             PREF{" "}
-            <strong className="text-slate-100">{effectivePolicy.preferredDte}</strong>
+            <strong className={effectivePolicy.preferredDte === "1-2DTE" ? "text-cyan-300" : "text-slate-100"}>
+              {effectivePolicy.preferredDte === "1-2DTE" ? "1DTE" : effectivePolicy.preferredDte}
+            </strong>
+            {effectivePolicy.tollShieldActive && (
+              <span className="ml-1 text-[10px] text-cyan-400">(Toll Shield)</span>
+            )}
           </span>
           <span className="text-slate-600">|</span>
           <span className="text-slate-400">
@@ -860,11 +942,15 @@ export const PrzmTopDeck: React.FC<{
                 </span>
               </>
             ) : (
-              <strong className="text-amber-300">UNCALIBRATED</strong>
+              <strong className="text-slate-300">CAUSAL</strong>
             )}
           </span>
           <span className="text-slate-600 hidden sm:inline">|</span>
-          <span className="text-slate-400 hidden sm:inline">
+          <span className="text-slate-400 hidden sm:inline" title="Minutes elapsed since recent 90m swing turn">
+            LAG <strong className="text-slate-200 tabular-nums">{zeroEval.turnLagMins}m</strong>
+          </span>
+          <span className="text-slate-600 hidden md:inline">|</span>
+          <span className="text-slate-400 hidden md:inline">
             CKPT{" "}
             <strong className="text-slate-200">{effectivePolicy.checkpoint}</strong>
             {effectivePolicy.evaluatedAtEt ? (
@@ -874,7 +960,7 @@ export const PrzmTopDeck: React.FC<{
         </div>
 
         {effectivePolicy.standAsideVetoReason ? (
-          <div className="px-2.5 py-0.5 rounded border border-red-500/50 bg-red-950/60 text-red-200 text-[10px] font-bold tracking-wide max-w-full truncate">
+          <div className="px-2.5 py-0.5 rounded border border-amber-500/45 bg-amber-950/40 text-amber-200 text-[10px] font-bold tracking-wide max-w-full truncate">
             STAND ASIDE · {effectivePolicy.standAsideVetoReason}
           </div>
         ) : effectivePolicy.trailing5dDrawdownDollars > 0 ? (
@@ -890,34 +976,69 @@ export const PrzmTopDeck: React.FC<{
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-3.5 mb-3.5">
       {/* CARD 1: +--[ CALL ]----+ (5 Columns on lg) */}
       <div className="lg:col-span-5 rounded-xl bg-[#131424]/95 border border-slate-800/80 px-4 py-3.5 flex flex-col justify-between shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-        <PrzmAsciiHeader title="CALL" />
+        <PrzmAsciiHeader
+          title="CALL"
+          rightSlot={
+            <span className="text-[10px] font-mono font-bold tracking-wider text-slate-400">
+              {effectiveZeroMode === "SIT_OUT" ? "SIT OUT" : effectiveZeroMode}
+            </span>
+          }
+        />
 
-        <div className="my-3">
+        <div className="my-2.5">
           <div className="flex items-baseline justify-between gap-2.5">
             <span
-              className={`font-mono text-2xl sm:text-[28px] font-black tracking-tight flex items-center gap-2 ${
-                activeType === "LONG"
+              className={`font-mono text-xl sm:text-[25px] font-black tracking-tight flex items-center gap-2 ${
+                activeVerdict === "LONG"
                   ? "text-[#00F5D4] drop-shadow-[0_0_12px_rgba(0,245,212,0.35)]"
-                  : "text-[#FF2A55] drop-shadow-[0_0_12px_rgba(255,42,85,0.35)]"
+                  : activeVerdict === "SHORT"
+                    ? "text-[#FF2A55] drop-shadow-[0_0_12px_rgba(255,42,85,0.35)]"
+                    : "text-amber-300/95"
               }`}
             >
-              <span>{activeType === "LONG" ? "↗" : "↘"}</span>
-              <span>{activeType}</span>
+              <span>
+                {activeVerdict === "LONG" ? "↗" : activeVerdict === "SHORT" ? "↘" : "—"}
+              </span>
+              <span>
+                {activeVerdict === "STAND_ASIDE"
+                  ? effectiveZeroMode === "SIT_OUT"
+                    ? "SIT OUT"
+                    : "STAND ASIDE"
+                  : activeVerdict}
+              </span>
             </span>
             <span className="font-mono text-xl sm:text-2xl font-bold tabular-nums text-slate-100 tracking-tight">
               ${liveSpot.toFixed(2)}
             </span>
           </div>
 
-          {/* 24-Segment Horizontal LED Conviction Bar */}
-          <div className="mt-3.5 flex items-center gap-2.5">
+          <div className="mt-1.5">
+            <span
+              className={`inline-block px-2 py-0.5 rounded text-[10px] font-mono font-semibold tracking-wider border ${
+                activeVerdict === "LONG"
+                  ? "bg-emerald-500/10 border-emerald-500/35 text-emerald-300"
+                  : activeVerdict === "SHORT"
+                    ? "bg-rose-500/10 border-rose-500/35 text-rose-300"
+                    : "bg-slate-900/90 border-slate-700/80 text-slate-300"
+              }`}
+            >
+              {zeroEval.verdictReason}
+            </span>
+          </div>
+
+          {/* 24-Segment Horizontal LED Composite Conviction Bar */}
+          <div className="mt-3 flex items-center gap-2.5">
             <div className="flex-1 flex items-center gap-[3px] h-4 bg-[#0b0c16] px-2 py-1 rounded border border-slate-800/70">
               {Array.from({ length: 24 }).map((_, idx) => {
                 const isLit = idx < litSegments;
                 const activeColor =
-                  activeType === "LONG"
+                  activeVerdict === "LONG"
                     ? "bg-[#00F5D4] shadow-[0_0_6px_rgba(0,245,212,0.55)]"
-                    : "bg-[#FF2A55] shadow-[0_0_6px_rgba(255,42,85,0.55)]";
+                    : activeVerdict === "SHORT"
+                      ? "bg-[#FF2A55] shadow-[0_0_6px_rgba(255,42,85,0.55)]"
+                      : convictionScore >= 0
+                        ? "bg-slate-400/65"
+                        : "bg-amber-400/65";
                 return (
                   <div
                     key={idx}
@@ -929,11 +1050,16 @@ export const PrzmTopDeck: React.FC<{
               })}
             </div>
             <span
-              className={`font-mono text-xs font-bold tabular-nums min-w-[34px] text-right ${
-                activeType === "LONG" ? "text-[#00F5D4]" : "text-[#FF2A55]"
+              className={`font-mono text-xs font-bold tabular-nums min-w-[38px] text-right ${
+                activeVerdict === "LONG"
+                  ? "text-[#00F5D4]"
+                  : activeVerdict === "SHORT"
+                    ? "text-[#FF2A55]"
+                    : "text-slate-300"
               }`}
+              title="Laundered multi-driver composite conviction (-100..+100)"
             >
-              {convictionScore >= 0 ? `+${convictionScore}` : convictionScore}
+              {convictionScore > 0 ? `+${convictionScore}` : convictionScore}
             </span>
           </div>
         </div>
@@ -1052,7 +1178,14 @@ export const PrzmTopDeck: React.FC<{
 
       {/* CARD 3: +--[ DRIVERS ]----+ (4 Columns on lg) */}
       <div className="lg:col-span-4 rounded-xl bg-[#131424]/95 border border-slate-800/80 px-4 py-3.5 flex flex-col justify-between shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-        <PrzmAsciiHeader title="DRIVERS" />
+        <PrzmAsciiHeader
+          title="DRIVERS"
+          rightSlot={
+            <span className="text-[9.5px] font-mono font-bold tracking-wider text-cyan-300/90">
+              {launderTag}
+            </span>
+          }
+        />
 
         <div className="mt-2.5 flex-1 grid grid-cols-5 gap-2.5 items-end pt-1">
           {drivers.map((drv) => {
@@ -1112,54 +1245,6 @@ export const PrzmTopDeck: React.FC<{
 };
 
 /**
- * Horizontal Segmented Regime Strip (`THE CALL`) directly below the main trajectory
- */
-export const PrzmTheCallStrip: React.FC<{
-  series: PrzmCandlePoint[];
-  replayBarTsSec?: number;
-}> = ({ series, replayBarTsSec }) => {
-  if (!series.length) return null;
-  const refNowSec = typeof replayBarTsSec === "number" && replayBarTsSec > 0 ? replayBarTsSec : Math.floor(Date.now() / 1000);
-
-  return (
-    <div className="mt-2 px-2 py-1.5 rounded-lg bg-[#0d0e1a]/90 border border-slate-800/70 flex items-center gap-3">
-      <span className="font-mono text-[10px] font-bold tracking-[0.16em] text-slate-400 uppercase shrink-0 min-w-[68px]">
-        THE CALL
-      </span>
-      <div className="flex-1 flex items-center gap-[2px] h-3.5">
-        {series.map((bar, idx) => {
-          const rawTs = Number(bar.timestamp ?? 0);
-          const barSec = toEpochSeconds(rawTs);
-          const isFuture = barSec > 0 && barSec > refNowSec;
-          const refVwap = bar.flowVwap || bar.vwap || bar.close;
-          const spread = bar.close - refVwap;
-          const fallbackWing = Math.max(0.05, bar.close * 0.0015);
-          const bandSpan = Math.max(
-            Math.max(0.02, bar.close * 0.0003),
-            ((bar.upperBand ?? refVwap + fallbackWing) - (bar.lowerBand ?? refVwap - fallbackWing)) * 0.12
-          );
-          let bg = "bg-[#8B5CF6]/70";
-          if (isFuture) {
-            bg = "bg-slate-800/40";
-          } else if (spread > bandSpan * 0.35) {
-            bg = "bg-[#00F5D4] shadow-[0_0_4px_rgba(0,245,212,0.35)]";
-          } else if (spread < -bandSpan * 0.35) {
-            bg = "bg-[#FF2A55] shadow-[0_0_4px_rgba(255,42,85,0.35)]";
-          }
-          return (
-            <div
-              key={`${bar.time}-${idx}`}
-              className={`flex-1 h-2.5 rounded-[1px] ${bg}`}
-              title={`${bar.time} · Close $${bar.close.toFixed(2)} vs FlowVWAP $${refVwap.toFixed(2)}`}
-            />
-          );
-        })}
-      </div>
-    </div>
-  );
-};
-
-/**
  * Bottom Tactical Ledger & Win-Rate Scoreboard (`+--[ CALL LOG ]----+`)
  */
 export const PrzmCallLogDeck: React.FC<{
@@ -1168,129 +1253,271 @@ export const PrzmCallLogDeck: React.FC<{
   liveSpot: number;
   activeFsmState?: "LONG" | "SHORT" | "STAND_ASIDE";
   serverTrades?: ServerTradeData;
+  zeroShadow?: ZeroShadowReadout | null;
   ticker?: string;
   replayBarTsSec?: number;
-}> = ({ signals, series, liveSpot, activeFsmState, serverTrades, ticker = "SPY", replayBarTsSec }) => {
+}> = ({
+  signals,
+  series,
+  liveSpot,
+  activeFsmState,
+  serverTrades,
+  zeroShadow,
+  ticker = "SPY",
+  replayBarTsSec,
+}) => {
+  const [activeTab, setActiveTab] = useState<"LIVE" | "SHADOW">("LIVE");
   const ledger = useMemo(
     () => evaluatePrzmCallLedger(signals, series, liveSpot, activeFsmState, serverTrades, ticker, replayBarTsSec),
     [signals, series, liveSpot, activeFsmState, serverTrades, ticker, replayBarTsSec]
   );
 
+  const shadowEntries = useMemo(
+    () => [...(zeroShadow?.entriesToday ?? [])].reverse(),
+    [zeroShadow?.entriesToday]
+  );
+  const shadowModeScores = zeroShadow?.modeScores ?? [];
+
   return (
     <div className="mt-3.5 rounded-xl bg-[#131424]/95 border border-slate-800/80 px-4 py-3.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-      <PrzmAsciiHeader title="CALL LOG" />
+      <PrzmAsciiHeader
+        title="CALL LOG"
+        rightSlot={
+          <div className="flex items-center gap-1.5 font-mono text-[10px] tabular-nums">
+            <button
+              type="button"
+              onClick={() => setActiveTab("LIVE")}
+              className={`px-2 py-0.5 rounded border transition cursor-pointer ${
+                activeTab === "LIVE"
+                  ? "bg-emerald-500/15 border-emerald-400/55 text-emerald-300 font-bold"
+                  : "bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              LIVE ({ledger.entries.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab("SHADOW")}
+              className={`px-2 py-0.5 rounded border transition cursor-pointer ${
+                activeTab === "SHADOW"
+                  ? "bg-cyan-500/15 border-cyan-400/55 text-cyan-300 font-bold"
+                  : "bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200"
+              }`}
+              title="Paper-only experimental Zero modes (Ask-in / Bid-out, isolated from live portfolio lock)"
+            >
+              SHADOW ({shadowEntries.length})
+            </button>
+          </div>
+        }
+      />
 
-      <div className="mt-3 grid grid-cols-1 lg:grid-cols-12 gap-4 items-center">
-        {/* Left: Chronological Trade Ledger (8 cols) */}
-        <div className="lg:col-span-8 divide-y divide-slate-800/60 font-mono text-xs">
-          {ledger.entries.length === 0 ? (
-            <div className="py-4 text-slate-500 tracking-wider uppercase text-[11px]">
-              AWAITING HIGH-CONVICTION REGIME TRIGGER...
-            </div>
-          ) : (
-            ledger.entries.map((entry) => {
-              const sideColor =
-                entry.type === "LONG" ? "text-[#00F5D4]" : "text-[#FF2A55]";
-              const dirLabel = entry.contractType
-                ? `${entry.type} · ${entry.contractType}`
-                : entry.type;
-              const shortContract = entry.contractLabel
-                ? entry.contractLabel.replace(/\s*\(.*\)/, "")
-                : null;
+      {activeTab === "LIVE" ? (
+        <div className="mt-3 grid grid-cols-1 lg:grid-cols-12 gap-4 items-center">
+          {/* Left: Chronological Live Server Trade Ledger (8 cols) */}
+          <div className="lg:col-span-8 divide-y divide-slate-800/60 font-mono text-xs tabular-nums">
+            {ledger.entries.length === 0 ? (
+              <div className="py-4 text-slate-500 tracking-wider uppercase text-[11px]">
+                NO LIVE EXECUTIONS YET TODAY · STANDING GUARD FOR A+ CONFLUENCE
+              </div>
+            ) : (
+              ledger.entries.map((entry) => {
+                const isCallOpt =
+                  entry.contractType === "CALL" || (!entry.contractType && entry.type === "LONG");
+                const sideColor = isCallOpt ? "text-[#00F5D4]" : "text-[#FF2A55]";
+                const pillStyle = isCallOpt
+                  ? "bg-emerald-500/12 border-emerald-500/40 text-emerald-300"
+                  : "bg-rose-500/12 border-rose-500/40 text-rose-300";
+                const dirLabel = entry.contractType
+                  ? `${entry.type} · ${entry.contractType}`
+                  : entry.type;
+                const shortContract = entry.contractLabel
+                  ? entry.contractLabel.replace(/\s*\(.*\)/, "")
+                  : null;
 
-              let statusBadge = "";
-              let statusColor = "text-slate-300";
+                let statusBadge = "";
+                let statusColor = "text-slate-300";
 
-              const signedDelta =
-                entry.delta > 0
-                  ? `+${entry.delta.toFixed(2)}`
-                  : entry.delta.toFixed(2);
+                const signedDelta =
+                  entry.delta > 0
+                    ? `+${entry.delta.toFixed(2)}`
+                    : entry.delta.toFixed(2);
 
-              if (entry.status === "OPEN") {
-                statusBadge = `OPEN ${signedDelta} pts`;
-                statusColor = "text-[#A78BFA] font-bold";
-              } else if (entry.status === "RIGHT") {
-                const optPctStr =
-                  typeof entry.pnlOptionPct === "number"
-                    ? `STC ${entry.pnlOptionPct > 0 ? "+" : ""}${entry.pnlOptionPct.toFixed(1)}% · `
-                    : "STC · ";
-                statusBadge = `${optPctStr}${signedDelta} pts · RIGHT`;
-                statusColor = "text-[#10b981] font-bold";
-              } else if (entry.status === "FLAT") {
-                statusBadge = `FLAT ${signedDelta} pts`;
-                statusColor = "text-slate-400";
-              } else {
-                const optPctStr =
-                  typeof entry.pnlOptionPct === "number"
-                    ? `STC ${entry.pnlOptionPct > 0 ? "+" : ""}${entry.pnlOptionPct.toFixed(1)}% · `
-                    : "STC · ";
-                statusBadge = `${optPctStr}${signedDelta} pts · WRONG`;
-                statusColor = "text-[#FF2A55] font-bold";
-              }
+                if (entry.status === "OPEN") {
+                  statusBadge = `OPEN ${signedDelta} pts`;
+                  statusColor = "text-[#A78BFA] font-bold";
+                } else if (entry.status === "RIGHT") {
+                  const optPctStr =
+                    typeof entry.pnlOptionPct === "number"
+                      ? `STC ${entry.pnlOptionPct > 0 ? "+" : ""}${entry.pnlOptionPct.toFixed(1)}% · `
+                      : "STC · ";
+                  statusBadge = `${optPctStr}${signedDelta} pts · RIGHT`;
+                  statusColor = "text-[#10b981] font-bold";
+                } else if (entry.status === "FLAT") {
+                  statusBadge = `SCRATCH ${signedDelta} pts`;
+                  statusColor = "text-slate-400 font-semibold";
+                } else {
+                  const optPctStr =
+                    typeof entry.pnlOptionPct === "number"
+                      ? `STC ${entry.pnlOptionPct > 0 ? "+" : ""}${entry.pnlOptionPct.toFixed(1)}% · `
+                      : "STC · ";
+                  statusBadge = `${optPctStr}${signedDelta} pts · WRONG`;
+                  statusColor = "text-[#FF2A55] font-bold";
+                }
 
-              return (
-                <div
-                  key={entry.id}
-                  className="py-2.5 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-800/20 px-2 rounded transition-colors"
-                >
-                  <span className="text-slate-300 font-semibold tabular-nums min-w-[72px] shrink-0">
-                    {entry.timeFormatted}
-                  </span>
-                  <span className="text-slate-500 text-[10.5px] tabular-nums shrink-0">
-                    {entry.heldLabel}
-                  </span>
-                  <span className={`font-bold tracking-wider min-w-[88px] shrink-0 ${sideColor}`}>
-                    {dirLabel}
-                  </span>
-                  <span className="text-slate-200 tabular-nums font-semibold shrink-0">
-                    ${entry.entryPrice.toFixed(2)}
-                    {entry.closedPrice && entry.status !== "OPEN" && (
-                      <span className="text-slate-400 font-normal">
-                        {" → "}${entry.closedPrice.toFixed(2)}
-                        {entry.closedTimeFormatted ? ` (${entry.closedTimeFormatted})` : ""}
+                return (
+                  <div
+                    key={entry.id}
+                    className="py-2.5 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-800/20 px-2 rounded transition-colors"
+                  >
+                    <span className="text-slate-300 font-semibold tabular-nums min-w-[72px] shrink-0">
+                      {entry.timeFormatted}
+                    </span>
+                    <span className="text-slate-500 text-[10.5px] tabular-nums shrink-0">
+                      {entry.heldLabel}
+                    </span>
+                    <span className={`font-bold tracking-wider min-w-[88px] shrink-0 ${sideColor}`}>
+                      {dirLabel}
+                    </span>
+                    <span className="text-slate-200 tabular-nums font-semibold shrink-0">
+                      ${entry.entryPrice.toFixed(2)}
+                      {entry.closedPrice && entry.status !== "OPEN" && (
+                        <span className="text-slate-400 font-normal">
+                          {" → "}${entry.closedPrice.toFixed(2)}
+                          {entry.closedTimeFormatted ? ` (${entry.closedTimeFormatted})` : ""}
+                        </span>
+                      )}
+                    </span>
+                    {shortContract && (
+                      <span
+                        className={`px-2 py-0.5 rounded border font-mono text-[10.5px] font-semibold truncate max-w-[210px] ${pillStyle}`}
+                        title={entry.contractLabel}
+                      >
+                        {shortContract}
                       </span>
                     )}
-                  </span>
-                  {shortContract && (
-                    <span
-                      className="px-2 py-0.5 rounded bg-slate-800/80 border border-slate-700/70 text-amber-300 font-mono text-[10.5px] font-semibold truncate max-w-[210px]"
-                      title={entry.contractLabel}
-                    >
-                      {shortContract}
+                    {typeof entry.btoOptionPrice === "number" && entry.btoOptionPrice > 0 && (
+                      <span className="text-slate-300 font-mono text-[11px] tabular-nums shrink-0">
+                        {typeof entry.stcOptionPrice === "number" && entry.stcOptionPrice > 0 && entry.status !== "OPEN"
+                          ? "$" + entry.btoOptionPrice.toFixed(2) + " → $" + entry.stcOptionPrice.toFixed(2)
+                          : "@ $" + entry.btoOptionPrice.toFixed(2)}
+                      </span>
+                    )}
+                    <span className={`tabular-nums tracking-wide text-right flex-1 ${statusColor}`}>
+                      {statusBadge}
                     </span>
-                  )}
-                  {typeof entry.btoOptionPrice === "number" && entry.btoOptionPrice > 0 && (
-                    <span className="text-slate-300 font-mono text-[11px] tabular-nums shrink-0">
-                      {typeof entry.stcOptionPrice === "number" && entry.stcOptionPrice > 0 && entry.status !== "OPEN"
-                        ? "$" + entry.btoOptionPrice.toFixed(2) + " → $" + entry.stcOptionPrice.toFixed(2)
-                        : "@ $" + entry.btoOptionPrice.toFixed(2)}
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {/* Right: Live Win-Rate & Expectancy Scoreboard (4 cols) */}
+          <div className="lg:col-span-4 lg:border-l lg:border-slate-800/80 lg:pl-6 flex flex-col items-center lg:items-end justify-center py-2 font-mono tabular-nums">
+            <div
+              className={`text-4xl sm:text-5xl font-black tracking-tight text-slate-100 transition-all duration-200 ease-out ${
+                ledger.decisiveCount === 0 || ledger.winRatePct >= 50
+                  ? "drop-shadow-[0_0_18px_rgba(0,245,212,0.25)]"
+                  : "drop-shadow-[0_0_18px_rgba(255,42,85,0.25)]"
+              }`}
+            >
+              {ledger.decisiveCount > 0 ? `${ledger.winRatePct}%` : "—"}
+            </div>
+            <div className="mt-1 text-[11px] tracking-[0.14em] text-slate-400 uppercase">
+              {ledger.rightCount} OF {ledger.decisiveCount} RIGHT
+              {ledger.decisiveCount > 0 && (
+                <span className={`ml-2 font-bold ${ledger.avgR >= 0 ? "text-emerald-300" : "text-rose-300"}`}>
+                  ({ledger.avgR >= 0 ? "+" : ""}
+                  {ledger.avgR.toFixed(2)}R)
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="mt-3 grid grid-cols-1 lg:grid-cols-12 gap-4 items-center font-mono tabular-nums">
+          {/* Left: Causal Paper-Only Shadow Modes (Ask-in / Bid-out) */}
+          <div className="lg:col-span-8 divide-y divide-slate-800/60 text-xs">
+            {shadowEntries.length === 0 ? (
+              <div className="py-4 text-slate-500 tracking-wider uppercase text-[11px]">
+                SHADOW LEDGER ARMED (FOLLOW · FADE · 1DTE) · AWAITING REAL ASK/BID QUOTE TRIGGER
+              </div>
+            ) : (
+              shadowEntries.map((sh) => {
+                const isCall = sh.contractType === "CALL";
+                const pillStyle = isCall
+                  ? "bg-emerald-500/12 border-emerald-500/40 text-emerald-300"
+                  : "bg-rose-500/12 border-rose-500/40 text-rose-300";
+                const pctStr = `${sh.pnlOptionPct >= 0 ? "+" : ""}${sh.pnlOptionPct.toFixed(1)}%`;
+                const statusColor =
+                  sh.status === "RIGHT"
+                    ? "text-emerald-400 font-bold"
+                    : sh.status === "WRONG"
+                      ? "text-rose-400 font-bold"
+                      : sh.status === "SCRATCH"
+                        ? "text-slate-400 font-semibold"
+                        : "text-cyan-300 font-bold";
+                return (
+                  <div
+                    key={sh.id}
+                    className="py-2.5 flex flex-wrap items-center justify-between gap-2.5 hover:bg-slate-800/20 px-2 rounded"
+                  >
+                    <span className="text-slate-300 font-semibold min-w-[66px]">{sh.openedTimeEt}</span>
+                    <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700/80 text-[10px] text-cyan-300 font-bold">
+                      {sh.modeBadge}
                     </span>
-                  )}
-                  <span className={`tabular-nums tracking-wide text-right flex-1 ${statusColor}`}>
-                    {statusBadge}
+                    <span className={`px-2 py-0.5 rounded border text-[10.5px] font-semibold ${pillStyle}`}>
+                      {sh.contractLabel}
+                    </span>
+                    <span className="text-slate-300 text-[11px]">
+                      Ask ${sh.entryAsk.toFixed(2)} → Bid ${(sh.exitBid ?? sh.currentBid).toFixed(2)}
+                    </span>
+                    <span className="text-slate-500 text-[10px]">LAG {sh.entryLagMins}m</span>
+                    <span className={`text-right flex-1 ${statusColor}`}>
+                      {sh.status === "OPEN" ? `OPEN ${pctStr}` : `${pctStr} (${sh.rMultiple >= 0 ? "+" : ""}${sh.rMultiple.toFixed(2)}R) · ${sh.status}`}
+                    </span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+
+          {/* Right: Rolling Public Shadow Mode Scoreboard */}
+          <div className="lg:col-span-4 lg:border-l lg:border-slate-800/80 lg:pl-5 flex flex-col gap-1.5 py-1.5 text-[11px]">
+            <div className="text-[10px] tracking-[0.14em] text-slate-400 uppercase mb-0.5">
+              ROLLING SHADOW SCOREBOARD (ISOLATED)
+            </div>
+            {shadowModeScores.length === 0 ? (
+              <div className="text-slate-500 text-[10.5px]">NO CLOSED SHADOW SAMPLES YET</div>
+            ) : (
+              shadowModeScores.map((ms) => (
+                <div
+                  key={ms.mode}
+                  className="flex items-center justify-between px-2.5 py-1 rounded bg-[#0c0e1a] border border-slate-800/80"
+                >
+                  <span className="font-bold text-slate-200">{ms.label}</span>
+                  <span className="text-slate-400">
+                    {ms.totalClosed > 0 ? (
+                      <>
+                        <strong className={ms.winRatePct >= 50 ? "text-emerald-300" : "text-rose-300"}>
+                          {ms.winRatePct}% WR
+                        </strong>{" "}
+                        ·{" "}
+                        <span className={ms.avgR >= 0 ? "text-cyan-300" : "text-amber-300"}>
+                          {ms.avgR >= 0 ? "+" : ""}
+                          {ms.avgR.toFixed(2)}R
+                        </span>{" "}
+                        <span className="text-slate-500">({ms.rightCount}/{ms.totalClosed})</span>
+                      </>
+                    ) : (
+                      <span className="text-slate-500">0 samples</span>
+                    )}
                   </span>
                 </div>
-              );
-            })
-          )}
-        </div>
-
-        {/* Right: Giant Win-Rate Scoreboard (4 cols) */}
-        <div className="lg:col-span-4 lg:border-l lg:border-slate-800/80 lg:pl-6 flex flex-col items-center lg:items-end justify-center py-2">
-          <div
-            className={`font-mono text-4xl sm:text-5xl font-black tracking-tight text-slate-100 tabular-nums transition-all duration-200 ease-out ${
-              ledger.winRatePct >= 50
-                ? "drop-shadow-[0_0_18px_rgba(0,245,212,0.25)]"
-                : "drop-shadow-[0_0_18px_rgba(255,42,85,0.25)]"
-            }`}
-          >
-            {ledger.winRatePct}%
-          </div>
-          <div className="mt-1 font-mono text-[11px] tracking-[0.16em] text-slate-400 uppercase transition-colors duration-200 ease-out">
-            {ledger.rightCount} OF {ledger.decisiveCount} RIGHT
+              ))
+            )}
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };

@@ -24,6 +24,7 @@ import {
   releaseBarEvaluationLock,
   ensureMocCutoffForRemainingPositions,
   getEtClockNow,
+  isAllowedAutonomousTicker,
 } from "@/lib/liveBotDaemon";
 import {
   getSessionBoundsEt,
@@ -421,8 +422,9 @@ async function attachIntraday(
           : 0;
       const isQuoteFreshForEntry = !payload.isStale && spotLagPct <= 0.015;
 
-      const tradeRes = isQuoteFreshForEntry
-        ? await evaluateTradeSignals({
+      const tradeRes =
+        isQuoteFreshForEntry && isAllowedAutonomousTicker(payload.ticker)
+          ? await evaluateTradeSignals({
         ticker: payload.ticker,
         spotPrice: payload.spotPrice,
         callWall: tacticalLevels.callWall,

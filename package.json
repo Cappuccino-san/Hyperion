@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start -p 3000 -H 0.0.0.0",
     "lint": "next lint",
-    "test": "npm run test:flow-vwap && npm run test:playbook && npm run test:invariants && npm run test:viewport && npm run test:fsm && npm run test:alpha-scorer && npm run test:persistence && npm run test:agentic-supervisor && npm run test:execution-guards && npm run test:quant-audit && npm run test:discord-webhook && npm run test:phase2",
+    "test": "npm run test:flow-vwap && npm run test:playbook && npm run test:invariants && npm run test:viewport && npm run test:fsm && npm run test:alpha-scorer && npm run test:persistence && npm run test:agentic-supervisor && npm run test:execution-guards && npm run test:quant-audit && npm run test:discord-webhook && npm run test:phase2 && npm run test:zero",
     "test:flow-vwap": "npx tsx lib/__tests__/flowGammaVwap.test.ts",
     "test:playbook": "npx tsx lib/__tests__/playbookEngine.test.ts",
     "test:invariants": "npx tsx scripts/verifyExecutionInvariants.ts",
@@ -20,6 +20,7 @@
     "test:quant-audit": "npx tsx --test lib/__tests__/quantAuditRegressions.test.ts",
     "test:discord-webhook": "npx tsx --test lib/__tests__/discordWebhook.test.ts",
     "test:phase2": "npx tsx --test lib/__tests__/phase2ElevationRegressions.test.ts",
+    "test:zero": "npx tsx --test lib/__tests__/zeroEngineAndHud.test.ts",
     "test:fsm-optimize": "npx tsx scripts/validateFsmAdaptiveParams.ts",
     "test:routes": "npx tsx scripts/verifyLiveRoutes.ts",
     "daemon:audit": "npx tsx scripts/autoImprovementDaemon.ts"

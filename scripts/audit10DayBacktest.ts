@@ -1641,7 +1641,10 @@ async function run10DaySniperAudit() {
               callWall: causalCallWall,
               putWall: causalPutWall,
               isAfternoon: bar.totalMinutes >= 690,
-              preferredDte: regimeInfo.preferredDte,
+              preferredDte:
+                sessionPolicy?.preferredDte && sessionPolicy.preferredDte !== "NONE"
+                  ? sessionPolicy.preferredDte
+                  : regimeInfo.preferredDte,
               regime: regimeInfo.regime,
               absImpulsePeclet: barAbsPe,
             });

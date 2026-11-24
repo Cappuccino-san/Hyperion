@@ -44,15 +44,113 @@ import { sanitizeTickerSymbol } from "@/lib/marketCache";
 import { sanitizeDiscordWebhookUrl } from "@/lib/discordWebhook";
 import {
   readAlphaPriors,
+  readIntradayStoreSync,
   readPostMarketAttribution,
   readSupervisorPolicy,
+  type SessionPlaybookPolicy,
 } from "@/lib/persistenceStore";
+import { computeBarFlowGammaVwapSeries } from "@/lib/flowGammaVwap";
+import { globalContractsCache } from "@/lib/optionsExposure";
+import { reanchorDelayedContractsToSpot } from "@/lib/execution/optionPricing";
+import { evaluateZeroFlowFilter } from "@/lib/zeroFlowFilter";
+import { evaluateZeroShadowTick, readZeroShadowSummary } from "@/lib/zeroShadowLedger";
 
 export const dynamic = "force-dynamic";
 
 const globalForSignals = globalThis as unknown as {
   __hyperionLastGetEvalAtMs?: number;
 };
+
+function buildServerZeroTelemetry(
+  sym: string,
+  sessionDate: string,
+  policy: SessionPlaybookPolicy | null,
+  activePos?: { contractType?: "CALL" | "PUT"; btoSpotPrice?: number } | null
+) {
+  try {
+    const intra = readIntradayStoreSync(sessionDate);
+    const tData = intra?.tickers?.[sym];
+    const pts = tData?.rthHistory?.length ? tData.rthHistory : tData?.history ?? [];
+    const buckets = new Map<number, { ts: number; open: number; high: number; low: number; close: number }>();
+    for (const p of pts) {
+      if (!p || !(p.spot > 0) || !(p.ts > 0)) continue;
+      const bTs = Math.floor(p.ts / 300) * 300;
+      const cur = buckets.get(bTs);
+      if (!cur) {
+        buckets.set(bTs, { ts: bTs, open: p.spot, high: p.spot, low: p.spot, close: p.spot });
+      } else {
+        if (p.spot > cur.high) cur.high = p.spot;
+        if (p.spot < cur.low) cur.low = p.spot;
+        cur.close = p.spot;
+      }
+    }
+    const bars = Array.from(buckets.values()).sort((a, b) => a.ts - b.ts);
+    const levels = tData?.officialLevels;
+    const pde =
+      bars.length > 0
+        ? computeBarFlowGammaVwapSeries(
+            bars.map((b) => ({
+              timestamp: b.ts,
+              open: b.open,
+              high: b.high,
+              low: b.low,
+              close: b.close,
+            })),
+            undefined,
+            levels
+              ? {
+                  ceilingNode: levels.callWall > 0 ? levels.callWall : undefined,
+                  floorNode: levels.putWall > 0 ? levels.putWall : undefined,
+                  zeroGamma: levels.zeroGamma > 0 ? levels.zeroGamma : undefined,
+                }
+              : undefined
+          )
+        : [];
+    const zeroEval = evaluateZeroFlowFilter({
+      ticker: sym,
+      candles: bars.map((b, idx) => ({
+        timestamp: b.ts,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+        flowVwap: pde[idx]?.flowVwap,
+        sigma: pde[idx]?.sigma,
+        chi: pde[idx]?.ceilingShareChi,
+        impulseChi: pde[idx]?.impulseChi,
+        pe: pde[idx]?.pecletNumber,
+        impulsePe: pde[idx]?.impulsePeclet,
+        netFluxJ: pde[idx]?.netFluxJ,
+        deltaNetFlux6Bar: pde[idx]?.deltaNetFlux6Bar,
+      })),
+      liveSpot: bars[bars.length - 1]?.close ?? null,
+      open930: bars[0]?.open ?? null,
+      zeroGamma0Dte: levels?.zeroGamma ?? null,
+      callWall0Dte: levels?.callWall ?? null,
+      putWall0Dte: levels?.putWall ?? null,
+      activeCallDirection: activePos
+        ? activePos.contractType === "CALL"
+          ? "LONG"
+          : "SHORT"
+        : null,
+      activeCallEntryPrice: activePos?.btoSpotPrice ?? null,
+      regimeMode: policy?.zeroMode ?? "FOLLOW",
+      standAsideVetoReason: policy?.standAsideVetoReason ?? null,
+    });
+    return {
+      mode: policy?.zeroMode ?? (policy?.standAsideVetoReason ? "SIT_OUT" : "FOLLOW"),
+      modeReason: policy?.zeroModeReason ?? policy?.summary ?? "",
+      preferredDte: policy?.preferredDte ?? "0DTE",
+      tollShieldActive: Boolean(policy?.tollShieldActive),
+      lastBar: bars[bars.length - 1] ?? null,
+      lastFlowVwap: pde[pde.length - 1]?.flowVwap ?? null,
+      lastSigma: pde[pde.length - 1]?.sigma ?? null,
+      ...zeroEval,
+    };
+  } catch {
+    return null;
+  }
+}
 
 function parseIsoDateParam(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
@@ -309,7 +407,7 @@ export async function GET(req: NextRequest) {
     if (searchParams.get("scan") === "true" || searchParams.get("poll") === "all") {
       const authError = authorizeAdminRequest(req);
       if (authError) return authError;
-      const tickers = Array.from(new Set([...getActiveTrackedTickers(), "SPY", "QQQ", "IWM"]));
+      const tickers = Array.from(new Set([...getActiveTrackedTickers(), "SPY", "QQQ"]));
       const scanController = new AbortController();
       const scanTimeout = setTimeout(() => scanController.abort(), 12_000);
       try {
@@ -382,13 +480,21 @@ export async function GET(req: NextRequest) {
         readPostMarketAttribution(requestedDate, policyTicker).catch(() => null),
         readAlphaPriors().catch(() => null),
       ]);
+      const histActive = getActivePositions(requestedDate);
       return NextResponse.json({
-        activePositions: getActivePositions(requestedDate),
+        activePositions: histActive,
         closedPositions: getClosedPositions(ticker, requestedDate),
         alerts: getDailyTradeAlerts(ticker, requestedDate),
         supervisorPolicy,
         postMarketAttribution,
         alphaPriors,
+        zeroShadow: readZeroShadowSummary(policyTicker, requestedDate),
+        zeroTelemetry: buildServerZeroTelemetry(
+          policyTicker,
+          requestedDate,
+          supervisorPolicy,
+          histActive?.[policyTicker] ?? null
+        ),
         sessionDate: requestedDate,
         timestamp: new Date().toISOString(),
       });
@@ -433,6 +539,55 @@ export async function GET(req: NextRequest) {
       readAlphaPriors().catch(() => null),
     ]);
 
+    const zeroTelemetry = buildServerZeroTelemetry(
+      policyTicker,
+      todayEt,
+      supervisorPolicy,
+      activePositions?.[policyTicker] ?? null
+    );
+    const rawCachedContracts = globalContractsCache.get(policyTicker) ?? [];
+    if (
+      getClock.isWeekday &&
+      rawCachedContracts.length > 0 &&
+      zeroTelemetry?.lastBar &&
+      zeroTelemetry.lastBar.close > 0
+    ) {
+      try {
+        const liveSpotNow = zeroTelemetry.lastBar.close;
+        // Infer reference spot of cached chain from near-0.50 delta calls before shadow selection
+        const atmCalls = rawCachedContracts.filter(
+          (c) => c.optionType === "C" && typeof c.delta === "number" && c.delta >= 0.42 && c.delta <= 0.58
+        );
+        const refChainSpot =
+          atmCalls.length > 0
+            ? atmCalls.reduce((s, c) => s + c.strike, 0) / atmCalls.length
+            : liveSpotNow;
+        const anchoredShadowContracts =
+          Math.abs(refChainSpot - liveSpotNow) > 0.25
+            ? reanchorDelayedContractsToSpot({
+                contracts: rawCachedContracts,
+                referenceSpot: refChainSpot,
+                liveSpot: liveSpotNow,
+                nowMs: Date.now(),
+              })
+            : rawCachedContracts;
+        evaluateZeroShadowTick({
+          ticker: policyTicker,
+          sessionDate: todayEt,
+          nowTsSec: Math.floor(Date.now() / 1000),
+          spotPrice: liveSpotNow,
+          openPrice: zeroTelemetry.lastBar.open,
+          flowVwap: zeroTelemetry.lastFlowVwap ?? liveSpotNow,
+          sigma: zeroTelemetry.lastSigma ?? undefined,
+          compositeScore: zeroTelemetry.compositeScore,
+          entryLagMins: zeroTelemetry.turnLagMins,
+          contracts: anchoredShadowContracts,
+        });
+      } catch {
+        // Non-fatal
+      }
+    }
+
     return NextResponse.json({
       activePositions,
       closedPositions,
@@ -440,6 +595,8 @@ export async function GET(req: NextRequest) {
       supervisorPolicy,
       postMarketAttribution,
       alphaPriors,
+      zeroShadow: readZeroShadowSummary(policyTicker, todayEt),
+      zeroTelemetry,
       executionMode: "PAPER_SHADOW",
       executionLocked: isExecutionHalted(),
       sessionDate: todayEt,

@@ -18,7 +18,18 @@ import {
   solveImpliedVol,
 } from "../execution/optionPricing";
 import { selectSmallAccountContract } from "../execution/contractRouter";
-import { getCanonicalGaiaSlot } from "../execution/discordGateway";
+import {
+  getCanonicalGaiaSlot,
+  DISCORD_ALLOWED_TICKERS,
+  isDiscordTickerAllowed,
+  sendDiscordTradeAlert,
+} from "../execution/discordGateway";
+import {
+  DEFAULT_WATCH_TICKERS,
+  getActiveTrackedTickers,
+  registerActiveTrackedTicker,
+} from "../liveBotDaemon";
+import { POST as postDiscordRoute } from "../../app/api/discord/route";
 import {
   evaluateTradeSignals,
   loadTradeStore,
@@ -624,5 +635,145 @@ test("P0-D1 & P0-A4: Single-writer ledger lock, SHORT_OPEN slot classification, 
     assert.equal(routeRes.status, 200);
     assert.equal(routeJson.dispatchedCount, 0);
     assert.equal(Object.keys(loadTradeStore().activePositions).length, 0);
+  });
+});
+
+test("SPY/QQQ Autonomous Execution & Discord Allowlist Gate: blocks IWM, NVDA, and all non-SPY/QQQ tickers", async () => {
+  await withTempCacheDir(async () => {
+    const today = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    saveTradeStore({
+      date: today,
+      activePositions: {},
+      closedPositions: [],
+      alerts: [],
+      prevSpotPrices: {},
+    });
+
+    // 1. DEFAULT_WATCH_TICKERS is strictly ["SPY", "QQQ"]
+    assert.deepEqual(Array.from(DEFAULT_WATCH_TICKERS), ["SPY", "QQQ"]);
+    assert.deepEqual(Array.from(DISCORD_ALLOWED_TICKERS), ["SPY", "QQQ"]);
+
+    // 2. Browsing IWM or NVDA never enrolls them into daemon tracking
+    assert.deepEqual(registerActiveTrackedTicker("IWM"), ["SPY", "QQQ"]);
+    assert.deepEqual(registerActiveTrackedTicker("NVDA"), ["SPY", "QQQ"]);
+    assert.deepEqual(getActiveTrackedTickers(), ["SPY", "QQQ"]);
+
+    // 3. Already-open legacy position still stays visible in getActiveTrackedTickers() solely so STC/MOC can close it cleanly
+    saveTradeStore({
+      date: today,
+      activePositions: {
+        IWM: {
+          id: "legacy-iwm-open",
+          ticker: "IWM",
+          contractType: "PUT",
+          contractLabel: "IWM 265P",
+          strike: 265,
+          expiration: today,
+          setupName: "Legacy Open",
+          status: "OPEN",
+          btoSpotPrice: 266,
+          btoOptionMid: 0.65,
+          contractsQty: 1,
+          remainingQty: 1,
+          totalOutlay: 65,
+          target1Spot: 264,
+          target2Spot: 262,
+          stopLossSpot: 267.5,
+          openedAt: "10:00 AM",
+          openedTs: Math.floor(Date.now() / 1000) - 300,
+        },
+      },
+      closedPositions: [],
+      alerts: [],
+      prevSpotPrices: {},
+    });
+    assert.deepEqual(getActiveTrackedTickers(), ["SPY", "QQQ", "IWM"]);
+
+    // 4. Outbound Discord trade & level-migration alerts hard-block non-SPY/QQQ tickers
+    assert.equal(isDiscordTickerAllowed("SPY"), true);
+    assert.equal(isDiscordTickerAllowed("QQQ"), true);
+    assert.equal(isDiscordTickerAllowed("IWM"), false);
+    assert.equal(isDiscordTickerAllowed("NVDA"), false);
+
+    const blockedDirect = await sendDiscordTradeAlert(
+      {
+        id: "iwm-bto-blocked",
+        timestamp: "10:15 AM",
+        ts: Math.floor(Date.now() / 1000),
+        ticker: "IWM",
+        action: "BUY_TO_OPEN",
+        contractType: "PUT",
+        contractLabel: "IWM 265P",
+        strike: 265,
+        expiration: today,
+        setupName: "Bearish Zero-Gamma Flush",
+        reason: "Entry",
+        status: "OPEN",
+        spotPrice: 265.5,
+        btoSpotPrice: 265.5,
+        target1Spot: 263.5,
+        target2Spot: 262.0,
+        stopLossSpot: 267.0,
+        optionMid: 0.65,
+        btoOptionMid: 0.65,
+        contractsQty: 1,
+        remainingQty: 1,
+        totalOutlay: 65,
+        message: "Blocked non-SPY/QQQ",
+      },
+      "https://discord.com/api/webhooks/123456789012345678/validToken123"
+    );
+    assert.equal(blockedDirect, false, "sendDiscordTradeAlert must never dispatch IWM alerts");
+
+    const prevAdminToken = process.env.HYPERION_ADMIN_TOKEN;
+    process.env.HYPERION_ADMIN_TOKEN = "test-admin-lock-token";
+    try {
+      for (const blockedSym of ["IWM", "NVDA"]) {
+        const routeBlocked = await postDiscordRoute(
+          new NextRequest("http://localhost:3000/api/discord", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-hyperion-admin-token": "test-admin-lock-token",
+            },
+            body: JSON.stringify({
+              dryRun: true,
+              ticker: blockedSym,
+              action: "BUY_TO_OPEN",
+              spotPrice: 265,
+            }),
+          })
+        );
+        const blockedJson = await routeBlocked.json();
+        assert.equal(routeBlocked.status, 200);
+        assert.equal(blockedJson.ignored, true);
+        assert.match(String(blockedJson.reason), /SPY and QQQ/);
+      }
+
+      for (const allowedSym of ["SPY", "QQQ"]) {
+        const routeAllowed = await postDiscordRoute(
+          new NextRequest("http://localhost:3000/api/discord", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-hyperion-admin-token": "test-admin-lock-token",
+            },
+            body: JSON.stringify({
+              dryRun: true,
+              ticker: allowedSym,
+              action: "BUY_TO_OPEN",
+              spotPrice: 650,
+            }),
+          })
+        );
+        const allowedJson = await routeAllowed.json();
+        assert.equal(routeAllowed.status, 200);
+        assert.equal(allowedJson.success, true);
+        assert.equal(allowedJson.validated, true);
+      }
+    } finally {
+      if (prevAdminToken === undefined) delete process.env.HYPERION_ADMIN_TOKEN;
+      else process.env.HYPERION_ADMIN_TOKEN = prevAdminToken;
+    }
   });
 });

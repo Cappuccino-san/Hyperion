@@ -27,6 +27,8 @@ import {
 import { getMergedIntradayHistory } from "@/lib/intradayHistory";
 import { computeCanonicalPdeSeries } from "@/lib/flowGammaVwap";
 import { getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
+import { evaluateZeroFlowFilter } from "@/lib/zeroFlowFilter";
+import { evaluateZeroShadowTick } from "@/lib/zeroShadowLedger";
 import {
   acquireCrossProcessExecutionLease,
   getExecutionRole,
@@ -34,7 +36,12 @@ import {
 } from "@/lib/executionLease";
 
 const POLL_INTERVAL_MS = 20_000; // 20 seconds during RTH
-const DEFAULT_WATCH_TICKERS = ["SPY", "QQQ", "IWM"] as const;
+export const DEFAULT_WATCH_TICKERS = ["SPY", "QQQ"] as const;
+
+export function isAllowedAutonomousTicker(rawTicker?: string): boolean {
+  const cleaned = (rawTicker || "").trim().toUpperCase().replace(/^\$/, "");
+  return cleaned === "SPY" || cleaned === "QQQ";
+}
 const MAX_TRACKED_TICKERS = 8;
 const TRACKED_TICKER_TTL_MS = 4 * 60 * 60_000;
 
@@ -190,20 +197,14 @@ export function registerActiveTrackedTicker(rawTicker?: string): string[] {
   if (!botState.activeTrackedTickers) {
     botState.activeTrackedTickers = new Map(DEFAULT_WATCH_TICKERS.map((t) => [t, now]));
   }
-  if (sym) {
+  // Strictly lock autonomous enrollment to DEFAULT_WATCH_TICKERS (SPY & QQQ only)
+  if (sym && isAllowedAutonomousTicker(sym)) {
     botState.activeTrackedTickers.set(sym, now);
   }
-  const openTickers = new Set(Object.keys(loadTradeStore().activePositions || {}));
-  for (const [k, ts] of Array.from(botState.activeTrackedTickers.entries())) {
-    if (!(DEFAULT_WATCH_TICKERS as readonly string[]).includes(k) && !openTickers.has(k) && now - ts > TRACKED_TICKER_TTL_MS) {
+  for (const k of Array.from(botState.activeTrackedTickers.keys())) {
+    if (!isAllowedAutonomousTicker(k)) {
       botState.activeTrackedTickers.delete(k);
     }
-  }
-  const nonPinned = Array.from(botState.activeTrackedTickers.entries())
-    .filter(([k]) => !(DEFAULT_WATCH_TICKERS as readonly string[]).includes(k) && !openTickers.has(k))
-    .sort((a, b) => b[1] - a[1]);
-  for (const [k] of nonPinned.slice(Math.max(0, MAX_TRACKED_TICKERS - DEFAULT_WATCH_TICKERS.length))) {
-    botState.activeTrackedTickers.delete(k);
   }
   return getActiveTrackedTickers();
 }
@@ -216,14 +217,12 @@ export function getActiveTrackedTickers(): string[] {
     botState.activeTrackedTickers = new Map(DEFAULT_WATCH_TICKERS.map((t) => [t, now]));
   }
   const ordered = new Set<string>(DEFAULT_WATCH_TICKERS);
-  for (const k of Object.keys(store.activePositions || {})) {
+  // Include any already-open position solely so STC / MOC liquidation can close it cleanly
+  for (const [k, pos] of Object.entries(store.activePositions || {})) {
+    if (!pos || pos.status === "CLOSED") continue;
     const norm = normalizeTrackedTicker(k);
     if (norm) ordered.add(norm);
   }
-  const recent = Array.from(botState.activeTrackedTickers.entries())
-    .filter(([k, ts]) => (DEFAULT_WATCH_TICKERS as readonly string[]).includes(k) || now - ts <= TRACKED_TICKER_TTL_MS)
-    .sort((a, b) => b[1] - a[1]);
-  for (const [k] of recent) ordered.add(k);
   return Array.from(ordered);
 }
 
@@ -632,6 +631,58 @@ export async function runLiveBotTick(): Promise<void> {
           if (hasWebhook) {
             await flushPendingDiscordAlerts({ webhookUrl, signal: controller.signal }).catch(() => 0);
           }
+          // Isolated Zero Shadow pass continues grading SPY/QQQ/IWM even while single-slot live position is open
+          if (isWithinRthWindow()) {
+            for (const shSym of DEFAULT_WATCH_TICKERS) {
+              if (controller.signal.aborted || botState.isStopped) break;
+              try {
+                const shContracts = await fetchLiveCboeOptions(shSym, controller.signal);
+                const shSpot = getCachedSpotPrice(shSym) ?? 0;
+                const shCandleRes = await fetchLive5mCandleAndDivergence(shSym, controller.signal, {
+                  contracts: shContracts,
+                });
+                const shCandle = shCandleRes.candle;
+                if (shSpot > 0 && shContracts.length > 0 && shCandle) {
+                  const snap = shCandle.flowSnapshot;
+                  const zEval = evaluateZeroFlowFilter({
+                    ticker: shSym,
+                    candles: [
+                      {
+                        timestamp: shCandle.timestamp ?? Math.floor(Date.now() / 1000),
+                        open: shCandle.open,
+                        high: shCandle.high,
+                        low: shCandle.low,
+                        close: shSpot,
+                        flowVwap: snap?.flowVwap ?? shSpot,
+                        sigma: snap?.sigma,
+                        chi: snap?.ceilingShareChi,
+                        impulseChi: snap?.impulseChi,
+                        pe: snap?.pecletNumber,
+                        impulsePe: snap?.impulsePeclet,
+                        netFluxJ: snap?.netFluxJ,
+                        deltaNetFlux6Bar: snap?.deltaNetFlux6Bar,
+                      },
+                    ],
+                    liveSpot: shSpot,
+                  });
+                  evaluateZeroShadowTick({
+                    ticker: shSym,
+                    sessionDate: todayStr,
+                    nowTsSec: Math.floor(Date.now() / 1000),
+                    spotPrice: shSpot,
+                    openPrice: shCandle.open,
+                    flowVwap: snap?.flowVwap ?? shSpot,
+                    sigma: snap?.sigma,
+                    compositeScore: zEval.compositeScore,
+                    entryLagMins: zEval.turnLagMins,
+                    contracts: shContracts,
+                  });
+                }
+              } catch {
+                // Non-fatal shadow sweep
+              }
+            }
+          }
         }
         return;
       }
@@ -656,6 +707,7 @@ export async function runLiveBotTick(): Promise<void> {
       let evaluatedAny = false;
       for (const ticker of trackedTickers) {
         if (controller.signal.aborted || botState.isStopped) break;
+        if (!isAllowedAutonomousTicker(ticker)) continue;
         refreshBarEvaluationLock(lockToken);
         const currentStore = loadTradeStore();
         if (Object.keys(currentStore.activePositions || {}).length > 0) break;
@@ -789,7 +841,7 @@ export async function runLiveBotTick(): Promise<void> {
           resolvedSpot > 0 &&
           shouldRefreshSupervisorCheckpoint(existingPolicy, nowClock.etMins, zeroGammaFlipped, curAbsPe)
         ) {
-          const historicalSessions = await readHistoricalSessions(5);
+          const historicalSessions = await readHistoricalSessions(10);
           effectivePolicy = await evaluateAndPersistSessionPlaybook({
             sessionDate: todayStr,
             ticker,
@@ -806,6 +858,54 @@ export async function runLiveBotTick(): Promise<void> {
             flowSnapshot: enrichedCandle?.flowSnapshot ?? null,
             historicalSessions,
           });
+        }
+
+        // Isolated real-quote Zero Shadow Ledger self-grading pass (Ask-in / Bid-out, 0 touch to live single-slot lock or Discord)
+        if (resolvedSpot > 0 && contracts.length > 0 && enrichedCandle) {
+          try {
+            const snap = enrichedCandle.flowSnapshot;
+            const zeroEval = evaluateZeroFlowFilter({
+              ticker,
+              candles: [
+                {
+                  timestamp: enrichedCandle.timestamp ?? Math.floor(Date.now() / 1000),
+                  open: enrichedCandle.open,
+                  high: enrichedCandle.high,
+                  low: enrichedCandle.low,
+                  close: resolvedSpot,
+                  flowVwap: snap?.flowVwap ?? resolvedSpot,
+                  sigma: snap?.sigma,
+                  chi: snap?.ceilingShareChi,
+                  impulseChi: snap?.impulseChi,
+                  pe: snap?.pecletNumber,
+                  impulsePe: snap?.impulsePeclet,
+                  netFluxJ: snap?.netFluxJ,
+                  deltaNetFlux6Bar: snap?.deltaNetFlux6Bar,
+                },
+              ],
+              liveSpot: resolvedSpot,
+              zeroGamma0Dte: resolvedLevels?.zeroDteZeroGamma ?? zgLevel,
+              callWall0Dte: resolvedLevels?.zeroDteCallWall ?? resolvedLevels?.callWall,
+              putWall0Dte: resolvedLevels?.zeroDtePutWall ?? resolvedLevels?.putWall,
+              netGex: resolvedLevels?.netGexMillions,
+              regimeMode: effectivePolicy?.zeroMode,
+              standAsideVetoReason: effectivePolicy?.standAsideVetoReason,
+            });
+            evaluateZeroShadowTick({
+              ticker,
+              sessionDate: todayStr,
+              nowTsSec: Math.floor(Date.now() / 1000),
+              spotPrice: resolvedSpot,
+              openPrice: enrichedCandle.open,
+              flowVwap: snap?.flowVwap ?? resolvedSpot,
+              sigma: snap?.sigma,
+              compositeScore: zeroEval.compositeScore,
+              entryLagMins: zeroEval.turnLagMins,
+              contracts,
+            });
+          } catch {
+            // Non-fatal: shadow telemetry never blocks live evaluation
+          }
         }
 
         if (effectivePolicy?.standAsideVetoReason) {

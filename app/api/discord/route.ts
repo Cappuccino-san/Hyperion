@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authorizeAdminRequest } from "@/lib/adminAuth";
 import { isValidDiscordWebhookUrl } from "@/lib/discordWebhook";
+import { isDiscordTickerAllowed } from "@/lib/execution/discordGateway";
 
 interface CachedEvent {
   timestamp: number;
@@ -113,7 +114,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const ticker = (body.ticker || "SPY").trim().toUpperCase();
+    const ticker = (body.ticker || "SPY").trim().toUpperCase().replace(/^\$/, "");
+    if (!isDiscordTickerAllowed(ticker)) {
+      return NextResponse.json({
+        ignored: true,
+        reason: "Discord notifications are strictly restricted to SPY and QQQ.",
+      });
+    }
     const spot = body.spotPrice ?? 0;
     const eventType = (body.eventType || "").toLowerCase();
     const action = body.action || (eventType === "bto" || eventType === "buy_to_open"

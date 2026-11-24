@@ -1258,3 +1258,53 @@ export function computeCanonicalPdeSeries(
     canonical.structuralNodes
   );
 }
+
+export type DominanceTriState = "CALL" | "PUT" | "NEUTRAL";
+
+export function classifyDominanceTriState(
+  chiRaw: number | undefined,
+  impulseChiRaw?: number | undefined
+): {
+  dominance: DominanceTriState;
+  chiPct: number;
+  dominancePct: number;
+  label: string;
+} {
+  const baseChi =
+    typeof chiRaw === "number" && Number.isFinite(chiRaw)
+      ? Math.max(0, Math.min(1, chiRaw))
+      : 0.5;
+  const impChi =
+    typeof impulseChiRaw === "number" && Number.isFinite(impulseChiRaw)
+      ? Math.max(0, Math.min(1, impulseChiRaw))
+      : baseChi;
+  const blended =
+    Math.abs(impChi - 0.5) > Math.abs(baseChi - 0.5) + 0.08
+      ? 0.72 * baseChi + 0.28 * impChi
+      : baseChi;
+  const chiPct = Math.max(0, Math.min(100, Math.round(blended * 100)));
+
+  if (chiPct >= 55) {
+    return {
+      dominance: "CALL",
+      chiPct,
+      dominancePct: chiPct,
+      label: `CALL DOMINANCE ${chiPct}%`,
+    };
+  }
+  if (chiPct <= 45) {
+    const putDom = 100 - chiPct;
+    return {
+      dominance: "PUT",
+      chiPct,
+      dominancePct: putDom,
+      label: `PUT DOMINANCE ${putDom}% (χ=${chiPct}%)`,
+    };
+  }
+  return {
+    dominance: "NEUTRAL",
+    chiPct,
+    dominancePct: chiPct,
+    label: `NEUTRAL BALANCE (χ=${chiPct}%)`,
+  };
+}

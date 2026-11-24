@@ -33,6 +33,7 @@ import {
 } from "@/lib/persistenceStore";
 import type { DailyTradeStore } from "@/lib/execution/types";
 import { computeTradeRealizedPnl } from "@/lib/execution/pnlAccounting";
+import { evaluateZeroRegimeSwitcher } from "@/lib/zeroRegimeSwitcher";
 
 export interface SessionPlaybookInput {
   sessionDate: string;
@@ -226,6 +227,30 @@ export function evaluateSessionPlaybook(
     preferredDte = "NONE";
   }
 
+  const zeroSwitch = evaluateZeroRegimeSwitcher({
+    sessionDate,
+    ticker: sym,
+    etMins,
+    spotPrice: input.spotPrice,
+    callWall: input.callWall,
+    putWall: input.putWall,
+    zeroGamma: input.zeroGamma,
+    netGex: input.netGex,
+    flowSnapshot: input.flowSnapshot,
+    historicalSessions: input.historicalSessions,
+    baseRegime: regimeInfo.regime,
+    baseShouldStandAside: Boolean(standAsideVetoReason),
+    basePreferredDte: preferredDte,
+  });
+
+  if (!standAsideVetoReason && zeroSwitch.standAsideVetoReason) {
+    standAsideVetoReason = zeroSwitch.standAsideVetoReason;
+    allowedRegimes = [];
+    preferredDte = "NONE";
+  } else if (!standAsideVetoReason) {
+    preferredDte = zeroSwitch.preferredDte;
+  }
+
   // Drawdown protection governor: if 5d drawdown exceeds $150, raise required E[R] & win rate
   if (trailing5dDrawdownDollars >= 150 && !standAsideVetoReason) {
     minExpectancyR = 0.5;
@@ -244,9 +269,12 @@ export function evaluateSessionPlaybook(
 
   const checkpoint = resolveSupervisorCheckpoint(etMins, zeroGammaFlipped);
   const evaluatedAtEt = formatEtTimeShort(nowSec);
+  const zeroMode: NonNullable<SessionPlaybookPolicy["zeroMode"]> = standAsideVetoReason
+    ? "SIT_OUT"
+    : zeroSwitch.mode;
   const summary = standAsideVetoReason
     ? `STAND ASIDE · ${standAsideVetoReason}`
-    : `${regimeInfo.regime} · Pref ${preferredDte} · Min E[R] +${minExpectancyR.toFixed(2)}R (${minWinRatePct.toFixed(0)}% WR)`;
+    : `${regimeInfo.regime} · Mode ${zeroMode} · Pref ${preferredDte} · Min E[R] +${minExpectancyR.toFixed(2)}R (${minWinRatePct.toFixed(0)}% WR)`;
 
   return {
     sessionDate,
@@ -267,6 +295,9 @@ export function evaluateSessionPlaybook(
     wallCorridorPct: regimeInfo.wallCorridorPct,
     absPeclet: regimeInfo.absPeclet,
     summary,
+    zeroMode,
+    zeroModeReason: zeroSwitch.modeReason,
+    tollShieldActive: zeroSwitch.tollShieldActive,
   };
 }
 
@@ -284,6 +315,10 @@ export function shouldRefreshSupervisorCheckpoint(
     Math.abs(currentAbsPeclet) >= 1.2
   ) {
     return true;
+  }
+  if (existing.evaluatedAtTs > 0) {
+    const prevMins = etMinutesOfDay(existing.evaluatedAtTs);
+    if (prevMins < 615 && etMins >= 615) return true;
   }
   const targetCheckpoint = resolveSupervisorCheckpoint(etMins, false);
   if (existing.checkpoint !== targetCheckpoint) return true;

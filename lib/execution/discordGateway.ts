@@ -21,12 +21,20 @@ import {
   saveTradeStore,
 } from "@/lib/execution/ledgerCommit";
 
+export const DISCORD_ALLOWED_TICKERS = ["SPY", "QQQ"] as const;
+
+export function isDiscordTickerAllowed(rawTicker?: string): boolean {
+  const cleaned = (rawTicker || "").trim().toUpperCase().replace(/^\$/, "");
+  return cleaned === "SPY" || cleaned === "QQQ";
+}
+
 export function isAlertDispatchEligible(
   alert: TradeLifecycleAlert,
   realNowTs: number,
   sessionBounds: SessionBoundsEt
 ): boolean {
   if (alert.isHistoricalBackfill) return false;
+  if (!isDiscordTickerAllowed(alert.ticker)) return false;
 
   const etMins = etMinutesOfDay(realNowTs);
   if (alert.action === "BUY_TO_OPEN") {
@@ -114,6 +122,9 @@ export async function sendDiscordTradeAlert(
     return false;
   }
   if (alert.isHistoricalBackfill) {
+    return false;
+  }
+  if (!isDiscordTickerAllowed(alert.ticker)) {
     return false;
   }
 
