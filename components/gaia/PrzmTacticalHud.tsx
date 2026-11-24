@@ -3,8 +3,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useDashboardStore } from "@/store/useDashboardStore";
 import {
-  RTH_CLOSE_MINS,
-  RTH_OPEN_MINS,
+  getSessionBoundsEt,
+  getTodayEt,
   toEpochSec,
 } from "@/lib/gaiaSessionGuards";
 import type { SessionPlaybookPolicy } from "@/lib/persistenceStore";
@@ -653,9 +653,12 @@ export const PrzmTopDeck: React.FC<{
       const sec = parseInt(parts.find((p) => p.type === "second")?.value ?? "0", 10);
       const etMins = hr * 60 + min + sec / 60;
 
-      const rthOpen = RTH_OPEN_MINS; // 570
-      const rthClose = RTH_CLOSE_MINS; // 960
+      const sessionEtDate = getTodayEt(refDate);
+      const bounds = getSessionBoundsEt(sessionEtDate);
+      const rthOpen = bounds.rthOpenMins;
+      const rthClose = bounds.rthCloseMins;
       const totalRth = rthClose - rthOpen;
+      const closeLabel = bounds.isEarlyClose ? "1:00" : "4:00";
 
       if (etMins >= rthOpen && etMins < rthClose) {
         const elapsed = etMins - rthOpen;
@@ -665,7 +668,7 @@ export const PrzmTopDeck: React.FC<{
         const progress = Math.min(1, Math.max(0, elapsed / totalRth));
         return {
           centerLabel: `${remH}h${String(remM).padStart(2, "0")}`,
-          subLabel: isReplayMode ? "REPLAY 9:30>4:00" : "9:30 > 4:00",
+          subLabel: isReplayMode ? `REPLAY 9:30>${closeLabel}` : `9:30 > ${closeLabel}`,
           progress,
           litTicks: Math.max(1, Math.round(progress * 48)),
           isLiveRth: !isReplayMode,

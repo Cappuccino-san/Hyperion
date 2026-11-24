@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useDashboardStore } from "@/store/useDashboardStore";
 import { computeIntradayExpiryYears, normPDF } from "@/lib/optionsExposure";
 import {
-  computeBarFlowGammaVwapSeries,
+  computeCanonicalPdeSeries,
   FlowGammaVwapSnapshot,
 } from "@/lib/flowGammaVwap";
 import {
@@ -667,6 +667,7 @@ export function GaiaView() {
   const setStoreTicker = useDashboardStore((state) => state.setTicker);
   const liveTickPrice = useDashboardStore((state) => state.liveTickPrice);
   const liveTickCount = useDashboardStore((state) => state.liveTickCount);
+  const liveTickMarketOpen = useDashboardStore((state) => state.liveTickMarketOpen);
   const storeActivePositions = useDashboardStore(
     (state) => state.serverActivePositions
   );
@@ -829,11 +830,19 @@ export function GaiaView() {
   const gaiaAbortRef = useRef<AbortController | null>(null);
   const gaiaReqSeqRef = useRef<number>(0);
   const gaiaInFlightRef = useRef<boolean>(false);
+  const hoverRafRef = useRef<number | null>(null);
+  const pendingHoverRef = useRef<{
+    cursor: { x: number; y: number } | null;
+    barIdx: number | null;
+  } | null>(null);
 
   useEffect(() => {
     return () => {
       gaiaAbortRef.current?.abort();
       gaiaInFlightRef.current = false;
+      if (hoverRafRef.current !== null && typeof window !== "undefined") {
+        window.cancelAnimationFrame(hoverRafRef.current);
+      }
     };
   }, []);
 
@@ -968,6 +977,7 @@ export function GaiaView() {
 
   useEffect(() => {
     if (!isReplaying && !isReplayFrozen && !selectedSessionIso) {
+      const pollMs = liveTickMarketOpen === false ? 45_000 : 8_000;
       const liveInterval = setInterval(() => {
         if (
           !isReplayingRef.current &&
@@ -976,14 +986,23 @@ export function GaiaView() {
         ) {
           fetchLiveGaia(loadedTicker, "", startHour, true);
         }
-      }, 8000);
+      }, pollMs);
       return () => clearInterval(liveInterval);
     }
-  }, [loadedTicker, selectedSessionIso, startHour, isReplaying, isReplayFrozen, fetchLiveGaia]);
+  }, [loadedTicker, selectedSessionIso, startHour, isReplaying, isReplayFrozen, liveTickMarketOpen, fetchLiveGaia]);
 
-  // Instant 800ms tick reactivity for GaiaView livePayload spot & candle tip
+  // Instant 800ms tick reactivity for GaiaView livePayload spot & candle tip strictly during active RTH
   useEffect(() => {
-    if (!liveTickPrice || liveTickPrice <= 0 || isReplaying || isReplayFrozen || Boolean(selectedSessionIso)) return;
+    if (
+      liveTickMarketOpen !== true ||
+      !liveTickPrice ||
+      liveTickPrice <= 0 ||
+      isReplaying ||
+      isReplayFrozen ||
+      Boolean(selectedSessionIso)
+    ) {
+      return;
+    }
     if (storeTicker.toUpperCase() !== loadedTicker.toUpperCase()) return;
     setLivePayload((prev) => {
       if (
@@ -1143,13 +1162,30 @@ export function GaiaView() {
 
   const flowVwapPoints = useMemo<FlowGammaVwapSnapshot[]>(() => {
     if (!dataset?.candles || dataset.candles.length === 0) return [];
-    const optionsBook = (livePayload?.optionBuckets || []).map((b) => ({
-      strike: b.strike,
-      gamma: (b.callGamma || 0) + (b.putGamma || 0),
-      volume: (b.callOI || 0) * 0.1 + (b.putOI || 0) * 0.1,
-    }));
-    return computeBarFlowGammaVwapSeries(dataset.candles, optionsBook);
-  }, [dataset?.candles, livePayload?.optionBuckets]);
+    const allowLiveWalls =
+      !isHistoricalOrReplay &&
+      storeHeatmapTicker?.toUpperCase() === loadedTicker?.toUpperCase();
+    return computeCanonicalPdeSeries({
+      candles: dataset.candles,
+      optionBuckets: livePayload?.optionBuckets,
+      structuralNodes: allowLiveWalls
+        ? {
+            callWall: gammaLevels?.callWall,
+            putWall: gammaLevels?.putWall,
+            zeroGamma: gammaLevels?.zeroGamma,
+          }
+        : undefined,
+    });
+  }, [
+    dataset?.candles,
+    livePayload?.optionBuckets,
+    isHistoricalOrReplay,
+    storeHeatmapTicker,
+    loadedTicker,
+    gammaLevels?.callWall,
+    gammaLevels?.putWall,
+    gammaLevels?.zeroGamma,
+  ]);
 
   const precomputedChartTrades = useMemo<NormalizedChartTrade[]>(
     () =>
@@ -1457,8 +1493,6 @@ export function GaiaView() {
     const mouseX = (e.clientX - rect.left) * scaleX;
     const mouseY = (e.clientY - rect.top) * scaleY;
 
-    setHoverCursor({ x: mouseX, y: mouseY });
-
     const padLeft = CHART_PAD_LEFT;
     const rightAxisWidth = CHART_RIGHT_AXIS_WIDTH;
     const padTop = CHART_PAD_TOP;
@@ -1499,30 +1533,41 @@ export function GaiaView() {
       return;
     }
 
-    if (mouseX < padLeft || mouseX > dividerX) {
-      setHoverBarIndex(null);
-      return;
+    let nextBarIdx: number | null = null;
+    if (mouseX >= padLeft && mouseX <= dividerX) {
+      const axisStartMins = startHour === 0 ? 0 : startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
+      const axisEndMins = startHour === 0 ? 1440 : 1020;
+      const totalSessionSlots = Math.round((axisEndMins - axisStartMins) / 5);
+      const stepX = (sessionWidth / totalSessionSlots) * xScale;
+      let bestBarIdx = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i <= safeActiveIdx; i++) {
+        const c = dataset.candles[i];
+        const etMins = c ? getCandleEtMinutes(c) : null;
+        const slotIdx = etMins !== null ? (etMins - axisStartMins) / 5 : i;
+        const cx = padLeft + xPanOffset + (slotIdx + 0.5) * stepX;
+        const d = Math.abs(cx - mouseX);
+        if (d < bestDist) {
+          bestDist = d;
+          bestBarIdx = i;
+        }
+      }
+      nextBarIdx = Math.max(0, Math.min(safeActiveIdx, bestBarIdx));
     }
 
-    const axisStartMins = startHour === 0 ? 0 : startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
-    const axisEndMins = startHour === 0 ? 1440 : 1020;
-    const totalSessionSlots = Math.round((axisEndMins - axisStartMins) / 5);
-    const stepX = (sessionWidth / totalSessionSlots) * xScale;
-    let bestBarIdx = 0;
-    let bestDist = Infinity;
-    for (let i = 0; i <= safeActiveIdx; i++) {
-      const c = dataset.candles[i];
-      const etMins = c ? getCandleEtMinutes(c) : null;
-      const slotIdx = etMins !== null ? (etMins - axisStartMins) / 5 : i;
-      const cx = padLeft + xPanOffset + (slotIdx + 0.5) * stepX;
-      const d = Math.abs(cx - mouseX);
-      if (d < bestDist) {
-        bestDist = d;
-        bestBarIdx = i;
-      }
+    pendingHoverRef.current = {
+      cursor: { x: mouseX, y: mouseY },
+      barIdx: nextBarIdx,
+    };
+    if (hoverRafRef.current === null && typeof window !== "undefined") {
+      hoverRafRef.current = window.requestAnimationFrame(() => {
+        hoverRafRef.current = null;
+        const pending = pendingHoverRef.current;
+        if (!pending) return;
+        setHoverCursor(pending.cursor);
+        setHoverBarIndex((prev) => (prev === pending.barIdx ? prev : pending.barIdx));
+      });
     }
-    const barIdx = Math.max(0, Math.min(safeActiveIdx, bestBarIdx));
-    setHoverBarIndex(barIdx);
   };
 
   const handleCanvasMouseUp = () => {
@@ -1531,6 +1576,11 @@ export function GaiaView() {
   };
 
   const handleCanvasMouseLeave = () => {
+    pendingHoverRef.current = null;
+    if (hoverRafRef.current !== null && typeof window !== "undefined") {
+      window.cancelAnimationFrame(hoverRafRef.current);
+      hoverRafRef.current = null;
+    }
     setHoverBarIndex(null);
     setHoverCursor(null);
   };
@@ -1635,6 +1685,9 @@ export function GaiaView() {
       const barLabel = dataset?.candles[safeActiveIdx]?.timeLabel;
       return barLabel ? barLabel.replace(/\s*ET$/i, "") : "REPLAY";
     }
+    if (liveTickMarketOpen === false) {
+      return "RTH CLOSED";
+    }
     const now = new Date();
     const rem = 300 - ((now.getUTCMinutes() % 5) * 60 + now.getUTCSeconds());
     const m = Math.floor(rem / 60);
@@ -1695,10 +1748,16 @@ export function GaiaView() {
     const width = canvasWidth;
     const height = chartHeight;
 
-    canvas.width = Math.floor(width * dpr);
-    canvas.height = Math.floor(height * dpr);
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
+    const targetW = Math.floor(width * dpr);
+    const targetH = Math.floor(height * dpr);
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+    } else {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    }
 
     ctx.save();
     ctx.scale(dpr, dpr);
@@ -2251,8 +2310,76 @@ export function GaiaView() {
       ctx.restore();
     }
 
-    // Clean Minimalist Outlook: All heavy cone fills, diagonal ray fans, and floating pills purged.
-    // Price levels are displayed in the right Y-axis gutter.
+    // =========================================================================
+    // LAYER 4: Right-Gutter Dealer GEX/VEX Strike Profile Histogram & ±1σ EM Bracket
+    // =========================================================================
+    const gutterWidth = Math.max(0, outlookRightX - dividerX);
+    if (gutterWidth >= 18) {
+      const profileCol = structuralBookCol ?? activeBookCol;
+      const profileValues = profileCol?.strikeValues ?? {};
+      const maxProfileAbs = Math.max(
+        1,
+        ...dataset.visibleStrikes.map((st) => Math.abs(profileValues[st] ?? 0))
+      );
+      const maxBarSpan = Math.max(8, gutterWidth - 10);
+      const barBaseRightX = outlookRightX - 3;
+
+      // Subtle ±1σ Daily Expected-Move Bracket anchored to Prior Close
+      if (dataset.priorClose > 0 && dataset.sigma1Move > 0) {
+        const emHighY = priceToY(dataset.priorClose + dataset.sigma1Move);
+        const emLowY = priceToY(dataset.priorClose - dataset.sigma1Move);
+        const clampedTopY = Math.max(padTop + 2, Math.min(height - padBottom - 2, emHighY));
+        const clampedBotY = Math.max(padTop + 2, Math.min(height - padBottom - 2, emLowY));
+        ctx.save();
+        ctx.fillStyle = "rgba(56, 189, 248, 0.045)";
+        ctx.fillRect(
+          dividerX + 1,
+          clampedTopY,
+          gutterWidth - 2,
+          Math.max(1, clampedBotY - clampedTopY)
+        );
+        ctx.strokeStyle = "rgba(56, 189, 248, 0.32)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        for (const emY of [emHighY, emLowY]) {
+          if (emY >= padTop + 2 && emY <= height - padBottom - 2) {
+            ctx.beginPath();
+            ctx.moveTo(dividerX + 2, emY);
+            ctx.lineTo(outlookRightX - 2, emY);
+            ctx.stroke();
+          }
+        }
+        ctx.setLineDash([]);
+        ctx.restore();
+      }
+
+      // Horizontal strike exposure bars aligned 1:1 with priceToY(strike)
+      const stepPx =
+        dataset.visibleStrikes.length >= 2
+          ? Math.abs(
+              priceToY(dataset.visibleStrikes[0]) -
+                priceToY(dataset.visibleStrikes[1])
+            )
+          : 8;
+      const barH = Math.max(2, Math.min(7, stepPx * 0.62));
+      ctx.save();
+      for (const st of dataset.visibleStrikes) {
+        const val = profileValues[st] ?? 0;
+        if (Math.abs(val) <= 0) continue;
+        const y = priceToY(st);
+        if (y < padTop + 2 || y > height - padBottom - 2) continue;
+        const norm = Math.min(1, Math.abs(val) / maxProfileAbs);
+        const w = Math.max(2, norm * maxBarSpan);
+        const isKingRow = st === allExpKingStrike || st === filteredKingStrike;
+        ctx.fillStyle = isKingRow
+          ? "rgba(250, 204, 21, 0.88)"
+          : val >= 0
+            ? "rgba(34, 211, 238, 0.62)"
+            : "rgba(168, 85, 247, 0.62)";
+        ctx.fillRect(barBaseRightX - w, y - barH / 2, w, barH);
+      }
+      ctx.restore();
+    }
 
     // =========================================================================
     // LAYER 5.5: Authoritative Server Trades Execution Overlay (BTO/STC Markers, Trajectory & PnL Badges)
@@ -2886,27 +3013,27 @@ export function GaiaView() {
         </div>
 
         {guideExpanded && (
-          <div className="bg-[#101520] border border-[#1e2638] rounded-xl px-4 pb-4 pt-3 grid grid-cols-1 md:grid-cols-[150px_1fr] gap-y-2.5 gap-x-4 text-xs leading-relaxed">
-            <div className="font-bold text-white">Position Growth</div>
+          <div className="bg-[#101520] border border-[#1e2638] rounded-xl px-4 pb-4 pt-3 grid grid-cols-1 md:grid-cols-[165px_1fr] gap-y-2.5 gap-x-4 text-xs leading-relaxed">
+            <div className="font-bold text-white">Candles &amp; Flow VWAP</div>
             <div className="text-slate-300">
-              Each strike level displays position growth across the session in 5-minute beads. As positioning builds or dealers re-hedge near spot, beads swell and glow intensely. King nodes are radiant circles (●), Call Walls are diamonds (◆), and Put Walls are triangles (▲/▼).
+              Regular session (09:30–16:00 ET, or 13:00 ET on NYSE half-days) in causal 5-minute candles overlaid with Spectral PDE Flow-VWAP, dynamic &plusmn;1&sigma;/&plusmn;2&sigma; dispersion bands, and 5m SMA(34).
             </div>
 
-            <div className="font-bold text-white">Candles</div>
+            <div className="font-bold text-white">Right-Gutter GEX/VEX</div>
             <div className="text-slate-300">
-              One regular session (9:30am–4pm ET) in 5-minute candles. Blue/Green closed up, Slate/Red closed down.
+              The right-hand outlook gutter renders live horizontal strike exposure bars (<span className="text-cyan-300 font-semibold">+GEX/+VEX</span> in cyan, <span className="text-purple-300 font-semibold">-GEX/-VEX</span> in purple, <span className="text-amber-300 font-semibold">King</span> in gold) inside the dashed &plusmn;1&sigma; daily Expected-Move bracket.
             </div>
 
-            <div className="font-bold text-white">Divergence</div>
+            <div className="font-bold text-white">MTF Divergence</div>
             <div className="text-slate-300">
-              SPY, QQQ, SPXW and IWM only. The table at the chart&apos;s top-left reads{" "}
-              <span className="text-[#22c55e] font-bold">BULL</span> when price made a lower low while RSI(14) and the MACD(12,26,9) histogram both made a higher low on the same two pivots,{" "}
-              <span className="text-[#ef4444] font-bold">BEAR</span> for a higher high with both making a lower high, and NO otherwise.
+              Non-repainting 3-left / 3-right pivot confirmation on SPY, QQQ, SPXW, and IWM:{" "}
+              <span className="text-[#22c55e] font-bold">BULL</span> when price prints a lower low while both RSI(14) and MACD(12,26,9) histogram print higher lows;{" "}
+              <span className="text-[#ef4444] font-bold">BEAR</span> on a higher high with lower highs on both oscillators.
             </div>
 
-            <div className="font-bold text-white">Expected Cone & Rays</div>
+            <div className="font-bold text-white">Execution Markers</div>
             <div className="text-slate-300">
-              The cone on the right is the options-implied range from prior close: inner is 1σ (~68%), outer is 2σ (~95%). Luminous volumetric rays beam towards the primary gravitational strikes.
+              Authoritative server <span className="text-emerald-300 font-semibold">BTO</span> / <span className="text-amber-300 font-semibold">STC</span> markers reflect Paper/Shadow single-contract sniper entries (09:35–14:30 ET) and mandatory 15:55 ET (12:55 ET half-day) MOC exits.
             </div>
           </div>
         )}

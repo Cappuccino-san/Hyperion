@@ -237,7 +237,7 @@ function formatTimeEt(epochMs: number): { short: string; full: string; isMajor: 
   return { short, full, isMajor, isRthOpen };
 }
 
-export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
+const GaiaCallPutBiasHudInner: React.FC<GaiaCallPutBiasHudProps> = ({
   symbol,
   ticker,
   candles,
@@ -270,6 +270,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   const executionArmState = useDashboardStore((s) => s.executionArmState);
   const liveTickPrice = useDashboardStore((s) => s.liveTickPrice);
   const liveTickCount = useDashboardStore((s) => s.liveTickCount);
+  const liveTickMarketOpen = useDashboardStore((s) => s.liveTickMarketOpen);
   const gammaLevels = useDashboardStore((s) => s.gammaLevels);
   const netMetrics = useDashboardStore((s) => s.netMetrics);
   const rawLiveSpot = typeof liveSpot === "number" && liveSpot > 0 ? liveSpot : typeof spot === "number" && spot > 0 ? spot : null;
@@ -465,16 +466,19 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
         cloned[lastIdx].low = Math.min(cloned[lastIdx].open, prevClose);
       }
 
-      // Live Sub-Second Real-Time Tick Sync (800ms stream from /api/tick or verified liveSpot)
-      const tickerMatchedTick = storeActiveTicker.toUpperCase() === activeSymbol ? liveTickPrice : null;
+      // Live Sub-Second Real-Time Tick Sync strictly during active RTH (never mutate 15:55 RTH close candle off-hours)
+      const tickerMatchedTick =
+        liveTickMarketOpen === true && storeActiveTicker.toUpperCase() === activeSymbol
+          ? liveTickPrice
+          : null;
       const verifiedLivePrice =
         typeof tickerMatchedTick === "number" && tickerMatchedTick > 0 && !STATIC_PRESET_SPOTS.has(Number(tickerMatchedTick.toFixed(2)))
           ? tickerMatchedTick
-          : typeof rawLiveSpot === "number" && rawLiveSpot > 0 && !STATIC_PRESET_SPOTS.has(Number(rawLiveSpot.toFixed(2)))
+          : liveTickMarketOpen === true && typeof rawLiveSpot === "number" && rawLiveSpot > 0 && !STATIC_PRESET_SPOTS.has(Number(rawLiveSpot.toFixed(2)))
             ? rawLiveSpot
             : null;
 
-      if (!isReplayMode && verifiedLivePrice !== null) {
+      if (!isReplayMode && liveTickMarketOpen === true && verifiedLivePrice !== null) {
         const relDiff = Math.abs(verifiedLivePrice - cloned[lastIdx].close) / Math.max(1, cloned[lastIdx].close);
         if (relDiff <= 0.005) {
           cloned[lastIdx].close = verifiedLivePrice;
@@ -485,7 +489,7 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
     }
 
     return cloned;
-  }, [candles, bars, rawLiveSpot, storeActiveTicker, liveTickPrice, liveTickCount, activeSymbol, isReplayMode]);
+  }, [candles, bars, rawLiveSpot, storeActiveTicker, liveTickPrice, liveTickCount, liveTickMarketOpen, activeSymbol, isReplayMode]);
 
   // 2. Compute Bar-by-Bar Flow VWAP & Spectral Flux Series (preferring canonical parent series)
   const pdeSeries = useMemo(() => {
@@ -1210,58 +1214,6 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
       boundaryFlux: pt.netFlux,
     }));
   }, [enrichedPoints, effectiveCandles]);
-
-  // Auto-sync active Gaia signals directly to Discord trade-signals engine
-  const lastSyncedGaiaSigFingerprint = useRef<string>("");
-  useEffect(() => {
-    const todayEt = getTodayEt();
-    if (
-      isReplayMode ||
-      executionArmState === "LOCKED" ||
-      (sessionDate && sessionDate !== todayEt) ||
-      !activeSymbol ||
-      effectiveCandles.length === 0 ||
-      !przmSignals ||
-      przmSignals.length === 0 ||
-      !activeSpotPrice ||
-      activeSpotPrice <= 0
-    ) {
-      return;
-    }
-    const fingerprint =
-      `${activeSymbol}::` +
-      przmSignals
-        .map((s) => `${s.id}:${s.type}:${s.time}:${s.price.toFixed(2)}`)
-        .join("|");
-    if (fingerprint === lastSyncedGaiaSigFingerprint.current) return;
-
-    const controller = new AbortController();
-    fetch("/api/signals", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "SYNC_GAIA_TICKER_SIGNALS",
-        ticker: activeSymbol,
-        sessionDate,
-        isHistoricalBackfill: Boolean(sessionDate && sessionDate !== todayEt),
-        signals: przmSignals,
-        spotPrice: activeSpotPrice,
-        activeFsmState: fsmCommittedState,
-        macroRegime: activeRegime,
-        chiPct: activeChiPct,
-        impulseChi: latestPt?.impulseChi,
-        zeroGamma: typeof gammaLevels?.zeroGamma === "number" && gammaLevels.zeroGamma > 0 ? gammaLevels.zeroGamma : undefined,
-      }),
-      signal: controller.signal,
-    })
-      .then((res) => {
-        if (res.ok && !controller.signal.aborted) {
-          lastSyncedGaiaSigFingerprint.current = fingerprint;
-        }
-      })
-      .catch(() => {});
-    return () => controller.abort();
-  }, [isReplayMode, executionArmState, sessionDate, activeSymbol, effectiveCandles.length, przmSignals, activeSpotPrice, fsmCommittedState, activeRegime, activeChiPct, latestPt?.impulseChi, gammaLevels?.zeroGamma]);
 
   const invalidateSvgCtm = useCallback(() => {
     cachedInverseCtmRef.current = null;
@@ -2293,4 +2245,5 @@ export const GaiaCallPutBiasHud: React.FC<GaiaCallPutBiasHudProps> = ({
   );
 };
 
+export const GaiaCallPutBiasHud = React.memo(GaiaCallPutBiasHudInner);
 export default GaiaCallPutBiasHud;

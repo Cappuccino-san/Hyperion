@@ -12,6 +12,7 @@ import { useDashboardStore } from "@/store/useDashboardStore";
  */
 export function GlobalMarketDataSync() {
   const activeTicker = useDashboardStore((state) => state.activeTicker);
+  const liveTickMarketOpen = useDashboardStore((state) => state.liveTickMarketOpen);
   const fetchOptionsChain = useDashboardStore((state) => state.fetchOptionsChain);
   const fetchServerTrades = useDashboardStore((state) => state.fetchServerTrades);
   const hydrateDiscordConfig = useDashboardStore((state) => state.hydrateDiscordConfig);
@@ -24,18 +25,21 @@ export function GlobalMarketDataSync() {
     // Initial fetch on mount or ticker change
     void fetchOptionsChain(activeTicker);
     void fetchServerTrades(activeTicker);
+  }, [activeTicker, fetchOptionsChain, fetchServerTrades]);
 
-    // Continuous 5-second market heartbeat (skip while tab is backgrounded)
+  useEffect(() => {
+    // Adaptive market heartbeat: 5s during active RTH, 45s backoff off-hours / weekends
+    const pollIntervalMs = liveTickMarketOpen === false ? 45_000 : 5_000;
     const interval = setInterval(() => {
       if (typeof document !== "undefined" && document.visibilityState !== "visible") {
         return;
       }
       void fetchOptionsChain(activeTicker);
       void fetchServerTrades(activeTicker);
-    }, 5_000);
+    }, pollIntervalMs);
 
     return () => clearInterval(interval);
-  }, [activeTicker, fetchOptionsChain, fetchServerTrades]);
+  }, [activeTicker, liveTickMarketOpen, fetchOptionsChain, fetchServerTrades]);
 
   return null;
 }

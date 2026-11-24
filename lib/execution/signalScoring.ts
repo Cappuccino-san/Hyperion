@@ -334,8 +334,10 @@ export function evaluateUnifiedSniperSetup(
     isOpeningHourFlushWindow &&
     spot < vwap &&
     spot < sma34 &&
+    vwapSlope <= -minVwapSlope * 0.5 &&
     features.gammaRegime < 0 &&
-    (bar.close < bar.open || bar.close < prevBar.close)
+    bar.close < bar.open &&
+    bar.close <= prevBar.close
   ) {
     direction = "SHORT";
     setupName = "Bearish Zero-Gamma Flush [BTO PUT]";
@@ -559,8 +561,11 @@ export function evaluateBtoCandidateSetup(input: {
       ? latest5mCandle.sma34
       : priorCloseRef;
   const isOpeningHour = etTotalMinutes >= sessionBounds.entryStartMins && etTotalMinutes <= 630;
+  const tickerMacroRegime =
+    store.gaiaStateByTicker?.[normalizedTicker]?.macroRegime ??
+    (normalizedTicker === "SPY" && !store.gaiaStateByTicker ? store.macroRegime : undefined);
   const isShortGammaOrRedFlux =
-    currentChi < 0.45 || currentNetFlux < 0 || isOpeningNegativeGamma || store.macroRegime === "PUT";
+    currentChi < 0.45 || currentNetFlux < 0 || isOpeningNegativeGamma || tickerMacroRegime === "PUT";
   const entryAtr5m: number =
     flowSnap && typeof flowSnap.atr5m === "number" && flowSnap.atr5m > 0
       ? flowSnap.atr5m
@@ -795,7 +800,7 @@ export function evaluateBtoCandidateSetup(input: {
     spotPrice > effectiveFlowVwap &&
     spotPrice > effectiveSma34;
   const hasPositiveFluxImpulse =
-    currentChi >= 0.48 || currentNetFlux > 0 || currentPe >= 0.40 || store.macroRegime === "CALL";
+    currentChi >= 0.48 || currentNetFlux > 0 || currentPe >= 0.40 || tickerMacroRegime === "CALL";
   if (
     !candidateBto &&
     isMiddayReclaimWindow &&
@@ -840,7 +845,8 @@ export function evaluateBtoCandidateSetup(input: {
           (spotPrice <= flowSnap.lower1Sigma * 1.0015 || recent5mLow <= flowSnap.lower1Sigma) &&
           divergence5m === "BULL" &&
           spotPrice >= effectiveFlowVwap)) &&
-      currentChi >= 0.45 &&
+      currentChi >= 0.48 &&
+      (currentNetFlux >= 0 || latest5mCandle.close >= latest5mCandle.sma34) &&
       hasAdequateCallRoomToWall &&
       latest5mCandle.close > latest5mCandle.open &&
       (flowSnap.flowVwap > spotPrice + spotPrice * 0.0003 || (isPositiveGammaRegime && spotPrice >= flowSnap.flowVwap))
@@ -878,7 +884,8 @@ export function evaluateBtoCandidateSetup(input: {
           (spotPrice >= flowSnap.upper1Sigma * 0.9985 || recent5mHigh >= flowSnap.upper1Sigma) &&
           divergence5m === "BEAR" &&
           spotPrice <= effectiveFlowVwap)) &&
-      currentChi <= 0.55 &&
+      currentChi <= 0.52 &&
+      (currentNetFlux <= 0 || latest5mCandle.close <= latest5mCandle.sma34) &&
       hasAdequatePutRoomToWall &&
       latest5mCandle.close < latest5mCandle.open &&
       latest5mCandle.close <= latest5mCandle.sma34 &&
@@ -1107,14 +1114,27 @@ export function evaluateBtoCandidateSetup(input: {
     latest5mCandle &&
     latest5mCandle.close <= latest5mCandle.sma34
   );
+  const hasConfirmedAdvectionReclaim = Boolean(
+    !isOpeningRange &&
+      etTotalMinutes >= 585 &&
+      spotPrice > effectiveFlowVwap &&
+      spotPrice > effectiveSma34 &&
+      impChi >= 0.72 &&
+      impPe >= 1.8 &&
+      currentNetFlux > 0 &&
+      deltaFlux6 >= 0 &&
+      barBody > 0 &&
+      barBody <= maxSignalBarBody * 1.35
+  );
   const isCounterTrendCallBlocked = Boolean(
     !hasBullImpulseReclaim &&
+    !hasConfirmedAdvectionReclaim &&
     !hasPositiveGammaPutSweepBounce && (
     (zeroGamma > 0 && spotPrice < zeroGamma) ||
     (flowSnap && typeof flowSnap.flowVwap === "number" && spotPrice < flowSnap.flowVwap) ||
     (latest5mCandle && typeof latest5mCandle.sma34 === "number" && spotPrice < latest5mCandle.sma34) ||
     currentChi < 0.50 ||
-    store.macroRegime === "PUT" ||
+    tickerMacroRegime === "PUT" ||
     isOpeningNegativeGamma ||
     (isOpeningRange && (currentChi < 0.50 || isOpeningNegativeGamma)))
   );
@@ -1206,6 +1226,7 @@ export function evaluateBtoCandidateSetup(input: {
       sameTickerClosedCount < 4 &&
       typeof prevClosedTrade.pnlOptionPct === "number" &&
       prevClosedTrade.pnlOptionPct >= 25 &&
+      !/WALL/i.test(prevClosedTrade.exitReason || "") &&
       typeof prevClosedTrade.closedTs === "number" &&
       nowTs - prevClosedTrade.closedTs >= 900 &&
       etTotalMinutes >= 630 &&
@@ -1213,23 +1234,19 @@ export function evaluateBtoCandidateSetup(input: {
       !(callClosedCountToday >= 1 && putClosedCountToday >= 1) &&
       Math.abs(impPe) >= 1.8 &&
       (prevClosedTrade.contractType === "PUT"
-        ? putClosedCountToday < 2 && impChi <= 0.35 && spotPrice < effectiveFlowVwap && spotPrice < effectiveSma34 && (effectiveZeroGamma <= 0 || spotPrice < effectiveZeroGamma)
-        : callClosedCountToday < 2 && impChi >= 0.65 && spotPrice > effectiveFlowVwap && spotPrice > effectiveSma34 && (effectiveZeroGamma <= 0 || spotPrice > effectiveZeroGamma))
+        ? putClosedCountToday < 2 &&
+          impChi <= 0.35 &&
+          spotPrice < effectiveFlowVwap &&
+          spotPrice < effectiveSma34 &&
+          (!prevClosedTrade.closedSpotPrice || spotPrice < prevClosedTrade.closedSpotPrice) &&
+          (effectiveZeroGamma <= 0 || spotPrice < effectiveZeroGamma)
+        : callClosedCountToday < 2 &&
+          impChi >= 0.65 &&
+          spotPrice > effectiveFlowVwap &&
+          spotPrice > effectiveSma34 &&
+          (!prevClosedTrade.closedSpotPrice || spotPrice > prevClosedTrade.closedSpotPrice) &&
+          (effectiveZeroGamma <= 0 || spotPrice > effectiveZeroGamma))
   );
-  if (candidateBto) {
-    const dirCapHit =
-      (candidateBto.contractType === "CALL" && callClosedCountToday >= 2) ||
-      (candidateBto.contractType === "PUT" && putClosedCountToday >= 2);
-    const sameDirBlocked =
-      sameTickerClosedCount >= 1 &&
-      prevClosedTrade &&
-      candidateBto.contractType === prevClosedTrade.contractType &&
-      !isShakeoutRecoveryWindow &&
-      !isWinningTrendContinuation;
-    if (dirCapHit || sameDirBlocked) {
-      candidateBto = null;
-    }
-  }
   if (!candidateBto) {
     const baseCallRejectRef =
       dailyExpectedMove?.high &&
@@ -1484,6 +1501,7 @@ export function evaluateBtoCandidateSetup(input: {
   if (
     !candidateBto &&
     hasBullImpulseReclaim &&
+    fluxZScore <= 0.95 &&
     hasAdequateCallRoomToWall &&
     (tacticalPw > 0 ? spotPrice >= tacticalPw * 0.9965 : true)
   ) {
@@ -1515,6 +1533,7 @@ export function evaluateBtoCandidateSetup(input: {
   if (
     !candidateBto &&
     hasBearImpulseRejection &&
+    fluxZScore >= -0.95 &&
     hasAdequatePutRoomToWall &&
     (tacticalCw > 0 ? spotPrice <= tacticalCw * 1.0035 : true)
   ) {
@@ -1544,6 +1563,25 @@ export function evaluateBtoCandidateSetup(input: {
     }
   }
 
+  // Post-Setup Direction Cap (2C / 2P), Same-Direction Continuation Gate & 30m Opposite-Leg Cooldown
+  if (candidateBto && sameTickerClosedCount >= 1 && prevClosedTrade) {
+    const dirCapHit =
+      (candidateBto.contractType === "CALL" && callClosedCountToday >= 2) ||
+      (candidateBto.contractType === "PUT" && putClosedCountToday >= 2);
+    const sameDirBlocked =
+      candidateBto.contractType === prevClosedTrade.contractType &&
+      !isShakeoutRecoveryWindow &&
+      !isWinningTrendContinuation;
+    const oppDirBeforeCooldown =
+      candidateBto.contractType !== prevClosedTrade.contractType &&
+      (!prevClosedTrade.closedTs ||
+        nowTs - prevClosedTrade.closedTs < 1800 ||
+        etTotalMinutes < 630);
+    if (dirCapHit || sameDirBlocked || oppDirBeforeCooldown) {
+      candidateBto = null;
+    }
+  }
+
   // Opening Horizon Alignment (09:35-10:00 ET)
   if (candidateBto && etTotalMinutes < 600) {
     const pre1000Check = evaluateOpeningHorizonAlignment({
@@ -1566,7 +1604,13 @@ export function evaluateBtoCandidateSetup(input: {
   }
 
   // Asymmetric Leg-2 Structural Gating & Anti-Whipsaw Firewall (10:30-cutoff ET, >= 30m cooldown, opposite dir)
-  if (candidateBto && isPhase2ReclaimWindow && lastClosed && !(isWinningTrendContinuation && candidateBto.contractType === lastClosed.contractType)) {
+  if (
+    candidateBto &&
+    sameTickerClosedCount >= 1 &&
+    lastClosed &&
+    !(isShakeoutRecoveryWindow && candidateBto.contractType === lastClosed.contractType) &&
+    !(isWinningTrendContinuation && candidateBto.contractType === lastClosed.contractType)
+  ) {
     const effectiveDeltaChi6 =
       deltaChi6 !== 0
         ? deltaChi6
@@ -1601,6 +1645,8 @@ export function evaluateBtoCandidateSetup(input: {
       impulseChi: impChi,
       deltaChi6Bar: effectiveDeltaChi6,
       impulsePeclet: impPe,
+      ceilingShareChi: currentChi,
+      netFluxJ: currentNetFlux,
     });
     const requiredLeg2Room = isShakeoutRecoveryWindow
       ? Math.max(2.25, entryMetrics.minWallRoom)
@@ -1734,19 +1780,21 @@ export function evaluateBtoCandidateSetup(input: {
         : spotPrice * 0.012;
     const emRemaining = baseDailyEm * Math.sqrt(remainingMins / 390);
     const minT1AtrDist = Math.max(entryAtr5m, spotPrice * 0.0005);
+    const setupRiskDist = Math.max(minRiskFloor, Math.abs(spotPrice - candidateBto.stopLossSpot));
+    const minT1RiskDist = Math.max(minT1AtrDist, setupRiskDist * 1.52);
 
     if (candidateBto.contractType === "CALL") {
       const isCallWallFar = tacticalCw <= spotPrice || tacticalCw - spotPrice > 1.5 * entryAtr5m;
-      if (isCallWallFar && upperBand2 > spotPrice) {
+      if (isCallWallFar && upperBand2 > spotPrice + minT1RiskDist) {
         candidateBto.target1Spot = Number(Math.min(candidateBto.target1Spot, upperBand2).toFixed(2));
       }
-      const emCappedT1 = spotPrice + Math.max(minT1AtrDist, emRemaining * 0.65);
-      const emCappedT2 = spotPrice + Math.max(minT1AtrDist * 1.25, emRemaining);
+      const emCappedT1 = spotPrice + Math.max(minT1RiskDist, emRemaining * 0.65);
+      const emCappedT2 = spotPrice + Math.max(minT1RiskDist * 1.25, emRemaining);
       const wallCap = tacticalCw > spotPrice ? tacticalCw : Number.POSITIVE_INFINITY;
       const boundedT1 = Math.min(
         wallCap,
         Math.max(
-          Math.min(wallCap, spotPrice + minT1AtrDist),
+          Math.min(wallCap, spotPrice + minT1RiskDist),
           Math.min(candidateBto.target1Spot, emCappedT1)
         )
       );
@@ -1757,16 +1805,16 @@ export function evaluateBtoCandidateSetup(input: {
     } else {
       const isPutWallFar =
         tacticalPw <= 0 || tacticalPw >= spotPrice || spotPrice - tacticalPw > 1.5 * entryAtr5m;
-      if (isPutWallFar && lowerBand2 > 0 && lowerBand2 < spotPrice) {
+      if (isPutWallFar && lowerBand2 > 0 && lowerBand2 < spotPrice - minT1RiskDist) {
         candidateBto.target1Spot = Number(Math.max(candidateBto.target1Spot, lowerBand2).toFixed(2));
       }
-      const emCappedT1 = spotPrice - Math.max(minT1AtrDist, emRemaining * 0.65);
-      const emCappedT2 = spotPrice - Math.max(minT1AtrDist * 1.25, emRemaining);
+      const emCappedT1 = spotPrice - Math.max(minT1RiskDist, emRemaining * 0.65);
+      const emCappedT2 = spotPrice - Math.max(minT1RiskDist * 1.25, emRemaining);
       const wallFloor = tacticalPw > 0 && tacticalPw < spotPrice ? tacticalPw : 0;
       const boundedT1 = Math.max(
         wallFloor,
         Math.min(
-          Math.max(wallFloor, spotPrice - minT1AtrDist),
+          Math.max(wallFloor, spotPrice - minT1RiskDist),
           Math.max(candidateBto.target1Spot, emCappedT1)
         )
       );

@@ -15,6 +15,8 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
   const updateDiscordConfig = useDashboardStore(
     (state) => state.updateDiscordConfig
   );
+  const adminToken = useDashboardStore((state) => state.adminToken);
+  const setAdminToken = useDashboardStore((state) => state.setAdminToken);
   const activeTicker = useDashboardStore((state) => state.activeTicker);
   const spotPrice = useDashboardStore((state) => state.spotPrice);
   const gammaLevels = useDashboardStore((state) => state.gammaLevels);
@@ -22,6 +24,7 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
 
   const [url, setUrl] = useState(discordConfig.webhookUrl || "");
   const [enabled, setEnabled] = useState(discordConfig.enabled ?? false);
+  const [tokenInput, setTokenInput] = useState(adminToken || "");
 
   const [testState, setTestState] = useState<"idle" | "sending" | "success" | "error">(
     "idle"
@@ -33,12 +36,14 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
     if (open) {
       setUrl(discordConfig.webhookUrl || "");
       setEnabled(discordConfig.enabled ?? false);
+      setTokenInput(adminToken || "");
       setTestState("idle");
       setTestMessage(null);
     }
-  }, [open, discordConfig]);
+  }, [open, discordConfig, adminToken]);
 
   const handleSave = () => {
+    setAdminToken(tokenInput);
     updateDiscordConfig({
       webhookUrl: url.trim(),
       enabled,
@@ -48,6 +53,7 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
 
   const handleSendTest = async () => {
     const targetUrl = url.trim();
+    const activeToken = tokenInput.trim() || adminToken.trim();
 
     setTestState("sending");
     setTestMessage(null);
@@ -55,7 +61,10 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
     try {
       const res = await fetch("/api/discord", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(activeToken ? { "x-hyperion-admin-token": activeToken } : {}),
+        },
         body: JSON.stringify({
           ...(targetUrl ? { webhookUrl: targetUrl } : {}),
           ticker: activeTicker,
@@ -138,6 +147,28 @@ export function SetupModal({ open, onOpenChange }: SetupModalProps) {
               />
               <p className="text-[11px] font-mono text-slate-400">
                 Recommended: set <code className="text-slate-300">DISCORD_WEBHOOK_URL</code> in server <code className="text-slate-300">.env.local</code>. Any URL entered here stays in memory only (never saved to localStorage) and is disabled in production.
+              </p>
+            </div>
+
+            {/* Operator Admin Token Input (sessionStorage / React memory only — never localStorage) */}
+            <div className="space-y-1.5">
+              <label
+                htmlFor="hyperion-admin-token"
+                className="block font-mono font-bold uppercase tracking-wider text-slate-300"
+              >
+                Operator Admin Token (Session Memory Only)
+              </label>
+              <input
+                id="hyperion-admin-token"
+                type="password"
+                autoComplete="off"
+                placeholder="HYPERION_ADMIN_TOKEN for Emergency Lock & Paper Flatten"
+                value={tokenInput}
+                onChange={(e) => setTokenInput(e.target.value)}
+                className="w-full rounded-xl bg-[#0b0d17] border border-white/15 px-3.5 py-2.5 font-mono text-xs text-white placeholder-slate-600 focus:outline-none focus:border-[#5e72e4] focus:ring-1 focus:ring-[#5e72e4] transition-all"
+              />
+              <p className="text-[11px] font-mono text-slate-400">
+                Held strictly in <code className="text-slate-300">sessionStorage</code> / React memory for the current tab (<strong className="text-slate-300">never</strong> persisted to <code className="text-slate-300">localStorage</code>). Execution stays strictly <code className="text-emerald-300">PAPER_SHADOW</code>.
               </p>
             </div>
 

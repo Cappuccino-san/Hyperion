@@ -53,6 +53,8 @@ export interface FlowGammaVwapData {
   upper2s: number;
   lower2s: number;
   sigma: number;
+  pecletNumber?: number;
+  ceilingShareChi?: number;
 }
 
 export interface IntradayPoint {
@@ -540,6 +542,8 @@ export interface DashboardState {
   cboeSpotLagDollars: number | null;
   optionsCacheAgeSec: number | null;
   executionArmState: "PAPER" | "LOCKED";
+  adminToken: string;
+  setAdminToken: (token: string) => void;
   audioAlertsMuted: boolean;
   setExecutionArmState: (mode: "PAPER" | "LOCKED") => void;
   toggleExecutionLock: (flattenPaper?: boolean) => Promise<void>;
@@ -629,6 +633,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   cboeSpotLagDollars: null,
   optionsCacheAgeSec: null,
   executionArmState: "PAPER",
+  adminToken: "",
   audioAlertsMuted: false,
   isLoadingChain: true,
   liveTickPrice: null,
@@ -797,12 +802,34 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   setSetupModalOpen: (open) => set({ isSetupModalOpen: open }),
   hydrateDiscordConfig: () => {
     let muted = false;
+    let sessionToken = "";
     if (typeof window !== "undefined") {
       try {
         muted = localStorage.getItem("hyperion_audio_muted") === "true";
+        // Strictly sessionStorage / React memory only — NEVER read or write admin token in localStorage
+        localStorage.removeItem("hyperion_admin_token");
+        sessionToken = sessionStorage.getItem("hyperion_admin_token")?.trim() ?? "";
       } catch {}
     }
-    set({ discordConfig: getInitialDiscordConfig(), audioAlertsMuted: muted });
+    set({
+      discordConfig: getInitialDiscordConfig(),
+      audioAlertsMuted: muted,
+      adminToken: sessionToken,
+    });
+  },
+  setAdminToken: (token) => {
+    const trimmed = token.trim();
+    if (typeof window !== "undefined") {
+      try {
+        localStorage.removeItem("hyperion_admin_token");
+        if (trimmed) {
+          sessionStorage.setItem("hyperion_admin_token", trimmed);
+        } else {
+          sessionStorage.removeItem("hyperion_admin_token");
+        }
+      } catch {}
+    }
+    set({ adminToken: trimmed });
   },
   setExecutionArmState: (mode) => set({ executionArmState: mode }),
   setAudioAlertsMuted: (muted) => {
@@ -815,6 +842,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
   toggleExecutionLock: async (flattenPaper = false) => {
     const current = get().executionArmState;
+    const token = get().adminToken.trim();
     const locking = flattenPaper ? true : current !== "LOCKED";
     const action = flattenPaper
       ? "FLATTEN_PAPER_POSITIONS"
@@ -824,9 +852,22 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     try {
       const res = await fetch("/api/signals", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { "x-hyperion-admin-token": token } : {}),
+        },
         body: JSON.stringify({ action }),
       });
+      if (res.status === 401 || res.status === 403) {
+        const errData = await res.json().catch(() => null);
+        set({
+          isSetupModalOpen: true,
+          toastMessage:
+            errData?.error ||
+            "Admin token required (HTTP 401/403) — enter session token in Setup",
+        });
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         const isLocked = Boolean(data?.executionLocked);
@@ -842,6 +883,8 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
               : "PAPER / SHADOW MODE resumed",
         });
         void get().fetchServerTrades(get().activeTicker);
+      } else {
+        set({ toastMessage: `Failed to toggle execution lock (HTTP ${res.status})` });
       }
     } catch {
       set({ toastMessage: "Failed to toggle execution lock" });
@@ -942,8 +985,11 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       const prev = state.liveTickPrice ?? state.spotPrice;
       const direction: "up" | "down" | "flat" =
         price > prev + 0.001 ? "up" : price < prev - 0.001 ? "down" : state.liveTickDirection;
+      // Preserve official RTH closing spotPrice when market is closed (off-hours / weekend)
+      const nextSpot =
+        nextMktOpen === false && state.spotPrice > 0 ? state.spotPrice : price;
       return {
-        spotPrice: price,
+        spotPrice: nextSpot,
         liveTickPrice: price,
         liveTickTimestamp: timestamp,
         liveTickDirection: direction,
@@ -1286,6 +1332,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       };
 
       const hasFreshTick =
+        state.liveTickMarketOpen === true &&
         state.liveTickPrice !== null &&
         state.liveTickPrice > 0 &&
         Date.now() - state.liveTickTimestamp < 3000 &&
@@ -1333,7 +1380,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     const reqId = ++flowVwapReqSeq;
     try {
       const res = await fetch(
-        `/api/flow-vwap?ticker=${encodeURIComponent(targetTicker)}`,
+        `/api/flow-vwap?ticker=${encodeURIComponent(targetTicker)}&latest=1`,
         { cache: "no-store", signal: ctrl.signal }
       );
       if (
@@ -1378,6 +1425,14 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
                 (Number.isFinite(l2) ? l2 : flowVwap - 2 * safeSigma).toFixed(2)
               ),
               sigma: Number(safeSigma.toFixed(3)),
+              pecletNumber:
+                typeof latest?.pecletNumber === "number" && Number.isFinite(latest.pecletNumber)
+                  ? Number(latest.pecletNumber.toFixed(3))
+                  : undefined,
+              ceilingShareChi:
+                typeof latest?.ceilingShareChi === "number" && Number.isFinite(latest.ceilingShareChi)
+                  ? Number(latest.ceilingShareChi.toFixed(4))
+                  : undefined,
             },
           });
         }

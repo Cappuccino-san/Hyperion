@@ -1085,3 +1085,176 @@ export function computeBarFlowGammaVwapSeries(
 
   return results;
 }
+
+export interface CanonicalPdeOptionBucket {
+  strike: number;
+  callGamma?: number;
+  putGamma?: number;
+  callOI?: number;
+  putOI?: number;
+  callVol?: number;
+  putVol?: number;
+}
+
+export interface CanonicalPdeBookEntry {
+  strike: number;
+  gamma: number;
+  volume?: number;
+  openInterest?: number;
+  last?: number;
+  bid?: number;
+  ask?: number;
+  optionType?: string;
+  delta?: number;
+}
+
+export interface BuildCanonicalPdeInputsParams {
+  candles: Array<{
+    timestamp: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume?: number;
+    etMins?: number;
+  }>;
+  contracts?: CanonicalPdeBookEntry[];
+  optionBuckets?: CanonicalPdeOptionBucket[];
+  structuralNodes?: StructuralFlowNodes & {
+    callWall?: number;
+    putWall?: number;
+  };
+  /** When true, slices multi-day raw feeds to the latest ET session + pre-open warmup bars. */
+  windowLatestSession?: boolean;
+  preOpenWarmupBars?: number;
+}
+
+export interface CanonicalPdeInputs {
+  candles: BuildCanonicalPdeInputsParams["candles"];
+  optionsBook: CanonicalPdeBookEntry[];
+  structuralNodes?: StructuralFlowNodes;
+}
+
+/**
+ * Single source of truth for preparing PDE Flow-VWAP & Boundary-Flux inputs across
+ * live execution (`optionPricing.ts`), `/api/flow-vwap`, `liveBotDaemon` attribution,
+ * and `GaiaView` HUD rendering so all evaluators produce identical chi / Pe / FVWAP.
+ */
+export function buildCanonicalPdeInputs(
+  params: BuildCanonicalPdeInputsParams
+): CanonicalPdeInputs {
+  const rawCandles = Array.isArray(params.candles) ? params.candles : [];
+  let normalizedCandles = rawCandles;
+
+  if (params.windowLatestSession && rawCandles.length > 0) {
+    const warmup = Math.max(0, params.preOpenWarmupBars ?? 12);
+    const sorted = [...rawCandles].sort((a, b) => a.timestamp - b.timestamp);
+    let latestEtDate = "";
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      const parsed = getEtDateAndMinsFromTimestamp(sorted[i].timestamp);
+      if (parsed?.etDate) {
+        latestEtDate = parsed.etDate;
+        break;
+      }
+    }
+    if (latestEtDate) {
+      let firstSessionRthIdx = -1;
+      for (let i = 0; i < sorted.length; i++) {
+        const parsed = getEtDateAndMinsFromTimestamp(sorted[i].timestamp);
+        if (parsed?.etDate === latestEtDate && parsed.etMins >= RTH_OPEN_MINS) {
+          firstSessionRthIdx = i;
+          break;
+        }
+      }
+      if (firstSessionRthIdx >= 0) {
+        const startIdx = Math.max(0, firstSessionRthIdx - warmup);
+        normalizedCandles = sorted.slice(startIdx);
+      } else {
+        const sameDay = sorted.filter(
+          (b) => getEtDateAndMinsFromTimestamp(b.timestamp)?.etDate === latestEtDate
+        );
+        normalizedCandles =
+          sameDay.length > 0 ? sameDay : sorted.slice(Math.max(0, sorted.length - 78));
+      }
+    } else {
+      normalizedCandles = sorted.slice(Math.max(0, sorted.length - 78));
+    }
+  }
+
+  let optionsBook: CanonicalPdeBookEntry[] = [];
+  if (Array.isArray(params.contracts) && params.contracts.length > 0) {
+    optionsBook = params.contracts;
+  } else if (Array.isArray(params.optionBuckets) && params.optionBuckets.length > 0) {
+    for (const b of params.optionBuckets) {
+      const callGamma = Number(b.callGamma) || 0;
+      const callOI = Number(b.callOI) || 0;
+      const callVol = Number(b.callVol) || 0;
+      if (callGamma > 0 || callOI > 0 || callVol > 0) {
+        optionsBook.push({
+          strike: b.strike,
+          gamma: callGamma,
+          volume: callVol > 0 ? callVol : callOI * 0.05,
+          openInterest: callOI,
+          optionType: "C",
+        });
+      }
+      const putGamma = Number(b.putGamma) || 0;
+      const putOI = Number(b.putOI) || 0;
+      const putVol = Number(b.putVol) || 0;
+      if (putGamma > 0 || putOI > 0 || putVol > 0) {
+        optionsBook.push({
+          strike: b.strike,
+          gamma: putGamma,
+          volume: putVol > 0 ? putVol : putOI * 0.05,
+          openInterest: putOI,
+          optionType: "P",
+        });
+      }
+    }
+  }
+
+  const rawNodes = params.structuralNodes;
+  const ceilingNode =
+    rawNodes?.ceilingNode && rawNodes.ceilingNode > 0
+      ? rawNodes.ceilingNode
+      : rawNodes?.callWall && rawNodes.callWall > 0
+        ? rawNodes.callWall
+        : undefined;
+  const floorNode =
+    rawNodes?.floorNode && rawNodes.floorNode > 0
+      ? rawNodes.floorNode
+      : rawNodes?.putWall && rawNodes.putWall > 0
+        ? rawNodes.putWall
+        : undefined;
+  const zeroGamma =
+    rawNodes?.zeroGamma && rawNodes.zeroGamma > 0 ? rawNodes.zeroGamma : undefined;
+  const netGex =
+    typeof rawNodes?.netGex === "number" && Number.isFinite(rawNodes.netGex)
+      ? rawNodes.netGex
+      : undefined;
+
+  const structuralNodes: StructuralFlowNodes | undefined =
+    ceilingNode !== undefined ||
+    floorNode !== undefined ||
+    zeroGamma !== undefined ||
+    netGex !== undefined
+      ? { ceilingNode, floorNode, zeroGamma, netGex }
+      : undefined;
+
+  return {
+    candles: normalizedCandles,
+    optionsBook,
+    structuralNodes,
+  };
+}
+
+export function computeCanonicalPdeSeries(
+  params: BuildCanonicalPdeInputsParams
+): FlowGammaVwapSnapshot[] {
+  const canonical = buildCanonicalPdeInputs(params);
+  return computeBarFlowGammaVwapSeries(
+    canonical.candles,
+    canonical.optionsBook,
+    canonical.structuralNodes
+  );
+}

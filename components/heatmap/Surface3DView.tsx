@@ -230,31 +230,12 @@ export function Surface3DView({
   }, [rows, atmRowIndex]);
 
   /**
-   * Compute upright exposure matrix so that:
-   * - Positive Gamma (+γ) Peaks always extrude UPWARD (+Y, up to +1.5B) into cyan/yellow heights
-   * - Negative Gamma (-γ) Valleys always drop DOWNWARD (-Y, down to -0.5B) into purple/indigo valleys
+   * True Signed Dealer Exposure Matrix:
+   * - Positive Exposure (+γ / +VEX) extrudes UPWARD (+Y) into cyan/yellow ridges
+   * - Negative Exposure (-γ / -VEX) drops DOWNWARD (-Y) into purple/indigo canyons
+   * Never sign-flips negative dealer exposure into fake positive peaks.
    */
   const { uprightValues, maxPositiveVal, maxNegativeVal } = useMemo(() => {
-    let rawMaxPos = 0;
-    let rawMaxNeg = 0;
-
-    for (const r of slicedRows) {
-      for (const c of columns) {
-        const rawV = r.values[c.id] ?? 0;
-        if (!Number.isFinite(rawV)) continue;
-        if (rawV > rawMaxPos) rawMaxPos = rawV;
-        if (rawV < 0 && Math.abs(rawV) > rawMaxNeg) rawMaxNeg = Math.abs(rawV);
-      }
-    }
-
-    // If raw chain values near ATM are predominantly negative (e.g. late-day 0DTE put OI skew),
-    // invert the vertical sign at/above the King/ATM pivot so the dominant King/Call gamma ridge
-    // extrudes UPWARD (+Y) as a positive mountain peak while lower OTM put strikes form downward (-Y) valleys.
-    const needsUprightInversion = rawMaxPos < rawMaxNeg * 0.45;
-    const safeSpot = Number.isFinite(spotPrice) && spotPrice > 0 ? spotPrice : 0;
-    const safeKing = Number.isFinite(kingStrike) && kingStrike > 0 ? kingStrike : safeSpot;
-    const pivotStrike = Math.min(safeSpot > 0 ? safeSpot : safeKing, safeKing > 0 ? safeKing : safeSpot) - 1.5;
-
     const matrix = new Map<number, Record<string, number>>();
     let maxPos = 0.1;
     let maxNeg = 0.1;
@@ -263,17 +244,7 @@ export function Surface3DView({
       const rowMap: Record<string, number> = {};
       for (const c of columns) {
         const rawCandidate = r.values[c.id] ?? 0;
-        const raw = Number.isFinite(rawCandidate) ? rawCandidate : 0;
-        let val = raw;
-
-        if (needsUprightInversion) {
-          if (r.strike >= pivotStrike || r.isKingNode) {
-            val = Math.abs(raw);
-          } else {
-            val = raw;
-          }
-        }
-
+        const val = Number.isFinite(rawCandidate) ? rawCandidate : 0;
         rowMap[c.id] = val;
         if (val > maxPos) maxPos = val;
         if (val < 0 && Math.abs(val) > maxNeg) maxNeg = Math.abs(val);
@@ -286,7 +257,7 @@ export function Surface3DView({
       maxPositiveVal: maxPos,
       maxNegativeVal: maxNeg,
     };
-  }, [slicedRows, columns, spotPrice, kingStrike]);
+  }, [slicedRows, columns]);
 
   const adjustZoom = (delta: number) => {
     cameraStateRef.current.radius = Math.max(
@@ -522,11 +493,11 @@ export function Surface3DView({
     const spanX = 22;
     const spanZ = 24;
 
-    // Upright Y-Axis scale matching Hyperion's mountain proportions:
+    // Upright Y-Axis scale matching true signed dealer exposure:
     // +Y peaks extrude upward up to +9.0 units
-    // -Y valleys drop downward down to -3.0 units
+    // -Y canyons drop downward down to -7.5 units
     const maxPositiveHeight = 9.0;
-    const maxNegativeDepth = 3.0;
+    const maxNegativeDepth = 7.5;
 
     const getX = (colIdx: number) =>
       numX > 1 ? (colIdx / (numX - 1) - 0.5) * spanX : 0;

@@ -25,7 +25,7 @@ import {
   readSupervisorPolicySync,
 } from "@/lib/persistenceStore";
 import { getMergedIntradayHistory } from "@/lib/intradayHistory";
-import { computeBarFlowGammaVwapSeries } from "@/lib/flowGammaVwap";
+import { computeCanonicalPdeSeries } from "@/lib/flowGammaVwap";
 import { getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
 import {
   acquireCrossProcessExecutionLease,
@@ -34,7 +34,7 @@ import {
 } from "@/lib/executionLease";
 
 const POLL_INTERVAL_MS = 20_000; // 20 seconds during RTH
-const DEFAULT_WATCH_TICKERS = ["SPY", "QQQ"] as const;
+const DEFAULT_WATCH_TICKERS = ["SPY", "QQQ", "IWM"] as const;
 const MAX_TRACKED_TICKERS = 8;
 const TRACKED_TICKER_TTL_MS = 4 * 60 * 60_000;
 
@@ -131,6 +131,12 @@ function getBotState(): LiveBotGlobalState {
     };
   } else if (!globalThis.__hyperionLiveBotState.activeTrackedTickers) {
     globalThis.__hyperionLiveBotState.activeTrackedTickers = new Map<string, number>(DEFAULT_WATCH_TICKERS.map((t) => [t, now]));
+  } else {
+    for (const pinned of DEFAULT_WATCH_TICKERS) {
+      if (!globalThis.__hyperionLiveBotState.activeTrackedTickers.has(pinned)) {
+        globalThis.__hyperionLiveBotState.activeTrackedTickers.set(pinned, now);
+      }
+    }
   }
   return globalThis.__hyperionLiveBotState;
 }
@@ -244,8 +250,15 @@ function computeLiveLevelsForTicker(
     contracts,
   });
   const levels = deriveTacticalStructuralLevels(analytics);
+  const rawZeroDte = analytics.gammaLevelsByFilter?.["0DTE"];
   return {
     ...levels,
+    zeroDteCallWall:
+      rawZeroDte?.callWall && rawZeroDte.callWall > 0 ? rawZeroDte.callWall : levels.callWall,
+    zeroDtePutWall:
+      rawZeroDte?.putWall && rawZeroDte.putWall > 0 ? rawZeroDte.putWall : levels.putWall,
+    zeroDteZeroGamma:
+      rawZeroDte?.zeroGamma && rawZeroDte.zeroGamma > 0 ? rawZeroDte.zeroGamma : levels.zeroGamma,
     kingNode: analytics.kingNode,
   };
 }
@@ -470,16 +483,33 @@ export async function runLiveBotTick(): Promise<void> {
       await flushPendingDiscordAlerts({ webhookUrl }).catch(() => 0);
     }
 
+    const currentPriors = readAlphaPriorsSync();
+    const pendingAttributionTickers = DEFAULT_WATCH_TICKERS.filter(
+      (sym) => currentPriors.lastAttributionDateByTicker?.[sym] !== startClock.etDate
+    );
     if (
       startClock.isWeekday &&
       startClock.etMins >= startBounds.rthCloseMins + 5 &&
-      readAlphaPriorsSync().lastAttributionDate !== startClock.etDate
+      pendingAttributionTickers.length > 0
     ) {
       try {
-        const ticks = getMergedIntradayHistory("SPY", startClock.etDate);
-        if (ticks.length >= 6) {
-          const bucketMap = new Map<number, typeof ticks>();
-          for (const tick of ticks) {
+        let attributedAny = false;
+        for (const sym of pendingAttributionTickers) {
+          const allTicks = getMergedIntradayHistory(sym, startClock.etDate);
+          const rthTicks = allTicks.filter((tick) => {
+            if (!tick || !Number.isFinite(tick.ts) || !Number.isFinite(tick.spot) || tick.spot <= 0) {
+              return false;
+            }
+            const tickClock = getEtClockNow(tick.ts * 1000);
+            return (
+              tickClock.etDate === startClock.etDate &&
+              tickClock.etMins >= startBounds.rthOpenMins &&
+              tickClock.etMins < startBounds.rthCloseMins
+            );
+          });
+          if (rthTicks.length < 6) continue;
+          const bucketMap = new Map<number, typeof rthTicks>();
+          for (const tick of rthTicks) {
             const bucket = Math.floor(tick.ts / 300) * 300;
             if (!bucketMap.has(bucket)) bucketMap.set(bucket, []);
             bucketMap.get(bucket)!.push(tick);
@@ -493,30 +523,42 @@ export async function runLiveBotTick(): Promise<void> {
               low: Math.min(...group.map((g) => g.spot)),
               close: group[group.length - 1].spot,
             }));
-          if (bars.length >= 6) {
-            const flowSeries = computeBarFlowGammaVwapSeries(
-              bars.map((b) => ({
-                timestamp: b.ts,
-                open: b.open,
-                high: b.high,
-                low: b.low,
-                close: b.close,
-              }))
-            );
-            const lastTick = ticks[ticks.length - 1];
-            await runPostMarketAttribution({
-              sessionDate: startClock.etDate,
-              ticker: "SPY",
-              bars,
-              flowSeries,
-              callWall: lastTick?.callWall || lastTick?.cw,
-              putWall: lastTick?.putWall || lastTick?.pw,
-              zeroGamma: lastTick?.zeroGamma || lastTick?.zg,
-              zeroDteKing: lastTick?.king,
-              executedTrades: initialStore.closedPositions,
-            });
-            if (!botState.isStopped) botState.lastStatus = "POST_MARKET_ATTRIBUTED";
-          }
+          if (bars.length < 6) continue;
+          const lastTick = rthTicks[rthTicks.length - 1];
+          const attrCw = lastTick?.callWall || lastTick?.cw || 0;
+          const attrPw = lastTick?.putWall || lastTick?.pw || 0;
+          const attrZg = lastTick?.zeroGamma || lastTick?.zg || 0;
+          const flowSeries = computeCanonicalPdeSeries({
+            candles: bars.map((b) => ({
+              timestamp: b.ts,
+              open: b.open,
+              high: b.high,
+              low: b.low,
+              close: b.close,
+            })),
+            structuralNodes:
+              attrCw > 0 && attrPw > 0
+                ? { ceilingNode: attrCw, floorNode: attrPw, zeroGamma: attrZg > 0 ? attrZg : undefined }
+                : undefined,
+          });
+          const tickerClosed = (initialStore.closedPositions || []).filter(
+            (p) => p.ticker === sym || (sym === "SPY" && p.ticker === "SPXW")
+          );
+          await runPostMarketAttribution({
+            sessionDate: startClock.etDate,
+            ticker: sym,
+            bars,
+            flowSeries,
+            callWall: attrCw || undefined,
+            putWall: attrPw || undefined,
+            zeroGamma: attrZg || undefined,
+            zeroDteKing: lastTick?.king,
+            executedTrades: tickerClosed,
+          });
+          attributedAny = true;
+        }
+        if (attributedAny && !botState.isStopped) {
+          botState.lastStatus = "POST_MARKET_ATTRIBUTED";
         }
       } catch (attrErr) {
         console.warn("[LiveBotDaemon] Post-market attribution failed:", attrErr);
@@ -621,10 +663,46 @@ export async function runLiveBotTick(): Promise<void> {
         const sameTickerClosed = (currentStore.closedPositions || []).filter(
           (p) => p.ticker === ticker || p.ticker === posKey
         );
-        if (sameTickerClosed.length >= 2) continue;
-        if (sameTickerClosed.length === 1) {
-          const lastClosed = sameTickerClosed.reduce((a, b) => ((b.closedTs ?? 0) >= (a.closedTs ?? 0) ? b : a));
-          if (!lastClosed?.closedTs || nowTs - lastClosed.closedTs < 1800 || nowClock.etMins < 630) {
+        if (sameTickerClosed.length >= 4) continue;
+        if (sameTickerClosed.length >= 1) {
+          const callsToday = sameTickerClosed.filter((p) => p.contractType === "CALL").length;
+          const putsToday = sameTickerClosed.filter((p) => p.contractType === "PUT").length;
+          const lossesToday = sameTickerClosed.filter(
+            (p) => typeof p.pnlOptionPct === "number" && p.pnlOptionPct < 0
+          ).length;
+          const realizedPnlDollars = sameTickerClosed.reduce((acc, p) => {
+            const outlay =
+              typeof p.totalOutlay === "number" && p.totalOutlay > 0
+                ? p.totalOutlay
+                : (p.optionAsk || p.btoOptionMid || 0.7) * 100;
+            const pct = typeof p.pnlOptionPct === "number" ? p.pnlOptionPct : 0;
+            return acc + (outlay * pct) / 100;
+          }, 0);
+          if (lossesToday >= 2 || realizedPnlDollars <= -75 || (callsToday >= 2 && putsToday >= 2)) {
+            continue;
+          }
+          const lastClosed = sameTickerClosed.reduce((a, b) =>
+            (b.closedTs ?? 0) >= (a.closedTs ?? 0) ? b : a
+          );
+          const isShakeout =
+            sameTickerClosed.length === 1 &&
+            typeof lastClosed.pnlOptionPct === "number" &&
+            lastClosed.pnlOptionPct >= 0 &&
+            lastClosed.pnlOptionPct < 25 &&
+            /RATCHET|BREAKEVEN/i.test(lastClosed.exitReason || "");
+          const isWinCont =
+            !(callsToday >= 1 && putsToday >= 1) &&
+            typeof lastClosed.pnlOptionPct === "number" &&
+            lastClosed.pnlOptionPct >= 25 &&
+            nowClock.etMins >= 630 &&
+            ((lastClosed.contractType === "CALL" && callsToday < 2) ||
+              (lastClosed.contractType === "PUT" && putsToday < 2));
+          const minCooldownSec = isShakeout || isWinCont ? 900 : 1800;
+          if (
+            !lastClosed?.closedTs ||
+            nowTs - lastClosed.closedTs < minCooldownSec ||
+            (!isShakeout && nowClock.etMins < 630)
+          ) {
             continue;
           }
         }
@@ -755,9 +833,9 @@ export async function runLiveBotTick(): Promise<void> {
           callWall: resolvedLevels?.callWall ?? 0,
           putWall: resolvedLevels?.putWall ?? 0,
           zeroGamma: resolvedLevels?.zeroGamma ?? 0,
-          zeroDteCallWall: resolvedLevels?.callWall ?? 0,
-          zeroDtePutWall: resolvedLevels?.putWall ?? 0,
-          zeroDteZeroGamma: resolvedLevels?.zeroGamma ?? 0,
+          zeroDteCallWall: resolvedLevels?.zeroDteCallWall ?? resolvedLevels?.callWall ?? 0,
+          zeroDtePutWall: resolvedLevels?.zeroDtePutWall ?? resolvedLevels?.putWall ?? 0,
+          zeroDteZeroGamma: resolvedLevels?.zeroDteZeroGamma ?? resolvedLevels?.zeroGamma ?? 0,
           dailyExpectedMove: resolvedLevels?.dailyExpectedMove ?? null,
           kingNode: resolvedLevels?.kingNode,
           filteredKing: resolvedLevels?.tacticalKing,

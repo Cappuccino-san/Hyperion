@@ -344,6 +344,8 @@ export function parseOccSymbol(occ: string): {
   if (!match) return null;
 
   const [, root, yy, mm, dd, typeChar, strikeRaw] = match;
+  // Reject non-standard / corporate-action adjusted option roots (e.g., SPY1, SMCI1)
+  if (/\d/.test(root)) return null;
   const expiration = `20${yy}-${mm}-${dd}`;
   const optionType = typeChar as "C" | "P";
   const strike = parseInt(strikeRaw, 10) / 1000;

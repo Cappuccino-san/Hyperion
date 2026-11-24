@@ -185,11 +185,19 @@ export async function selectSmallAccountContract(params: {
       etMins: etTime.totalMinutes,
     });
     const highIvFallbackCandidates: typeof validCandidates = [];
+    let hasPricedOutNearAtm = false;
     const fallbackMinDelta = Math.min(minOptionDelta, 0.18);
-    const target1Dist = Math.abs(effectiveTarget1 - effectiveSpot);
+    const normRemEm =
+      typeof remainingExpectedMove === "number" && remainingExpectedMove > 0
+        ? (isSpxw ? remainingExpectedMove / 10 : remainingExpectedMove)
+        : 0;
+    const target2Dist = Math.abs(effectiveTarget2 - effectiveSpot);
     const maxFallbackOtmDistance = Math.max(
       Math.min(3.50, effectiveSpot * 0.0045),
-      Math.min(effectiveSpot * 0.0085, target1Dist > 0 ? target1Dist * 0.85 : effectiveSpot * 0.0085)
+      Math.min(
+        Math.max(4.0, effectiveSpot * 0.011),
+        Math.max(effectiveSpot * 0.0095, normRemEm * 0.90, target2Dist * 0.85)
+      )
     );
 
     for (const c of contracts) {
@@ -200,7 +208,15 @@ export async function selectSmallAccountContract(params: {
       const rawBid = typeof c.bid === "number" && Number.isFinite(c.bid) ? c.bid : undefined;
       const rawAsk = typeof c.ask === "number" && Number.isFinite(c.ask) ? c.ask : undefined;
       const askPrice = rawAsk !== undefined ? rawAsk : mid;
-      if (askPrice < 0.15 || askPrice > 0.99) continue;
+      const maxOtmDistance = Math.min(3.50, effectiveSpot * 0.0045);
+      const otmDist = Math.abs(c.strike - effectiveSpot);
+      if (askPrice > 0.99) {
+        if (otmDist <= maxOtmDistance && c.expiration >= todayEt) {
+          hasPricedOutNearAtm = true;
+        }
+        continue;
+      }
+      if (askPrice < 0.15) continue;
 
       const absDelta = typeof c.delta === "number" && Number.isFinite(c.delta) ? Math.abs(c.delta) : 0;
       if (absDelta < fallbackMinDelta || absDelta > MAX_OPTION_DELTA) continue;
@@ -213,8 +229,6 @@ export async function selectSmallAccountContract(params: {
       if (isCall && c.strike < effectiveSpot * 0.998) continue;
       if (!isCall && c.strike > effectiveSpot * 1.002) continue;
 
-      const maxOtmDistance = Math.min(3.50, effectiveSpot * 0.0045);
-      const otmDist = Math.abs(c.strike - effectiveSpot);
       const passesPrimaryTier = absDelta >= minOptionDelta && otmDist <= maxOtmDistance;
       if (!passesPrimaryTier && otmDist > maxFallbackOtmDistance) continue;
 
@@ -279,8 +293,17 @@ export async function selectSmallAccountContract(params: {
       });
     }
 
+    const usingHighIvFallback =
+      validCandidates.length === 0 &&
+      highIvFallbackCandidates.length > 0 &&
+      hasPricedOutNearAtm &&
+      regime !== "POS_GAMMA_PIN";
     const selection = selectOptimalSmallAccountContract({
-      candidates: validCandidates.length > 0 ? validCandidates : highIvFallbackCandidates,
+      candidates: validCandidates.length > 0
+        ? validCandidates
+        : usingHighIvFallback
+          ? highIvFallbackCandidates
+          : [],
       spotPrice: effectiveSpot,
       target1Spot: effectiveTarget1,
       target2Spot: effectiveTarget2,
@@ -298,6 +321,9 @@ export async function selectSmallAccountContract(params: {
           : undefined,
       etMins: etTime.totalMinutes,
       nowMs: (nowEt ?? new Date()).getTime(),
+      minDeltaOverride: usingHighIvFallback ? fallbackMinDelta : undefined,
+      maxOtmDistOverride: usingHighIvFallback ? maxFallbackOtmDistance : undefined,
+      preferMultiDteInHighIv: usingHighIvFallback,
     });
     const chosen = selection?.chosen;
 

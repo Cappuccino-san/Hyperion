@@ -597,13 +597,31 @@ async function fetchLiveOptionsBuckets(
     }
   }
 
+  const maxBucketReach = Math.max(resolvedSigma1 * 3.5, liveSpot * 0.08);
+  let peakGammaStrike = liveSpot;
+  let peakGammaScore = -1;
+  for (const b of Array.from(bucketMap.values())) {
+    const score = b.callGammaWeighted + b.putGammaWeighted;
+    if (score > peakGammaScore) {
+      peakGammaScore = score;
+      peakGammaStrike = b.strike;
+    }
+  }
   const buckets: GaiaStrikeExpBucket[] = [];
   for (const b of Array.from(bucketMap.values())) {
+    if (
+      liveSpot > 0 &&
+      b.strike !== peakGammaStrike &&
+      (Math.abs(b.strike - liveSpot) > maxBucketReach ||
+        (b.dteDays > 45 && b.callOI + b.putOI < 250))
+    ) {
+      continue;
+    }
     buckets.push({
       strike: b.strike,
       expiration: b.expiration,
       dateLabel: b.dateLabel,
-      dteDays: b.dteDays,
+      dteDays: Number(b.dteDays.toFixed(2)),
       callOI: b.callOI,
       putOI: b.putOI,
       callIv:
@@ -615,9 +633,9 @@ async function fetchLiveOptionsBuckets(
           ? Number((b.putIvWeighted / b.putOI).toFixed(4))
           : iv30Decimal,
       callGamma:
-        b.callOI > 0 ? b.callGammaWeighted / b.callOI : 0,
+        b.callOI > 0 ? Number((b.callGammaWeighted / b.callOI).toFixed(6)) : 0,
       putGamma:
-        b.putOI > 0 ? b.putGammaWeighted / b.putOI : 0,
+        b.putOI > 0 ? Number((b.putGammaWeighted / b.putOI).toFixed(6)) : 0,
       callDelta:
         b.callOI > 0
           ? Number((b.callDeltaWeighted / b.callOI).toFixed(4))

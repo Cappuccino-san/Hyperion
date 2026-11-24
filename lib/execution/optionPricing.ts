@@ -3,7 +3,7 @@ import {
   computeBlackScholesGreeks,
 } from "@/lib/optionsExposure";
 import {
-  computeBarFlowGammaVwapSeries,
+  computeCanonicalPdeSeries,
   StructuralFlowNodes,
 } from "@/lib/flowGammaVwap";
 import { getTodayEt, getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
@@ -30,8 +30,8 @@ export function solveImpliedVol(
   strike: number,
   tYears: number,
   isCall: boolean,
-  r = 0.0475,
-  q = 0.0
+  r = 0.045,
+  q = 0.012
 ): number {
   if (midPrice <= 0 || spot <= 0 || strike <= 0) return 0.22;
   const effectiveT = Math.max(1 / (252 * 390), tYears);
@@ -66,8 +66,8 @@ export function repriceOptionBS(
   tYears: number,
   iv: number,
   isCall: boolean,
-  r = 0.0475,
-  q = 0.0
+  r = 0.045,
+  q = 0.012
 ): number {
   const effectiveT = Math.max(1 / (252 * 390), tYears); // 1-minute floor to prevent singularity
   const greeks = computeBlackScholesGreeks(spot, strike, effectiveT, Math.max(0.04, iv), r, q);
@@ -724,12 +724,12 @@ export async function fetchLive5mCandleAndDivergence(
             count++;
           }
           const sma34 = Number((sum / Math.max(1, count)).toFixed(2));
-          const sessionSlice = closedBars.slice(Math.max(0, closedBars.length - 78));
-          const flowSeries = computeBarFlowGammaVwapSeries(
-            sessionSlice,
-            options?.contracts,
-            options?.structuralNodes
-          );
+          const flowSeries = computeCanonicalPdeSeries({
+            candles: closedBars,
+            contracts: options?.contracts,
+            structuralNodes: options?.structuralNodes,
+            windowLatestSession: true,
+          });
           const flowSnapshot = flowSeries.length > 0 ? flowSeries[flowSeries.length - 1] : null;
           candle = {
             open: Number(latest.open.toFixed(2)),

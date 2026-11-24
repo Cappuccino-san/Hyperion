@@ -151,6 +151,8 @@ function HeaderTickBadge() {
     let timerId: ReturnType<typeof setTimeout> | null = null;
     let activeController: AbortController | null = null;
 
+    let nextDelayMs = 800;
+
     const pollTick = async () => {
       if (isCancelled) return;
       try {
@@ -164,21 +166,23 @@ function HeaderTickBadge() {
           });
           if (res.ok && !isCancelled && !signal.aborted) {
             const data = await res.json();
+            const isOpen = typeof data.marketOpen === "boolean" ? data.marketOpen : undefined;
+            nextDelayMs = isOpen === false ? 15_000 : 800;
             if (!isCancelled && !signal.aborted && typeof data.spot === "number" && data.spot > 0) {
               setLiveTick(
                 activeTicker,
                 data.spot,
                 data.timestamp || Date.now(),
-                typeof data.marketOpen === "boolean" ? data.marketOpen : undefined
+                isOpen
               );
             }
           }
         }
       } catch {
-        // Silent retry on next 800ms cycle
+        // Silent retry on next cycle
       } finally {
         if (!isCancelled) {
-          timerId = setTimeout(pollTick, 800);
+          timerId = setTimeout(pollTick, nextDelayMs);
         }
       }
     };
@@ -201,7 +205,10 @@ function HeaderTickBadge() {
   const isStale = isStaleSnapshot || connectionStatus === "SYNCING" || connectionStatus === "RECONNECTING";
   const isRthLive = liveTickMarketOpen === true && !isStale;
   const hasLagWarn = cboeSpotLagDollars !== null && Math.abs(cboeSpotLagDollars) >= 0.35;
-  const displayPrice = liveTickPrice ?? spotPrice;
+  const displayPrice =
+    liveTickMarketOpen === false && spotPrice > 0
+      ? spotPrice
+      : liveTickPrice ?? spotPrice;
 
   return (
     <div
@@ -411,7 +418,7 @@ export function TopNavBar() {
 
   return (
     <>
-      <header className="w-full bg-[#0b0d17]/95 backdrop-blur-md">
+      <header className="sticky top-0 z-40 w-full bg-[#0b0d17]/95 backdrop-blur-md border-b border-white/[0.06]">
         <div className="max-w-7xl mx-auto px-4 pt-3 pb-2 space-y-2.5">
           {/* Brand & Top Action Links Row */}
           <div className="flex flex-wrap items-center justify-between gap-3">

@@ -13,14 +13,12 @@ import { QuadView } from "@/components/views/QuadView";
 import { GaiaView } from "@/components/views/GaiaView";
 import { ScannerView } from "@/components/views/ScannerView";
 import { RecapView } from "@/components/views/RecapView";
+import { AppFooter } from "@/components/layout/AppFooter";
 import { useDashboardStore } from "@/store/useDashboardStore";
 
 export default function DashboardPage() {
   const activeView = useDashboardStore((state) => state.activeView);
   const setActiveView = useDashboardStore((state) => state.setActiveView);
-  const setSetupModalOpen = useDashboardStore(
-    (state) => state.setSetupModalOpen
-  );
 
   useEffect(() => {
     setActiveView("Heatmap");
@@ -66,57 +64,7 @@ export default function DashboardPage() {
         {activeView === "Recap" && <RecapView />}
       </main>
 
-      {/* Footer Links & Disclaimer */}
-      <footer className="border-t border-white/10 bg-[#111422]/80 py-4 px-4 mt-6">
-        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px] font-mono text-slate-400">
-          <div className="flex flex-wrap items-center gap-3">
-            <a
-              href="https://discord.gg/WS7t69W2D"
-              target="_blank"
-              rel="noreferrer"
-              className="hover:text-white transition-colors"
-            >
-              Discord
-            </a>
-            <a
-              href="https://whop.com/index-cheat-codes/affiliates"
-              target="_blank"
-              rel="noreferrer"
-              className="hover:text-white transition-colors"
-            >
-              Index Cheat Codes
-            </a>
-            <a href="/" className="hover:text-white transition-colors">
-              Heatmap
-            </a>
-            <a href="/quad" className="hover:text-white transition-colors">
-              Quad
-            </a>
-            <a href="/gaia" className="hover:text-white transition-colors">
-              Gaia
-            </a>
-            <a href="/scanner" className="hover:text-white transition-colors">
-              Scanner
-            </a>
-            <a href="/recap" className="hover:text-white transition-colors">
-              Recap
-            </a>
-            <a href="/guide" className="hover:text-white transition-colors">
-              Guide
-            </a>
-            <button
-              type="button"
-              onClick={() => setSetupModalOpen(true)}
-              className="hover:text-white transition-colors cursor-pointer"
-            >
-              Hyperion Alerts
-            </button>
-          </div>
-          <div className="text-center sm:text-right text-slate-500">
-            For educational and informational purposes only. Not financial advice. Data may be delayed or inaccurate; trade at your own risk.
-          </div>
-        </div>
-      </footer>
+      <AppFooter />
     </div>
   );
 }

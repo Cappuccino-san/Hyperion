@@ -170,7 +170,7 @@ export function evaluateActivePositionStepA(input: {
     peakPnlPct: prevPeakOptionPnlPct,
   });
 
-  const closePosition = (reason: string) => {
+  const closePosition = (reason: string, overrideFillPct?: number) => {
     const needsCap =
       isEodCutoff ||
       etTotalMinutes >= sessionBounds.rthCloseMins ||
@@ -186,11 +186,15 @@ export function evaluateActivePositionStepA(input: {
     const clampedSpotMovePct = isCall
       ? ((clampedExitSpot - activePos!.btoSpotPrice) / activePos!.btoSpotPrice) * 100
       : ((activePos!.btoSpotPrice - clampedExitSpot) / activePos!.btoSpotPrice) * 100;
+    const desiredExitPrice =
+      typeof overrideFillPct === "number" && Number.isFinite(overrideFillPct)
+        ? Math.max(0.01, Number((entryFillPrice * (1 + overrideFillPct / 100)).toFixed(2)))
+        : rawExitPrice;
     const clampedExitFill = clampOptionPriceToGreekEnvelope(
       activePos!.btoSpotPrice,
       clampedExitSpot,
       entryFillPrice,
-      rawExitPrice,
+      desiredExitPrice,
       isCall,
       heldMin
     );
@@ -500,7 +504,9 @@ export function evaluateActivePositionStepA(input: {
     onFavorableSideOfVwap,
     evaluateOnCloseOnly: true,
   });
-  activePos.peakOptionPnlPct = ratchetEval.nextPeakOptionPnlPct;
+  if (!posCandle || isNewBarAfterEntry || ratchetEval.nextPeakOptionPnlPct >= 60) {
+    activePos.peakOptionPnlPct = ratchetEval.nextPeakOptionPnlPct;
+  }
 
   // 1. STC (15:55 PM ET HARD CUTOFF / 12:55 PM EARLY CLOSE)
   if (isEodCutoff) {
@@ -522,7 +528,7 @@ export function evaluateActivePositionStepA(input: {
   }
   // 1C. STC: PROGRESSIVE OPTION-% PROFIT RATCHET / FLUX-FLIP MFE HARVEST (confirmed 5m bar close only)
   else if ((!posCandle || isNewBarAfterEntry) && ratchetEval.triggered && ratchetEval.reason) {
-    closePosition(ratchetEval.reason);
+    closePosition(ratchetEval.reason, ratchetEval.fillPnlPct ?? undefined);
   }
   // 1D. STC: STAGE 3 STRUCTURAL WALL HARVEST (PUT WALL / CALL WALL within $0.35)
   else if (

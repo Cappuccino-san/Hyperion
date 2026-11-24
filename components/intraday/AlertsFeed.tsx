@@ -48,7 +48,7 @@ export function AlertsFeed() {
   // Tactical 0DTE / Next-Exp levels for intraday Pre-Trade Radar
   // Anchors BTO Put triggers and Call triggers to 0DTE walls instead of distant all-expiration LEAPS outliers
   const zeroDteLevels = gammaLevelsByFilter?.["0DTE"] ?? gammaLevelsByFilter?.["THIS_WEEK"];
-  const currentSpot = spotPrice > 0 ? spotPrice : (getStaticTickerPreset(activeTicker)?.spotPrice || 0);
+  const currentSpot = spotPrice > 0 ? spotPrice : 0;
   const strikeStep = useDashboardStore((state) => state.strikeStep) || 1;
   const roundToStep = (v: number) =>
     Number.isFinite(v) && strikeStep > 0
@@ -336,7 +336,9 @@ export function AlertsFeed() {
               <span className="text-slate-200 font-bold">${activePosition.btoSpotPrice.toFixed(2)}</span>
             </div>
             <div>
-              <span className="text-[9.5px] uppercase text-slate-400 block font-semibold">TP1 (Trim 50%)</span>
+              <span className="text-[9.5px] uppercase text-slate-400 block font-semibold">
+                {(activePosition.contractsQty ?? 1) === 1 ? "TP1 Target" : "TP1 (Trim 50%)"}
+              </span>
               <span className="text-amber-300 font-bold">${activePosition.target1Spot.toFixed(2)}</span>
             </div>
             <div>

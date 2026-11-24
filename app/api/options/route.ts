@@ -428,9 +428,12 @@ async function attachIntraday(
         callWall: tacticalLevels.callWall,
         putWall: tacticalLevels.putWall,
         zeroGamma: tacticalLevels.zeroGamma,
-        zeroDteCallWall: tacticalLevels.callWall,
-        zeroDtePutWall: tacticalLevels.putWall,
-        zeroDteZeroGamma: tacticalLevels.zeroGamma,
+        zeroDteCallWall:
+          payload.gammaLevelsByFilter?.["0DTE"]?.callWall || tacticalLevels.callWall,
+        zeroDtePutWall:
+          payload.gammaLevelsByFilter?.["0DTE"]?.putWall || tacticalLevels.putWall,
+        zeroDteZeroGamma:
+          payload.gammaLevelsByFilter?.["0DTE"]?.zeroGamma || tacticalLevels.zeroGamma,
         dailyExpectedMove: tacticalLevels.dailyExpectedMove,
         kingNode: payload.kingNode,
         filteredKing: tacticalLevels.tacticalKing,
@@ -493,6 +496,56 @@ async function attachIntraday(
   }
 }
 
+function stripZeroCells(rec: Record<string, number>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const k in rec) {
+    const v = rec[k];
+    if (typeof v === "number" && v !== 0 && Number.isFinite(v)) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function slimOptionsPayloadForWire(
+  payload: OptionsAnalyticsPayload
+): OptionsAnalyticsPayload {
+  const spot = payload.spotPrice;
+  const dailyEm = payload.expectedMoves?.daily?.em ?? spot * 0.015;
+  const maxReach = Math.max(dailyEm * 4.0, spot * 0.12);
+  const pinnedStrikes = new Set<number>([
+    payload.kingNode?.allExpKing ?? 0,
+    payload.kingNode?.zeroDteKing ?? 0,
+    payload.kingNode?.weeklyKing ?? 0,
+    payload.gammaLevels?.callWall ?? 0,
+    payload.gammaLevels?.putWall ?? 0,
+  ]);
+
+  const slimStrikes = payload.strikes
+    .filter((row) => {
+      if (pinnedStrikes.has(row.strike)) {
+        return true;
+      }
+      if (spot > 0 && Math.abs(row.strike - spot) <= maxReach) {
+        return true;
+      }
+      return Math.abs(row.totalNetGex) >= 10_000;
+    })
+    .map((row) => ({
+      ...row,
+      gex: stripZeroCells(row.gex),
+      vex: stripZeroCells(row.vex),
+      dex: stripZeroCells(row.dex),
+      charm: stripZeroCells(row.charm),
+      openPctChange: stripZeroCells(row.openPctChange),
+    }));
+
+  return {
+    ...payload,
+    strikes: slimStrikes,
+  };
+}
+
 export async function GET(request: NextRequest) {
   ensureLiveBotRunning();
   const { searchParams } = new URL(request.url);
@@ -509,7 +562,7 @@ export async function GET(request: NextRequest) {
         connectionStatus: cached.payload.connectionStatus ?? "LIVE",
         cacheAgeSec,
       });
-      return NextResponse.json(enriched);
+      return NextResponse.json(slimOptionsPayloadForWire(enriched));
     }
   }
 
@@ -530,7 +583,7 @@ export async function GET(request: NextRequest) {
           payload: taggedTradier,
         });
         const enriched = await attachIntraday(taggedTradier);
-        return NextResponse.json(enriched);
+        return NextResponse.json(slimOptionsPayloadForWire(enriched));
       }
     } catch {
       // Fall through to Tier 2 (CBOE Market Data)
@@ -552,7 +605,7 @@ export async function GET(request: NextRequest) {
         payload: taggedCboe,
       });
       const enriched = await attachIntraday(taggedCboe);
-      return NextResponse.json(enriched);
+      return NextResponse.json(slimOptionsPayloadForWire(enriched));
     }
   } catch {
     // Live feed error - fall through to Tier 2b/3
@@ -566,7 +619,7 @@ export async function GET(request: NextRequest) {
       isStale: true,
       connectionStatus: "SYNCING",
     });
-    return NextResponse.json(enriched, {
+    return NextResponse.json(slimOptionsPayloadForWire(enriched), {
       headers: {
         "X-Hyperion-Data-Status": "STALE_SYNCING",
         "Cache-Control": "no-store, max-age=0",

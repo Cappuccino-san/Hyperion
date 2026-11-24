@@ -1,34 +1,22 @@
-import { computeAdaptiveQuantMetrics } from "@/lib/gaiaSignalFsm";
 import {
   buildDiscordWebhookDispatchUrl,
   isValidDiscordWebhookUrl,
 } from "@/lib/discordWebhook";
 import {
-  capExitTsToEodFlat,
   etMinutesOfDay,
   getSessionBoundsEt,
   getTodayEt,
   type SessionBoundsEt,
 } from "@/lib/gaiaSessionGuards";
-import { DEFAULT_HARD_OPTION_STOP_LOSS_PCT } from "@/lib/bracketOrderEngine";
 import {
-  ContractType,
   DailyTradeStore,
   GaiaSpySignalSyncInput,
-  OptionTradePosition,
   SyncGaiaTickerParams,
   SyncGaiaTickerResult,
   TradeLifecycleAlert,
   isSupportedTradeTicker,
 } from "@/lib/execution/types";
 import {
-  clampOptionPriceToGreekEnvelope,
-  formatTimeEt,
-  getNowEtTime,
-} from "@/lib/execution/optionPricing";
-import { selectSmallAccountContract } from "@/lib/execution/contractRouter";
-import {
-  getGaiaDiscordDedupState,
   loadTradeStore,
   saveTradeStore,
 } from "@/lib/execution/ledgerCommit";
@@ -44,7 +32,7 @@ export function isAlertDispatchEligible(
   if (alert.action === "BUY_TO_OPEN") {
     const isFresh = Math.abs(realNowTs - alert.ts) <= 180;
     const isRth = etMins >= sessionBounds.rthOpenMins && etMins < sessionBounds.rthCloseMins;
-    return isFresh && isRth;
+    return isRth && isFresh;
   }
 
   // SELL_TO_CLOSE: allow live retries inside RTH and during post-close MOC grace (+20m) on same session date
@@ -498,36 +486,52 @@ export async function sendDiscordTradeAlert(
   }
 }
 
-function getCanonicalGaiaSlot(sig: GaiaSpySignalSyncInput): string {
+export function getCanonicalGaiaSlot(sig: GaiaSpySignalSyncInput): string {
   const lbl = (sig.label || "").toUpperCase();
-  const baseSlot =
-    lbl.includes("OPEN") || sig.id === "sig-open" || sig.id.startsWith("sig-open")
-      ? "LONG_OPEN"
+  const isShort = sig.type === "SHORT" || lbl.includes("SHORT");
+  const baseSlot = isShort
+    ? lbl.includes("OPEN") || sig.id === "sig-open" || sig.id.startsWith("sig-open")
+      ? "SHORT_OPEN"
       : lbl.includes("PEAK") || sig.id === "sig-peak" || sig.id.startsWith("sig-peak")
-      ? "SHORT_PEAK"
-      : lbl.includes("BREAK") || sig.id.includes("break")
-      ? "SHORT_BREAK"
+        ? "SHORT_PEAK"
+        : lbl.includes("BREAK") || sig.id.includes("break")
+          ? "SHORT_BREAK"
+          : `${sig.type}_${sig.time || sig.timeLabel || "SIG"}`
+    : lbl.includes("OPEN") || sig.id === "sig-open" || sig.id.startsWith("sig-open")
+      ? "LONG_OPEN"
       : lbl.includes("RECLAIM") || sig.id.includes("reclaim")
-      ? "LONG_RECLAIM"
-      : `${sig.type}_${sig.time || sig.timeLabel || "SIG"}`;
+        ? "LONG_RECLAIM"
+        : `${sig.type}_${sig.time || sig.timeLabel || "SIG"}`;
 
   const idxMatch = sig.id ? sig.id.match(/-(\d+)$/) : null;
   return idxMatch ? `${baseSlot}_${idxMatch[1]}` : baseSlot;
 }
 
-export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParams): Promise<SyncGaiaTickerResult> {
+/**
+ * Single-Writer Telemetry Sync (P0-D1):
+ * `liveBotDaemon` -> `evaluateTradeSignals` is the sole authoritative writer for
+ * `activePositions`, `closedPositions`, `alerts`, and Discord BTO/STC webhooks.
+ * This endpoint updates per-ticker Gaia HUD regime metadata (`gaiaStateByTicker`) only
+ * and NEVER opens, closes, or dispatches trades.
+ */
+export async function syncGaiaTickerSignalsToDiscord(
+  params: SyncGaiaTickerParams
+): Promise<SyncGaiaTickerResult> {
+  if (params.signal?.aborted) {
+    return { dispatchedCount: 0, keys: [] };
+  }
   const sym = (params.ticker || "").trim().toUpperCase().replace(/^\$/, "");
   const normalizedTicker = sym === "SPX" ? "SPXW" : sym;
   if (!isSupportedTradeTicker(normalizedTicker)) {
     return { dispatchedCount: 0, keys: [] };
   }
-  const isSpxwSync = normalizedTicker === "SPXW";
-  const positionTicker = isSpxwSync ? "SPY" : normalizedTicker;
-  const tickerSlug = positionTicker.toLowerCase().replace(/[^a-z0-9]/g, "") || "ticker";
+  const positionTicker = normalizedTicker === "SPXW" ? "SPY" : normalizedTicker;
   const resolvedDate = params.sessionDate || getTodayEt();
-  const sessionBounds = getSessionBoundsEt(resolvedDate);
+  if (params.isHistoricalBackfill || resolvedDate !== getTodayEt()) {
+    return { dispatchedCount: 0, keys: [] };
+  }
 
-  let store = loadTradeStore();
+  const store: DailyTradeStore = loadTradeStore();
   store.gaiaStateByTicker = store.gaiaStateByTicker || {};
   const prevTickerState = store.gaiaStateByTicker[positionTicker] || {};
   const updatedTickerState = {
@@ -549,653 +553,35 @@ export async function syncGaiaTickerSignalsToDiscord(params: SyncGaiaTickerParam
         : prevTickerState.zeroGamma ?? (positionTicker === "SPY" ? store.zeroGamma : undefined),
   };
 
-  const applyGaiaStateToStore = (targetStore: DailyTradeStore): boolean => {
-    targetStore.gaiaStateByTicker = targetStore.gaiaStateByTicker || {};
-    const existing = targetStore.gaiaStateByTicker[positionTicker] || {};
-    let changed =
-      existing.activeFsmState !== updatedTickerState.activeFsmState ||
-      existing.macroRegime !== updatedTickerState.macroRegime ||
-      existing.chiPct !== updatedTickerState.chiPct ||
-      existing.zeroGamma !== updatedTickerState.zeroGamma;
-    targetStore.gaiaStateByTicker[positionTicker] = updatedTickerState;
-    if (positionTicker === "SPY") {
-      if (params.activeFsmState && targetStore.activeFsmState !== params.activeFsmState) {
-        targetStore.activeFsmState = params.activeFsmState;
-        changed = true;
-      }
-      if (params.macroRegime && targetStore.macroRegime !== params.macroRegime) {
-        targetStore.macroRegime = params.macroRegime;
-        changed = true;
-      }
-      if (typeof params.chiPct === "number" && targetStore.chiPct !== params.chiPct) {
-        targetStore.chiPct = params.chiPct;
-        changed = true;
-      }
-      if (typeof params.zeroGamma === "number" && params.zeroGamma > 0 && targetStore.zeroGamma !== params.zeroGamma) {
-        targetStore.zeroGamma = params.zeroGamma;
-        changed = true;
-      }
+  let changed =
+    prevTickerState.activeFsmState !== updatedTickerState.activeFsmState ||
+    prevTickerState.macroRegime !== updatedTickerState.macroRegime ||
+    prevTickerState.chiPct !== updatedTickerState.chiPct ||
+    prevTickerState.zeroGamma !== updatedTickerState.zeroGamma;
+  store.gaiaStateByTicker[positionTicker] = updatedTickerState;
+
+  if (positionTicker === "SPY") {
+    if (params.activeFsmState && store.activeFsmState !== params.activeFsmState) {
+      store.activeFsmState = params.activeFsmState;
+      changed = true;
     }
-    return changed;
-  };
-  const gaiaStateChanged = applyGaiaStateToStore(store);
-
-  const tickerPos = store.activePositions[positionTicker];
-  const isTickerStructural = Boolean(tickerPos && !tickerPos.setupName.includes("Gaia Tactical HUD"));
-  const guardNowDate = new Date();
-  const guardRawNowTs = Math.floor(guardNowDate.getTime() / 1000);
-  const guardNowEt = getNowEtTime(guardNowDate);
-  const isGuardMocCutoff = !params.isHistoricalBackfill && guardNowEt.totalMinutes >= sessionBounds.eodFlatMins;
-  const guardHeldSec = tickerPos ? guardRawNowTs - (tickerPos.openedTs || guardRawNowTs) : 0;
-  const rawParamsSpot = Number(params.spotPrice);
-  const guardCloseSpot =
-    rawParamsSpot > 0
-      ? (isSpxwSync ? Number((rawParamsSpot / 10).toFixed(2)) : Number(rawParamsSpot.toFixed(2)))
-      : (tickerPos?.btoSpotPrice ?? 0);
-  const guardAdverseMove = tickerPos
-    ? (tickerPos.contractType === "CALL" ? tickerPos.btoSpotPrice - guardCloseSpot : guardCloseSpot - tickerPos.btoSpotPrice)
-    : 0;
-  const guardMinInvalidation = computeAdaptiveQuantMetrics(
-    guardCloseSpot,
-    tickerPos?.atr5m ?? guardCloseSpot * 0.0018
-  ).minReversalInvalidation;
-
-  let guardExitReason: string | null = null;
-  if (tickerPos && !isTickerStructural) {
-    const isGuardCall = tickerPos.contractType === "CALL";
-    const isGuardWinning = isGuardCall
-      ? guardCloseSpot > tickerPos.btoSpotPrice
-      : guardCloseSpot < tickerPos.btoSpotPrice;
-    if (isGuardMocCutoff) {
-      guardExitReason = sessionBounds.isEarlyClose
-        ? "12:55 PM ET HARD EARLY-CLOSE MARKET CUTOFF"
-        : "15:55 PM ET HARD MARKET CLOSE CUTOFF";
-    } else if (
-      params.activeFsmState === "STAND_ASIDE" &&
-      guardHeldSec >= 600 &&
-      (guardAdverseMove >= guardMinInvalidation || isGuardWinning)
-    ) {
-      guardExitReason = "Gaia FSM Neutralization to STAND_ASIDE";
-    } else if (
-      guardHeldSec >= 600 &&
-      guardAdverseMove >= guardMinInvalidation &&
-      !isGuardCall &&
-      (params.activeFsmState === "LONG" || (updatedTickerState.macroRegime === "CALL" && (updatedTickerState.chiPct ?? 50) > 52))
-    ) {
-      guardExitReason = "Macro Rotation to Bull Regime";
-    } else if (
-      guardHeldSec >= 600 &&
-      guardAdverseMove >= guardMinInvalidation &&
-      isGuardCall &&
-      (params.activeFsmState === "SHORT" || (updatedTickerState.macroRegime === "PUT" && (updatedTickerState.chiPct ?? 50) < 48))
-    ) {
-      guardExitReason = "Macro Rotation to Bear Regime";
+    if (params.macroRegime && store.macroRegime !== params.macroRegime) {
+      store.macroRegime = params.macroRegime;
+      changed = true;
+    }
+    if (typeof params.chiPct === "number" && store.chiPct !== params.chiPct) {
+      store.chiPct = params.chiPct;
+      changed = true;
+    }
+    if (typeof params.zeroGamma === "number" && params.zeroGamma > 0 && store.zeroGamma !== params.zeroGamma) {
+      store.zeroGamma = params.zeroGamma;
+      changed = true;
     }
   }
 
-  let guardSaved = false;
-  if (guardExitReason && tickerPos) {
-    console.warn(`[GaiaSync] Closed ${positionTicker} ${tickerPos.contractType} position: ${guardExitReason}`);
-    const isGuardCall = tickerPos.contractType === "CALL";
-    const entryOptPrice = tickerPos.btoOptionMid || tickerPos.optionAsk || 0.50;
-    const dirMove = isGuardCall ? guardCloseSpot - tickerPos.btoSpotPrice : tickerPos.btoSpotPrice - guardCloseSpot;
-    const spotMovePct = Number(((dirMove / Math.max(0.01, tickerPos.btoSpotPrice)) * 100).toFixed(2));
-    const rawEstOpt = Math.max(0.05, Number((entryOptPrice + dirMove * 0.45).toFixed(2)));
-    const closedOptMid = clampOptionPriceToGreekEnvelope(
-      tickerPos.btoSpotPrice,
-      guardCloseSpot,
-      entryOptPrice,
-      rawEstOpt,
-      isGuardCall,
-      Math.max(1, guardHeldSec / 60)
-    );
-    const pnlOptionPct = Number((((closedOptMid - entryOptPrice) / Math.max(0.01, entryOptPrice)) * 100).toFixed(2));
-
-    const needsGuardCap =
-      isGuardMocCutoff ||
-      guardNowEt.totalMinutes >= sessionBounds.rthCloseMins ||
-      guardNowEt.totalMinutes < sessionBounds.rthOpenMins;
-    const guardNowTs = needsGuardCap ? capExitTsToEodFlat(guardRawNowTs, resolvedDate).ts : guardRawNowTs;
-    const guardTimeStr = formatTimeEt(guardNowTs);
-    const isGuardLiveRth =
-      guardNowEt.totalMinutes >= sessionBounds.rthOpenMins &&
-      guardNowEt.totalMinutes < sessionBounds.rthCloseMins;
-    const isGuardHistorical =
-      Boolean(params.isHistoricalBackfill || tickerPos.originBackfill) || !isGuardLiveRth;
-    const guardExitAlertId = `${tickerPos.id}-guard-stc`;
-
-    tickerPos.status = "CLOSED";
-    tickerPos.remainingQty = 0;
-    tickerPos.closedTs = guardNowTs;
-    tickerPos.closedAt = guardTimeStr;
-    tickerPos.closedSpotPrice = guardCloseSpot;
-    tickerPos.closedOptionMid = closedOptMid;
-    tickerPos.pnlSpotPct = spotMovePct;
-    tickerPos.pnlOptionPct = pnlOptionPct;
-    tickerPos.exitReason = guardExitReason;
-
-    const guardExitAlert: TradeLifecycleAlert = {
-      id: guardExitAlertId,
-      timestamp: guardTimeStr,
-      ts: guardNowTs,
-      ticker: positionTicker,
-      action: "SELL_TO_CLOSE",
-      contractType: tickerPos.contractType,
-      contractLabel: tickerPos.contractLabel,
-      strike: tickerPos.strike,
-      expiration: tickerPos.expiration,
-      expHuman: tickerPos.expHuman,
-      robinhoodExp: tickerPos.robinhoodExp,
-      setupName: tickerPos.setupName,
-      reason: guardExitReason,
-      status: "CLOSED",
-      spotPrice: guardCloseSpot,
-      btoSpotPrice: tickerPos.btoSpotPrice,
-      target1Spot: tickerPos.target1Spot,
-      target2Spot: tickerPos.target2Spot,
-      stopLossSpot: tickerPos.stopLossSpot,
-      optionMid: closedOptMid,
-      optionBid: closedOptMid,
-      optionAsk: closedOptMid,
-      btoOptionMid: entryOptPrice,
-      contractsQty: tickerPos.contractsQty,
-      remainingQty: 0,
-      totalOutlay: tickerPos.totalOutlay,
-      pnlSpotPct: spotMovePct,
-      pnlOptionPct,
-      isHistoricalBackfill: isGuardHistorical,
-      eventId: guardExitAlertId,
-      message: `🔴 STC · ${tickerPos.contractLabel} [${guardExitReason}] @ $${guardCloseSpot.toFixed(2)} · Spot ${spotMovePct >= 0 ? "+" : ""}${spotMovePct}% (${pnlOptionPct >= 0 ? "+" : ""}${pnlOptionPct}%)`,
-    };
-
-    store.closedPositions.push(tickerPos);
-    delete store.activePositions[positionTicker];
-    store.alerts.push(guardExitAlert);
-    saveTradeStore(store);
-    guardSaved = true;
-
-    if (!isGuardHistorical && !params.signal?.aborted) {
-      const sent = await sendDiscordTradeAlert(guardExitAlert, params.webhookUrl, { signal: params.signal }).catch(
-        (err) => {
-          console.error("[GaiaSync] Failed to dispatch Consistency Guard STC alert to Discord:", err);
-          return false;
-        }
-      );
-      if (sent) {
-        const afterGuardSend = loadTradeStore();
-        afterGuardSend.dispatchedAlertIds = afterGuardSend.dispatchedAlertIds || {};
-        afterGuardSend.dispatchedAlertIds[guardExitAlertId] = true;
-        saveTradeStore(afterGuardSend);
-        store = afterGuardSend;
-      }
-    }
-  }
-
-  const rawSignals = Array.isArray(params.signals) ? params.signals : [];
-  if (rawSignals.length === 0 || params.activeFsmState === "STAND_ASIDE") {
-    if (gaiaStateChanged && !guardSaved) {
-      saveTradeStore(store);
-    }
-    return { dispatchedCount: 0, keys: [] };
-  }
-  if (gaiaStateChanged && !guardSaved) {
+  if (changed) {
     saveTradeStore(store);
   }
 
-  const dispatchedSet = getGaiaDiscordDedupState().syncDate(resolvedDate);
-  const sorted = [...rawSignals].sort((a, b) => (a.index ?? a.idx ?? 0) - (b.index ?? b.idx ?? 0));
-  const newlyDispatched: string[] = [];
-
-  for (let i = 0; i < sorted.length; i++) {
-    if (params.signal?.aborted) break;
-    store = loadTradeStore();
-    const sig = sorted[i];
-    const nextSig = sorted[i + 1];
-    const slot = getCanonicalGaiaSlot(sig);
-    const rawSigTs = sig.timestamp || sig.barTimestamp;
-    const nowTs = Math.floor(Date.now() / 1000);
-    const eventTs =
-      typeof rawSigTs === "number" && rawSigTs > 0
-        ? rawSigTs > 1e11
-          ? Math.floor(rawSigTs / 1000)
-          : rawSigTs
-        : nowTs;
-    const isCall = sig.type === "LONG";
-    const direction: ContractType = isCall ? "CALL" : "PUT";
-
-    const tickerFsmState = updatedTickerState.activeFsmState;
-    const tickerChiPct = updatedTickerState.chiPct;
-    const effectiveMacro =
-      updatedTickerState.macroRegime ||
-      (tickerChiPct !== undefined ? (tickerChiPct > 50 ? "CALL" : "PUT") : undefined);
-    if (
-      direction === "PUT" &&
-      (tickerFsmState === "LONG" || (effectiveMacro === "CALL" && (tickerChiPct ?? 50) > 52))
-    ) {
-      console.warn(`[GaiaSync FIREWALL] Blocked ${positionTicker} PUT signal at $${sig.price} while regime is ${effectiveMacro} / FSM ${tickerFsmState} (χ=${tickerChiPct}%).`);
-      continue;
-    }
-    const zgRef =
-      typeof params.zeroGamma === "number" && params.zeroGamma > 0
-        ? params.zeroGamma
-        : typeof updatedTickerState.zeroGamma === "number" && updatedTickerState.zeroGamma > 0
-          ? updatedTickerState.zeroGamma
-          : undefined;
-    const isBelowZeroGamma = typeof zgRef === "number" && zgRef > 0 && sig.price < zgRef;
-    const isChiBearish = (tickerChiPct ?? 50) < 50;
-
-    const sigDate = new Date(eventTs * 1000);
-    const sigEt = getNowEtTime(sigDate);
-    const inferredIntervalSec =
-      typeof sig.barSpanSeconds === "number" && sig.barSpanSeconds > 0
-        ? sig.barSpanSeconds
-        : 300;
-    const eventCloseTs = sig.barCloseTimestamp || (eventTs + inferredIntervalSec);
-    const eventCloseEtMins = etMinutesOfDay(eventCloseTs);
-    if (
-      sigEt.totalMinutes < sessionBounds.entryStartMins ||
-      sigEt.totalMinutes > sessionBounds.entryCutoffMins ||
-      eventCloseEtMins > sessionBounds.entryCutoffMins
-    ) {
-      console.warn(
-        `[GaiaSync FIREWALL] Blocked signal outside entry window (${sigEt.hours}:${String(sigEt.minutes).padStart(2, "0")}, closeEtMins=${eventCloseEtMins} > ${sessionBounds.entryCutoffMins}).`
-      );
-      continue;
-    }
-    const storedSpotNorm = store.prevSpotPrices[normalizedTicker];
-    const storedSpotPos = store.prevSpotPrices[positionTicker];
-    const scaledStoredPos =
-      typeof storedSpotPos === "number" && storedSpotPos > 0
-        ? (isSpxwSync ? storedSpotPos * 10 : storedSpotPos)
-        : undefined;
-    const liveSpotRef =
-      Number(params.spotPrice) > 0
-        ? Number(params.spotPrice)
-        : (storedSpotNorm ?? scaledStoredPos);
-    if (typeof liveSpotRef === "number" && liveSpotRef > 0) {
-      const basisDiffPct = Math.abs(sig.price - liveSpotRef) / liveSpotRef;
-      if (basisDiffPct > 0.0075) {
-        console.warn(`[GaiaSync FIREWALL] Blocked unphysical ${positionTicker} signal price ${sig.price} vs live spot ${liveSpotRef}`);
-        continue;
-      }
-    }
-    const isOpeningRangeSig = sigEt.totalMinutes < 585;
-    const priorCloseRef =
-      typeof storedSpotNorm === "number" && storedSpotNorm > 0
-        ? storedSpotNorm
-        : typeof scaledStoredPos === "number" && scaledStoredPos > 0
-          ? scaledStoredPos
-          : Number(params.spotPrice) > 0
-            ? Number(params.spotPrice)
-            : undefined;
-    const isOpeningNegativeGamma =
-      isOpeningRangeSig &&
-      (isBelowZeroGamma ||
-        (typeof priorCloseRef === "number" && sig.price < priorCloseRef) ||
-        isChiBearish);
-
-    const isImpulseCallReclaim =
-      !isOpeningRangeSig &&
-      ((params.impulseChi ?? 0) >= 0.60 ||
-        Boolean(sig.label?.includes("Impulse") || sig.tag?.includes("IMPULSE")));
-    const isHardBearishFlux = (tickerChiPct ?? 50) < 45 || effectiveMacro === "PUT" || tickerFsmState === "SHORT";
-    if (
-      direction === "CALL" &&
-      !isImpulseCallReclaim &&
-      (isHardBearishFlux || isBelowZeroGamma || isOpeningNegativeGamma)
-    ) {
-      console.warn(
-        `[GaiaSync FIREWALL] Blocked Counter-Trend ${positionTicker} CALL signal at $${sig.price} (below ZG: ${isBelowZeroGamma}, χ: ${tickerChiPct}%, FSM: ${tickerFsmState}, Macro: ${effectiveMacro}, OpeningRange: ${isOpeningRangeSig}, PriorClose: ${priorCloseRef}).`
-      );
-      continue;
-    }
-
-    const idempotencyKey = `${positionTicker}_${eventTs}_${direction}`;
-    const entryKey = `${resolvedDate}:${positionTicker}:ENTRY:${slot}:${idempotencyKey}`;
-
-    if (!dispatchedSet.has(entryKey) && !store.dispatchedAlertIds?.[idempotencyKey]) {
-      const sameTickerClosed = (store.closedPositions ?? []).filter(
-        (p) => p.ticker === positionTicker || p.ticker === normalizedTicker
-      );
-      const closedCount = sameTickerClosed.length;
-      const prevClosed = sameTickerClosed.reduce<OptionTradePosition | undefined>(
-        (latest, cur) => (!latest || (cur.closedTs ?? 0) >= (latest.closedTs ?? 0) ? cur : latest),
-        undefined
-      );
-      const prevCooldownMet =
-        closedCount === 1 &&
-        typeof prevClosed?.closedTs === "number" &&
-        eventTs - prevClosed.closedTs >= 1800;
-      const canPhase2OppositeReclaim =
-        closedCount === 1 &&
-        prevCooldownMet &&
-        sigEt.totalMinutes >= 630 &&
-        sigEt.totalMinutes <= sessionBounds.entryCutoffMins &&
-        prevClosed?.contractType !== direction;
-      if (closedCount >= 2 || (closedCount >= 1 && !canPhase2OppositeReclaim)) {
-        console.warn(`[GaiaSync FIREWALL] Blocked ${positionTicker} trade dispatch: Day is LOCKED_FOR_DAY (${closedCount} closed trades on ${positionTicker}).`);
-        continue;
-      }
-      const activePos = store.activePositions[positionTicker];
-      if (activePos && activePos.status === "OPEN") {
-        console.warn(`[GaiaSync FIREWALL] Blocked trade dispatch: ${positionTicker} already has an ACTIVE position (${activePos.contractLabel}).`);
-        continue;
-      }
-      if (Object.keys(store.activePositions || {}).length >= 1) {
-        console.warn("[GaiaSync FIREWALL] Blocked trade dispatch: Another ticker position is already ACTIVE.");
-        continue;
-      }
-
-      const posSigPrice = isSpxwSync ? Number((sig.price / 10).toFixed(2)) : Number(sig.price.toFixed(2));
-      const syncStopDist = Math.max(0.05, Number((posSigPrice * 0.0016).toFixed(2)));
-      const syncTp1Dist = Math.ceil((syncStopDist * 1.5 - 1e-9) * 100) / 100;
-      const syncTp2Dist = Math.max(syncTp1Dist + 0.05, Number((posSigPrice * 0.0047).toFixed(2)));
-      const target1Spot = isCall
-        ? Number((posSigPrice + syncTp1Dist).toFixed(2))
-        : Number((posSigPrice - syncTp1Dist).toFixed(2));
-      const target2Spot = isCall
-        ? Number((posSigPrice + syncTp2Dist).toFixed(2))
-        : Number((posSigPrice - syncTp2Dist).toFixed(2));
-      const stopLossSpot = isCall
-        ? Number((posSigPrice - syncStopDist).toFixed(2))
-        : Number((posSigPrice + syncStopDist).toFixed(2));
-
-      const contractSpot = isSpxwSync ? Number((posSigPrice * 10).toFixed(2)) : posSigPrice;
-      const contractT1 = isSpxwSync ? Number((target1Spot * 10).toFixed(2)) : target1Spot;
-      const contractT2 = isSpxwSync ? Number((target2Spot * 10).toFixed(2)) : target2Spot;
-      const contractSl = isSpxwSync ? Number((stopLossSpot * 10).toFixed(2)) : stopLossSpot;
-      const optimal = await selectSmallAccountContract({
-        ticker: normalizedTicker,
-        contractType: direction,
-        spotPrice: contractSpot,
-        target1Spot: contractT1,
-        target2Spot: contractT2,
-        stopLossSpot: contractSl,
-        conviction: 92,
-        nowEt: sigDate,
-        contractsAlreadyAnchored: true,
-        signal: params.signal,
-      }).catch(() => null);
-
-      if (params.signal?.aborted) break;
-      if (!optimal) {
-        console.warn(`[GaiaSync FIREWALL] No qualifying live contract under $1.00 for ${normalizedTicker} ${direction} @ $${posSigPrice.toFixed(2)} — skipping synthetic fallback.`);
-        continue;
-      }
-
-      const strike = optimal.strike;
-      const expDate = optimal.expiration;
-      const contractLabel = optimal.contractLabel;
-      const entryAsk = optimal.optionAsk || optimal.optionMid;
-      const contractsQty: 1 = 1;
-      const singleContractCents = Math.round(entryAsk * 10000);
-      if (singleContractCents > 10000) {
-        console.warn(`[GaiaSync FIREWALL] Blocked ${positionTicker} outlay $${(singleContractCents / 100).toFixed(2)} (> $100 cap).`);
-        continue;
-      }
-      const totalOutlay = singleContractCents / 100;
-      const estTp1 = optimal.estTp1Mid;
-      const estTp2 = optimal.estTp2Mid;
-      const maxStopLossFloor = Number((entryAsk * (1 - DEFAULT_HARD_OPTION_STOP_LOSS_PCT / 100)).toFixed(2));
-      const estStop = Math.max(maxStopLossFloor, optimal.estStopMid);
-      const tp1Pct = Math.round(((estTp1 - entryAsk) / Math.max(0.01, entryAsk)) * 100);
-      const tp2Pct = Math.round(((estTp2 - entryAsk) / Math.max(0.01, entryAsk)) * 100);
-      const alertTimeStr = sig.time || sig.timeLabel || formatTimeEt(sigDate);
-
-      const isStale = nowTs - eventCloseTs > Math.round(inferredIntervalSec * 1.5);
-      const isRthWindow =
-        sigEt.totalMinutes >= sessionBounds.rthOpenMins &&
-        sigEt.totalMinutes < sessionBounds.rthCloseMins;
-      const isHistoricalBackfill = isStale || !isRthWindow || Boolean(params.isHistoricalBackfill);
-      const alertId = `gaia-${tickerSlug}-${entryKey.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
-
-      const btoAlert: TradeLifecycleAlert = {
-        id: alertId,
-        timestamp: alertTimeStr,
-        ts: eventTs,
-        dispatchedAt: nowTs,
-        ticker: positionTicker,
-        action: "BUY_TO_OPEN",
-        contractType: direction,
-        contractLabel,
-        strike,
-        expiration: expDate,
-        expHuman: optimal.expHuman,
-        robinhoodExp: optimal.robinhoodExp,
-        robinhoodTab: optimal.robinhoodTab,
-        setupName: `Gaia Tactical HUD [${sig.label || sig.type}]`,
-        reason: `Gaia Intraday ${sig.label || sig.type} signal at $${posSigPrice.toFixed(2)}`,
-        status: "OPEN",
-        spotPrice: posSigPrice,
-        btoSpotPrice: posSigPrice,
-        target1Spot,
-        target2Spot,
-        stopLossSpot,
-        optionMid: entryAsk,
-        optionBid: optimal.optionBid,
-        optionAsk: entryAsk,
-        btoOptionMid: entryAsk,
-        contractsQty,
-        remainingQty: contractsQty,
-        totalOutlay,
-        estTp1Mid: estTp1,
-        estTp2Mid: estTp2,
-        estStopMid: estStop,
-        tp1Pct,
-        tp2Pct,
-        rrRatio: 1.5,
-        altContractNote: optimal.altContractNote,
-        isHistoricalBackfill,
-        eventId: alertId,
-        message: `${isCall ? "🟢" : "🟣"} BUY TO OPEN (${contractsQty}x @ $${entryAsk.toFixed(2)}) · ${positionTicker} [Gaia ${sig.label || sig.type}] @ $${posSigPrice.toFixed(2)} · SL: $${stopLossSpot}, TP1: $${target1Spot}, TP2: $${target2Spot}`,
-      };
-
-      const newPos: OptionTradePosition = {
-        id: alertId,
-        ticker: positionTicker,
-        contractType: direction,
-        contractLabel,
-        strike,
-        expiration: expDate,
-        expHuman: optimal.expHuman,
-        robinhoodExp: optimal.robinhoodExp,
-        robinhoodTab: optimal.robinhoodTab,
-        setupName: btoAlert.setupName,
-        status: "OPEN",
-        btoSpotPrice: posSigPrice,
-        btoOptionMid: entryAsk,
-        optionBid: optimal.optionBid,
-        optionAsk: entryAsk,
-        contractsQty,
-        remainingQty: contractsQty,
-        totalOutlay,
-        estTp1Mid: estTp1,
-        estTp2Mid: estTp2,
-        estStopMid: estStop,
-        tp1Pct,
-        tp2Pct,
-        target1Spot,
-        target2Spot,
-        stopLossSpot,
-        openedAt: alertTimeStr,
-        openedTs: eventTs,
-        rrRatio: 1.5,
-        initialRisk: Number(Math.max(0.05, Math.abs(posSigPrice - stopLossSpot)).toFixed(2)),
-        atr5m: Number((posSigPrice * 0.0018).toFixed(4)),
-        altContractNote: optimal.altContractNote,
-        originBackfill: isHistoricalBackfill,
-      };
-
-      if (params.signal?.aborted) break;
-      const latestStoreBeforeCommit = loadTradeStore();
-      if (Object.keys(latestStoreBeforeCommit.activePositions || {}).length > 0) {
-        console.warn(`[GaiaSync FIREWALL] Aborted ${positionTicker} commit: global slot became occupied during option lookup.`);
-        continue;
-      }
-      applyGaiaStateToStore(latestStoreBeforeCommit);
-      latestStoreBeforeCommit.activePositions[positionTicker] = newPos;
-      latestStoreBeforeCommit.alerts.push(btoAlert);
-      latestStoreBeforeCommit.dispatchedAlertIds = latestStoreBeforeCommit.dispatchedAlertIds || {};
-      if (isHistoricalBackfill) {
-        dispatchedSet.add(entryKey);
-        newlyDispatched.push(entryKey);
-        latestStoreBeforeCommit.dispatchedAlertIds[btoAlert.id] = true;
-        latestStoreBeforeCommit.dispatchedAlertIds[idempotencyKey] = true;
-        saveTradeStore(latestStoreBeforeCommit);
-        store = latestStoreBeforeCommit;
-      } else {
-        saveTradeStore(latestStoreBeforeCommit);
-        store = latestStoreBeforeCommit;
-        const sent = await sendDiscordTradeAlert(btoAlert, params.webhookUrl, { signal: params.signal }).catch((err) => {
-          console.error("[GaiaSync] Failed to dispatch BTO alert to Discord:", err);
-          return false;
-        });
-        if (sent) {
-          dispatchedSet.add(entryKey);
-          newlyDispatched.push(entryKey);
-          const afterSendStore = loadTradeStore();
-          afterSendStore.dispatchedAlertIds = afterSendStore.dispatchedAlertIds || {};
-          afterSendStore.dispatchedAlertIds[btoAlert.id] = true;
-          afterSendStore.dispatchedAlertIds[idempotencyKey] = true;
-          saveTradeStore(afterSendStore);
-          store = afterSendStore;
-        }
-      }
-    }
-
-    if (nextSig && nextSig.type !== sig.type) {
-      if (params.signal?.aborted) break;
-      const latestExitStore = loadTradeStore();
-      const openPos = latestExitStore.activePositions[positionTicker];
-      if (!openPos || openPos.contractType !== direction) {
-        continue;
-      }
-      const nextSigRawTs = nextSig.timestamp || nextSig.barTimestamp || Math.floor(Date.now() / 1000);
-      const rawNextSigEpochSec = nextSigRawTs > 1e11 ? Math.floor(nextSigRawTs / 1000) : nextSigRawTs;
-      const nextSigEtRaw = getNowEtTime(new Date(rawNextSigEpochSec * 1000));
-      const nextSigNeedsCap =
-        nextSigEtRaw.totalMinutes >= sessionBounds.eodFlatMins ||
-        nextSigEtRaw.totalMinutes >= sessionBounds.rthCloseMins ||
-        nextSigEtRaw.totalMinutes < sessionBounds.rthOpenMins;
-      const nextSigEpochSec = nextSigNeedsCap
-        ? capExitTsToEodFlat(rawNextSigEpochSec, resolvedDate).ts
-        : rawNextSigEpochSec;
-      const nextPosPrice = isSpxwSync ? Number((nextSig.price / 10).toFixed(2)) : Number(nextSig.price.toFixed(2));
-      const heldSeconds = nextSigEpochSec - (openPos.openedTs || nextSigEpochSec);
-      const adverseSpot = isCall ? openPos.btoSpotPrice - nextPosPrice : nextPosPrice - openPos.btoSpotPrice;
-      const estOptMovePct = (((isCall ? nextPosPrice - openPos.btoSpotPrice : openPos.btoSpotPrice - nextPosPrice) * 0.45) / Math.max(0.01, openPos.btoOptionMid || 0.5)) * 100;
-      const minSyncRev = computeAdaptiveQuantMetrics(
-        nextPosPrice,
-        openPos.atr5m ?? nextPosPrice * 0.0018
-      ).minReversalInvalidation;
-      if (heldSeconds < 600 || (adverseSpot < minSyncRev && estOptMovePct < 10)) {
-        continue;
-      }
-
-      const exitKey = `${resolvedDate}:${positionTicker}:EXIT:${slot}`;
-      const dedupExitAlertId = `gaia-${tickerSlug}-${exitKey.toLowerCase().replace(/[^a-z0-9]/g, "-")}`;
-      if (!dispatchedSet.has(exitKey) && !latestExitStore.dispatchedAlertIds?.[dedupExitAlertId]) {
-        const entrySpot = openPos.btoSpotPrice;
-        const entryOptMid = openPos.btoOptionMid || openPos.optionAsk || 0.50;
-        const underlyingMove = isCall ? nextPosPrice - entrySpot : entrySpot - nextPosPrice;
-        const spotMovePct = Number(((underlyingMove / Math.max(0.01, entrySpot)) * 100).toFixed(2));
-        const rawEstExit = Math.max(0.05, Number((entryOptMid + underlyingMove * 0.45).toFixed(2)));
-        const estExitPrice = clampOptionPriceToGreekEnvelope(
-          entrySpot,
-          nextPosPrice,
-          entryOptMid,
-          rawEstExit,
-          isCall,
-          Math.max(1, heldSeconds / 60)
-        );
-        const pnlOptionPct = Number((((estExitPrice - entryOptMid) / Math.max(0.01, entryOptMid)) * 100).toFixed(1));
-        const exitAlertId = dedupExitAlertId;
-        const nextSigDate = new Date(nextSigEpochSec * 1000);
-        const exitTimeStr = nextSigNeedsCap
-          ? formatTimeEt(nextSigEpochSec)
-          : nextSig.time || nextSig.timeLabel || formatTimeEt(nextSigDate);
-        const nextSigEt = getNowEtTime(nextSigDate);
-        const isExitRthWindow =
-          nextSigEt.totalMinutes >= sessionBounds.rthOpenMins &&
-          nextSigEt.totalMinutes < sessionBounds.rthCloseMins;
-        const isExitStale = Math.floor(Date.now() / 1000) - nextSigEpochSec > 450;
-        const isExitHistorical =
-          isExitStale ||
-          !isExitRthWindow ||
-          Boolean(params.isHistoricalBackfill || openPos.originBackfill);
-
-        const exitAlert: TradeLifecycleAlert = {
-          id: exitAlertId,
-          timestamp: exitTimeStr,
-          ts: nextSigEpochSec,
-          ticker: positionTicker,
-          action: "SELL_TO_CLOSE",
-          contractType: direction,
-          contractLabel: openPos.contractLabel,
-          strike: openPos.strike,
-          expiration: openPos.expiration,
-          setupName: openPos.setupName,
-          reason: `Gaia closed on reversal transition to ${nextSig.label || nextSig.type}`,
-          status: "CLOSED",
-          spotPrice: nextPosPrice,
-          btoSpotPrice: entrySpot,
-          target1Spot: openPos.target1Spot,
-          target2Spot: openPos.target2Spot,
-          stopLossSpot: openPos.stopLossSpot,
-          optionMid: estExitPrice,
-          optionBid: estExitPrice,
-          optionAsk: estExitPrice,
-          btoOptionMid: entryOptMid,
-          contractsQty: openPos.contractsQty,
-          remainingQty: 0,
-          totalOutlay: openPos.totalOutlay,
-          pnlSpotPct: spotMovePct,
-          pnlOptionPct,
-          isHistoricalBackfill: isExitHistorical,
-          eventId: exitAlertId,
-          message: `🔴 SELL TO CLOSE · ${openPos.contractLabel} [Gaia ${sig.label || sig.type}] @ $${nextPosPrice.toFixed(2)} · Spot ${spotMovePct >= 0 ? "+" : ""}${spotMovePct}% (${pnlOptionPct >= 0 ? "+" : ""}${pnlOptionPct}%)`,
-        };
-
-        openPos.status = "CLOSED";
-        openPos.remainingQty = 0;
-        openPos.closedAt = exitTimeStr;
-        openPos.closedTs = nextSigEpochSec;
-        openPos.closedSpotPrice = nextPosPrice;
-        openPos.closedOptionMid = estExitPrice;
-        openPos.pnlOptionPct = pnlOptionPct;
-        openPos.pnlSpotPct = spotMovePct;
-        openPos.exitReason = exitAlert.reason;
-        latestExitStore.closedPositions.push(openPos);
-        delete latestExitStore.activePositions[positionTicker];
-
-        latestExitStore.alerts.push(exitAlert);
-        latestExitStore.dispatchedAlertIds = latestExitStore.dispatchedAlertIds || {};
-        if (isExitHistorical) {
-          dispatchedSet.add(exitKey);
-          newlyDispatched.push(exitKey);
-          latestExitStore.dispatchedAlertIds[exitAlert.id] = true;
-          saveTradeStore(latestExitStore);
-          store = latestExitStore;
-        } else {
-          saveTradeStore(latestExitStore);
-          store = latestExitStore;
-          const sent = await sendDiscordTradeAlert(exitAlert, params.webhookUrl, { signal: params.signal }).catch((err) => {
-            console.error("[GaiaSync] Failed to dispatch STC alert to Discord:", err);
-            return false;
-          });
-          if (sent) {
-            dispatchedSet.add(exitKey);
-            newlyDispatched.push(exitKey);
-            const afterExitSend = loadTradeStore();
-            afterExitSend.dispatchedAlertIds = afterExitSend.dispatchedAlertIds || {};
-            afterExitSend.dispatchedAlertIds[exitAlert.id] = true;
-            saveTradeStore(afterExitSend);
-            store = afterExitSend;
-          }
-        }
-      }
-    }
-  }
-
-  return { dispatchedCount: newlyDispatched.length, keys: newlyDispatched };
+  return { dispatchedCount: 0, keys: [] };
 }

@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import { readHistoricalSessions, getPersistenceCacheDir } from "@/lib/persistenceStore";
 import { computeTradeRealizedPnl } from "@/lib/execution/pnlAccounting";
+import { getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
 import { optionsMemoryCache } from "@/lib/marketCache";
 
 export const dynamic = "force-dynamic";
@@ -364,10 +365,27 @@ function buildLiveStructuralRecapTickers(dayIso: string, cacheDir: string) {
   return result;
 }
 
+function computeNextTradingDayIso(fromIso: string): string {
+  const m = fromIso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return fromIso;
+  const dt = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  for (let i = 1; i <= 10; i++) {
+    const cand = new Date(dt.getTime() + i * 86_400_000);
+    const iso = cand.toISOString().slice(0, 10);
+    if (getSessionBoundsEt(iso).isTradingDay) {
+      return iso;
+    }
+  }
+  return fromIso;
+}
+
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
-    const rawDay = searchParams.get("day")?.trim() || "";
+    const rawDay =
+      searchParams.get("day")?.trim() ||
+      searchParams.get("date")?.trim() ||
+      "";
     const requestedDay = /^\d{4}-\d{2}-\d{2}$/.test(rawDay) ? rawDay : "";
 
     const portfolio = await buildRollingPortfolioSummary();
@@ -402,7 +420,7 @@ export async function GET(req: Request) {
         recap: {
           day: latestDay,
           built_at: Math.floor(Date.now() / 1000),
-          next_date: latestDay,
+          next_date: computeNextTradingDayIso(latestDay),
           tickers: liveTickers,
         },
         portfolio,

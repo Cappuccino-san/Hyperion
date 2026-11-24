@@ -1,14 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
-  computeBarFlowGammaVwapSeries,
+  computeCanonicalPdeSeries,
   FlowGammaVwapSnapshot,
+  StructuralFlowNodes,
 } from "@/lib/flowGammaVwap";
 import {
+  computeOptionsAnalytics,
+  deriveTacticalStructuralLevels,
   globalContractsCache,
   NormalizedOptionContract,
   parseOccSymbol,
 } from "@/lib/optionsExposure";
-import { sanitizeTickerSymbol, setBoundedMapEntry } from "@/lib/marketCache";
+import { isMarketOpen } from "@/lib/marketDataService";
+import {
+  optionsMemoryCache,
+  sanitizeTickerSymbol,
+  setBoundedMapEntry,
+} from "@/lib/marketCache";
 
 export const dynamic = "force-dynamic";
 
@@ -100,29 +108,31 @@ async function fetchIntradayCandles(
     }
 
     if (bars.length >= 2) {
-      // Synchronize latest bar close with sub-second Robinhood live tick
-      try {
-        const sym = ticker.trim().toUpperCase();
-        const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym === "NDX" || sym === "NDXP" ? "QQQ" : sym;
-        const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
-          headers: { "User-Agent": "Mozilla/5.0" },
-          cache: "no-store",
-          signal: AbortSignal.timeout(2500),
-        });
-        if (rhRes.ok) {
-          const rhJson = await rhRes.json();
-          const p = Number(rhJson?.results?.[0]?.last_trade_price ?? rhJson?.results?.[0]?.bid_price ?? 0);
-          if (p > 0 && Number.isFinite(p)) {
-            const mult = sym === "SPX" || sym === "SPXW" ? 10 : sym === "NDX" || sym === "NDXP" ? 40 : 1;
-            const liveP = Number((p * mult).toFixed(2));
-            const lastBar = bars[bars.length - 1];
-            lastBar.close = liveP;
-            lastBar.high = Math.max(lastBar.high, liveP);
-            lastBar.low = Math.min(lastBar.low, liveP);
+      // Synchronize latest forming bar close with live tick strictly during active RTH
+      if (isMarketOpen().open) {
+        try {
+          const sym = ticker.trim().toUpperCase();
+          const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym === "NDX" || sym === "NDXP" ? "QQQ" : sym;
+          const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
+            headers: { "User-Agent": "Mozilla/5.0" },
+            cache: "no-store",
+            signal: AbortSignal.timeout(2500),
+          });
+          if (rhRes.ok) {
+            const rhJson = await rhRes.json();
+            const p = Number(rhJson?.results?.[0]?.last_trade_price ?? rhJson?.results?.[0]?.bid_price ?? 0);
+            if (p > 0 && Number.isFinite(p)) {
+              const mult = sym === "SPX" || sym === "SPXW" ? 10 : sym === "NDX" || sym === "NDXP" ? 40 : 1;
+              const liveP = Number((p * mult).toFixed(2));
+              const lastBar = bars[bars.length - 1];
+              lastBar.close = liveP;
+              lastBar.high = Math.max(lastBar.high, liveP);
+              lastBar.low = Math.min(lastBar.low, liveP);
+            }
           }
+        } catch {
+          // Non-fatal
         }
-      } catch {
-        // Non-fatal
       }
       return bars;
     }
@@ -221,6 +231,10 @@ export async function GET(request: NextRequest) {
     const ticker = sanitizeTickerSymbol(searchParams.get("ticker"), "SPY");
     const timeframe = (searchParams.get("timeframe") || "5m").trim().toLowerCase();
 
+    const latestOnly =
+      searchParams.get("latest") === "1" ||
+      searchParams.get("latest")?.toLowerCase() === "true";
+
     const [candles, contracts] = await Promise.all([
       fetchIntradayCandles(ticker, timeframe),
       getOrFetchOptionContracts(ticker),
@@ -233,13 +247,78 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const flowPoints: FlowGammaVwapSnapshot[] = computeBarFlowGammaVwapSeries(
-      candles,
-      contracts
-    );
+    let structuralNodes: StructuralFlowNodes | undefined;
+    const cachedAnalytics = optionsMemoryCache.get(ticker)?.payload;
+    if (cachedAnalytics) {
+      const tactical = deriveTacticalStructuralLevels(cachedAnalytics);
+      structuralNodes = {
+        ceilingNode:
+          cachedAnalytics.gammaLevelsByFilter?.["0DTE"]?.callWall || tactical.callWall,
+        floorNode:
+          cachedAnalytics.gammaLevelsByFilter?.["0DTE"]?.putWall || tactical.putWall,
+        zeroGamma:
+          cachedAnalytics.gammaLevelsByFilter?.["0DTE"]?.zeroGamma || tactical.zeroGamma,
+        netGex: tactical.netGexMillions,
+      };
+    } else if (contracts.length > 0) {
+      try {
+        const latestSpot = candles[candles.length - 1].close;
+        const analytics = computeOptionsAnalytics({
+          ticker: ticker as any,
+          dataSource: "CBOE_MARKET_DATA",
+          spotPrice: latestSpot,
+          previousClose: candles[0].open || latestSpot,
+          impliedVolatility: 0.22,
+          contracts,
+        });
+        const tactical = deriveTacticalStructuralLevels(analytics);
+        structuralNodes = {
+          ceilingNode:
+            analytics.gammaLevelsByFilter?.["0DTE"]?.callWall || tactical.callWall,
+          floorNode:
+            analytics.gammaLevelsByFilter?.["0DTE"]?.putWall || tactical.putWall,
+          zeroGamma:
+            analytics.gammaLevelsByFilter?.["0DTE"]?.zeroGamma || tactical.zeroGamma,
+          netGex: tactical.netGexMillions,
+        };
+      } catch {
+        // Non-fatal fallback to book-derived anchors
+      }
+    }
 
-    // Return the session's 5m/1m aggregated flow-gamma points Array<{ timestamp, spot, flowVwap, upper1Sigma, lower1Sigma, upper2Sigma, lower2Sigma, cumGammaWeight }>
-    return NextResponse.json(flowPoints, {
+    const flowPoints: FlowGammaVwapSnapshot[] = computeCanonicalPdeSeries({
+      candles,
+      contracts,
+      structuralNodes,
+      windowLatestSession: true,
+    });
+
+    const responsePayload = latestOnly
+      ? flowPoints.length > 0
+        ? (() => {
+            const p = flowPoints[flowPoints.length - 1];
+            return [
+              {
+                timestamp: p.timestamp,
+                spot: Number(p.spot.toFixed(2)),
+                flowVwap: Number(p.flowVwap.toFixed(2)),
+                upper1s: Number(p.upper1s.toFixed(2)),
+                lower1s: Number(p.lower1s.toFixed(2)),
+                upper2s: Number(p.upper2s.toFixed(2)),
+                lower2s: Number(p.lower2s.toFixed(2)),
+                sigma: Number(p.sigma.toFixed(3)),
+                pecletNumber: p.pecletNumber,
+                ceilingShareChi: p.ceilingShareChi,
+                netFluxJ: p.netFluxJ,
+                impulseChi: p.impulseChi,
+                gammaRegime: p.gammaRegime,
+              },
+            ];
+          })()
+        : []
+      : flowPoints;
+
+    return NextResponse.json(responsePayload, {
       headers: {
         "Cache-Control": "no-store, max-age=0",
       },

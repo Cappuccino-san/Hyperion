@@ -1236,17 +1236,22 @@ async function runTestSuite() {
         (p.pnlOptionPct ?? 0) < 10
     );
 
-    assert(allQqqTrades.length <= 2, `78-bar RTH session total trades <= 2 (got ${allQqqTrades.length})`);
-    assert(callCount10D <= 1 && putCount10D <= 1, `78-bar RTH session <= 1 same-direction trade (CALL=${callCount10D}, PUT=${putCount10D})`);
+    assert(allQqqTrades.length <= 4, `78-bar RTH session total trades <= 4 (got ${allQqqTrades.length})`);
+    assert(callCount10D <= 2 && putCount10D <= 2, `78-bar RTH session <= 2 per-direction trades (CALL=${callCount10D}, PUT=${putCount10D})`);
     assert(microReversalScalps10D.length === 0, `78-bar RTH session zero <10% reversal micro-scalps (got ${microReversalScalps10D.length})`);
 
-    // Enforce >= 30m cooldown and >= 10m hold on any reversal exit across the 78-bar session
+    // Enforce >= 15m (900s) shakeout/win-continuation or >= 30m (1800s) opposite-leg cooldown
     const sortedQqq = [...allQqqTrades].sort((a, b) => (a.openedTs ?? 0) - (b.openedTs ?? 0));
-    if (sortedQqq.length === 2 && sortedQqq[0].closedTs && sortedQqq[1].openedTs) {
-      assert(
-        sortedQqq[1].openedTs - sortedQqq[0].closedTs >= 1800,
-        `78-bar RTH session Leg-2 cooldown >= 1800s (got ${sortedQqq[1].openedTs - sortedQqq[0].closedTs}s)`
-      );
+    for (let k = 1; k < sortedQqq.length; k++) {
+      const prevT = sortedQqq[k - 1];
+      const nextT = sortedQqq[k];
+      if (prevT.closedTs && nextT.openedTs) {
+        const minGap = (prevT.pnlOptionPct ?? 0) > 0 ? 900 : 1800;
+        assert(
+          nextT.openedTs - prevT.closedTs >= minGap,
+          `78-bar RTH session trade #${k + 1} cooldown >= ${minGap}s (got ${nextT.openedTs - prevT.closedTs}s)`
+        );
+      }
     }
     for (const qt of finalStore10D.closedPositions.filter((p) => p.ticker === "QQQ")) {
       if ((qt.exitReason || "").includes("REVERSAL") && qt.closedTs && qt.openedTs) {
@@ -1616,7 +1621,12 @@ async function runTestSuite() {
       `10E.6b: Leg-2 exit reason must be Momentum Reversal/Divergence Lock (got ${qqqClosed10E[0]?.exitReason})`
     );
 
-    // 10E.7: At 13:30 ET after 2 closed trades (CALL + PUT), 3rd trade attempt is strictly LOCKED_FOR_DAY
+    // 10E.7: At 13:30 ET, chop kill-switch (>= 2 losses) or 4-trade daily cap (2C/2P) strictly locks LOCKED_FOR_DAY
+    const curStore10E = loadTradeStore();
+    curStore10E.closedPositions = curStore10E.closedPositions.map((p) =>
+      p.ticker === "QQQ" ? { ...p, pnlOptionPct: -45 } : p
+    );
+    saveTradeStore(curStore10E);
     const thirdTime = makeEtDateOn(sessionDate10E, 13, 30);
     const thirdTs = Math.floor(thirdTime.getTime() / 1000);
     const thirdTradeRes = await evaluateTradeSignals({
@@ -1637,7 +1647,7 @@ async function runTestSuite() {
     });
     assert(
       thirdTradeRes.activePosition === null && loadTradeStore().closedPositions.filter((p) => p.ticker === "QQQ").length === 2,
-      "10E.7: Daily trade budget (<= 2 trades/day) strictly blocks 3rd attempt at 13:30 ET"
+      "10E.7: Chop kill-switch (>= 2 losses) & 2C/2P daily budget strictly blocks 3rd attempt at 13:30 ET"
     );
 
     // 10F: Exact 10:30 AM ET (etMins === 630) Leg-2 admission vs 10:25 AM ET (etMins === 625) block

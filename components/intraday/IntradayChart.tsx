@@ -368,7 +368,8 @@ export function IntradayChart({
         .join(" ")
     : "";
 
-  // Flux Field PDE Péclet number & Ceiling Share chi
+  // Flux Field PDE Péclet number & Ceiling Share chi (prefer canonical PDE telemetry when present)
+  const latestPdeSnap = flowGammaVwapData;
   const hasDualWalls = latestCallWall > 0 && latestPutWall > 0;
   const corridorWidth = Math.max(
     1.0,
@@ -380,10 +381,17 @@ export function IntradayChart({
         Math.max(1, displayData.length)
       : 0;
   const gammaDiffEst = Math.max(0.05, (corridorWidth * corridorWidth) / 140);
-  const pecletNumber = Number(
+  const fallbackPeclet = Number(
     Math.max(-15, Math.min(15, (driftEst * 2.5 * corridorWidth) / gammaDiffEst)).toFixed(2)
   );
-  const ceilingShareChi = computeCeilingShareChi(pecletNumber);
+  const pecletNumber =
+    typeof latestPdeSnap?.pecletNumber === "number" && Number.isFinite(latestPdeSnap.pecletNumber)
+      ? Number(latestPdeSnap.pecletNumber.toFixed(2))
+      : fallbackPeclet;
+  const ceilingShareChi =
+    typeof latestPdeSnap?.ceilingShareChi === "number" && Number.isFinite(latestPdeSnap.ceilingShareChi)
+      ? latestPdeSnap.ceilingShareChi
+      : computeCeilingShareChi(pecletNumber);
   const nodeMidpoint =
     latestCallWall > 0 && latestPutWall > 0
       ? Number(((latestCallWall + latestPutWall) / 2).toFixed(2))

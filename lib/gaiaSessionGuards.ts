@@ -247,6 +247,22 @@ export function isAtOrPastEodFlat(etMins: number, etDate?: string): boolean {
 }
 
 /**
+ * Timezone- and early-close-aware option expiration liveness check.
+ * Treats same-day 0DTE options as alive strictly until RTH close (16:00 ET regular,
+ * 13:00 ET on NYSE early-close half-days) in both EDT and EST.
+ */
+export function isAliveOptionExpiration(isoDate: string, nowDate: Date = new Date()): boolean {
+  const expDay = typeof isoDate === "string" ? isoDate.trim().slice(0, 10) : "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(expDay)) return false;
+  const todayEt = getTodayEt(nowDate);
+  if (expDay > todayEt) return true;
+  if (expDay < todayEt) return false;
+  const bounds = getSessionBoundsEt(todayEt);
+  if (!bounds.isTradingDay) return false;
+  return etMinutesOfDay(nowDate.getTime()) < bounds.rthCloseMins;
+}
+
+/**
  * Caps an exit timestamp to 15:55:00 ET (or 12:55:00 ET on early-close sessions).
  * - At/after MOC cutoff -> that day's MOC cutoff.
  * - Before 09:30 ET (overnight carry) -> the prior session's MOC cutoff.

@@ -650,17 +650,61 @@ export async function evaluateTradeSignals(
     (latest, cur) => (!latest || (cur.closedTs ?? 0) >= (latest.closedTs ?? 0) ? cur : latest),
     undefined
   );
-  const phase1CooldownOk =
+  const earlyCalls = closedForTickerEarly.filter((p) => p.contractType === "CALL").length;
+  const earlyPuts = closedForTickerEarly.filter((p) => p.contractType === "PUT").length;
+  const earlyLosses = closedForTickerEarly.filter(
+    (p) => typeof p.pnlOptionPct === "number" && p.pnlOptionPct < 0
+  ).length;
+  const earlyRealizedPnlDollars = closedForTickerEarly.reduce((acc, p) => {
+    const outlay =
+      typeof p.totalOutlay === "number" && p.totalOutlay > 0
+        ? p.totalOutlay
+        : (p.optionAsk || p.btoOptionMid || 0.7) * 100;
+    const pct = typeof p.pnlOptionPct === "number" ? p.pnlOptionPct : 0;
+    return acc + (outlay * pct) / 100;
+  }, 0);
+  const isEarlyKillSwitchHit = earlyLosses >= 2 || earlyRealizedPnlDollars <= -75;
+  const isEarlyShakeout =
     closedForTickerEarly.length === 1 &&
+    typeof phase1Closed?.pnlOptionPct === "number" &&
+    phase1Closed.pnlOptionPct >= 0 &&
+    phase1Closed.pnlOptionPct < 25 &&
+    /RATCHET|BREAKEVEN/i.test(phase1Closed.exitReason || "");
+  const isEarlyWinCont =
+    closedForTickerEarly.length >= 1 &&
+    closedForTickerEarly.length < 4 &&
+    !(earlyCalls >= 1 && earlyPuts >= 1) &&
+    typeof phase1Closed?.pnlOptionPct === "number" &&
+    phase1Closed.pnlOptionPct >= 25 &&
+    etTime.totalMinutes >= 630 &&
+    ((phase1Closed.contractType === "CALL" && earlyCalls < 2) ||
+      (phase1Closed.contractType === "PUT" && earlyPuts < 2));
+  const canTryEarlyShakeoutOrWinCont =
+    !isEarlyKillSwitchHit &&
+    (isEarlyShakeout || isEarlyWinCont) &&
     typeof phase1Closed?.closedTs === "number" &&
-    nowTs - phase1Closed.closedTs >= 1800;
-  const canTryPhase2Reclaim =
-    closedForTickerEarly.length === 1 &&
-    phase1CooldownOk &&
+    nowTs - phase1Closed.closedTs >= 900 &&
+    etTime.totalMinutes <=
+      (isEarlyShakeout
+        ? Math.min(840, sessionBounds.entryCutoffMins)
+        : sessionBounds.entryCutoffMins);
+  const canTryEarlyPhase2Reclaim =
+    !isEarlyKillSwitchHit &&
+    closedForTickerEarly.length >= 1 &&
+    closedForTickerEarly.length < 4 &&
+    (earlyCalls < 2 || earlyPuts < 2) &&
+    typeof phase1Closed?.closedTs === "number" &&
+    nowTs - phase1Closed.closedTs >= 1800 &&
     etTime.totalMinutes >= 630 &&
     etTime.totalMinutes <= sessionBounds.entryCutoffMins;
 
-  if ((closedForTickerEarly.length >= 2 || (closedForTickerEarly.length >= 1 && !canTryPhase2Reclaim)) && !activePos) {
+  if (
+    !activePos &&
+    closedForTickerEarly.length >= 1 &&
+    (closedForTickerEarly.length >= 4 ||
+      isEarlyKillSwitchHit ||
+      (!canTryEarlyPhase2Reclaim && !canTryEarlyShakeoutOrWinCont))
+  ) {
     return {
       ticker: normalizedTicker,
       activePosition: null,
@@ -871,7 +915,12 @@ export async function evaluateTradeSignals(
           flowSnapshot: flowSnap,
           regimeClassification,
           priors: readAlphaPriorsSync(),
-          minExpectancyR: isPhase2ReclaimWindow ? LEG2_MIN_EXPECTANCY_R : LEG1_MIN_EXPECTANCY_R,
+          minExpectancyR:
+            isShakeoutRecoveryWindow || isWinningTrendContinuationWindow
+              ? 0.40
+              : isPhase2ReclaimWindow
+                ? LEG2_MIN_EXPECTANCY_R
+                : LEG1_MIN_EXPECTANCY_R,
         });
 
         const calibration = await calibrateWalkForwardExpectancy(normalizedTicker, sessionDate, params.signal);
@@ -1063,7 +1112,11 @@ export async function evaluateTradeSignals(
           typeof flowSnap.pecletNumber === "number"
             ? ` · FVWAP $${flowSnap.flowVwap.toFixed(2)} (χ=${(flowSnap.ceilingShareChi * 100).toFixed(0)}%, Pe=${flowSnap.pecletNumber >= 0 ? "+" : ""}${flowSnap.pecletNumber.toFixed(2)})`
             : "";
-        const msg = `${emoji} BUY TO OPEN (${optimalContract.contractsQty}x @ $${optimalContract.optionMid.toFixed(
+        const fillAskForLog =
+          typeof optimalContract.optionAsk === "number" && optimalContract.optionAsk > 0
+            ? optimalContract.optionAsk
+            : optimalContract.optionMid;
+        const msg = `${emoji} BUY TO OPEN (${optimalContract.contractsQty}x @ $${fillAskForLog.toFixed(
           2
         )}) · ${optimalContract.contractLabel} @ $${positionSpot.toFixed(2)} [${
           candidateBto.setupName

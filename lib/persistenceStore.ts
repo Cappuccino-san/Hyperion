@@ -43,6 +43,7 @@ export interface AlphaPriorsState {
   regimeStats: Record<MarketRegimeId, RegimeAlphaStats>;
   setupStats: Record<string, RegimeAlphaStats>;
   lastAttributionDate?: string;
+  lastAttributionDateByTicker?: Record<string, string>;
 }
 
 export interface SessionPlaybookPolicy {
@@ -120,8 +121,10 @@ export interface DurableKvAdapter {
 const KEY_PREFIX = "hyperion:v1:";
 const RETENTION_DAYS = 14;
 
+export const ALPHA_PRIORS_SCHEMA_VERSION = 2;
+
 const DEFAULT_ALPHA_PRIORS: AlphaPriorsState = {
-  version: 1,
+  version: ALPHA_PRIORS_SCHEMA_VERSION,
   updatedAt: new Date(0).toISOString(),
   priorStrengthM: 5,
   baselineWinRate: 0.50,
@@ -224,7 +227,7 @@ export async function flushPersistenceWritesForTests(): Promise<void> {
   }
 }
 
-function atomicWriteJsonSync(filePath: string, payload: unknown): number {
+function atomicWriteJsonSync(filePath: string, payload: unknown, compact = false): number {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
     try {
@@ -237,7 +240,9 @@ function atomicWriteJsonSync(filePath: string, payload: unknown): number {
     (globalForPersistence.__hyperionWriteSeq ?? 0) + 1);
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${writeSeq}`;
   try {
-    const serialized = JSON.stringify(payload, null, 2);
+    const serialized = compact
+      ? JSON.stringify(payload)
+      : JSON.stringify(payload, null, 2);
     fs.writeFileSync(tmpPath, serialized, "utf-8");
     try {
       fs.renameSync(tmpPath, filePath);
@@ -603,6 +608,9 @@ export function readSessionLedgerSync(sessionDate?: string): DailyTradeStore {
     if (fs.existsSync(filePath)) {
       try {
         const stat = fs.statSync(filePath);
+        if (stat.mtimeMs <= memEntry.mtimeMs && memEntry.mtimeMs > 0) {
+          return memEntry.store;
+        }
         const raw = fs.readFileSync(filePath, "utf-8");
         const parsed = JSON.parse(raw) as DailyTradeStore;
         if (
@@ -759,7 +767,7 @@ export function readIntradayStoreSync(sessionDate?: string): DailyStore {
 export function appendIntradaySnapshotSync(date: string, store: DailyStore): void {
   const cacheDir = getPersistenceCacheDir();
   const filePath = path.join(cacheDir, `intraday-${date}.json`);
-  const mtimeMs = atomicWriteJsonSync(filePath, store);
+  const mtimeMs = atomicWriteJsonSync(filePath, store, true);
   getIntradayMemMap().set(date, { store, mtimeMs });
   scheduleRemoteWrite(`${KEY_PREFIX}intraday:${date}`, store);
 }
@@ -767,7 +775,7 @@ export function appendIntradaySnapshotSync(date: string, store: DailyStore): voi
 export async function appendIntradaySnapshot(date: string, store: DailyStore): Promise<void> {
   const cacheDir = getPersistenceCacheDir();
   const filePath = path.join(cacheDir, `intraday-${date}.json`);
-  const mtimeMs = atomicWriteJsonSync(filePath, store);
+  const mtimeMs = atomicWriteJsonSync(filePath, store, true);
   getIntradayMemMap().set(date, { store, mtimeMs });
   await writeRemoteNow(`${KEY_PREFIX}intraday:${date}`, store);
 }
@@ -849,21 +857,43 @@ export async function writeSupervisorPolicy(policy: SessionPlaybookPolicy): Prom
   await writeRemoteNow(`${KEY_PREFIX}policy:${policy.sessionDate}:${sym}`, policy);
 }
 
+function migrateAlphaPriorsIfNeeded(parsed: AlphaPriorsState): {
+  priors: AlphaPriorsState;
+  migrated: boolean;
+} {
+  if ((parsed.version ?? 1) >= ALPHA_PRIORS_SCHEMA_VERSION) {
+    return { priors: parsed, migrated: false };
+  }
+  const fresh = cloneDefaultAlphaPriors();
+  const migratedPriors: AlphaPriorsState = {
+    ...fresh,
+    regimeStats: parsed.regimeStats ?? fresh.regimeStats,
+    setupStats: parsed.setupStats ?? {},
+    version: ALPHA_PRIORS_SCHEMA_VERSION,
+    updatedAt: new Date().toISOString(),
+  };
+  return { priors: migratedPriors, migrated: true };
+}
+
 export function readAlphaPriorsSync(): AlphaPriorsState {
   const filePath = path.join(getPersistenceCacheDir(), "alpha-priors.json");
   const cached = globalForPersistence.__hyperionPriorsMemCache;
   if (fs.existsSync(filePath)) {
     try {
       const mtimeMs = fs.statSync(filePath).mtimeMs;
-      if (cached && cached.mtimeMs === mtimeMs) return cached.priors;
-      const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8")) as AlphaPriorsState;
-      if (parsed && parsed.regimeStats) {
-        globalForPersistence.__hyperionPriorsMemCache = { priors: parsed, mtimeMs };
-        return parsed;
+      if (cached && cached.mtimeMs === mtimeMs && (cached.priors.version ?? 1) >= ALPHA_PRIORS_SCHEMA_VERSION) {
+        return cached.priors;
+      }
+      const rawParsed = JSON.parse(fs.readFileSync(filePath, "utf-8")) as AlphaPriorsState;
+      if (rawParsed && rawParsed.regimeStats) {
+        const { priors, migrated } = migrateAlphaPriorsIfNeeded(rawParsed);
+        const finalMtime = migrated ? atomicWriteJsonSync(filePath, priors) : mtimeMs;
+        globalForPersistence.__hyperionPriorsMemCache = { priors, mtimeMs: finalMtime };
+        return priors;
       }
     } catch {}
   }
-  if (cached) return cached.priors;
+  if (cached && (cached.priors.version ?? 1) >= ALPHA_PRIORS_SCHEMA_VERSION) return cached.priors;
   const def = cloneDefaultAlphaPriors();
   globalForPersistence.__hyperionPriorsMemCache = { priors: def, mtimeMs: 0 };
   return def;
@@ -886,11 +916,12 @@ export async function readAlphaPriors(): Promise<AlphaPriorsState> {
     const raw = await adapter.get(`${KEY_PREFIX}alpha-priors`);
     if (raw) {
       try {
-        const parsed = JSON.parse(raw) as AlphaPriorsState;
-        if (parsed && parsed.regimeStats) {
-          const mtimeMs = atomicWriteJsonSync(filePath, parsed);
-          globalForPersistence.__hyperionPriorsMemCache = { priors: parsed, mtimeMs };
-          return parsed;
+        const rawParsed = JSON.parse(raw) as AlphaPriorsState;
+        if (rawParsed && rawParsed.regimeStats) {
+          const { priors } = migrateAlphaPriorsIfNeeded(rawParsed);
+          const mtimeMs = atomicWriteJsonSync(filePath, priors);
+          globalForPersistence.__hyperionPriorsMemCache = { priors, mtimeMs };
+          return priors;
         }
       } catch {}
     }

@@ -138,6 +138,8 @@ export interface Leg2StructuralGateInput {
   impulseChi: number;
   deltaChi6Bar: number;
   impulsePeclet: number;
+  ceilingShareChi?: number;
+  netFluxJ?: number;
   calibratedExpectancyR?: number;
 }
 
@@ -177,6 +179,8 @@ export function evaluateLeg2StructuralGate(
     impulseChi,
     deltaChi6Bar,
     impulsePeclet,
+    ceilingShareChi,
+    netFluxJ,
     calibratedExpectancyR,
   } = input;
 
@@ -271,12 +275,18 @@ export function evaluateLeg2StructuralGate(
     const strongFlipPeclet = isCall
       ? impulsePeclet >= LEG2_POST_LOSS_MIN_ABS_PECLET
       : impulsePeclet <= -LEG2_POST_LOSS_MIN_ABS_PECLET;
+    const macroFluxConfirmed =
+      ceilingShareChi === undefined
+        ? true
+        : isCall
+          ? ceilingShareChi >= 0.58 && (netFluxJ === undefined || netFluxJ > 0) && deltaChi6Bar >= 0.06
+          : ceilingShareChi <= 0.42 && (netFluxJ === undefined || netFluxJ < 0) && deltaChi6Bar <= -0.06;
 
-    if (!heldAcrossZeroGamma || !strongFlipPeclet) {
+    if (!heldAcrossZeroGamma || !strongFlipPeclet || !macroFluxConfirmed) {
       return {
         allowed: false,
         requiredMinExpectancyR: LEG2_MIN_EXPECTANCY_R,
-        reason: `LEG2_ANTI_WHIPSAW_VETO: Leg-1 closed as loss (${leg1Pnl.toFixed(1)}%); requires clean Zero Gamma hold & |Pe| >= ${LEG2_POST_LOSS_MIN_ABS_PECLET}`,
+        reason: `LEG2_ANTI_WHIPSAW_VETO: Leg-1 closed as loss (${leg1Pnl.toFixed(1)}%); requires clean Zero Gamma hold, macro Flux flip & |Pe| >= ${LEG2_POST_LOSS_MIN_ABS_PECLET}`,
       };
     }
   }
@@ -293,9 +303,12 @@ export function evaluateLeg2StructuralGate(
   }
 
   if (isCall) {
+    const hasVwap = typeof flowVwap === "number" && flowVwap > 0;
+    const hasSma = typeof sma34 === "number" && sma34 > 0;
     const reclaimed =
-      (typeof flowVwap === "number" && flowVwap > 0 && spotPrice >= flowVwap) ||
-      (typeof sma34 === "number" && sma34 > 0 && spotPrice >= sma34);
+      (hasVwap || hasSma) &&
+      (!hasVwap || spotPrice >= flowVwap) &&
+      (!hasSma || spotPrice >= sma34);
     if (!testedPutWallOrMinus1Sigma) {
       return {
         allowed: false,
@@ -325,9 +338,12 @@ export function evaluateLeg2StructuralGate(
       };
     }
   } else {
+    const hasVwap = typeof flowVwap === "number" && flowVwap > 0;
+    const hasSma = typeof sma34 === "number" && sma34 > 0;
     const lost =
-      (typeof flowVwap === "number" && flowVwap > 0 && spotPrice <= flowVwap) ||
-      (typeof sma34 === "number" && sma34 > 0 && spotPrice <= sma34);
+      (hasVwap || hasSma) &&
+      (!hasVwap || spotPrice <= flowVwap) &&
+      (!hasSma || spotPrice <= sma34);
     if (!testedCallWallOrPlus1Sigma) {
       return {
         allowed: false,
@@ -503,7 +519,15 @@ export function resolveEtMinutesFromMs(nowMs: number): number {
 export function estimateRemainingYears(nowMs: number, dteDays: number): number {
   const safeDte = Math.max(0, dteDays);
   const etMins = resolveEtMinutesFromMs(nowMs);
-  const { rthCloseMins } = getSessionBoundsEt();
+  let etDate: string | undefined;
+  try {
+    etDate = new Date(nowMs).toLocaleDateString("en-CA", {
+      timeZone: "America/New_York",
+    });
+  } catch {
+    etDate = undefined;
+  }
+  const { rthCloseMins } = getSessionBoundsEt(etDate);
   const minsLeftToday = Math.max(15, rthCloseMins - etMins);
   const totalTradingMinutes = safeDte * 390 + (safeDte === 0 ? minsLeftToday : 240);
   return Math.max(15 / (252 * 390), totalTradingMinutes / (252 * 390));
@@ -1072,6 +1096,9 @@ export function selectOptimalSmallAccountContract(params: {
   remainingExpectedMove?: number;
   etMins?: number;
   nowMs?: number;
+  minDeltaOverride?: number;
+  maxOtmDistOverride?: number;
+  preferMultiDteInHighIv?: boolean;
 }): ScoredContractSelection | null {
   const {
     candidates,
@@ -1088,19 +1115,31 @@ export function selectOptimalSmallAccountContract(params: {
     absImpulsePeclet,
     remainingExpectedMove,
     nowMs = Date.now(),
+    minDeltaOverride,
+    maxOtmDistOverride,
+    preferMultiDteInHighIv = false,
   } = params;
 
   if (!candidates || candidates.length === 0) return null;
 
-  const effectiveMinDelta = resolveMinOptionDelta({
+  const baseMinDelta = resolveMinOptionDelta({
     regime: regime ?? (preferredDte === "1-2DTE" ? "POS_GAMMA_PIN" : undefined),
     absImpulsePeclet,
     etMins: params.etMins,
   });
+  const effectiveMinDelta =
+    typeof minDeltaOverride === "number" && Number.isFinite(minDeltaOverride) && minDeltaOverride > 0
+      ? minDeltaOverride
+      : baseMinDelta;
+  const maxOtmDist =
+    typeof maxOtmDistOverride === "number" && Number.isFinite(maxOtmDistOverride) && maxOtmDistOverride > 0
+      ? maxOtmDistOverride
+      : Math.min(3.5, spotPrice * 0.0045);
 
   // Compute median ATM IV across valid candidates for IV-skew evaluation
+  const ivSearchBand = Math.max(spotPrice * 0.012, maxOtmDist);
   const nearAtmIvs = candidates
-    .filter((c) => Math.abs(c.contract.strike - spotPrice) <= spotPrice * 0.008)
+    .filter((c) => Math.abs(c.contract.strike - spotPrice) <= ivSearchBand)
     .map((c) => {
       const iv = c.contract.iv ?? 0;
       return iv > 4 ? iv / 100 : iv;
@@ -1122,12 +1161,16 @@ export function selectOptimalSmallAccountContract(params: {
   const stage1: ScoredCand[] = [];
   const stage2: ScoredCand[] = [];
   const stage3: ScoredCand[] = [];
-  const maxOtmDist = Math.min(3.5, spotPrice * 0.0045);
 
   const structuralTargetWall = isCall
     ? (zeroDteCallWall && isSpxw ? zeroDteCallWall / 10 : zeroDteCallWall)
     : (zeroDtePutWall && isSpxw ? zeroDtePutWall / 10 : zeroDtePutWall);
-  const rawTargetMove = Math.abs(target1Spot - spotPrice);
+  const rawTarget1Move = Math.abs(target1Spot - spotPrice);
+  const rawTarget2Move = Math.abs(target2Spot - spotPrice);
+  const rawTargetMove =
+    maxOtmDistOverride && maxOtmDistOverride > Math.min(3.5, spotPrice * 0.0045)
+      ? Math.max(rawTarget1Move, rawTarget2Move * 0.65)
+      : rawTarget1Move;
   const wallRoom =
     structuralTargetWall &&
     structuralTargetWall > 0 &&
@@ -1274,7 +1317,13 @@ export function selectOptimalSmallAccountContract(params: {
       spreadToEdgeRatio: Number(taylorEval.spreadToEdgeRatio.toFixed(4)),
     };
 
-    if (preferredDte === "0DTE") {
+    if (preferMultiDteInHighIv) {
+      // High-IV fallback tier: prefer qualifying 1-2DTE when it clears all gates (<= $0.99, spread <= 0.24, NetEV > 0),
+      // while keeping qualifying 0DTE unpenalized in Stage 2 so a valid 0DTE is NEVER turned into null.
+      if (dte >= 1 && dte <= 2) stage1.push(scoredObj);
+      else if (dte === 0) stage2.push(scoredObj);
+      else stage3.push(scoredObj);
+    } else if (preferredDte === "0DTE") {
       // Prioritize 0DTE convexity when affordable <= $0.99; fall back to 1-2 DTE first, then 3+ DTE
       if (dte === 0) stage1.push(scoredObj);
       else if (dte >= 1 && dte <= 2) stage2.push(scoredObj);

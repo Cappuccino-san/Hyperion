@@ -5,11 +5,13 @@ import {
   computeDailyOptionTheta,
   estimateRemainingYears,
   MarketRegimeClassification,
+  resolveEtMinutesFromMs,
   scoreSetupExpectancy,
 } from "@/lib/alphaScorer";
 import { FlowGammaVwapSnapshot } from "@/lib/flowGammaVwap";
 import { computeLocalMtfDivergence } from "@/lib/divergenceDetector";
-import { etMinutesOfDay, getTodayEt } from "@/lib/gaiaSessionGuards";
+import { etMinutesOfDay, getSessionBoundsEt, getTodayEt } from "@/lib/gaiaSessionGuards";
+import { DEFAULT_HARD_OPTION_STOP_LOSS_PCT } from "@/lib/bracketOrderEngine";
 import {
   AlphaFeatureWeights,
   AlphaPriorsState,
@@ -459,6 +461,42 @@ function pearsonCorrelation(xs: number[], ys: number[]): number {
  * Computes out-of-sample Information Coefficient (IC) for each alpha feature against
  * forward 6-bar directional payoff asymmetry (mfeR - maeR).
  */
+function filterCleanRthAttributionBars(
+  rawBars: AttributionBar[],
+  sessionDate?: string
+): { bars: AttributionBar[]; indices: number[] } {
+  const sortedWithIdx = rawBars
+    .map((b, idx) => ({ b, idx }))
+    .filter(({ b }) => b && Number.isFinite(b.ts) && Number.isFinite(b.close) && b.close > 0)
+    .sort((a, b) => a.b.ts - b.b.ts);
+  if (sortedWithIdx.length === 0) return { bars: [], indices: [] };
+
+  const bounds = getSessionBoundsEt(sessionDate);
+  const rthFiltered = sortedWithIdx.filter(({ b }) => {
+    const etMins = resolveEtMinutesFromMs(b.ts * 1000);
+    return etMins >= bounds.rthOpenMins && etMins < bounds.rthCloseMins;
+  });
+  const base = rthFiltered.length >= 6 ? rthFiltered : sortedWithIdx;
+
+  // Drop stale pre-open quote jumps (> 3.5% single-bar discontinuity on index/ETF bars)
+  const cleaned: typeof base = [];
+  for (let i = 0; i < base.length; i++) {
+    const cur = base[i];
+    if (
+      i === 0 &&
+      base.length >= 3 &&
+      Math.abs(base[1].b.open - cur.b.close) / Math.max(0.01, cur.b.close) > 0.035
+    ) {
+      continue;
+    }
+    cleaned.push(cur);
+  }
+  return {
+    bars: cleaned.map((x) => x.b),
+    indices: cleaned.map((x) => x.idx),
+  };
+}
+
 export function computeFeatureInformationCoefficients(input: {
   bars?: AttributionBar[];
   flowSeries?: FlowGammaVwapSnapshot[];
@@ -468,12 +506,20 @@ export function computeFeatureInformationCoefficients(input: {
   zeroDteKing?: number;
   priors?: AlphaPriorsState;
   samples?: FeatureIcSample[];
+  sessionDate?: string;
 }): FeatureIcMap {
-  let samples: FeatureIcSample[] = input.samples ? [...input.samples] : [];
+  let samples: FeatureIcSample[] = input.samples
+    ? input.samples.map((s) => ({
+        features: s.features,
+        mfeR: Math.max(-1.0, Math.min(4.0, s.mfeR)),
+        maeR: Math.max(0.0, Math.min(4.0, s.maeR)),
+      }))
+    : [];
 
   if (samples.length === 0 && Array.isArray(input.bars) && input.bars.length >= 13) {
-    const bars = [...input.bars].sort((a, b) => a.ts - b.ts);
-    const flowSeries = input.flowSeries ?? [];
+    const { bars, indices } = filterCleanRthAttributionBars(input.bars, input.sessionDate);
+    const rawFlowSeries = input.flowSeries ?? [];
+    const flowSeries = indices.map((origIdx) => rawFlowSeries[origIdx]);
     for (let i = 6; i < bars.length - 6; i++) {
       const b = bars[i];
       const flow = flowSeries[i];
@@ -536,8 +582,8 @@ export function computeFeatureInformationCoefficients(input: {
 
       samples.push({
         features: scored.featureBreakdown,
-        mfeR: mfe / risk,
-        maeR: mae / risk,
+        mfeR: Math.max(-1.0, Math.min(4.0, mfe / risk)),
+        maeR: Math.max(0.0, Math.min(4.0, mae / risk)),
       });
     }
   }
@@ -726,18 +772,25 @@ export async function runPostMarketAttribution(
     ? JSON.parse(JSON.stringify(input.priorsOverride))
     : JSON.parse(JSON.stringify(readAlphaPriorsSync()));
 
-  if (!input.force && priors.lastAttributionDate === input.sessionDate) {
+  const lastDateForTicker =
+    priors.lastAttributionDateByTicker?.[sym] ??
+    (sym === "SPY" && !priors.lastAttributionDateByTicker ? priors.lastAttributionDate : undefined);
+  if (!input.force && lastDateForTicker === input.sessionDate) {
     const existing = await readPostMarketAttribution(input.sessionDate, sym);
     if (existing) return existing;
   }
 
-  const bars = [...input.bars].sort((a, b) => a.ts - b.ts);
-  const flowSeries = input.flowSeries ?? [];
+  const { bars, indices: rthIndices } = filterCleanRthAttributionBars(input.bars, input.sessionDate);
+  const rawFlowSeries = input.flowSeries ?? [];
+  const flowSeries = rthIndices.map((origIdx) => rawFlowSeries[origIdx]);
   const atmIv = input.atmIv ?? 0.18;
   const records: CounterfactualEvalRecord[] = [];
+  const tickerExecutedTrades = (input.executedTrades ?? []).filter(
+    (t) => !t.ticker || t.ticker.trim().toUpperCase() === sym
+  );
 
   // 1. Score executed closed trades using canonical entry/exit fill and true -45% 1R stop denominator
-  for (const pos of input.executedTrades ?? []) {
+  for (const pos of tickerExecutedTrades) {
     const posAny = pos as unknown as Record<string, unknown>;
     const entryAsk =
       (typeof posAny.btoOptionAsk === "number" && posAny.btoOptionAsk > 0 ? posAny.btoOptionAsk : 0) ||
@@ -977,6 +1030,7 @@ export async function runPostMarketAttribution(
     zeroDteKing: input.zeroDteKing,
     priors,
     samples: input.featureSamples,
+    sessionDate: input.sessionDate,
   });
 
   const prevRollingIc = priors.rollingFeatureIc ?? zeroFeatureIc();
@@ -989,11 +1043,12 @@ export async function runPostMarketAttribution(
       ).toFixed(4)
     );
     const effectiveIc = sessionIc[key] < 0 ? sessionIc[key] : nextRollingIc[key];
-    if (effectiveIc < 0) {
-      const decayMagnitude = Math.max(0.03, Math.min(0.25, Math.abs(effectiveIc) * 0.35));
+    if (effectiveIc < -0.05) {
+      const decayMagnitude = Math.max(0.02, Math.min(0.12, Math.abs(effectiveIc) * 0.12));
       priors.featureWeights[key] = clampWeight(priors.featureWeights[key] - decayMagnitude);
-    } else if (sessionIc[key] > 0.15 && nextRollingIc[key] > 0.1) {
-      priors.featureWeights[key] = clampWeight(priors.featureWeights[key] + 0.02);
+    } else if (sessionIc[key] > 0.1 && nextRollingIc[key] > 0.08) {
+      const growthMagnitude = Math.max(0.02, Math.min(0.08, effectiveIc * 0.08));
+      priors.featureWeights[key] = clampWeight(priors.featureWeights[key] + growthMagnitude);
     }
   }
   priors.rollingFeatureIc = nextRollingIc;
@@ -1017,14 +1072,23 @@ export async function runPostMarketAttribution(
   }
   if (missedAlphaCount > savedChopCount) {
     priors.baselineExpectancyR = Number(
-      Math.max(0.28, Math.min(0.6, priors.baselineExpectancyR - 0.01)).toFixed(3)
+      Math.max(0.0, Math.min(0.35, priors.baselineExpectancyR + 0.01)).toFixed(3)
     );
-  } else if (savedChopCount > missedAlphaCount && sessionIc.regimeFit >= 0) {
-    priors.featureWeights.regimeFit = clampWeight(priors.featureWeights.regimeFit + 0.03);
+  } else if (savedChopCount > missedAlphaCount) {
+    priors.baselineExpectancyR = Number(
+      Math.max(0.0, Math.min(0.35, priors.baselineExpectancyR - 0.01)).toFixed(3)
+    );
+    if (sessionIc.regimeFit >= 0) {
+      priors.featureWeights.regimeFit = clampWeight(priors.featureWeights.regimeFit + 0.03);
+    }
   }
 
   priors.updatedAt = new Date().toISOString();
   priors.lastAttributionDate = input.sessionDate;
+  priors.lastAttributionDateByTicker = {
+    ...(priors.lastAttributionDateByTicker || {}),
+    [sym]: input.sessionDate,
+  };
 
   const updatedPriorsSummary =
     `RegimeFit=${priors.featureWeights.regimeFit.toFixed(2)} Flux=${priors.featureWeights.fluxAlignment.toFixed(2)} ` +
@@ -1032,7 +1096,7 @@ export async function runPostMarketAttribution(
     `SavedChop=${savedChopCount} MissedAlpha=${missedAlphaCount}`;
 
   const shadowParityReport = computeShadowReplayParity(
-    input.executedTrades ?? [],
+    tickerExecutedTrades,
     input.shadowReplayTrades
   );
 
@@ -1117,7 +1181,10 @@ export function computeShadowReplayParity(
     const replayPnl = typeof replay.pnlOptionPct === "number" ? replay.pnlOptionPct : 0;
     const pnlDrift = Math.abs(livePnl - replayPnl);
     maxPnlPctDrift = Math.max(maxPnlPctDrift, pnlDrift);
-    outcomeRDriftSum += Math.abs(livePnl / 25 - replayPnl / 25);
+    outcomeRDriftSum += Math.abs(
+      livePnl / DEFAULT_HARD_OPTION_STOP_LOSS_PCT -
+        replayPnl / DEFAULT_HARD_OPTION_STOP_LOSS_PCT
+    );
   }
 
   const directionMatchPct = Number(((dirMatches / pairCount) * 100).toFixed(1));

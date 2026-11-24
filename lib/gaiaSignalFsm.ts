@@ -10,12 +10,8 @@
  */
 
 import {
-  ENTRY_CUTOFF_MINS,
-  ENTRY_START_MINS,
-  EOD_FORCE_FLAT_MINS,
-  RTH_CLOSE_MINS,
-  RTH_OPEN_MINS,
   etMinutesOfDay,
+  getSessionBoundsEt,
   getTodayEt,
 } from "@/lib/gaiaSessionGuards";
 
@@ -299,26 +295,32 @@ export class GaiaSignalFsm {
     targetWallRef: number = 0
   ): TransitionResult {
     const etMins = resolveGaiaBarEtMinutes(bar);
+    const barEtDate =
+      typeof bar.barTimestamp === "number" && bar.barTimestamp > 1e9
+        ? getTodayEt(new Date(bar.barTimestamp > 1e11 ? bar.barTimestamp : bar.barTimestamp * 1000))
+        : this.currentSessionEtDate || undefined;
+    const bounds = getSessionBoundsEt(barEtDate);
 
-    // 1. Strict After-Hours & Pre-Market Firewall (< 09:30 ET, or >= 16:00 ET when already flat)
+    // 1. Strict After-Hours & Pre-Market Firewall (< 09:30 ET, or >= RTH close when already flat)
     if (
       typeof etMins === "number" &&
-      (etMins < RTH_OPEN_MINS || (etMins >= RTH_CLOSE_MINS && currentState === "STAND_ASIDE"))
+      (etMins < bounds.rthOpenMins || (etMins >= bounds.rthCloseMins && currentState === "STAND_ASIDE"))
     ) {
       return { nextState: currentState };
     }
 
-    // 2. Mandatory 15:55 ET Hard EOD Flat Liquidation (also force-closes open state if >= 16:00 ET bar arrives)
-    if (typeof etMins === "number" && etMins >= EOD_FORCE_FLAT_MINS) {
+    // 2. Mandatory Hard EOD Flat Liquidation (15:55 ET regular, 12:55 ET on NYSE early-close half-days)
+    if (typeof etMins === "number" && etMins >= bounds.eodFlatMins) {
       if (currentState !== "STAND_ASIDE") {
-        return { nextState: "STAND_ASIDE", reason: "EOD_1555_FORCE_CLOSE", fillPrice: bar.close };
+        const mocReason = bounds.isEarlyClose ? "EOD_1255_FORCE_CLOSE" : "EOD_1555_FORCE_CLOSE";
+        return { nextState: "STAND_ASIDE", reason: mocReason, fillPrice: bar.close };
       }
       return { nextState: "STAND_ASIDE" };
     }
 
-    // 3. Strict Entry Window (09:30 open bar / 09:35 closed bar through 14:30 ET)
+    // 3. Strict Entry Window (09:35 ET through 14:30 ET regular / 11:30 ET on early-close half-days)
     const isWithinEntryWindow = typeof etMins === "number"
-      ? (etMins >= ENTRY_START_MINS && etMins <= ENTRY_CUTOFF_MINS)
+      ? (bounds.isTradingDay && etMins >= bounds.entryStartMins && etMins <= bounds.entryCutoffMins)
       : false;
 
     // Excursion from structural equilibrium (chi=0.5, flux=0.0)
@@ -440,7 +442,7 @@ export class GaiaSignalFsm {
       }
       const isLeg2 = this.closedTradesToday === 1;
       if (isLeg2) {
-        const phase2WindowOk = typeof etMins === "number" ? etMins >= 630 && etMins <= 870 : true;
+        const phase2WindowOk = typeof etMins === "number" ? etMins >= 630 && etMins <= bounds.entryCutoffMins : true;
         const cooldownOk = this.lastExitBarTs > 0 ? bar.barTimestamp - this.lastExitBarTs >= PHASE2_COOLDOWN_SEC : false;
         if (!phase2WindowOk || !cooldownOk) {
           return { nextState: "STAND_ASIDE" };
@@ -650,7 +652,7 @@ export class GaiaSignalFsm {
         }
 
         // Setup P-C (Pre-Market Upper Flux Field / Zero-Gamma Rejection + Bearish Opening Lean)
-      if (!putBlockedByWall && typeof etMins === "number" && etMins >= ENTRY_START_MINS && etMins <= 630) {
+      if (!putBlockedByWall && typeof etMins === "number" && etMins >= bounds.entryStartMins && etMins <= 630) {
         const rejectedOverhead = (zg !== undefined && bar.close < zg) &&
           (callWall !== undefined && bar.close < callWall);
         const bearishLean = (bar.flowVwap !== undefined && bar.close < bar.flowVwap) &&
@@ -1008,10 +1010,13 @@ export class GaiaSignalFsm {
     if (barEtDate) this.currentSessionEtDate = barEtDate;
     if (typeof resolvedEtMins === "number") this.lastEtMinsSeen = resolvedEtMins;
 
-    // RTH Gate: Pre-market (etMins < 570) and post-close (etMins >= 960 when flat) bars are strictly gated
+    // RTH Gate: Pre-market (etMins < rthOpenMins) and post-close (etMins >= rthCloseMins when flat) bars are strictly gated
+    const commitBounds = getSessionBoundsEt(barEtDate || this.currentSessionEtDate || undefined);
     if (
       typeof resolvedEtMins === "number" &&
-      (resolvedEtMins < RTH_OPEN_MINS || (resolvedEtMins >= RTH_CLOSE_MINS && this.committedState === "STAND_ASIDE"))
+      (!commitBounds.isTradingDay ||
+        resolvedEtMins < commitBounds.rthOpenMins ||
+        (resolvedEtMins >= commitBounds.rthCloseMins && this.committedState === "STAND_ASIDE"))
     ) {
       return null;
     }

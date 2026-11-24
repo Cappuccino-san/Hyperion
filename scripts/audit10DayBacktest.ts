@@ -150,9 +150,20 @@ function selectRegimeAdaptiveBacktestContract(params: {
     absImpulsePeclet,
     etMins,
   });
+  const fallbackMinDelta = Math.min(minOptionDelta, 0.18);
+  const target2Dist = Math.abs(target2Spot - spot);
+  const maxFallbackOtmDist = Math.max(
+    maxOtmDist,
+    Math.min(
+      Math.max(4.0, spot * 0.011),
+      Math.max(spot * 0.0095, target2Dist * 0.85)
+    )
+  );
   const dtePool = preferredDte === "1-2DTE" || isAfternoon ? [1, 2, 0] : [0, 1, 2];
 
-  const candidates: ContractCandidateInput[] = [];
+  const primaryCandidates: ContractCandidateInput[] = [];
+  const highIvFallbackCandidates: ContractCandidateInput[] = [];
+  let hasPricedOutNearAtm = false;
   const metaByKey = new Map<
     string,
     { strike: number; dteDays: number; remainingYears: number; quote: ReturnType<typeof priceOptionWithSkew> }
@@ -164,9 +175,10 @@ function selectRegimeAdaptiveBacktestContract(params: {
     const baseStrike = isCall
       ? Math.ceil(spot / strikeStep) * strikeStep
       : Math.floor(spot / strikeStep) * strikeStep;
-    for (let step = 0; step <= 14; step++) {
+    for (let step = 0; step <= 20; step++) {
       const strike = Number((isCall ? baseStrike + step * strikeStep : baseStrike - step * strikeStep).toFixed(2));
-      if (Math.abs(strike - spot) > maxOtmDist) break;
+      const otmDist = Math.abs(strike - spot);
+      if (otmDist > maxFallbackOtmDist) break;
       // Exact parity with production contractRouter.ts:
       // 12:30-13:29 ET bans >ceil/<floor OTM 0DTE; >= 13:30 ET (<2.5h to expiry) bans ALL OTM 0DTE.
       if (
@@ -182,6 +194,10 @@ function selectRegimeAdaptiveBacktestContract(params: {
       ) {
         continue;
       }
+      if (isCall && callWall > spot && strike > callWall) continue;
+      const putFloorBuf = Math.max(0.5, spot * 0.0027);
+      if (!isCall && putWall > 0 && putWall < spot && strike < putWall - putFloorBuf) continue;
+
       const quote = priceOptionWithSkew({
         spot,
         strike,
@@ -192,17 +208,21 @@ function selectRegimeAdaptiveBacktestContract(params: {
       const absDelta = Math.abs(quote.delta);
       const spreadPct = quote.ask > 0 ? (quote.ask - quote.bid) / quote.ask : 1;
       const minAskFloor = dteDays === 0 ? 0.45 : 0.15;
+      if (quote.ask > 0.99 && otmDist <= maxOtmDist) {
+        hasPricedOutNearAtm = true;
+      }
       if (
         quote.ask >= minAskFloor &&
         quote.ask <= 0.99 &&
-        absDelta >= minOptionDelta &&
+        absDelta >= fallbackMinDelta &&
         absDelta <= MAX_OPTION_DELTA &&
         quote.bid > 0 &&
         quote.bid <= quote.ask &&
         spreadPct <= 0.24
       ) {
+        const passesPrimary = absDelta >= minOptionDelta && otmDist <= maxOtmDist;
         const key = `${dteDays}:${strike}`;
-        candidates.push({
+        const candObj: ContractCandidateInput = {
           contract: {
             symbol: `${ticker}${expIso.replace(/-/g, "").slice(2)}${isCall ? "C" : "P"}${String(Math.round(strike * 1000)).padStart(8, "0")}`,
             strike,
@@ -228,16 +248,27 @@ function selectRegimeAdaptiveBacktestContract(params: {
           robinhoodTab: dteDays === 0 ? "0DTE" : `${dteDays}DTE`,
           absDelta,
           theta: quote.thetaPerDay,
-        });
+        };
+        (passesPrimary ? primaryCandidates : highIvFallbackCandidates).push(candObj);
         metaByKey.set(key, { strike, dteDays, remainingYears, quote });
       }
     }
   }
 
-  if (candidates.length === 0) return null;
+  const usingHighIvFallback =
+    primaryCandidates.length === 0 &&
+    highIvFallbackCandidates.length > 0 &&
+    hasPricedOutNearAtm &&
+    regime !== "POS_GAMMA_PIN";
+  const candidatePool = primaryCandidates.length > 0
+    ? primaryCandidates
+    : usingHighIvFallback
+      ? highIvFallbackCandidates
+      : [];
+  if (candidatePool.length === 0) return null;
 
   const optimized = selectOptimalSmallAccountContract({
-    candidates,
+    candidates: candidatePool,
     spotPrice: spot,
     target1Spot,
     target2Spot,
@@ -250,6 +281,9 @@ function selectRegimeAdaptiveBacktestContract(params: {
     absImpulsePeclet,
     etMins,
     nowMs: barTsSec * 1000,
+    minDeltaOverride: usingHighIvFallback ? fallbackMinDelta : undefined,
+    maxOtmDistOverride: usingHighIvFallback ? maxFallbackOtmDist : undefined,
+    preferMultiDteInHighIv: usingHighIvFallback,
   });
 
   if (!optimized) return null;
@@ -1155,6 +1189,15 @@ async function run10DaySniperAudit() {
         const chopKillSwitchHit = lossesToday >= 2 || realizedPnlDollarsToday <= -75;
         const cooldownMet = lastExitTs !== null && bar.ts - lastExitTs >= 1800;
         const contCooldownMet = lastExitTs !== null && bar.ts - lastExitTs >= 900;
+        const canShakeoutRecovery =
+          !chopKillSwitchHit &&
+          tradeCountToday === 1 &&
+          contCooldownMet &&
+          typeof lastClosedTrade?.pnlOptionPct === "number" &&
+          lastClosedTrade.pnlOptionPct >= 0 &&
+          lastClosedTrade.pnlOptionPct < 25 &&
+          /RATCHET|BREAKEVEN/i.test(lastClosedTrade.exitReason || "") &&
+          bar.totalMinutes <= Math.min(840, sessionBounds.entryCutoffMins);
         const canTrendContWin =
           !chopKillSwitchHit &&
           tradeCountToday >= 1 &&
@@ -1163,10 +1206,15 @@ async function run10DaySniperAudit() {
           !(callCountToday >= 1 && putCountToday >= 1) &&
           (sessionPolicy?.regime === "NEG_GAMMA_TREND" || sessionPolicy?.regime === "ZERO_GAMMA_FLIP") &&
           (lastClosedTrade?.pnlOptionPct ?? 0) >= 25 &&
+          !/WALL/i.test(lastClosedTrade?.exitReason || "") &&
           bar.totalMinutes >= 630 &&
           bar.totalMinutes <= sessionBounds.entryCutoffMins &&
-          ((lastClosedTrade?.contractType === "CALL" && callCountToday < 2) ||
-            (lastClosedTrade?.contractType === "PUT" && putCountToday < 2));
+          ((lastClosedTrade?.contractType === "CALL" &&
+            callCountToday < 2 &&
+            (!lastClosedTrade.closedSpotPrice || bar.close > lastClosedTrade.closedSpotPrice)) ||
+            (lastClosedTrade?.contractType === "PUT" &&
+              putCountToday < 2 &&
+              (!lastClosedTrade.closedSpotPrice || bar.close < lastClosedTrade.closedSpotPrice)));
         const canPhase2CallReclaim =
           !chopKillSwitchHit &&
           tradeCountToday >= 1 &&
@@ -1189,7 +1237,7 @@ async function run10DaySniperAudit() {
         if (
           !activePosition &&
           !chopKillSwitchHit &&
-          (tradeCountToday === 0 || canPhase2CallReclaim || canPhase2PutReject || canTrendContWin) &&
+          (tradeCountToday === 0 || canPhase2CallReclaim || canPhase2PutReject || canTrendContWin || canShakeoutRecovery) &&
           bar.totalMinutes >= sessionBounds.entryStartMins &&
           bar.totalMinutes <= sessionBounds.entryCutoffMins
         ) {
@@ -1239,7 +1287,7 @@ async function run10DaySniperAudit() {
           const zVwap = (bar.close - fvwap) / Math.max(0.05, sigma);
           const impPe = flowSnap?.impulsePeclet ?? 0;
 
-          if (tradeCountToday === 0 || canTrendContWin) {
+          if (tradeCountToday === 0 || canTrendContWin || canShakeoutRecovery) {
             const candidate = evaluateUnifiedSniperSetup(unifiedBars, idx, explicitKing);
             if (candidate) {
               const isCall = candidate.direction === "LONG";
@@ -1262,9 +1310,11 @@ async function run10DaySniperAudit() {
                     (flowSnap?.netFluxJ ?? 0) >= 0 &&
                     isNonExtendedBounce)
                 : isZgf
-                  ? (flowSnap?.ceilingShareChi ?? 0.5) < 0.45 &&
-                    impChi <= 0.4 &&
+                  ? (flowSnap?.ceilingShareChi ?? 0.5) < 0.44 &&
+                    impChi <= 0.38 &&
+                    impPe <= -1.2 &&
                     (flowSnap?.netFluxJ ?? 0) < 0 &&
+                    dFlux6 <= 0 &&
                     !bullDiv5m &&
                     !(lowerWickRatio >= 0.45 && bar.close >= bar.open)
                   : !candidate.setupName.includes("Rejection") ||
@@ -1293,6 +1343,8 @@ async function run10DaySniperAudit() {
             }
             if (!candDir && flowSnap?.bandSignal === "LOWER_2S_BOUNCE") {
               if (
+                (flowSnap?.ceilingShareChi ?? 0.5) >= 0.48 &&
+                ((flowSnap?.netFluxJ ?? 0) >= 0 || bar.close >= bar.sma34) &&
                 impChi >= 0.62 &&
                 (dFlux6 > 0 || dChi6 > 0) &&
                 bar.close > bar.open &&
@@ -1308,6 +1360,8 @@ async function run10DaySniperAudit() {
               }
             } else if (!candDir && flowSnap?.bandSignal === "UPPER_2S_REJECT") {
               if (
+                (flowSnap?.ceilingShareChi ?? 0.5) <= 0.52 &&
+                ((flowSnap?.netFluxJ ?? 0) <= 0 || bar.close <= bar.sma34) &&
                 impChi <= 0.38 &&
                 (dFlux6 < 0 || dChi6 < 0) &&
                 bar.close < bar.open &&
@@ -1330,11 +1384,13 @@ async function run10DaySniperAudit() {
               bar.close > bar.sma34 &&
               bar.close > bar.open &&
               prevBar.close > prevBar.open &&
-              (flowSnap?.ceilingShareChi ?? 0.5) > 0.55 &&
-              impChi >= 0.65 &&
-              impPe >= 2.0 &&
+              (flowSnap?.ceilingShareChi ?? 0.5) >= 0.58 &&
+              impChi >= 0.68 &&
+              impPe >= 2.2 &&
               (flowSnap?.netFluxJ ?? 0) > 0 &&
-              zVwap <= 1.85 &&
+              dFlux6 > 0 &&
+              zVwap <= 1.05 &&
+              barBody <= barAdaptive.maxSignalBarBody &&
               causalCallWall - bar.close >= barAdaptive.minWallRoom
             ) {
               candDir = "CALL";
@@ -1352,11 +1408,13 @@ async function run10DaySniperAudit() {
               bar.close < bar.sma34 &&
               bar.close < bar.open &&
               prevBar.close < prevBar.open &&
-              (flowSnap?.ceilingShareChi ?? 0.5) < 0.45 &&
-              impChi <= 0.35 &&
-              impPe <= -2.0 &&
+              (flowSnap?.ceilingShareChi ?? 0.5) <= 0.42 &&
+              impChi <= 0.32 &&
+              impPe <= -2.2 &&
               (flowSnap?.netFluxJ ?? 0) < 0 &&
-              zVwap >= -1.85 &&
+              dFlux6 < 0 &&
+              zVwap >= -1.05 &&
+              -barBody <= barAdaptive.maxSignalBarBody &&
               bar.close - causalPutWall >= barAdaptive.minWallRoom
             ) {
               candDir = "PUT";
@@ -1383,6 +1441,7 @@ async function run10DaySniperAudit() {
             if (
               canPhase2CallReclaim &&
               testedPutWallOrMinus1S &&
+              zVwap <= 0.95 &&
               impChi >= 0.65 &&
               (dChi6 >= 0.04 || dImpChi6 >= 0.06 || dFlux6 > 0) &&
               barBody <= barAdaptive.maxSignalBarBody &&
@@ -1400,6 +1459,7 @@ async function run10DaySniperAudit() {
             } else if (
               canPhase2PutReject &&
               testedCallWallOrPlus1S &&
+              zVwap >= -0.95 &&
               impChi <= 0.35 &&
               (dChi6 <= -0.04 || dImpChi6 <= -0.06 || dFlux6 < 0) &&
               -barBody <= barAdaptive.maxSignalBarBody &&
@@ -1474,6 +1534,7 @@ async function run10DaySniperAudit() {
                 btoSpotPrice: lastClosedTrade.btoSpotPrice,
                 closedSpotPrice: lastClosedTrade.closedSpotPrice,
                 pnlOptionPct: lastClosedTrade.pnlOptionPct,
+                exitReason: lastClosedTrade.exitReason,
               },
               testedPutWallOrMinus1Sigma: testedPutWallOrMinus1S,
               testedCallWallOrPlus1Sigma: testedCallWallOrPlus1S,
@@ -1482,6 +1543,8 @@ async function run10DaySniperAudit() {
               impulseChi: impChi,
               deltaChi6Bar: effDeltaChi6,
               impulsePeclet: flowSnap?.impulsePeclet ?? flowSnap?.pecletNumber ?? 0,
+              ceilingShareChi: flowSnap?.ceilingShareChi ?? 0.5,
+              netFluxJ: flowSnap?.netFluxJ ?? 0,
             });
             if (!leg2Gate.allowed) {
               skippedSetupsToday.push({
@@ -1515,9 +1578,11 @@ async function run10DaySniperAudit() {
             });
 
             const reqMinExpR =
-              tradeCountToday === 1
-                ? Math.max(sessionPolicy?.minExpectancyR ?? LEG2_MIN_EXPECTANCY_R, LEG2_MIN_EXPECTANCY_R)
-                : (sessionPolicy?.minExpectancyR ?? LEG1_MIN_EXPECTANCY_R);
+              canShakeoutRecovery || canTrendContWin
+                ? 0.40
+                : tradeCountToday >= 1
+                  ? Math.max(sessionPolicy?.minExpectancyR ?? LEG2_MIN_EXPECTANCY_R, LEG2_MIN_EXPECTANCY_R)
+                  : (sessionPolicy?.minExpectancyR ?? LEG1_MIN_EXPECTANCY_R);
 
             const alphaScore = scoreSetupExpectancy({
               direction: candDir,

@@ -561,7 +561,7 @@ export async function POST(req: NextRequest) {
           impulseChi: typeof body.impulseChi === "number" ? body.impulseChi : undefined,
           zeroGamma: typeof body.zeroGamma === "number" ? body.zeroGamma : undefined,
           sessionDate,
-          webhookUrl: backfill ? undefined : validWebhookUrl,
+          webhookUrl: undefined,
           isHistoricalBackfill: backfill,
           signal: syncController.signal,
         });
@@ -570,7 +570,12 @@ export async function POST(req: NextRequest) {
         if (!backfill && clock.etMins >= syncBounds.eodFlatMins) {
           await ensureMocCutoffForRemainingPositions(validWebhookUrl, clock);
         }
-        return NextResponse.json({ success: true, ...res });
+        return NextResponse.json({
+          success: true,
+          retiredClientLedgerWrite: true,
+          authority: "liveBotDaemon",
+          ...res,
+        });
       } finally {
         clearTimeout(syncTimeout);
         req.signal?.removeEventListener("abort", onReqAbort);

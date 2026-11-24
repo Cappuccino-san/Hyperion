@@ -8,7 +8,7 @@ import {
   useDashboardStore,
 } from "@/store/useDashboardStore";
 import { OptionsAnalyticsPayload } from "@/lib/optionsExposure";
-import { getTodayEt } from "@/lib/gaiaSessionGuards";
+import { getTodayEt, isAliveOptionExpiration } from "@/lib/gaiaSessionGuards";
 import { cn } from "@/lib/utils";
 
 const QUAD_TICKERS = ["SPY", "QQQ", "SPXW", "IWM"] as const;
@@ -55,9 +55,7 @@ function formatMoney(v: number): string {
 }
 
 function isAliveExpiration(isoDate: string): boolean {
-  const now = Date.now();
-  const t = Date.parse(isoDate.slice(0, 10) + "T20:00:00Z");
-  return !isNaN(t) && t > now;
+  return isAliveOptionExpiration(isoDate);
 }
 
 export function QuadView() {
@@ -237,17 +235,15 @@ export function QuadView() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
         {QUAD_TICKERS.map((sym) => {
           const payload = quadPayloads[sym];
-          const preset = getStaticTickerPreset(sym);
-          const spot = payload?.spotPrice ?? preset.spotPrice;
-          const prevClose = payload?.previousClose ?? preset.previousClose;
+          const spot = payload?.spotPrice ?? 0;
+          const prevClose = payload?.previousClose ?? 0;
           const pctChange =
-            prevClose > 0 ? ((spot - prevClose) / prevClose) * 100 : 0;
+            spot > 0 && prevClose > 0 ? ((spot - prevClose) / prevClose) * 100 : 0;
           const isPosChange = pctChange >= 0;
           const cardSel = cardHorizons[sym] ?? "";
           const effectiveHorizon = cardSel === "" ? globalExpFilter : cardSel;
 
-          const fallbackAllExpKing =
-            payload?.kingNode.allExpKing ?? preset.kingPreset.allExpKing;
+          const fallbackAllExpKing = payload?.kingNode.allExpKing ?? 0;
           const contested = payload?.kingNode.isContested ?? false;
 
           // Determine columns to sum
@@ -354,14 +350,10 @@ export function QuadView() {
 
           if (maxActiveAbs <= 0) {
             if (effectiveHorizon === "0DTE") {
-              activeKing =
-                payload?.kingByFilter["0DTE"].strike ??
-                preset.kingPreset.zeroDteKing;
+              activeKing = payload?.kingByFilter["0DTE"].strike ?? 0;
               activeExpDate = payload?.kingByFilter["0DTE"].exp ?? "";
             } else if (effectiveHorizon === "THIS_WEEK") {
-              activeKing =
-                payload?.kingByFilter.THIS_WEEK.strike ??
-                preset.kingPreset.weeklyKing;
+              activeKing = payload?.kingByFilter.THIS_WEEK.strike ?? 0;
               activeExpDate =
                 payload?.kingByFilter.THIS_WEEK.exp ?? "";
             } else if (effectiveHorizon !== "ALL") {
@@ -452,17 +444,19 @@ export function QuadView() {
                       </span>
                     )}
                     <span className="font-mono text-[13px] font-bold text-slate-100 tabular-nums">
-                      ${spot.toFixed(2)}
+                      {spot > 0 ? `$${spot.toFixed(2)}` : "SYNCING"}
                     </span>
-                    <small
-                      className={cn(
-                        "font-mono text-[11px] font-semibold tabular-nums",
-                        isPosChange ? "text-emerald-400" : "text-rose-400"
-                      )}
-                    >
-                      {isPosChange ? "+" : ""}
-                      {pctChange.toFixed(2)}%
-                    </small>
+                    {spot > 0 && prevClose > 0 && (
+                      <small
+                        className={cn(
+                          "font-mono text-[11px] font-semibold tabular-nums",
+                          isPosChange ? "text-emerald-400" : "text-rose-400"
+                        )}
+                      >
+                        {isPosChange ? "+" : ""}
+                        {pctChange.toFixed(2)}%
+                      </small>
+                    )}
                   </button>
                 </div>
 
@@ -529,12 +523,12 @@ export function QuadView() {
                   {effectiveHorizon !== "ALL" && (
                     <>
                       <span>{horizonKingPrefix} </span>
-                      <b className="text-[#facc15] font-bold">{activeKing}</b>
+                      <b className="text-[#facc15] font-bold">{activeKing > 0 ? activeKing : "—"}</b>
                       <span>{horizonKingDay} · </span>
                     </>
                   )}
                   <span>All-exp King </span>
-                  <b className="text-[#facc15] font-bold">{allExpKing}</b>
+                  <b className="text-[#facc15] font-bold">{allExpKing > 0 ? allExpKing : "—"}</b>
                   {contested && <span> · contested</span>}
                 </div>
               </div>
