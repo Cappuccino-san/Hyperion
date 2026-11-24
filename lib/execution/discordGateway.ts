@@ -383,14 +383,29 @@ export async function sendDiscordTradeAlert(
       )} (${directionalFavorPct >= 0 ? "+" : ""}${directionalFavorPct.toFixed(1)}% to ${alert.contractType})`;
 
       let optionPnlStr = "N/A";
-      if (alert.btoOptionMid != null && alert.optionMid != null) {
-        const optPct =
-          alert.pnlOptionPct != null
-            ? alert.pnlOptionPct
-            : ((alert.optionMid - alert.btoOptionMid) / alert.btoOptionMid) * 100;
-        optionPnlStr = `$${alert.btoOptionMid.toFixed(2)} → $${alert.optionMid.toFixed(2)} (${
+      const entryAskBasis =
+        typeof alert.btoOptionAsk === "number" && alert.btoOptionAsk > 0
+          ? alert.btoOptionAsk
+          : alert.btoOptionMid;
+      const exitBidBasis =
+        typeof alert.closedOptionBid === "number" && alert.closedOptionBid > 0
+          ? alert.closedOptionBid
+          : typeof alert.optionBid === "number" && alert.optionBid > 0
+            ? alert.optionBid
+            : alert.optionMid;
+      if (entryAskBasis != null && entryAskBasis > 0 && exitBidBasis != null) {
+        const optPct = ((exitBidBasis - entryAskBasis) / entryAskBasis) * 100;
+        const srcBadge =
+          alert.exitQuoteSource === "LIVE_CHAIN_BID"
+            ? " · LIVE BID"
+            : alert.exitQuoteSource === "DELAYED_CBOE_BID"
+              ? " · CBOE DELAYED"
+              : alert.exitQuoteSource === "BS_FALLBACK"
+                ? " · BS"
+                : "";
+        optionPnlStr = `Ask $${entryAskBasis.toFixed(2)} → Bid $${exitBidBasis.toFixed(2)} (${
           optPct >= 0 ? "+" : ""
-        }${optPct.toFixed(1)}%)`;
+        }${optPct.toFixed(1)}%${srcBadge})`;
       }
 
       let positionActionStr: string;

@@ -7,6 +7,7 @@ export type ContractType = "CALL" | "PUT";
 export type PositionStatus = "OPEN" | "PARTIAL_TP1" | "CLOSED";
 export type SignalAction = "BUY_TO_OPEN" | "SELL_TO_CLOSE";
 export type DivergenceDirection = "BULL" | "BEAR" | "NO";
+export type ExitQuoteSource = "LIVE_CHAIN_BID" | "DELAYED_CBOE_BID" | "BS_FALLBACK";
 
 export const MAX_ENGINE_CACHE_ENTRIES = 64;
 
@@ -63,6 +64,7 @@ export interface OptionTradePosition {
   status: PositionStatus;
   btoSpotPrice: number;
   btoOptionMid: number;
+  btoOptionAsk?: number;
   optionBid?: number;
   optionAsk?: number;
   contractsQty: 1 | 2;
@@ -82,6 +84,8 @@ export interface OptionTradePosition {
   closedTs?: number;
   closedSpotPrice?: number;
   closedOptionMid?: number | null;
+  closedOptionBid?: number | null;
+  exitQuoteSource?: ExitQuoteSource;
   exitReason?: string;
   pnlSpotPct?: number;
   pnlOptionPct?: number;
@@ -137,6 +141,9 @@ export interface TradeLifecycleAlert {
   optionBid?: number;
   optionAsk?: number;
   btoOptionMid: number | null;
+  btoOptionAsk?: number;
+  closedOptionBid?: number | null;
+  exitQuoteSource?: ExitQuoteSource;
   contractsQty: 1 | 2;
   remainingQty: 0 | 1 | 2;
   totalOutlay: number;

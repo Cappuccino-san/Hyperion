@@ -1,6 +1,10 @@
 import {
+  CachedRawChainEntry,
   NormalizedOptionContract,
+  OptionContractQuoteSource,
   computeBlackScholesGreeks,
+  globalContractsCache,
+  resolveTradierAccessToken,
 } from "@/lib/optionsExposure";
 import {
   computeCanonicalPdeSeries,
@@ -16,6 +20,7 @@ import {
   MAX_ENGINE_CACHE_ENTRIES,
   SkewBlackScholesInput,
   SkewBlackScholesQuote,
+  createLinkedTimeoutSignal,
   setBoundedMapEntry,
 } from "@/lib/execution/types";
 
@@ -35,26 +40,45 @@ export function solveImpliedVol(
 ): number {
   if (midPrice <= 0 || spot <= 0 || strike <= 0) return 0.22;
   const effectiveT = Math.max(1 / (252 * 390), tYears);
-  const intrinsic = isCall ? Math.max(0, spot - strike) : Math.max(0, strike - spot);
-  if (midPrice <= intrinsic) return 0.08;
+  const discountedForwardIntrinsic = isCall
+    ? Math.max(0, spot * Math.exp(-q * effectiveT) - strike * Math.exp(-r * effectiveT))
+    : Math.max(0, strike * Math.exp(-r * effectiveT) - spot * Math.exp(-q * effectiveT));
+  if (midPrice <= discountedForwardIntrinsic + 1e-4) return 0.04;
 
   let low = 0.02;
-  let high = 3.5;
+  let high = 4.0;
   let iv = 0.25;
 
-  for (let i = 0; i < 22; i++) {
+  for (let i = 0; i < 28; i++) {
     iv = 0.5 * (low + high);
     const greeks = computeBlackScholesGreeks(spot, strike, effectiveT, iv, r, q);
     const price = isCall ? greeks.callPrice : greeks.putPrice;
     const diff = price - midPrice;
-    if (Math.abs(diff) < 0.001) break;
+    if (Math.abs(diff) < 0.0001) break;
     if (diff > 0) {
       high = iv;
     } else {
       low = iv;
     }
   }
-  return Number(iv.toFixed(4));
+  return Number(iv.toFixed(6));
+}
+
+/**
+ * Unrounded Black-Scholes valuation for exact differential quote shifts (zero cent-rounding drift).
+ */
+export function repriceOptionBSExact(
+  spot: number,
+  strike: number,
+  tYears: number,
+  iv: number,
+  isCall: boolean,
+  r = 0.045,
+  q = 0.012
+): number {
+  const effectiveT = Math.max(1 / (252 * 390), tYears);
+  const greeks = computeBlackScholesGreeks(spot, strike, effectiveT, Math.max(0.04, iv), r, q);
+  return Math.max(0.001, isCall ? greeks.callPrice : greeks.putPrice);
 }
 
 /**
@@ -69,9 +93,7 @@ export function repriceOptionBS(
   r = 0.045,
   q = 0.012
 ): number {
-  const effectiveT = Math.max(1 / (252 * 390), tYears); // 1-minute floor to prevent singularity
-  const greeks = computeBlackScholesGreeks(spot, strike, effectiveT, Math.max(0.04, iv), r, q);
-  const rawPrice = isCall ? greeks.callPrice : greeks.putPrice;
+  const rawPrice = repriceOptionBSExact(spot, strike, tYears, iv, isCall, r, q);
   return Number(Math.max(0.01, rawPrice).toFixed(2));
 }
 
@@ -329,13 +351,18 @@ function diffIsoDays(expIso: string, todayIso: string): number {
 
 /**
  * Re-anchors delayed CBOE option chain quotes (`mid`, `bid`, `ask`, `delta`, `gamma`, `theta`)
- * to sub-second live underlying `spotPrice` using each contract's solved or reported IV.
+ * onto fresh clones using a differential Black-Scholes shift:
+ *   `bsDelta = BS(liveSpot, anchorIv, tNow) - BS(referenceSpot, anchorIv, tRef)`
+ * where `anchorIv` is solved strictly from `(rawMid, referenceSpot, strike, tRef)` so
+ * `BS(referenceSpot, anchorIv, tRef) === rawMid` within < $0.005 (never trusting unvalidated `raw.iv`).
+ * Live Tradier quotes (`quoteSource === "TRADIER_LIVE"`) bypass re-anchoring cleanly.
  */
 export function reanchorDelayedContractsToSpot(params: {
-  contracts: NormalizedOptionContract[];
+  contracts: ReadonlyArray<NormalizedOptionContract>;
   referenceSpot: number;
   liveSpot: number;
   nowMs?: number;
+  fetchedAtMs?: number;
   fallbackIv?: number;
   forceReprice?: boolean;
 }): NormalizedOptionContract[] {
@@ -344,88 +371,206 @@ export function reanchorDelayedContractsToSpot(params: {
     referenceSpot,
     liveSpot,
     nowMs = Date.now(),
+    fetchedAtMs,
     fallbackIv = 0.22,
     forceReprice = false,
   } = params;
   if (!Array.isArray(contracts) || contracts.length === 0 || !Number.isFinite(liveSpot) || liveSpot <= 0) {
-    return contracts;
+    return Array.isArray(contracts) ? contracts.map((c) => ({ ...c })) : [];
   }
 
+  const refTimeMs =
+    typeof fetchedAtMs === "number" && Number.isFinite(fetchedAtMs) && fetchedAtMs > 0
+      ? fetchedAtMs
+      : nowMs;
   const todayIso = formatEtIsoDate(new Date(nowMs));
+  const refIso = formatEtIsoDate(new Date(refTimeMs));
   const spotDelta = Number.isFinite(referenceSpot) && referenceSpot > 0 ? Math.abs(liveSpot - referenceSpot) : 0;
+  const timeDeltaMs = Math.abs(nowMs - refTimeMs);
   const shouldShiftQuotes =
     forceReprice ||
+    timeDeltaMs >= 15_000 ||
     (Number.isFinite(referenceSpot) && referenceSpot > 0 && spotDelta > Math.max(0.01, referenceSpot * 0.0001));
 
   return contracts.map((c) => {
-    if (!c || !Number.isFinite(c.strike) || c.strike <= 0) return c;
+    if (!c || !Number.isFinite(c.strike) || c.strike <= 0) return { ...c };
+    if (c.quoteSource === "TRADIER_LIVE") {
+      return { ...c, quoteSource: "TRADIER_LIVE" };
+    }
     const isCall = c.optionType === "C";
-    const dte =
+    const dteNow =
       typeof c.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(c.expiration)
         ? diffIsoDays(c.expiration, todayIso)
         : 0;
-    if (dte < 0) return c;
+    if (dteNow < 0) return { ...c, quoteSource: c.quoteSource ?? "DELAYED_CBOE" };
+    const dteRef =
+      typeof c.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(c.expiration)
+        ? Math.max(0, diffIsoDays(c.expiration, refIso))
+        : Math.max(0, dteNow);
 
-    const remainingYears = computeRemainingYearsToExpiration(nowMs, Math.max(0, dte));
+    const tNow = computeRemainingYearsToExpiration(nowMs, Math.max(0, dteNow));
+    const tRef = computeRemainingYearsToExpiration(refTimeMs, Math.max(0, dteRef));
     const rawBid = typeof c.bid === "number" && Number.isFinite(c.bid) && c.bid > 0 ? c.bid : 0;
     const rawAsk = typeof c.ask === "number" && Number.isFinite(c.ask) && c.ask > 0 ? c.ask : 0;
     const rawMid = getContractMidPrice(c);
 
-    const rawIv = typeof c.iv === "number" && Number.isFinite(c.iv) && c.iv > 0
-      ? (c.iv > 4 ? c.iv / 100 : c.iv)
-      : 0;
-    const solvedIv =
-      rawIv >= 0.04 && rawIv <= 2.5
-        ? rawIv
-        : rawMid > 0 && referenceSpot > 0
-          ? solveImpliedVol(rawMid, referenceSpot, c.strike, remainingYears, isCall)
-          : fallbackIv;
-    const contractIv = Math.max(0.05, Math.min(2.5, solvedIv));
-
-    const observedHalfSpreadPct =
-      rawBid > 0 && rawAsk >= rawBid && rawMid > 0
-        ? Math.max(0.005, Math.min(0.12, (rawAsk - rawBid) / (2 * rawMid)))
-        : 0.02;
-
-    const repriced = priceOptionWithSkew({
-      spot: liveSpot,
-      strike: c.strike,
-      direction: isCall ? "LONG" : "SHORT",
-      remainingYears,
-      atmIv: contractIv,
-      skewSlope: 0,
-      smileConvexity: 0,
-      halfSpreadPct: observedHalfSpreadPct,
-    });
-
-    const existingTheta = typeof c.theta === "number" && Number.isFinite(c.theta) ? c.theta : undefined;
-
-    if (!shouldShiftQuotes) {
+    const rawIv =
+      typeof c.iv === "number" && Number.isFinite(c.iv) && c.iv > 0
+        ? c.iv > 4
+          ? c.iv / 100
+          : c.iv
+        : 0;
+    const quoteSource: OptionContractQuoteSource = c.quoteSource ?? "DELAYED_CBOE";
+    // Far-dated LEAPS (> 45 DTE) are never selected by the 0-3 DTE sniper router; skip 28-step bisection
+    if (dteNow > 45) {
+      const leapsIv = rawIv >= 0.04 && rawIv <= 1.8 ? rawIv : fallbackIv;
       return {
         ...c,
-        iv: Number(contractIv.toFixed(4)),
-        theta: existingTheta ?? repriced.thetaPerDay,
+        iv: Number(leapsIv.toFixed(4)),
+        quoteSource,
       };
     }
 
+    const anchorIv =
+      rawMid > 0 && referenceSpot > 0
+        ? solveImpliedVol(rawMid, referenceSpot, c.strike, tRef, isCall)
+        : rawIv >= 0.04 && rawIv <= 1.8
+          ? rawIv
+          : fallbackIv;
+    const contractIv = Math.max(0.04, Math.min(3.5, anchorIv));
+
+    const liveGreeks = computeBlackScholesGreeks(liveSpot, c.strike, tNow, contractIv);
+    const liveDelta = isCall ? liveGreeks.deltaCall : liveGreeks.deltaPut;
+    const bsNowExact = repriceOptionBSExact(liveSpot, c.strike, tNow, contractIv, isCall);
+    const bsNextDay = repriceOptionBSExact(
+      liveSpot,
+      c.strike,
+      Math.max(1 / (252 * 390), tNow - 1 / 252),
+      contractIv,
+      isCall
+    );
+    const liveTheta = Math.min(0, bsNextDay - bsNowExact);
+    const existingTheta = typeof c.theta === "number" && Number.isFinite(c.theta) ? c.theta : undefined;
+
+    if (!shouldShiftQuotes || !(referenceSpot > 0) || !(rawMid > 0)) {
+      return {
+        ...c,
+        iv: Number(contractIv.toFixed(4)),
+        delta: Number(liveDelta.toFixed(4)),
+        gamma: Number(liveGreeks.gamma.toFixed(5)),
+        theta: existingTheta ?? Number(liveTheta.toFixed(4)),
+        quoteSource,
+      };
+    }
+
+    const bsRef = repriceOptionBSExact(referenceSpot, c.strike, tRef, contractIv, isCall);
+    const bsDelta = bsNowExact - bsRef;
+
+    const shiftedMid = Number(Math.max(0.01, rawMid + bsDelta).toFixed(2));
+    const shiftedBid =
+      rawBid > 0
+        ? Number(Math.max(0.01, rawBid + bsDelta).toFixed(2))
+        : 0;
+    const shiftedAsk =
+      rawAsk > 0
+        ? Number(
+            Math.max(
+              shiftedBid > 0 ? shiftedBid + (rawAsk > rawBid ? 0.01 : 0) : 0.01,
+              rawAsk + bsDelta
+            ).toFixed(2)
+          )
+        : 0;
+
     return {
       ...c,
-      bid: repriced.bid,
-      ask: repriced.ask,
-      last: repriced.mid,
-      delta: Number(repriced.delta.toFixed(4)),
-      gamma: Number(repriced.gamma.toFixed(5)),
+      bid: shiftedBid,
+      ask: shiftedAsk,
+      last: shiftedMid,
+      delta: Number(liveDelta.toFixed(4)),
+      gamma: Number(liveGreeks.gamma.toFixed(5)),
       iv: Number(contractIv.toFixed(4)),
-      theta: existingTheta ?? repriced.thetaPerDay,
+      theta: Number(liveTheta.toFixed(4)),
+      quoteSource,
     };
   });
+}
+
+const derivedShiftMemo = new WeakMap<
+  CachedRawChainEntry,
+  {
+    liveSpot: number;
+    bucketMs: number;
+    fallbackIv: number;
+    shifted: ReadonlyArray<NormalizedOptionContract>;
+  }
+>();
+
+/**
+ * Materializes fresh option contract clones from an immutable `CachedRawChainEntry`.
+ * - `TRADIER_LIVE`: returns fresh clones without re-anchoring.
+ * - `DELAYED_CBOE`: applies single-pass differential BS shift from `(referenceSpot, fetchedAtMs)` to `(liveSpot, nowMs)`.
+ */
+export function resolveContractsFromRawCacheEntry(
+  entry: CachedRawChainEntry | undefined | null,
+  liveSpot: number,
+  nowMs = Date.now(),
+  fallbackIv = 0.22
+): NormalizedOptionContract[] {
+  if (!entry || !Array.isArray(entry.rawContracts) || entry.rawContracts.length === 0) {
+    return [];
+  }
+  if (entry.quoteSource === "TRADIER_LIVE") {
+    return entry.rawContracts.map((c) => ({ ...c, quoteSource: "TRADIER_LIVE" }));
+  }
+  const effectiveLiveSpot =
+    Number.isFinite(liveSpot) && liveSpot > 0
+      ? liveSpot
+      : entry.referenceSpot;
+  const bucketMs = Math.floor(nowMs / 5000);
+  const memo = derivedShiftMemo.get(entry);
+  if (
+    memo &&
+    memo.bucketMs === bucketMs &&
+    memo.fallbackIv === fallbackIv &&
+    Math.abs(memo.liveSpot - effectiveLiveSpot) < 0.005
+  ) {
+    return memo.shifted.map((c) => ({ ...c }));
+  }
+  const shifted = reanchorDelayedContractsToSpot({
+    contracts: entry.rawContracts,
+    referenceSpot: entry.referenceSpot,
+    liveSpot: effectiveLiveSpot,
+    fetchedAtMs: entry.fetchedAtMs,
+    nowMs,
+    fallbackIv,
+  });
+  derivedShiftMemo.set(entry, {
+    liveSpot: effectiveLiveSpot,
+    bucketMs,
+    fallbackIv,
+    shifted,
+  });
+  return shifted.map((c) => ({ ...c }));
+}
+
+export interface GreekEnvelopeOptions {
+  strike?: number;
+  tEntryYears?: number;
+  tRemainingYears?: number;
+  /**
+   * When false (mandatory on matched `LIVE_CHAIN_BID` and `DELAYED_CBOE_BID` quotes),
+   * `clampOptionPriceToGreekEnvelope` acts strictly as an upper outlier ceiling (`<= rawCurrentOptionPrice`)
+   * and NEVER inflates `exitFillPrice` above `rawCurrentOptionPrice`.
+   */
+  allowFloor?: boolean;
 }
 
 /**
  * Physical Greek Envelope Clamp:
  * Prevents noisy delayed CBOE quotes or wide bid-ask jumps from violating options microstructure physics.
  * 1. Adverse spot excursion (dirSpotMove <= -0.02) MUST NEVER produce an option price above entry.
- * 2. Positive spot excursion is bounded by delta + gamma convexity.
+ * 2. Positive spot excursion is bounded by strike-accurate Black-Scholes (or delta + gamma convexity).
+ * 3. When `options.allowFloor === false` (matched chain bid), NEVER raises `rawCurrentOptionPrice` upward.
  */
 export function clampOptionPriceToGreekEnvelope(
   entrySpot: number,
@@ -433,10 +578,62 @@ export function clampOptionPriceToGreekEnvelope(
   entryOptionPrice: number,
   rawCurrentOptionPrice: number,
   isCall: boolean,
-  elapsedMinutes = 5
+  elapsedMinutes = 5,
+  options?: GreekEnvelopeOptions
 ): number {
   const baseEntry = Math.max(0.05, entryOptionPrice);
+  const rawPrice = Math.max(0.01, rawCurrentOptionPrice);
+  const allowFloor = options?.allowFloor ?? true;
   const dirSpotMove = (currentSpot - entrySpot) * (isCall ? 1 : -1);
+  const minMoveEps = Math.max(0.02, Math.max(1, entrySpot) * 0.00003);
+
+  if (
+    options?.strike &&
+    Number.isFinite(options.strike) &&
+    options.strike > 0 &&
+    entrySpot > 0 &&
+    currentSpot > 0
+  ) {
+    const defaultEntryYears = Math.max(1 / (252 * 390), 3.5 / (252 * 6.5));
+    const tEntry =
+      typeof options.tEntryYears === "number" && options.tEntryYears > 0
+        ? options.tEntryYears
+        : defaultEntryYears;
+    const elapsedYears = Math.max(0, elapsedMinutes) / (252 * 390);
+    const tRem =
+      typeof options.tRemainingYears === "number" && options.tRemainingYears > 0
+        ? options.tRemainingYears
+        : Math.max(1 / (252 * 390), tEntry - elapsedYears);
+    const entryIv = solveImpliedVol(baseEntry, entrySpot, options.strike, tEntry, isCall);
+
+    if (dirSpotMove <= -minMoveEps) {
+      const bsAdverse = repriceOptionBSExact(currentSpot, options.strike, tRem, entryIv, isCall);
+      const upperAdverseCap = Math.max(0.01, Math.min(baseEntry - 0.01, bsAdverse + 0.02));
+      if (!allowFloor) {
+        return Number(Math.max(0.01, Math.min(rawPrice, upperAdverseCap)).toFixed(2));
+      }
+      const lowerAdverseFloor = Math.max(0.01, bsAdverse * 0.7 - 0.03);
+      return Number(Math.max(lowerAdverseFloor, Math.min(upperAdverseCap, rawPrice)).toFixed(2));
+    }
+
+    const maxPlausibleIv = Math.min(3.5, entryIv * (isCall ? 1.05 : 1.12));
+    const bsUpper = repriceOptionBSExact(currentSpot, options.strike, tRem, maxPlausibleIv, isCall);
+    const upperFavorableCap =
+      dirSpotMove >= 0 ? Math.max(baseEntry, bsUpper + 0.02) : baseEntry + 0.01;
+    if (!allowFloor) {
+      return Number(Math.max(0.01, Math.min(rawPrice, upperFavorableCap)).toFixed(2));
+    }
+    const bsLower = repriceOptionBSExact(
+      currentSpot,
+      options.strike,
+      tRem,
+      Math.max(0.04, entryIv * 0.85),
+      isCall
+    );
+    const lowerFloor = Math.max(0.01, bsLower - 0.03);
+    return Number(Math.max(lowerFloor, Math.min(upperFavorableCap, rawPrice)).toFixed(2));
+  }
+
   const effectiveDelta = Math.min(0.8, Math.max(0.25, baseEntry / 1.8));
   const minDelta = Math.min(0.2, effectiveDelta * 0.45);
   const maxThetaAllowance = Math.min(
@@ -444,7 +641,6 @@ export function clampOptionPriceToGreekEnvelope(
     Math.max(baseEntry * 0.15, Math.max(0, elapsedMinutes) * 0.0045)
   );
   const thetaDecay = Math.min(maxThetaAllowance, Math.max(0, elapsedMinutes) * 0.0045);
-  const minMoveEps = Math.max(0.02, Math.max(1, entrySpot) * 0.00003);
   const gammaScale = 750 / Math.max(1, entrySpot);
 
   if (dirSpotMove <= -minMoveEps) {
@@ -453,9 +649,13 @@ export function clampOptionPriceToGreekEnvelope(
       effectiveDelta * dirSpotMove - thetaDecay - 0.04
     );
     const minLossDelta = Math.min(-0.01, minDelta * dirSpotMove);
+    const upperAdverse = Math.max(0.01, baseEntry + minLossDelta);
+    if (!allowFloor) {
+      return Number(Math.max(0.01, Math.min(rawPrice, upperAdverse)).toFixed(2));
+    }
     const clampedDelta = Math.max(
       maxLossDelta,
-      Math.min(minLossDelta, rawCurrentOptionPrice - baseEntry)
+      Math.min(minLossDelta, rawPrice - baseEntry)
     );
     return Number(Math.max(0.05, baseEntry + clampedDelta).toFixed(2));
   }
@@ -463,11 +663,15 @@ export function clampOptionPriceToGreekEnvelope(
   const posMove = Math.max(0, dirSpotMove);
   const maxGainDelta =
     effectiveDelta * posMove + 0.06 * gammaScale * posMove * posMove + 0.02;
+  const upperFavorable = Math.max(0.01, baseEntry + maxGainDelta);
+  if (!allowFloor) {
+    return Number(Math.max(0.01, Math.min(rawPrice, upperFavorable)).toFixed(2));
+  }
   const minGainDelta = Math.max(
     -Math.max(0.08 * baseEntry, thetaDecay),
     minDelta * dirSpotMove - thetaDecay
   );
-  const rawDeltaV = rawCurrentOptionPrice - baseEntry;
+  const rawDeltaV = rawPrice - baseEntry;
   const clampedDelta = Math.max(minGainDelta, Math.min(maxGainDelta, rawDeltaV));
   return Number(Math.max(0.05, baseEntry + clampedDelta).toFixed(2));
 }
@@ -480,14 +684,14 @@ export function clampToCandleRange(price: number, candle?: { low?: number; high?
 }
 
 /**
- * Cache for live CBOE delayed options chain (10s TTL) and live underlying spot prices
+ * Immutable raw cache for CBOE delayed options chain (10s TTL) and live underlying spot prices.
+ * Stores raw CBOE snapshots and shifts onto fresh clones per call (zero double-shift, zero frozen quotes).
  */
-const cboeChainCache = new Map<
-  string,
-  { ts: number; cboeSpot: number; effectiveSpot: number; contracts: NormalizedOptionContract[] }
->();
+const cboeChainCache = new Map<string, CachedRawChainEntry>();
+const cboeFailureCooldownUntil = new Map<string, number>();
 const spotPriceCache = new Map<string, number>();
 const CBOE_CACHE_TTL_MS = 10_000;
+const CBOE_FAILURE_BACKOFF_MS = 3_000;
 
 export function getCachedSpotPrice(ticker: string): number | null {
   const sym = ticker.trim().toUpperCase();
@@ -504,46 +708,170 @@ export async function fetchLiveCboeOptions(
   if (signal?.aborted) return [];
   const cboeSymbol =
     sym === "SPX" || sym === "SPXW" ? "_SPX" : sym === "NDX" || sym === "NDXP" ? "_NDX" : sym;
+  const tickSym =
+    sym === "SPX" || sym === "SPXW"
+      ? "SPX"
+      : sym === "NDX" || sym === "NDXP"
+        ? "NDX"
+        : sym;
 
-  const cached = cboeChainCache.get(cboeSymbol);
-  if (cached && Date.now() - cached.ts < CBOE_CACHE_TTL_MS) {
-    return cached.contracts;
+  const globalCached = globalContractsCache.get(sym);
+  if (
+    globalCached &&
+    globalCached.quoteSource === "TRADIER_LIVE" &&
+    Date.now() - globalCached.fetchedAtMs < CBOE_CACHE_TTL_MS
+  ) {
+    if (globalCached.referenceSpot > 0) {
+      setBoundedMapEntry(spotPriceCache, cboeSymbol, globalCached.referenceSpot);
+    }
+    return resolveContractsFromRawCacheEntry(globalCached, globalCached.referenceSpot, Date.now());
   }
 
+  const tradierToken = resolveTradierAccessToken();
+  if (tradierToken) {
+    try {
+      const headers = {
+        Authorization: `Bearer ${tradierToken}`,
+        Accept: "application/json",
+      };
+      const [quoteRes, expRes] = await Promise.all([
+        fetch(`https://api.tradier.com/v1/markets/quotes?symbols=${encodeURIComponent(tickSym)}`, {
+          headers,
+          cache: "no-store",
+          signal: signal ?? AbortSignal.timeout(5000),
+        }),
+        fetch(
+          `https://api.tradier.com/v1/markets/options/expirations?symbol=${encodeURIComponent(sym)}&includeAllRoots=true`,
+          {
+            headers,
+            cache: "no-store",
+            signal: signal ?? AbortSignal.timeout(5000),
+          }
+        ),
+      ]);
+      if (quoteRes.ok && expRes.ok) {
+        const quoteJson = await quoteRes.json();
+        const expJson = await expRes.json();
+        const quoteObj = quoteJson?.quotes?.quote;
+        const tSpot = Number(quoteObj?.last ?? quoteObj?.bid ?? 0);
+        const rawDates: string[] = (expJson?.expirations?.date ?? []).slice(0, 4);
+        if (tSpot > 0 && rawDates.length > 0) {
+          const chainResponses = await Promise.all(
+            rawDates.map((exp) =>
+              fetch(
+                `https://api.tradier.com/v1/markets/options/chains?symbol=${encodeURIComponent(sym)}&expiration=${exp}&greeks=true`,
+                {
+                  headers,
+                  cache: "no-store",
+                  signal: signal ?? AbortSignal.timeout(5000),
+                }
+              ).then((r) => (r.ok ? r.json() : null))
+            )
+          );
+          const tradierContracts: NormalizedOptionContract[] = [];
+          for (const chainJson of chainResponses) {
+            const list = chainJson?.options?.option;
+            if (!Array.isArray(list)) continue;
+            for (const item of list) {
+              const strike = Number(item.strike);
+              const expiration = String(item.expiration_date ?? "");
+              if (!strike || !expiration) continue;
+              const iv = Number(item.greeks?.mid_iv ?? item.greeks?.smv_vol ?? 0);
+              tradierContracts.push({
+                symbol: String(item.symbol ?? ""),
+                expiration,
+                optionType: item.option_type === "call" ? "C" : "P",
+                strike,
+                openInterest: Number(item.open_interest ?? 0),
+                volume: Number(item.volume ?? 0),
+                iv: iv > 0 ? iv : 0.18,
+                delta: Number(item.greeks?.delta ?? 0),
+                gamma: Number(item.greeks?.gamma ?? 0),
+                vega: Number(item.greeks?.vega ?? 0),
+                theta: typeof item.greeks?.theta === "number" ? Number(item.greeks.theta) : undefined,
+                percentChange: Number(item.change_percentage ?? 0),
+                bid: Number(item.bid ?? 0),
+                ask: Number(item.ask ?? 0),
+                last: Number(item.last ?? 0),
+                quoteSource: "TRADIER_LIVE",
+              });
+            }
+          }
+          if (tradierContracts.length > 0) {
+            const fetchedAtMs = Date.now();
+            setBoundedMapEntry(spotPriceCache, cboeSymbol, tSpot);
+            setBoundedMapEntry(spotPriceCache, sym, tSpot);
+            const tEntry: CachedRawChainEntry = {
+              rawContracts: tradierContracts,
+              referenceSpot: tSpot,
+              fetchedAtMs,
+              quoteSource: "TRADIER_LIVE",
+            };
+            setBoundedMapEntry(globalContractsCache, sym, tEntry);
+            return resolveContractsFromRawCacheEntry(tEntry, tSpot, fetchedAtMs);
+          }
+        }
+      }
+    } catch {
+      // Fall through cleanly to Tier-2 CBOE delayed chain
+    }
+  }
+
+  const cached = cboeChainCache.get(cboeSymbol);
+  if (cached && Date.now() - cached.fetchedAtMs < CBOE_CACHE_TTL_MS) {
+    const latestSpot = getCachedSpotPrice(cboeSymbol) || cached.referenceSpot;
+    return resolveContractsFromRawCacheEntry(cached, latestSpot, Date.now());
+  }
+
+  const fallbackFromCached = () =>
+    cached
+      ? resolveContractsFromRawCacheEntry(
+          cached,
+          getCachedSpotPrice(cboeSymbol) ?? cached.referenceSpot,
+          Date.now()
+        )
+      : [];
+
+  const cooldownUntil = cboeFailureCooldownUntil.get(cboeSymbol) ?? 0;
+  if (Date.now() < cooldownUntil) {
+    return fallbackFromCached();
+  }
+
+  const linkedTimeout = createLinkedTimeoutSignal(signal, 6000);
   try {
     const res = await fetch(`https://cdn-api.cboe.com/api/global/delayed_quotes/options/${cboeSymbol}.json`, {
       headers: {
-      Accept: "application/json, text/plain, */*",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      Referer: "https://www.cboe.com/",
-      Origin: "https://www.cboe.com",
-    },
+        Accept: "application/json, text/plain, */*",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        Referer: "https://www.cboe.com/",
+        Origin: "https://www.cboe.com",
+      },
       cache: "no-store",
-      signal,
+      signal: linkedTimeout.signal,
     });
 
-    if (!res.ok) return cached?.contracts ?? [];
+    if (!res.ok) {
+      setBoundedMapEntry(cboeFailureCooldownUntil, cboeSymbol, Date.now() + CBOE_FAILURE_BACKOFF_MS);
+      return fallbackFromCached();
+    }
     const json = await res.json();
     const data = json?.data;
-    if (!data) return cached?.contracts ?? [];
+    if (!data) {
+      setBoundedMapEntry(cboeFailureCooldownUntil, cboeSymbol, Date.now() + CBOE_FAILURE_BACKOFF_MS);
+      return fallbackFromCached();
+    }
 
     const marketOpenNow = isMarketOpen().open;
     const cboeClose = Number(data.close ?? data.current_price ?? 0);
     const cboeSpot = marketOpenNow
       ? Number(data.current_price ?? data.close ?? 0)
       : cboeClose;
-    const tickSym =
-      sym === "SPX" || sym === "SPXW"
-        ? "SPX"
-        : sym === "NDX" || sym === "NDXP"
-          ? "NDX"
-          : sym;
 
     const liveQuote = marketOpenNow
       ? await fetchLiveTickQuote(tickSym).catch(() => null)
       : null;
-    if (signal?.aborted) return cached?.contracts ?? [];
+    if (signal?.aborted) return fallbackFromCached();
 
     const effectiveSpot =
       marketOpenNow && liveQuote && liveQuote.spot > 0 ? liveQuote.spot : cboeSpot;
@@ -559,7 +887,7 @@ export async function fetchLiveCboeOptions(
     }
 
     const rawOptions = data.options;
-    if (!Array.isArray(rawOptions)) return cached?.contracts ?? [];
+    if (!Array.isArray(rawOptions)) return fallbackFromCached();
 
     const rawContracts: NormalizedOptionContract[] = [];
     for (const raw of rawOptions) {
@@ -597,29 +925,38 @@ export async function fetchLiveCboeOptions(
         bid,
         ask,
         last,
+        quoteSource: "DELAYED_CBOE",
       });
     }
 
-    const contracts =
-      effectiveSpot > 0
-        ? reanchorDelayedContractsToSpot({
-            contracts: rawContracts,
-            referenceSpot: cboeSpot,
-            liveSpot: effectiveSpot,
-          })
-        : rawContracts;
-
-    if (contracts.length > 0) {
-      setBoundedMapEntry(cboeChainCache, cboeSymbol, {
-        ts: Date.now(),
-        cboeSpot,
-        effectiveSpot,
-        contracts,
-      });
+    const fetchedAtMs = Date.now();
+    const rawEntry: CachedRawChainEntry = {
+      rawContracts,
+      referenceSpot: cboeSpot,
+      fetchedAtMs,
+      quoteSource: "DELAYED_CBOE",
+    };
+    if (rawContracts.length > 0 && cboeSpot > 0) {
+      setBoundedMapEntry(cboeChainCache, cboeSymbol, rawEntry);
+      setBoundedMapEntry(globalContractsCache, sym, rawEntry);
+      if (cboeSymbol === "_SPX") {
+        setBoundedMapEntry(globalContractsCache, "SPX", rawEntry);
+        setBoundedMapEntry(globalContractsCache, "SPXW", rawEntry);
+      } else if (cboeSymbol === "_NDX") {
+        setBoundedMapEntry(globalContractsCache, "NDX", rawEntry);
+        setBoundedMapEntry(globalContractsCache, "NDXP", rawEntry);
+      }
     }
-    return contracts;
+
+    cboeFailureCooldownUntil.delete(cboeSymbol);
+    return effectiveSpot > 0
+      ? resolveContractsFromRawCacheEntry(rawEntry, effectiveSpot, fetchedAtMs)
+      : rawContracts.map((c) => ({ ...c }));
   } catch {
-    return cached?.contracts ?? [];
+    setBoundedMapEntry(cboeFailureCooldownUntil, cboeSymbol, Date.now() + CBOE_FAILURE_BACKOFF_MS);
+    return fallbackFromCached();
+  } finally {
+    linkedTimeout.cleanup();
   }
 }
 

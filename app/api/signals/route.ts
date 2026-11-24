@@ -51,7 +51,7 @@ import {
 } from "@/lib/persistenceStore";
 import { computeBarFlowGammaVwapSeries } from "@/lib/flowGammaVwap";
 import { globalContractsCache } from "@/lib/optionsExposure";
-import { reanchorDelayedContractsToSpot } from "@/lib/execution/optionPricing";
+import { resolveContractsFromRawCacheEntry } from "@/lib/execution/optionPricing";
 import { evaluateZeroFlowFilter } from "@/lib/zeroFlowFilter";
 import { evaluateZeroShadowTick, readZeroShadowSummary } from "@/lib/zeroShadowLedger";
 
@@ -545,32 +545,21 @@ export async function GET(req: NextRequest) {
       supervisorPolicy,
       activePositions?.[policyTicker] ?? null
     );
-    const rawCachedContracts = globalContractsCache.get(policyTicker) ?? [];
+    const rawCacheEntry = globalContractsCache.get(policyTicker);
     if (
       getClock.isWeekday &&
-      rawCachedContracts.length > 0 &&
+      rawCacheEntry &&
+      rawCacheEntry.rawContracts.length > 0 &&
       zeroTelemetry?.lastBar &&
       zeroTelemetry.lastBar.close > 0
     ) {
       try {
         const liveSpotNow = zeroTelemetry.lastBar.close;
-        // Infer reference spot of cached chain from near-0.50 delta calls before shadow selection
-        const atmCalls = rawCachedContracts.filter(
-          (c) => c.optionType === "C" && typeof c.delta === "number" && c.delta >= 0.42 && c.delta <= 0.58
+        const anchoredShadowContracts = resolveContractsFromRawCacheEntry(
+          rawCacheEntry,
+          liveSpotNow,
+          Date.now()
         );
-        const refChainSpot =
-          atmCalls.length > 0
-            ? atmCalls.reduce((s, c) => s + c.strike, 0) / atmCalls.length
-            : liveSpotNow;
-        const anchoredShadowContracts =
-          Math.abs(refChainSpot - liveSpotNow) > 0.25
-            ? reanchorDelayedContractsToSpot({
-                contracts: rawCachedContracts,
-                referenceSpot: refChainSpot,
-                liveSpot: liveSpotNow,
-                nowMs: Date.now(),
-              })
-            : rawCachedContracts;
         evaluateZeroShadowTick({
           ticker: policyTicker,
           sessionDate: todayEt,

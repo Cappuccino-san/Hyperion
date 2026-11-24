@@ -357,14 +357,21 @@ export async function selectSmallAccountContract(params: {
             ? c.iv / 100
             : c.iv
           : 0;
-      const hasLiveChainIv = rawChainIv >= 0.04 && rawChainIv <= 2.50;
+      const midForIv = mid > 0 ? mid : entryAsk;
+      const impliedMidIv = solveImpliedVol(midForIv, effectiveSpot, c.strike, tYears, isCall);
       const impliedAskIv = solveImpliedVol(entryAsk, effectiveSpot, c.strike, tYears, isCall);
-      const solvedIv = hasLiveChainIv ? Number(rawChainIv.toFixed(4)) : impliedAskIv;
+      const hasLiveChainIv =
+        c.quoteSource !== "DELAYED_CBOE" && rawChainIv >= 0.04 && rawChainIv <= 2.50;
+      const solvedIv = hasLiveChainIv ? Number(rawChainIv.toFixed(4)) : Number(impliedMidIv.toFixed(4));
       const bsEntryCheck = hasLiveChainIv
         ? repriceOptionBS(effectiveSpot, c.strike, tYears, solvedIv, isCall)
         : entryAsk;
       const repriceIv =
-        hasLiveChainIv && Math.abs(bsEntryCheck - entryAsk) > entryAsk * 0.25 ? impliedAskIv : solvedIv;
+        hasLiveChainIv && Math.abs(bsEntryCheck - entryAsk) > Math.max(0.02, entryAsk * 0.10)
+          ? impliedAskIv
+          : hasLiveChainIv
+            ? solvedIv
+            : impliedAskIv;
 
       const bsTp1Mid = repriceOptionBS(effectiveTarget1, c.strike, tYears * 0.96, repriceIv, isCall);
       const bsTp2Mid = repriceOptionBS(effectiveTarget2, c.strike, tYears * 0.92, repriceIv, isCall);

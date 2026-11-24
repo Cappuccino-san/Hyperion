@@ -28,6 +28,7 @@ export interface TradePerformanceItem {
   pnlOptionPct: number;
   pnlSpotPct: number;
   exitReason: string;
+  exitQuoteSource?: string;
   isWin: boolean;
 }
 
@@ -120,6 +121,7 @@ export function generateDailyPerformanceReport(date?: string): DailyPerformanceR
       pnlOptionPct,
       pnlSpotPct,
       exitReason: p.exitReason || "Closed",
+      exitQuoteSource: p.exitQuoteSource,
       isWin: realizedDollarPnl > 0,
     };
   });
@@ -176,7 +178,7 @@ export function generateDailyPerformanceReport(date?: string): DailyPerformanceR
   if (tradeItems.length === 0) {
     md += `*No closed trades for this session.*\n`;
   } else {
-    md += `| # | Ticker | Contract | Time | Entry Mid | Exit Mid | PnL ($) | PnL (%) | Reason |\n`;
+    md += `| # | Ticker | Contract | Time | Entry Ask | Exit Bid | PnL ($) | PnL (%) | Reason |\n`;
     md += `|---|---|---|---|---|---|---|---|---|\n`;
     tradeItems.forEach((t, i) => {
       const rowSign = t.realizedDollarPnl >= 0 ? "+" : "";
@@ -280,7 +282,7 @@ export async function sendDailyPerformanceDiscordRecap(
       const tradeLines = report.trades.slice(0, 8).map((t, idx) => {
         const sign = t.realizedDollarPnl >= 0 ? "+" : "";
         const itemEmoji = t.realizedDollarPnl > 0 ? "🟢" : t.realizedDollarPnl === 0 ? "⚪" : "🔴";
-        return `${itemEmoji} **Trade #${idx + 1} · ${t.ticker} ${t.contractType}S** (\`${t.contractLabel}\`)\n• Entry: ${t.openedAt} @ $${t.btoOptionMid.toFixed(2)} → Exit: ${t.closedAt} @ $${t.closedOptionMid.toFixed(2)}\n• PnL: **${sign}$${t.realizedDollarPnl.toFixed(2)} (${sign}${t.pnlOptionPct.toFixed(1)}%)** · *${t.exitReason}*`;
+        return `${itemEmoji} **Trade #${idx + 1} · ${t.ticker} ${t.contractType}S** (\`${t.contractLabel}\`)\n• Entry: ${t.openedAt} @ Ask $${t.btoOptionMid.toFixed(2)} → Exit: ${t.closedAt} @ Bid $${t.closedOptionMid.toFixed(2)}\n• PnL: **${sign}$${t.realizedDollarPnl.toFixed(2)} (${sign}${t.pnlOptionPct.toFixed(1)}%)** · *${t.exitReason}*`;
       });
 
       tradeFields.push({

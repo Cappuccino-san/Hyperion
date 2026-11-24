@@ -135,21 +135,33 @@ async function computeFreshPlaybook(): Promise<PlaybookPayload> {
       const prevClose = telemetryOverrides[sUpper]?.previousClose ?? liveSpot;
       if (contracts && contracts.length > 0 && liveSpot && liveSpot > 0) {
         try {
-          setBoundedMapEntry(globalContractsCache, sUpper, contracts, 64);
+          const rawEntry = globalContractsCache.get(sUpper);
+          const sourceContracts =
+            rawEntry && rawEntry.rawContracts.length > 0
+              ? rawEntry.rawContracts
+              : contracts;
+          const refSpot =
+            rawEntry && rawEntry.referenceSpot > 0
+              ? rawEntry.referenceSpot
+              : cboeRefSpot > 0
+                ? cboeRefSpot
+                : liveSpot;
+          const fetchedAtMs = rawEntry?.fetchedAtMs ?? Date.now();
           // Restrict on-demand 0DTE Playbook hydration to front 5 expirations + +/-8% spot corridor
           // (avoids 1M+ Newton-Raphson BS iterations across 30+ LEAPS expirations on cold boot)
-          const activeExps = Array.from(new Set(contracts.map((c) => c.expiration)))
+          const activeExps = Array.from(new Set(sourceContracts.map((c) => c.expiration)))
             .sort()
             .slice(0, 5);
           const expSet = new Set(activeExps);
-          const nearContracts = contracts.filter(
+          const nearContracts = sourceContracts.filter(
             (c) => expSet.has(c.expiration) && Math.abs(c.strike - liveSpot) <= liveSpot * 0.08
           );
-          const workingSet = nearContracts.length > 0 ? nearContracts : contracts.slice(0, 600);
+          const workingSet = nearContracts.length > 0 ? nearContracts : sourceContracts.slice(0, 600);
           const anchored = reanchorDelayedContractsToSpot({
             contracts: workingSet,
-            referenceSpot: cboeRefSpot > 0 ? cboeRefSpot : liveSpot,
+            referenceSpot: refSpot,
             liveSpot,
+            fetchedAtMs,
             fallbackIv: 0.22,
           });
           payload = computeOptionsAnalytics({

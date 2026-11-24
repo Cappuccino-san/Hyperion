@@ -9,7 +9,7 @@ import {
 import {
   fetchLiveCboeOptions,
   getCachedSpotPrice,
-  reanchorDelayedContractsToSpot,
+  resolveContractsFromRawCacheEntry,
 } from "@/lib/tradeSignalEngine";
 import { fetchLiveTickQuote } from "@/lib/liveTick";
 
@@ -87,13 +87,15 @@ async function warmSingleTickerCache(
 
     const prevClose =
       (tick && tick.prevClose > 0 ? tick.prevClose : 0) || liveSpot;
-    const anchored = reanchorDelayedContractsToSpot({
-      contracts,
-      referenceSpot: cboeRefSpot > 0 ? cboeRefSpot : liveSpot,
-      liveSpot,
-      fallbackIv: getTickerPreset(sym, liveSpot).impliedVolatility || 0.22,
-    });
-    setBoundedMapEntry(globalContractsCache, sym, anchored, 64);
+    const rawEntry = globalContractsCache.get(sym);
+    const anchored = rawEntry
+      ? resolveContractsFromRawCacheEntry(
+          rawEntry,
+          liveSpot,
+          Date.now(),
+          getTickerPreset(sym, liveSpot).impliedVolatility || 0.22
+        )
+      : contracts;
 
     const payload = computeOptionsAnalytics({
       ticker: sym,

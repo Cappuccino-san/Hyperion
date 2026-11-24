@@ -9,6 +9,20 @@ import { computeDealerFlowSummary } from "@/lib/dealerFlowMetrics";
 
 export type DataSourceType = "TRADIER_LIVE" | "CBOE_MARKET_DATA" | "ROBINHOOD_LIVE";
 
+export type OptionContractQuoteSource = "TRADIER_LIVE" | "DELAYED_CBOE";
+
+export function resolveTradierAccessToken(
+  env: Record<string, string | undefined> = process.env
+): string {
+  return (env.TRADIER_API_KEY || env.TRADIER_ACCESS_TOKEN || "").trim();
+}
+
+export function resolveOptionsQuoteProvider(
+  env: Record<string, string | undefined> = process.env
+): OptionContractQuoteSource {
+  return resolveTradierAccessToken(env).length > 0 ? "TRADIER_LIVE" : "DELAYED_CBOE";
+}
+
 export interface NormalizedOptionContract {
   symbol: string;
   expiration: string; // YYYY-MM-DD
@@ -25,17 +39,25 @@ export interface NormalizedOptionContract {
   bid?: number;
   ask?: number;
   last?: number;
+  quoteSource?: OptionContractQuoteSource;
+}
+
+export interface CachedRawChainEntry {
+  rawContracts: ReadonlyArray<NormalizedOptionContract>;
+  referenceSpot: number;
+  fetchedAtMs: number;
+  quoteSource: OptionContractQuoteSource;
 }
 
 const globalForOptionsExposure = globalThis as unknown as {
-  __hyperionGlobalContractsCache?: Map<string, NormalizedOptionContract[]>;
+  __hyperionGlobalRawContractsCache?: Map<string, CachedRawChainEntry>;
 };
 
-export const globalContractsCache: Map<string, NormalizedOptionContract[]> =
-  globalForOptionsExposure.__hyperionGlobalContractsCache ??
-  (globalForOptionsExposure.__hyperionGlobalContractsCache = new Map<
+export const globalContractsCache: Map<string, CachedRawChainEntry> =
+  globalForOptionsExposure.__hyperionGlobalRawContractsCache ??
+  (globalForOptionsExposure.__hyperionGlobalRawContractsCache = new Map<
     string,
-    NormalizedOptionContract[]
+    CachedRawChainEntry
   >());
 
 export interface ExpirationColumnSpec {

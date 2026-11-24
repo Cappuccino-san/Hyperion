@@ -7,6 +7,7 @@ import {
   NormalizedOptionContract,
   OptionsAnalyticsPayload,
   parseOccSymbol,
+  resolveTradierAccessToken,
 } from "@/lib/optionsExposure";
 import { TickerSymbol } from "@/store/useDashboardStore";
 import { recordIntradaySnapshot } from "@/lib/intradayHistory";
@@ -14,7 +15,7 @@ import {
   evaluateTradeSignals,
   evaluateAllActivePositions,
   loadTradeStore,
-  reanchorDelayedContractsToSpot,
+  resolveContractsFromRawCacheEntry,
 } from "@/lib/tradeSignalEngine";
 import { fetchLiveTickQuote } from "@/lib/liveTick";
 import { isMarketOpen } from "@/lib/marketDataService";
@@ -204,13 +205,24 @@ async function fetchTradierOptions(
         bid: Number(item.bid ?? 0),
         ask: Number(item.ask ?? 0),
         last: Number(item.last ?? 0),
+        quoteSource: "TRADIER_LIVE",
       });
     }
   }
 
   if (contracts.length === 0) return null;
 
-  setBoundedMapEntry(contractsCache, ticker, contracts, 64);
+  setBoundedMapEntry(
+    contractsCache,
+    ticker,
+    {
+      rawContracts: contracts,
+      referenceSpot: spotPrice,
+      fetchedAtMs: Date.now(),
+      quoteSource: "TRADIER_LIVE",
+    },
+    64
+  );
   const impliedVolatility = ivCount > 0 ? ivSum / ivCount : 0.18;
 
   return computeOptionsAnalytics({
@@ -326,19 +338,26 @@ async function fetchCboeOptions(
       bid: Number(rawOpt.bid ?? 0),
       ask: Number(rawOpt.ask ?? 0),
       last: Number(rawOpt.last_trade_price ?? 0),
+      quoteSource: "DELAYED_CBOE",
     });
   }
 
   if (contracts.length === 0) return null;
 
-  const anchoredContracts = reanchorDelayedContractsToSpot({
-    contracts,
+  const fetchedAtMs = Date.now();
+  const rawCacheEntry = {
+    rawContracts: contracts,
     referenceSpot: cboeSpotPrice,
-    liveSpot: spotPrice,
-    fallbackIv: impliedVolatility,
-  });
-
-  setBoundedMapEntry(contractsCache, ticker, anchoredContracts, 64);
+    fetchedAtMs,
+    quoteSource: "DELAYED_CBOE" as const,
+  };
+  setBoundedMapEntry(contractsCache, ticker, rawCacheEntry, 64);
+  const anchoredContracts = resolveContractsFromRawCacheEntry(
+    rawCacheEntry,
+    spotPrice,
+    fetchedAtMs,
+    impliedVolatility
+  );
   const extendedQuote = await fetchExtendedQuote(ticker, spotPrice);
 
   const analytics = computeOptionsAnalytics({
@@ -413,7 +432,11 @@ async function attachIntraday(
       // Guard and evaluate all active positions across all tickers first
       await evaluateAllActivePositions({ signal: evalController.signal });
 
-      const contracts = contractsCache.get(payload.ticker);
+      const rawCacheEntry = contractsCache.get(payload.ticker);
+      const contracts = resolveContractsFromRawCacheEntry(
+        rawCacheEntry,
+        payload.spotPrice
+      );
       const tacticalLevels = deriveTacticalStructuralLevels(payload);
 
       const spotLagPct =
@@ -568,8 +591,8 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  // Tier 1: Tradier Real-Time API (if TRADIER_API_KEY is configured)
-  const tradierKey = process.env.TRADIER_API_KEY?.trim();
+  // Tier 1: Tradier Real-Time API (if TRADIER_API_KEY or TRADIER_ACCESS_TOKEN is configured)
+  const tradierKey = resolveTradierAccessToken();
   if (tradierKey) {
     try {
       const tradierPayload = await fetchTradierOptions(ticker, tradierKey);

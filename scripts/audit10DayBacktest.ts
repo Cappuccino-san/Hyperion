@@ -956,8 +956,13 @@ async function run10DaySniperAudit() {
             exitTriggered = true;
             exitSpot = bar.close;
             const fillPct = ratchetEval.fillPnlPct ?? curOptPnlPct;
+            const rawLimitPrice = Math.max(0.01, activePosition.entryAsk * (1 + fillPct / 100));
+            const realizableBarBid =
+              ratchetEval.reason === "FLUX_FLIP_MFE_HARVEST"
+                ? Math.max(0.05, curCloseQuote.bid)
+                : Math.max(0.05, openBarQuote.bid, curCloseQuote.bid, advBarQuote.bid);
             limitFillOptionPrice = Number(
-              Math.max(0.01, activePosition.entryAsk * (1 + fillPct / 100)).toFixed(2)
+              Math.min(realizableBarBid, rawLimitPrice).toFixed(2)
             );
             exitReason = ratchetEval.reason;
             const dirMove = isCall ? exitSpot - activePosition.entrySpot : activePosition.entrySpot - exitSpot;

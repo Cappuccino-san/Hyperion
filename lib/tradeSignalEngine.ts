@@ -67,6 +67,7 @@ export {
   estimateDynamicAtmIv,
   priceOptionWithSkew,
   reanchorDelayedContractsToSpot,
+  resolveContractsFromRawCacheEntry,
   clampOptionPriceToGreekEnvelope,
   clampToCandleRange,
   getCachedSpotPrice,
@@ -767,6 +768,7 @@ export async function evaluateTradeSignals(
       latest5mCandle,
       divergence5m,
       contracts: params.contracts,
+      dataSource: params.dataSource,
       nowTs,
       timeStr,
       etHours: etTime.hours,
@@ -1065,6 +1067,10 @@ export async function evaluateTradeSignals(
           status: "OPEN",
           btoSpotPrice: positionSpot,
           btoOptionMid: optimalContract.optionMid,
+          btoOptionAsk:
+            typeof optimalContract.optionAsk === "number" && optimalContract.optionAsk > 0
+              ? optimalContract.optionAsk
+              : optimalContract.optionMid,
           optionBid: optimalContract.optionBid,
           optionAsk: optimalContract.optionAsk,
           contractsQty: 1,
@@ -1149,6 +1155,7 @@ export async function evaluateTradeSignals(
           optionBid: optimalContract.optionBid,
           optionAsk: optimalContract.optionAsk,
           btoOptionMid: optimalContract.optionMid,
+          btoOptionAsk: fillAskForLog,
           contractsQty: optimalContract.contractsQty,
           remainingQty: optimalContract.contractsQty,
           totalOutlay: optimalContract.totalOutlay,

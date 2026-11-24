@@ -61,6 +61,10 @@ export function computeTradeRealizedPnl(trade: unknown): CanonicalTradePnl {
       ? Number((entryPrice * 100 * qty).toFixed(2))
       : Math.max(0, Number(raw.totalOutlay ?? 0));
 
+  const hasExplicitEntryAndExit =
+    firstPositiveNum(raw.btoOptionAsk, raw.optionAsk, raw.btoPrice, raw.btoOptionMid, raw.btoMid) !== null &&
+    firstFiniteNum(raw.closedOptionBid, raw.stcPrice, raw.closedOptionMid) !== null;
+
   const realizedDollarPnl = Number(
     (
       firstFiniteNum(raw.realizedPnlDollars, raw.pnlDollars) ??
@@ -70,6 +74,9 @@ export function computeTradeRealizedPnl(trade: unknown): CanonicalTradePnl {
 
   const pnlOptionPct = Number(
     (
+      (hasExplicitEntryAndExit && entryPrice > 0
+        ? ((exitPrice - entryPrice) / entryPrice) * 100
+        : null) ??
       firstFiniteNum(raw.pnlOptionPct, raw.realizedPnlPct) ??
       (entryPrice > 0 ? ((exitPrice - entryPrice) / entryPrice) * 100 : 0)
     ).toFixed(1)

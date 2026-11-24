@@ -71,6 +71,7 @@ export interface EvaluatedCallEntry {
   index: number;
   contractLabel?: string;
   exitReason?: string;
+  exitQuoteSource?: "LIVE_CHAIN_BID" | "DELAYED_CBOE_BID" | "BS_FALLBACK";
   isServerTrade?: boolean;
 }
 
@@ -224,6 +225,12 @@ export function evaluatePrzmCallLedger(
         openedTs: bto?.ts,
         closedAt: stc.timestamp,
         closedTs: stc.ts,
+        btoOptionAsk: stc.btoOptionAsk ?? bto?.btoOptionAsk ?? bto?.optionAsk,
+        optionAsk: bto?.optionAsk ?? stc.btoOptionAsk,
+        btoOptionMid: stc.btoOptionMid ?? bto?.btoOptionMid,
+        closedOptionBid: stc.closedOptionBid ?? stc.optionBid ?? stc.optionMid,
+        closedOptionMid: stc.optionMid,
+        exitQuoteSource: stc.exitQuoteSource,
         pnlOptionPct: stc.pnlOptionPct,
         pnlSpotPct: stc.pnlSpotPct,
         exitReason: stc.reason || stc.setupName,
@@ -273,17 +280,23 @@ export function evaluatePrzmCallLedger(
     const clampedBto = entryBar && btoSpot > 0 ? Math.max(entryBar.low, Math.min(entryBar.high, btoSpot)) : btoSpot;
     const clampedClosed = exitBar && closedSpot > 0 ? Math.max(exitBar.low, Math.min(exitBar.high, closedSpot)) : closedSpot;
     const btoOpt =
-      typeof pos.btoOptionMid === "number" && pos.btoOptionMid > 0
-        ? pos.btoOptionMid
-        : typeof pos.btoPrice === "number" && pos.btoPrice > 0
-          ? pos.btoPrice
-          : undefined;
+      typeof pos.btoOptionAsk === "number" && pos.btoOptionAsk > 0
+        ? pos.btoOptionAsk
+        : typeof pos.optionAsk === "number" && pos.optionAsk > 0
+          ? pos.optionAsk
+          : typeof pos.btoPrice === "number" && pos.btoPrice > 0
+            ? pos.btoPrice
+            : typeof pos.btoOptionMid === "number" && pos.btoOptionMid > 0
+              ? pos.btoOptionMid
+              : undefined;
     const stcOpt =
-      typeof pos.closedOptionMid === "number" && pos.closedOptionMid > 0
-        ? pos.closedOptionMid
+      typeof pos.closedOptionBid === "number" && pos.closedOptionBid > 0
+        ? pos.closedOptionBid
         : typeof pos.stcPrice === "number" && pos.stcPrice > 0
           ? pos.stcPrice
-          : undefined;
+          : typeof pos.closedOptionMid === "number" && pos.closedOptionMid > 0
+            ? pos.closedOptionMid
+            : undefined;
 
     if (isStillOpenInReplay) {
       const currentSpot = Number.isFinite(liveSpot) && liveSpot > 0 ? liveSpot : clampedBto;
@@ -312,13 +325,19 @@ export function evaluatePrzmCallLedger(
     }
 
     const delta = Number((type === "SHORT" ? clampedBto - clampedClosed : clampedClosed - clampedBto).toFixed(2));
-    const hasOptPnl = typeof pos.pnlOptionPct === "number" && Number.isFinite(pos.pnlOptionPct);
+    const reconciledOptPnlPct =
+      typeof btoOpt === "number" && btoOpt > 0 && typeof stcOpt === "number" && stcOpt >= 0
+        ? Number((((stcOpt - btoOpt) / btoOpt) * 100).toFixed(1))
+        : typeof pos.pnlOptionPct === "number" && Number.isFinite(pos.pnlOptionPct)
+          ? pos.pnlOptionPct
+          : undefined;
+    const hasOptPnl = typeof reconciledOptPnlPct === "number" && Number.isFinite(reconciledOptPnlPct);
     const isLoss = hasOptPnl
-      ? pos.pnlOptionPct < 0 || delta < -0.005
+      ? reconciledOptPnlPct! < 0 || delta < -0.005
       : delta < -0.005 || Boolean(pos.exitReason?.includes("STOP")) || (typeof pos.pnlSpotPct === "number" && pos.pnlSpotPct < 0);
     const isWin = !isLoss && (
       hasOptPnl
-        ? pos.pnlOptionPct > 0 && delta >= 0
+        ? reconciledOptPnlPct! > 0 && delta >= 0
         : delta > 0.005 || (typeof pos.pnlSpotPct === "number" && pos.pnlSpotPct > 0 && delta >= 0)
     );
     const status: "RIGHT" | "WRONG" | "FLAT" = isLoss ? "WRONG" : isWin ? "RIGHT" : "FLAT";
@@ -335,7 +354,7 @@ export function evaluatePrzmCallLedger(
       entryPrice: clampedBto,
       closedPrice: clampedClosed,
       closedTimeFormatted: pos.closedTs ? formatPrzmTime(pos.closedAt, pos.closedTs) : pos.closedAt,
-      pnlOptionPct: typeof pos.pnlOptionPct === "number" ? pos.pnlOptionPct : undefined,
+      pnlOptionPct: reconciledOptPnlPct,
       btoOptionPrice: btoOpt,
       stcOptionPrice: stcOpt,
       status,
@@ -345,6 +364,7 @@ export function evaluatePrzmCallLedger(
       index: 0,
       contractLabel: (pos.contractLabel || (pos as any).optionSymbol),
       exitReason: pos.exitReason,
+      exitQuoteSource: pos.exitQuoteSource,
       isServerTrade: true,
     });
   }
@@ -381,11 +401,15 @@ export function evaluatePrzmCallLedger(
       contractType: isCall ? "CALL" : "PUT",
       entryPrice: clampedBto,
       btoOptionPrice:
-        typeof pos.btoOptionMid === "number" && pos.btoOptionMid > 0
-          ? pos.btoOptionMid
-          : typeof pos.btoPrice === "number" && pos.btoPrice > 0
-            ? pos.btoPrice
-            : undefined,
+        typeof pos.btoOptionAsk === "number" && pos.btoOptionAsk > 0
+          ? pos.btoOptionAsk
+          : typeof pos.optionAsk === "number" && pos.optionAsk > 0
+            ? pos.optionAsk
+            : typeof pos.btoPrice === "number" && pos.btoPrice > 0
+              ? pos.btoPrice
+              : typeof pos.btoOptionMid === "number" && pos.btoOptionMid > 0
+                ? pos.btoOptionMid
+                : undefined,
       status: "OPEN",
       delta,
       heldMinutes: heldMin,
@@ -1396,10 +1420,26 @@ export const PrzmCallLogDeck: React.FC<{
                       </span>
                     )}
                     {typeof entry.btoOptionPrice === "number" && entry.btoOptionPrice > 0 && (
-                      <span className="text-slate-300 font-mono text-[11px] tabular-nums shrink-0">
+                      <span
+                        className="text-slate-300 font-mono text-[11px] tabular-nums shrink-0"
+                        title={
+                          entry.exitQuoteSource
+                            ? `Entry Ask → Exit Bid (${entry.exitQuoteSource})`
+                            : "Entry Ask → Exit Bid"
+                        }
+                      >
                         {typeof entry.stcOptionPrice === "number" && entry.stcOptionPrice > 0 && entry.status !== "OPEN"
                           ? "$" + entry.btoOptionPrice.toFixed(2) + " → $" + entry.stcOptionPrice.toFixed(2)
                           : "@ $" + entry.btoOptionPrice.toFixed(2)}
+                        {entry.status !== "OPEN" && entry.exitQuoteSource && (
+                          <span className="ml-1.5 text-[9.5px] text-slate-500 uppercase">
+                            {entry.exitQuoteSource === "LIVE_CHAIN_BID"
+                              ? "LIVE"
+                              : entry.exitQuoteSource === "DELAYED_CBOE_BID"
+                                ? "CBOE"
+                                : "BS"}
+                          </span>
+                        )}
                       </span>
                     )}
                     <span className={`tabular-nums tracking-wide text-right flex-1 ${statusColor}`}>

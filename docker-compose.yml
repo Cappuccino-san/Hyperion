@@ -9,6 +9,8 @@ services:
     ports:
       - "3000:3000"
     env_file:
+      - path: .env
+        required: false
       - path: .env.local
         required: false
     environment:
@@ -38,6 +40,8 @@ services:
       - audit
     restart: unless-stopped
     env_file:
+      - path: .env
+        required: false
       - path: .env.local
         required: false
     environment:

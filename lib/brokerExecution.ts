@@ -533,8 +533,8 @@ class TradierApiClient {
   private accountId: string | null = null;
 
   constructor() {
-    this.apiKey = process.env.TRADIER_API_KEY || null;
-    this.accountId = process.env.TRADIER_ACCOUNT_ID || null;
+    this.apiKey = (process.env.TRADIER_API_KEY || process.env.TRADIER_ACCESS_TOKEN || "").trim() || null;
+    this.accountId = process.env.TRADIER_ACCOUNT_ID?.trim() || null;
   }
 
   isConfigured(): boolean {

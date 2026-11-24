@@ -1,7 +1,12 @@
 import fs from "fs";
 import path from "path";
 import type { NormalizedOptionContract } from "@/lib/optionsExposure";
+import type { ExitQuoteSource } from "@/lib/execution/types";
 import { DEFAULT_HARD_OPTION_STOP_LOSS_PCT } from "@/lib/bracketOrderEngine";
+import {
+  clampOptionPriceToGreekEnvelope,
+  computeRemainingYearsToExpiration,
+} from "@/lib/execution/optionPricing";
 import {
   etMinutesOfDay,
   getSessionBoundsEt,
@@ -35,6 +40,7 @@ export interface ZeroShadowEntry {
   closedTimeEt?: string;
   exitSpot?: number;
   exitBid?: number;
+  exitQuoteSource?: ExitQuoteSource;
   exitReason?: string;
   pnlOptionPct: number;
   rMultiple: number;
@@ -249,41 +255,83 @@ export function evaluateZeroShadowTick(input: EvaluateZeroShadowTickInput): Zero
           c.optionType === (entry.contractType === "CALL" ? "C" : "P"))
     );
 
-    const liveBid =
+    const rawMatchedBid =
       match && typeof match.bid === "number" && Number.isFinite(match.bid) && match.bid > 0
         ? Number(match.bid.toFixed(2))
+        : null;
+    const heldMins = Math.max(1, (nowSec - entry.openedTs) / 60);
+    const tEntry = computeRemainingYearsToExpiration(entry.openedTs * 1000, entry.dteDays);
+    const tRem = computeRemainingYearsToExpiration(nowSec * 1000, entry.dteDays);
+
+    const liveBid =
+      rawMatchedBid !== null
+        ? clampOptionPriceToGreekEnvelope(
+            entry.entrySpot,
+            input.spotPrice,
+            entry.entryAsk,
+            rawMatchedBid,
+            entry.contractType === "CALL",
+            heldMins,
+            {
+              strike: entry.strike,
+              tEntryYears: tEntry,
+              tRemainingYears: tRem,
+              allowFloor: false,
+            }
+          )
         : entry.sessionDate < sessionDate || etMins >= bounds.eodFlatMins
           ? entry.currentBid
           : null;
+    const quoteSource: ExitQuoteSource =
+      rawMatchedBid !== null
+        ? match?.quoteSource === "TRADIER_LIVE"
+          ? "LIVE_CHAIN_BID"
+          : "DELAYED_CBOE_BID"
+        : "BS_FALLBACK";
 
     if (liveBid !== null) {
       entry.currentBid = liveBid;
       const curPct = Number((((liveBid - entry.entryAsk) / entry.entryAsk) * 100).toFixed(1));
       entry.pnlOptionPct = curPct;
       entry.rMultiple = Number((curPct / DEFAULT_HARD_OPTION_STOP_LOSS_PCT).toFixed(2));
-      if (curPct > entry.peakOptionPnlPct) {
+      if (
+        curPct > entry.peakOptionPnlPct &&
+        (quoteSource === "LIVE_CHAIN_BID" || Math.floor(nowSec / 300) > Math.floor(entry.openedTs / 300))
+      ) {
         entry.peakOptionPnlPct = curPct;
       }
       mutated = true;
 
       let exitReason: string | null = null;
+      let limitCapPrice: number | null = null;
       if (entry.sessionDate < sessionDate || etMins >= bounds.eodFlatMins) {
         exitReason = "SHADOW MOC FLAT";
       } else if (curPct <= -DEFAULT_HARD_OPTION_STOP_LOSS_PCT) {
         exitReason = "SHADOW HARD STOP (-45%)";
+        limitCapPrice = Number((entry.entryAsk * (1 - DEFAULT_HARD_OPTION_STOP_LOSS_PCT / 100)).toFixed(2));
       } else if (curPct >= 55) {
         exitReason = "SHADOW TARGET LOCK (+55%)";
       } else if (entry.peakOptionPnlPct >= 32 && curPct <= 12) {
         exitReason = "SHADOW RATCHET (+32% -> +12%)";
+        limitCapPrice = Number((entry.entryAsk * 1.12).toFixed(2));
       }
 
       if (exitReason) {
+        const finalExitBid =
+          limitCapPrice !== null
+            ? Number(Math.min(liveBid, limitCapPrice).toFixed(2))
+            : liveBid;
+        const finalPct = Number((((finalExitBid - entry.entryAsk) / entry.entryAsk) * 100).toFixed(1));
         entry.closedTs = nowSec;
         entry.closedTimeEt = formatEtShort(nowSec);
         entry.exitSpot = Number(input.spotPrice.toFixed(2));
-        entry.exitBid = liveBid;
+        entry.exitBid = finalExitBid;
+        entry.currentBid = finalExitBid;
+        entry.exitQuoteSource = quoteSource;
+        entry.pnlOptionPct = finalPct;
+        entry.rMultiple = Number((finalPct / DEFAULT_HARD_OPTION_STOP_LOSS_PCT).toFixed(2));
         entry.exitReason = exitReason;
-        entry.status = gradeClosedShadowPnl(curPct);
+        entry.status = gradeClosedShadowPnl(finalPct);
       }
     }
   }

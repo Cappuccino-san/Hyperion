@@ -150,8 +150,8 @@ async function getOrFetchOptionContracts(
   ticker: string
 ): Promise<NormalizedOptionContract[]> {
   const cached = globalContractsCache.get(ticker.toUpperCase());
-  if (cached && cached.length > 0) {
-    return cached;
+  if (cached && cached.rawContracts.length > 0) {
+    return cached.rawContracts.map((c) => ({ ...c }));
   }
 
   const cboeSymbol =
@@ -207,11 +207,23 @@ async function getOrFetchOptionContracts(
             bid: Number(raw.bid ?? 0),
             ask: Number(raw.ask ?? 0),
             last: Number(raw.last_trade_price ?? 0),
+            quoteSource: "DELAYED_CBOE",
           });
         }
 
         if (contracts.length > 0) {
-          setBoundedMapEntry(globalContractsCache, ticker.toUpperCase(), contracts, 64);
+          const cboeRefSpot = Number(data.current_price ?? data.close ?? 0);
+          setBoundedMapEntry(
+            globalContractsCache,
+            ticker.toUpperCase(),
+            {
+              rawContracts: contracts,
+              referenceSpot: cboeRefSpot > 0 ? cboeRefSpot : 0,
+              fetchedAtMs: Date.now(),
+              quoteSource: "DELAYED_CBOE",
+            },
+            64
+          );
           return contracts;
         }
       }

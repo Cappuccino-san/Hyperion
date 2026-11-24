@@ -14,6 +14,8 @@ interface OptionTradePositionUI {
   status: "OPEN" | "PARTIAL_TP1" | "CLOSED";
   btoSpotPrice: number;
   btoOptionMid: number | null;
+  btoOptionAsk?: number;
+  optionAsk?: number;
   contractsQty?: 1 | 2;
   remainingQty?: 0 | 1 | 2;
   totalOutlay?: number;
@@ -199,7 +201,20 @@ export function AlertsFeed() {
     (serverActivePositions?.[activeTicker] as OptionTradePositionUI) ??
     (serverActivePositions?.[normalizedPosKey] as OptionTradePositionUI) ??
     null;
-  const signalAlerts = (serverTradeAlerts || []) as { id: string; timestamp: string; message: string; ts?: number }[];
+  const signalAlerts = (serverTradeAlerts || []) as {
+    id: string;
+    timestamp: string;
+    message: string;
+    ts?: number;
+    action?: "BUY_TO_OPEN" | "SELL_TO_CLOSE";
+    btoOptionAsk?: number;
+    optionAsk?: number;
+    btoOptionMid?: number | null;
+    closedOptionBid?: number | null;
+    optionBid?: number;
+    optionMid?: number | null;
+    exitQuoteSource?: string;
+  }[];
   const closedCount = Array.isArray(serverClosedTrades) ? serverClosedTrades.length : 0;
   const [radarSending, setRadarSending] = useState(false);
 
@@ -231,10 +246,32 @@ export function AlertsFeed() {
     const map = new Map<string, { id: string; timestamp: string; message: string }>();
     for (const sa of signalAlerts) {
       if (sa && sa.message) {
-        map.set(sa.message, {
+        let displayMsg = sa.message;
+        if (sa.action === "SELL_TO_CLOSE" && !displayMsg.includes("Ask $")) {
+          const entryAsk =
+            typeof sa.btoOptionAsk === "number" && sa.btoOptionAsk > 0
+              ? sa.btoOptionAsk
+              : typeof sa.btoOptionMid === "number" && sa.btoOptionMid > 0
+                ? sa.btoOptionMid
+                : null;
+          const exitBid =
+            typeof sa.closedOptionBid === "number" && sa.closedOptionBid > 0
+              ? sa.closedOptionBid
+              : typeof sa.optionBid === "number" && sa.optionBid > 0
+                ? sa.optionBid
+                : typeof sa.optionMid === "number" && sa.optionMid > 0
+                  ? sa.optionMid
+                  : null;
+          if (entryAsk !== null && exitBid !== null) {
+            const pct = Number((((exitBid - entryAsk) / entryAsk) * 100).toFixed(1));
+            const src = sa.exitQuoteSource ? ` · ${sa.exitQuoteSource}` : "";
+            displayMsg = `${displayMsg} · Ask $${entryAsk.toFixed(2)} → Bid $${exitBid.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct}%${src})`;
+          }
+        }
+        map.set(sa.id || displayMsg, {
           id: sa.id,
           timestamp: sa.timestamp,
-          message: sa.message,
+          message: displayMsg,
         });
       }
     }
@@ -319,7 +356,11 @@ export function AlertsFeed() {
               </span>
               {activePosition.totalOutlay && (
                 <span className="text-[10px] text-slate-400">
-                  (${activePosition.totalOutlay} Outlay)
+                  (${activePosition.totalOutlay} Outlay
+                  {typeof (activePosition.btoOptionAsk ?? activePosition.optionAsk) === "number"
+                    ? ` · Ask $${(activePosition.btoOptionAsk ?? activePosition.optionAsk)!.toFixed(2)}`
+                    : ""}
+                  )
                 </span>
               )}
             </div>

@@ -11,6 +11,7 @@ import type {
   Candle5m,
   DailyTradeStore,
   DivergenceDirection,
+  ExitQuoteSource,
   OptionTradePosition,
   TradeLifecycleAlert,
 } from "@/lib/execution/types";
@@ -20,7 +21,7 @@ import {
   computeRemainingYearsToExpiration,
   formatTimeEt,
   getContractMidPrice,
-  repriceOptionBS,
+  repriceOptionBSExact,
   solveImpliedVol,
 } from "@/lib/execution/optionPricing";
 
@@ -45,6 +46,7 @@ export function evaluateActivePositionStepA(input: {
   latest5mCandle: Candle5m | null;
   divergence5m: DivergenceDirection | null;
   contracts?: NormalizedOptionContract[] | null;
+  dataSource?: string;
   nowTs: number;
   timeStr: string;
   etHours: number;
@@ -66,6 +68,7 @@ export function evaluateActivePositionStepA(input: {
     latest5mCandle,
     divergence5m,
     contracts,
+    dataSource,
     nowTs,
     timeStr,
     etHours,
@@ -105,7 +108,16 @@ export function evaluateActivePositionStepA(input: {
   let liveBid: number | undefined = activePos.optionBid;
   let liveAsk: number | undefined = activePos.optionAsk;
 
+  const dte = computeDteDays(activePos.expiration, sessionDate);
+  const tRemaining = computeRemainingYearsToExpiration(nowTs * 1000, dte);
+  const tEntry =
+    typeof activePos.entryTYears === "number" && activePos.entryTYears > 0
+      ? activePos.entryTYears
+      : computeRemainingYearsToExpiration((activePos.openedTs || nowTs) * 1000, dte);
+  const entryFillPrice = activePos.btoOptionAsk ?? activePos.optionAsk ?? activePos.btoOptionMid;
+
   let matchedContract = false;
+  let exitQuoteSource: ExitQuoteSource = "BS_FALLBACK";
   if (contracts && contracts.length > 0) {
     const match = contracts.find(
       (c) =>
@@ -113,49 +125,81 @@ export function evaluateActivePositionStepA(input: {
         c.optionType === (isCall ? "C" : "P") &&
         c.expiration === activePos?.expiration
     );
-    if (match) {
+    if (match && typeof match.bid === "number" && Number.isFinite(match.bid) && match.bid > 0) {
       matchedContract = true;
       const liveMid = getContractMidPrice(match);
       if (liveMid > 0) currentOptionMid = liveMid;
-      if (match.bid && match.bid > 0) liveBid = match.bid;
+      liveBid = match.bid;
       if (match.ask && match.ask > 0) liveAsk = match.ask;
+      exitQuoteSource =
+        match.quoteSource === "DELAYED_CBOE" || dataSource === "CBOE_MARKET_DATA"
+          ? "DELAYED_CBOE_BID"
+          : "LIVE_CHAIN_BID";
     }
   }
   if (!matchedContract && activePos.strike > 0 && nowTs > (activePos.openedTs || nowTs)) {
-    const dte = computeDteDays(activePos.expiration, sessionDate);
-    const tRemaining = computeRemainingYearsToExpiration(nowTs * 1000, dte);
-    const tEntry =
-      typeof activePos.entryTYears === "number" && activePos.entryTYears > 0
-        ? activePos.entryTYears
-        : computeRemainingYearsToExpiration((activePos.openedTs || nowTs) * 1000, dte);
-    const entryAskRef = activePos.optionAsk || activePos.btoOptionMid || 0.45;
-    const anchorIv =
-      typeof activePos.entryIv === "number" && activePos.entryIv >= 0.04
-        ? activePos.entryIv
-        : solveImpliedVol(entryAskRef, activePos.btoSpotPrice, activePos.strike, tEntry, isCall);
-    const bsEntryCheck = repriceOptionBS(activePos.btoSpotPrice, activePos.strike, tEntry, anchorIv, isCall);
-    const effectiveIv =
-      Math.abs(bsEntryCheck - entryAskRef) > entryAskRef * 0.15
-        ? solveImpliedVol(entryAskRef, activePos.btoSpotPrice, activePos.strike, tEntry, isCall)
-        : anchorIv;
-    const bsMid = repriceOptionBS(posSpotPrice, activePos.strike, tRemaining, effectiveIv, isCall);
-    currentOptionMid = bsMid;
-    liveBid = Math.max(0.01, Number((bsMid - 0.01).toFixed(2)));
-    liveAsk = Number(Math.max(liveBid + 0.01, bsMid + 0.01).toFixed(2));
+    const entryMidRef =
+      typeof activePos.btoOptionMid === "number" && activePos.btoOptionMid > 0
+        ? activePos.btoOptionMid
+        : entryFillPrice > 0
+          ? entryFillPrice
+          : 0.45;
+    const baseEntryIv = solveImpliedVol(
+      entryMidRef,
+      activePos.btoSpotPrice,
+      activePos.strike,
+      tEntry,
+      isCall
+    );
+    const evalSpotForBs = posCandle ? clampToCandleRange(posSpotPrice, posCandle) : posSpotPrice;
+    // Conservative equity-index call skew compression on spot rallies (prevents constant-vol BS overstatement on OTM calls)
+    const callRallyPct =
+      isCall && activePos.btoSpotPrice > 0
+        ? Math.max(0, (evalSpotForBs - activePos.btoSpotPrice) / activePos.btoSpotPrice)
+        : 0;
+    const effectiveIv = baseEntryIv * Math.max(0.88, 1 - callRallyPct * 18);
+    const bsMidAtEval = repriceOptionBSExact(
+      evalSpotForBs,
+      activePos.strike,
+      tRemaining,
+      effectiveIv,
+      isCall
+    );
+    const entryHalfSpread =
+      typeof activePos.optionAsk === "number" &&
+      typeof activePos.optionBid === "number" &&
+      activePos.optionAsk >= activePos.optionBid
+        ? Math.max(0.01, (activePos.optionAsk - activePos.optionBid) / 2)
+        : 0.01;
+    liveBid = Math.max(0.01, Number((bsMidAtEval - entryHalfSpread).toFixed(2)));
+    liveAsk = Number(Math.max(liveBid + 0.01, bsMidAtEval + entryHalfSpread).toFixed(2));
+    currentOptionMid = Number(((liveBid + liveAsk) / 2).toFixed(2));
+    exitQuoteSource = "BS_FALLBACK";
   }
 
   const rawHeldMin = Math.max(0, (nowTs - (activePos.openedTs || nowTs)) / 60);
   const heldMin = Math.max(1, rawHeldMin);
   const adverseSpotMove = isCall ? activePos.btoSpotPrice - posSpotPrice : posSpotPrice - activePos.btoSpotPrice;
   const rawExitPrice = liveBid && liveBid > 0 ? liveBid : currentOptionMid;
-  const entryFillPrice = activePos.optionAsk || activePos.btoOptionMid;
+  const evalSpotForEnvelope =
+    exitQuoteSource === "LIVE_CHAIN_BID"
+      ? posSpotPrice
+      : posCandle
+        ? clampToCandleRange(posSpotPrice, posCandle)
+        : posSpotPrice;
   const exitFillPrice = clampOptionPriceToGreekEnvelope(
     activePos.btoSpotPrice,
-    posSpotPrice,
+    evalSpotForEnvelope,
     entryFillPrice,
     rawExitPrice,
     isCall,
-    heldMin
+    heldMin,
+    {
+      strike: activePos.strike,
+      tEntryYears: tEntry,
+      tRemainingYears: tRemaining,
+      allowFloor: false,
+    }
   );
   const pnlOptionPct = Number(
     (((exitFillPrice - entryFillPrice) / Math.max(0.01, entryFillPrice)) * 100).toFixed(2)
@@ -186,23 +230,37 @@ export function evaluateActivePositionStepA(input: {
     const clampedSpotMovePct = isCall
       ? ((clampedExitSpot - activePos!.btoSpotPrice) / activePos!.btoSpotPrice) * 100
       : ((activePos!.btoSpotPrice - clampedExitSpot) / activePos!.btoSpotPrice) * 100;
-    const desiredExitPrice =
-      typeof overrideFillPct === "number" && Number.isFinite(overrideFillPct)
-        ? Math.max(0.01, Number((entryFillPrice * (1 + overrideFillPct / 100)).toFixed(2)))
-        : rawExitPrice;
-    const clampedExitFill = clampOptionPriceToGreekEnvelope(
+    const realizableExitBid = clampOptionPriceToGreekEnvelope(
       activePos!.btoSpotPrice,
       clampedExitSpot,
       entryFillPrice,
-      desiredExitPrice,
+      rawExitPrice,
       isCall,
-      heldMin
+      heldMin,
+      {
+        strike: activePos!.strike,
+        tEntryYears: tEntry,
+        tRemainingYears: tRemaining,
+        allowFloor: false,
+      }
     );
+    const clampedExitFill =
+      typeof overrideFillPct === "number" && Number.isFinite(overrideFillPct)
+        ? Number(
+            Math.min(
+              realizableExitBid,
+              Math.max(0.01, Number((entryFillPrice * (1 + overrideFillPct / 100)).toFixed(2)))
+            ).toFixed(2)
+          )
+        : realizableExitBid;
     const clampedOptPnlPct = Number(
       (((clampedExitFill - entryFillPrice) / Math.max(0.01, entryFillPrice)) * 100).toFixed(2)
     );
+    activePos!.btoOptionAsk = entryFillPrice;
     activePos!.closedSpotPrice = clampedExitSpot;
+    activePos!.closedOptionBid = clampedExitFill;
     activePos!.closedOptionMid = clampedExitFill;
+    activePos!.exitQuoteSource = exitQuoteSource;
     activePos!.exitReason = reason;
     activePos!.pnlSpotPct = Number(clampedSpotMovePct.toFixed(2));
     activePos!.pnlOptionPct = clampedOptPnlPct;
@@ -210,7 +268,9 @@ export function evaluateActivePositionStepA(input: {
     const optPnlStr = ` (${clampedOptPnlPct >= 0 ? "+" : ""}${clampedOptPnlPct}%)`;
     const msg = `🔴 STC · ${activePos!.contractLabel} [${reason}] @ $${clampedExitSpot.toFixed(
       2
-    )} · Spot ${clampedSpotMovePct >= 0 ? "+" : ""}${clampedSpotMovePct.toFixed(2)}%${optPnlStr}`;
+    )} · Ask $${entryFillPrice.toFixed(2)} → Bid $${clampedExitFill.toFixed(2)}${optPnlStr} · Spot ${
+      clampedSpotMovePct >= 0 ? "+" : ""
+    }${clampedSpotMovePct.toFixed(2)}%`;
 
     const alertTicker = activePos!.ticker || normalizedTicker;
     const stcAlertId = `${activePos!.id}-stc`;
@@ -251,6 +311,9 @@ export function evaluateActivePositionStepA(input: {
       optionBid: alignedExitBid,
       optionAsk: alignedExitAsk,
       btoOptionMid: activePos!.btoOptionMid,
+      btoOptionAsk: entryFillPrice,
+      closedOptionBid: clampedExitFill,
+      exitQuoteSource,
       contractsQty: activePos!.contractsQty,
       remainingQty: 0,
       totalOutlay: activePos!.totalOutlay,
@@ -504,7 +567,11 @@ export function evaluateActivePositionStepA(input: {
     onFavorableSideOfVwap,
     evaluateOnCloseOnly: true,
   });
-  if (!posCandle || isNewBarAfterEntry || ratchetEval.nextPeakOptionPnlPct >= 60) {
+  if (
+    !posCandle ||
+    isNewBarAfterEntry ||
+    (exitQuoteSource === "LIVE_CHAIN_BID" && ratchetEval.nextPeakOptionPnlPct >= 60)
+  ) {
     activePos.peakOptionPnlPct = ratchetEval.nextPeakOptionPnlPct;
   }
 
@@ -587,23 +654,23 @@ export function evaluateActivePositionStepA(input: {
         : "MOMENTUM DIVERGENCE SCRATCH";
     closePosition(exitReason);
   }
-  // 4. STC (TARGET 2 HIT)
+  // 4. STC (TARGET 2 HIT — option-% shortcut restricted strictly to real-time LIVE_CHAIN_BID)
   else if (
     !activePos.setupName.includes("Bearish Zero-Gamma Flush") &&
     ((isCall && posSpotPrice >= activePos.target2Spot) ||
       (!isCall && posSpotPrice <= activePos.target2Spot) ||
-      pnlOptionPct >= (activePos.tp2Pct || 50))
+      (exitQuoteSource === "LIVE_CHAIN_BID" && pnlOptionPct >= (activePos.tp2Pct || 50)))
   ) {
     closePosition("TARGET 2 HIT · FULL PROFIT EXIT");
   }
-  // 5. STC (TARGET 1 HIT · 1 CONTRACT SNIPER FULL EXIT)
+  // 5. STC (TARGET 1 HIT · 1 CONTRACT SNIPER FULL EXIT — option-% shortcut restricted strictly to LIVE_CHAIN_BID)
   else if (
     activePos.status === "OPEN" &&
     !(isTrendRunnerActive && (solidFluxAligned || isAlignedTrendRegime)) &&
     !activePos.setupName.includes("Bearish Zero-Gamma Flush") &&
     ((isCall && posSpotPrice >= activePos.target1Spot) ||
       (!isCall && posSpotPrice <= activePos.target1Spot) ||
-      pnlOptionPct >= (activePos.tp1Pct || 25))
+      (exitQuoteSource === "LIVE_CHAIN_BID" && pnlOptionPct >= (activePos.tp1Pct || 25)))
   ) {
     closePosition("TARGET 1 HIT · FULL PROFIT EXIT (1 CONTRACT)");
   }

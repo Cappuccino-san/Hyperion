@@ -14,8 +14,11 @@ import type {
 } from "@/lib/execution/types";
 import {
   clampOptionPriceToGreekEnvelope,
+  computeRemainingYearsToExpiration,
   formatTimeEt,
   getCachedSpotPrice,
+  repriceOptionBSExact,
+  solveImpliedVol,
 } from "@/lib/execution/optionPricing";
 
 const globalForGaiaDiscord = globalThis as unknown as {
@@ -126,27 +129,63 @@ export function purgeZombieToClosed(
         pos.btoSpotPrice;
 
   const isCall = pos.contractType === "CALL";
-  const entryMid = pos.optionAsk || pos.btoOptionMid || 0.5;
+  const entryAsk = pos.btoOptionAsk ?? pos.optionAsk ?? pos.btoOptionMid ?? 0.5;
   const heldMin = Math.max(1, (cappedTs - (pos.openedTs || cappedTs)) / 60);
   const dirMove = isCall ? spotRef - pos.btoSpotPrice : pos.btoSpotPrice - spotRef;
   const spotMovePct = Number(((dirMove / Math.max(0.01, pos.btoSpotPrice)) * 100).toFixed(2));
-  const rawEstMid = Math.max(0.05, Number((entryMid + dirMove * 0.45).toFixed(2)));
+  const dte =
+    typeof pos.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(pos.expiration) && pos.expiration > sessionDate
+      ? 1
+      : 0;
+  const tEntry =
+    typeof pos.entryTYears === "number" && pos.entryTYears > 0
+      ? pos.entryTYears
+      : computeRemainingYearsToExpiration((pos.openedTs || cappedTs) * 1000, dte);
+  const tRem = computeRemainingYearsToExpiration(cappedTs * 1000, dte);
+  const entrySpread =
+    typeof pos.optionAsk === "number" && typeof pos.optionBid === "number" && pos.optionAsk >= pos.optionBid
+      ? Math.max(0.01, pos.optionAsk - pos.optionBid)
+      : 0.02;
+  const rawEstBid =
+    pos.strike > 0 && pos.btoSpotPrice > 0 && spotRef > 0
+      ? Number(
+          Math.max(
+            0.01,
+            repriceOptionBSExact(
+              spotRef,
+              pos.strike,
+              tRem,
+              solveImpliedVol(entryAsk, pos.btoSpotPrice, pos.strike, tEntry, isCall),
+              isCall
+            ) - entrySpread
+          ).toFixed(2)
+        )
+      : Math.max(0.05, Number((entryAsk + dirMove * 0.25 - entrySpread).toFixed(2)));
   const exitMid = clampOptionPriceToGreekEnvelope(
     pos.btoSpotPrice,
     spotRef,
-    entryMid,
-    rawEstMid,
+    entryAsk,
+    rawEstBid,
     isCall,
-    heldMin
+    heldMin,
+    {
+      strike: pos.strike > 0 ? pos.strike : undefined,
+      tEntryYears: tEntry,
+      tRemainingYears: tRem,
+      allowFloor: false,
+    }
   );
-  const pnlOptPct = Number((((exitMid - entryMid) / Math.max(0.01, entryMid)) * 100).toFixed(2));
+  const pnlOptPct = Number((((exitMid - entryAsk) / Math.max(0.01, entryAsk)) * 100).toFixed(2));
 
   pos.status = "CLOSED";
   pos.remainingQty = 0;
+  pos.btoOptionAsk = entryAsk;
   pos.closedTs = cappedTs;
   pos.closedAt = formatTimeEt(cappedTs);
   pos.closedSpotPrice = Number(spotRef.toFixed(2));
+  pos.closedOptionBid = exitMid;
   pos.closedOptionMid = exitMid;
+  pos.exitQuoteSource = "BS_FALLBACK";
   pos.pnlSpotPct = spotMovePct;
   pos.pnlOptionPct = pnlOptPct;
   pos.exitReason = `${reason}${bounds.isEarlyClose ? " (EARLY CLOSE)" : ""}`;

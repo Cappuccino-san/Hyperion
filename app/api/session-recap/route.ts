@@ -27,6 +27,7 @@ export interface PortfolioTradeRow {
   pnlOptionPct: number;
   rMultiple: number;
   exitReason: string;
+  exitQuoteSource?: string;
 }
 
 export interface PortfolioDailyRow {
@@ -127,6 +128,7 @@ async function buildRollingPortfolioSummary(): Promise<PortfolioRecapSummary> {
           pnlOptionPct,
           rMultiple,
           exitReason: String(p.exitReason || "Closed"),
+          exitQuoteSource: typeof p.exitQuoteSource === "string" ? p.exitQuoteSource : undefined,
         });
       }
 
