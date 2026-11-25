@@ -12,6 +12,13 @@ import {
   parseOccSymbol,
 } from "@/lib/optionsExposure";
 import { isMarketOpen } from "@/lib/marketDataService";
+import { fetchLiveTickQuote } from "@/lib/liveTick";
+import { fetchCboeDelayedChain } from "@/lib/cboeClient";
+import {
+  etMinutesOfDay,
+  getSessionBoundsEt,
+  getTodayEt,
+} from "@/lib/gaiaSessionGuards";
 import {
   optionsMemoryCache,
   sanitizeTickerSymbol,
@@ -19,6 +26,26 @@ import {
 } from "@/lib/marketCache";
 
 export const dynamic = "force-dynamic";
+
+const FLOW_ET_DATE_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+function formatBarDateEt(tsSec: number): string {
+  const parts = FLOW_ET_DATE_FMT.formatToParts(new Date(tsSec * 1000));
+  let y = "";
+  let m = "";
+  let d = "";
+  for (const p of parts) {
+    if (p.type === "year") y = p.value;
+    else if (p.type === "month") m = p.value;
+    else if (p.type === "day") d = p.value;
+  }
+  return `${y}-${m}-${d}`;
+}
 
 interface RawBar {
   timestamp: number;
@@ -29,8 +56,15 @@ interface RawBar {
   volume: number;
 }
 
+const YAHOO_BROWSER_HEADERS: Record<string, string> = {
+  Accept: "application/json",
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+};
+
 /**
- * Fetches intraday session candles from Yahoo Finance.
+ * Fetches intraday session candles from Yahoo Finance (query1 -> query2 failover)
+ * and appends/updates the active forming bar through the current ET minute during RTH.
  */
 async function fetchIntradayCandles(
   ticker: string,
@@ -45,27 +79,36 @@ async function fetchIntradayCandles(
 
   const interval = timeframe === "1m" ? "1m" : "5m";
   const range = timeframe === "1m" ? "1d" : "2d";
+  const bucketSec = interval === "1m" ? 60 : 300;
 
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
-      yahooSymbol
-    )}?interval=${interval}&range=${range}&includePrePost=true`;
-
-    const res = await fetch(url, {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": "Mozilla/5.0 (compatible; HyperionAnalytics/1.0)",
-      },
-      cache: "no-store",
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!res.ok) {
-      return [];
+    let json: any = null;
+    for (const host of ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]) {
+      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(
+        yahooSymbol
+      )}?interval=${interval}&range=${range}&includePrePost=true`;
+      try {
+        const res = await fetch(url, {
+          headers: YAHOO_BROWSER_HEADERS,
+          cache: "no-store",
+          signal: AbortSignal.timeout(5500),
+        });
+        if (!res.ok) {
+          console.warn(`[flow-vwap API] ${host} ${yahooSymbol} ${interval} returned HTTP ${res.status}`);
+          continue;
+        }
+        json = await res.json();
+        if (json?.chart?.result?.[0]) break;
+      } catch (err) {
+        console.warn(
+          `[flow-vwap API] ${host} ${yahooSymbol} ${interval} fetch error:`,
+          err instanceof Error ? err.message : String(err)
+        );
+      }
     }
 
-    const json = await res.json();
     const result = json?.chart?.result?.[0];
+    if (!result) return [];
     const timestamps: number[] = result?.timestamp ?? [];
     const quote = result?.indicators?.quote?.[0] ?? {};
     const opens: (number | null)[] = quote.open ?? [];
@@ -75,11 +118,7 @@ async function fetchIntradayCandles(
     const volumes: (number | null)[] = quote.volume ?? [];
 
     const bars: RawBar[] = [];
-
-    // Filter to current session (starting from 9:30 AM ET today or full today)
-    const todayEt = new Date().toLocaleDateString("en-CA", {
-      timeZone: "America/New_York",
-    });
+    const todayEt = getTodayEt();
 
     for (let i = 0; i < timestamps.length; i++) {
       const c = closes[i];
@@ -90,11 +129,8 @@ async function fetchIntradayCandles(
       if (c == null || o == null || h == null || l == null) continue;
 
       const ts = timestamps[i];
-      const barDateEt = new Date(ts * 1000).toLocaleDateString("en-CA", {
-        timeZone: "America/New_York",
-      });
+      const barDateEt = formatBarDateEt(ts);
 
-      // Include points from today's session
       if (barDateEt === todayEt || timestamps.length < 50) {
         bars.push({
           timestamp: ts,
@@ -108,23 +144,35 @@ async function fetchIntradayCandles(
     }
 
     if (bars.length >= 2) {
-      // Synchronize latest forming bar close with live tick strictly during active RTH
+      // Synchronize & append latest forming bar through the current ET minute strictly during active RTH
       if (isMarketOpen().open) {
         try {
           const sym = ticker.trim().toUpperCase();
-          const rhSym = sym === "SPX" || sym === "SPXW" ? "SPY" : sym === "NDX" || sym === "NDXP" ? "QQQ" : sym;
-          const rhRes = await fetch(`https://api.robinhood.com/quotes/?symbols=${encodeURIComponent(rhSym)}`, {
-            headers: { "User-Agent": "Mozilla/5.0" },
-            cache: "no-store",
-            signal: AbortSignal.timeout(2500),
-          });
-          if (rhRes.ok) {
-            const rhJson = await rhRes.json();
-            const p = Number(rhJson?.results?.[0]?.last_trade_price ?? rhJson?.results?.[0]?.bid_price ?? 0);
-            if (p > 0 && Number.isFinite(p)) {
-              const mult = sym === "SPX" || sym === "SPXW" ? 10 : sym === "NDX" || sym === "NDXP" ? 40 : 1;
-              const liveP = Number((p * mult).toFixed(2));
-              const lastBar = bars[bars.length - 1];
+          const tickSym =
+            sym === "SPXW" ? "SPX" : sym === "NDXP" ? "NDX" : sym;
+          const liveTick = await fetchLiveTickQuote(tickSym).catch(() => null);
+          if (liveTick && liveTick.spot > 0 && Number.isFinite(liveTick.spot)) {
+            const liveP = Number(liveTick.spot.toFixed(2));
+            const nowSec = Math.floor(Date.now() / 1000);
+            const etMins = etMinutesOfDay(nowSec);
+            const bounds = getSessionBoundsEt(todayEt);
+            const curBucketTs = Math.floor(nowSec / bucketSec) * bucketSec;
+            const lastBar = bars[bars.length - 1];
+            const lastBucketTs = Math.floor(lastBar.timestamp / bucketSec) * bucketSec;
+            if (
+              etMins >= bounds.rthOpenMins &&
+              etMins < bounds.rthCloseMins &&
+              curBucketTs > lastBucketTs
+            ) {
+              bars.push({
+                timestamp: curBucketTs,
+                open: liveP,
+                high: liveP,
+                low: liveP,
+                close: liveP,
+                volume: 100,
+              });
+            } else {
               lastBar.close = liveP;
               lastBar.high = Math.max(lastBar.high, liveP);
               lastBar.low = Math.min(lastBar.low, liveP);
@@ -137,101 +185,86 @@ async function fetchIntradayCandles(
       return bars;
     }
   } catch (err) {
-    console.error("[flow-vwap API] Failed to fetch Yahoo series:", err);
+    console.warn(
+      "[flow-vwap API] Failed to fetch Yahoo series:",
+      err instanceof Error ? err.message : String(err)
+    );
   }
 
   return [];
 }
 
 /**
- * Fetches or retrieves cached CBOE option contracts.
+ * Fetches or retrieves cached CBOE option contracts via the shared singleflight cache.
  */
 async function getOrFetchOptionContracts(
   ticker: string
 ): Promise<NormalizedOptionContract[]> {
-  const cached = globalContractsCache.get(ticker.toUpperCase());
-  if (cached && cached.rawContracts.length > 0) {
+  const upper = ticker.toUpperCase();
+  const cached = globalContractsCache.get(upper);
+  if (cached && cached.rawContracts.length > 0 && Date.now() - cached.fetchedAtMs < 15_000) {
     return cached.rawContracts.map((c) => ({ ...c }));
   }
 
-  const cboeSymbol =
-    ticker === "SPX" || ticker === "SPXW"
-      ? "_SPX"
-      : ticker === "NDX" || ticker === "NDXP"
-      ? "_NDX"
-      : ticker.toUpperCase();
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 6000);
   try {
-    const url = `https://cdn-api.cboe.com/api/global/delayed_quotes/options/${cboeSymbol}.json`;
-
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-      Accept: "application/json, text/plain, */*",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      Referer: "https://www.cboe.com/",
-      Origin: "https://www.cboe.com",
-    },
-      cache: "no-store",
+    const cboeResult = await fetchCboeDelayedChain(upper, {
+      allowStaleFallback: true,
     });
+    const data = cboeResult.data;
+    if (data && Array.isArray(data.options)) {
+      const contracts: NormalizedOptionContract[] = [];
+      for (const raw of data.options) {
+        const occSymbol = String(raw.option ?? "");
+        const parsed = parseOccSymbol(occSymbol);
+        if (!parsed) continue;
 
-    if (res.ok) {
-      const json = await res.json();
-      const data = json?.data;
-      if (data && Array.isArray(data.options)) {
-        const contracts: NormalizedOptionContract[] = [];
-        for (const raw of data.options) {
-          const occSymbol = String(raw.option ?? "");
-          const parsed = parseOccSymbol(occSymbol);
-          if (!parsed) continue;
+        const openInterest = Number(raw.open_interest ?? 0);
+        const volume = Number(raw.volume ?? 0);
+        if (openInterest <= 0 && volume <= 0) continue;
 
-          const openInterest = Number(raw.open_interest ?? 0);
-          const volume = Number(raw.volume ?? 0);
-          if (openInterest <= 0 && volume <= 0) continue;
+        contracts.push({
+          symbol: occSymbol,
+          expiration: parsed.expiration,
+          optionType: parsed.optionType,
+          strike: parsed.strike,
+          openInterest,
+          volume,
+          iv: Number(raw.iv ?? 0.2),
+          delta: Number(raw.delta ?? 0),
+          gamma: Number(raw.gamma ?? 0),
+          vega: Number(raw.vega ?? 0),
+          percentChange: Number(raw.percent_change ?? 0),
+          bid: Number(raw.bid ?? 0),
+          ask: Number(raw.ask ?? 0),
+          last: Number(raw.last_trade_price ?? 0),
+          quoteSource: "DELAYED_CBOE",
+        });
+      }
 
-          contracts.push({
-            symbol: occSymbol,
-            expiration: parsed.expiration,
-            optionType: parsed.optionType,
-            strike: parsed.strike,
-            openInterest,
-            volume,
-            iv: Number(raw.iv ?? 0.2),
-            delta: Number(raw.delta ?? 0),
-            gamma: Number(raw.gamma ?? 0),
-            vega: Number(raw.vega ?? 0),
-            percentChange: Number(raw.percent_change ?? 0),
-            bid: Number(raw.bid ?? 0),
-            ask: Number(raw.ask ?? 0),
-            last: Number(raw.last_trade_price ?? 0),
+      if (contracts.length > 0) {
+        const cboeRefSpot = Number(data.current_price ?? data.close ?? 0);
+        setBoundedMapEntry(
+          globalContractsCache,
+          upper,
+          {
+            rawContracts: contracts,
+            referenceSpot: cboeRefSpot > 0 ? cboeRefSpot : 0,
+            fetchedAtMs: cboeResult.fetchedAtMs,
             quoteSource: "DELAYED_CBOE",
-          });
-        }
-
-        if (contracts.length > 0) {
-          const cboeRefSpot = Number(data.current_price ?? data.close ?? 0);
-          setBoundedMapEntry(
-            globalContractsCache,
-            ticker.toUpperCase(),
-            {
-              rawContracts: contracts,
-              referenceSpot: cboeRefSpot > 0 ? cboeRefSpot : 0,
-              fetchedAtMs: Date.now(),
-              quoteSource: "DELAYED_CBOE",
-            },
-            64
-          );
-          return contracts;
-        }
+          },
+          64
+        );
+        return contracts;
       }
     }
-  } catch {
-    // Non-fatal, fallback to empty/simulated
-  } finally {
-    clearTimeout(timeout);
+  } catch (err) {
+    console.warn(
+      `[flow-vwap API] CBOE options fallback for ${upper}:`,
+      err instanceof Error ? err.message : String(err)
+    );
+    if (cached && cached.rawContracts.length > 0) {
+      return cached.rawContracts.map((c) => ({ ...c }));
+    }
   }
 
   return [];

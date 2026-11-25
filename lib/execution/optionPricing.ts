@@ -12,6 +12,7 @@ import {
 } from "@/lib/flowGammaVwap";
 import { getTodayEt, getSessionBoundsEt } from "@/lib/gaiaSessionGuards";
 import { fetchLiveTickQuote } from "@/lib/liveTick";
+import { fetchCboeDelayedChain } from "@/lib/cboeClient";
 import { isMarketOpen } from "@/lib/marketDataService";
 import { computeLocalMtfDivergence } from "@/lib/divergenceDetector";
 import {
@@ -97,22 +98,50 @@ export function repriceOptionBS(
   return Number(Math.max(0.01, rawPrice).toFixed(2));
 }
 
+const ET_ISO_DATE_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+const ET_TIME_SHORT_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+const ET_HMS_PARTS_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+  hourCycle: "h23",
+});
+
 export function formatEtIsoDate(d: Date): string {
   try {
-    return d.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const parts = ET_ISO_DATE_FMT.formatToParts(d);
+    let y = "";
+    let m = "";
+    let day = "";
+    for (const p of parts) {
+      if (p.type === "year") y = p.value;
+      else if (p.type === "month") m = p.value;
+      else if (p.type === "day") day = p.value;
+    }
+    if (y && m && day) return `${y}-${m}-${day}`;
   } catch {
-    return d.toISOString().slice(0, 10);
+    // Fallback below
   }
+  return d.toISOString().slice(0, 10);
 }
 
 export function formatTimeEt(dateOrTs: Date | number): string {
   const d = typeof dateOrTs === "number" ? new Date(dateOrTs * 1000) : dateOrTs;
   try {
-    return d.toLocaleTimeString("en-US", {
-      timeZone: "America/New_York",
-      hour: "numeric",
-      minute: "2-digit",
-    });
+    return ET_TIME_SHORT_FMT.format(d);
   } catch {
     return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   }
@@ -174,6 +203,41 @@ function normCdf(x: number): number {
   return 0.5 * (1.0 + sign * y);
 }
 
+function computeBaseRemainingIntradayMins(timestampMs: number): {
+  etDate: string;
+  remainingIntradayMins: number;
+} {
+  const dt = new Date(timestampMs);
+  const etDate = formatEtIsoDate(dt);
+  const sessionBounds = getSessionBoundsEt(etDate);
+  const parts = ET_HMS_PARTS_FMT.formatToParts(dt);
+  let rawHour = 9;
+  let minute = 30;
+  let second = 0;
+  for (const p of parts) {
+    if (p.type === "hour") rawHour = Number(p.value);
+    else if (p.type === "minute") minute = Number(p.value);
+    else if (p.type === "second") second = Number(p.value);
+  }
+  const hour = (Number.isFinite(rawHour) ? rawHour : 9) % 24;
+  const safeMin = Number.isFinite(minute) ? minute : 30;
+  const safeSec = Number.isFinite(second) ? second : 0;
+  const etMinutes = hour * 60 + safeMin + safeSec / 60;
+  return {
+    etDate,
+    remainingIntradayMins: Math.max(1, sessionBounds.rthCloseMins - etMinutes),
+  };
+}
+
+function remainingYearsFromBaseMins(remainingIntradayMins: number, dteSessions: number): number {
+  const overnightEquivMins = 90; // Overnight theta variance weight
+  const rthSessionMins = 390;
+  const totalEffectiveMins =
+    remainingIntradayMins + Math.max(0, dteSessions) * (overnightEquivMins + rthSessionMins);
+  const tradingMinsPerYear = 252 * 390;
+  return Math.max(1 / 525600, totalEffectiveMins / tradingMinsPerYear);
+}
+
 /**
  * Computes exact remaining time to expiration in years from bar.timestampMs
  * to either 0DTE session close (16:00 ET or 13:00 ET on early closes) or Next-Session close,
@@ -183,33 +247,8 @@ export function computeRemainingYearsToExpiration(
   timestampMs: number,
   dteSessions: number = 1
 ): number {
-  const dt = new Date(timestampMs);
-  const etDate = formatEtIsoDate(dt);
-  const sessionBounds = getSessionBoundsEt(etDate);
-  const fmt = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-    hourCycle: "h23",
-  });
-  const parts = fmt.formatToParts(dt);
-  const rawHour = Number(parts.find((p) => p.type === "hour")?.value ?? 9);
-  const hour = rawHour % 24;
-  const minute = Number(parts.find((p) => p.type === "minute")?.value ?? 30);
-  const second = Number(parts.find((p) => p.type === "second")?.value ?? 0);
-
-  const etMinutes = hour * 60 + minute + second / 60;
-  const remainingIntradayMins = Math.max(1, sessionBounds.rthCloseMins - etMinutes);
-  const overnightEquivMins = 90; // Overnight theta variance weight
-  const rthSessionMins = 390;
-
-  const totalEffectiveMins =
-    remainingIntradayMins + Math.max(0, dteSessions) * (overnightEquivMins + rthSessionMins);
-
-  const tradingMinsPerYear = 252 * 390;
-  return Math.max(1 / 525600, totalEffectiveMins / tradingMinsPerYear);
+  const { remainingIntradayMins } = computeBaseRemainingIntradayMins(timestampMs);
+  return remainingYearsFromBaseMins(remainingIntradayMins, dteSessions);
 }
 
 /**
@@ -383,8 +422,10 @@ export function reanchorDelayedContractsToSpot(params: {
     typeof fetchedAtMs === "number" && Number.isFinite(fetchedAtMs) && fetchedAtMs > 0
       ? fetchedAtMs
       : nowMs;
-  const todayIso = formatEtIsoDate(new Date(nowMs));
-  const refIso = formatEtIsoDate(new Date(refTimeMs));
+  const nowBase = computeBaseRemainingIntradayMins(nowMs);
+  const refBase = computeBaseRemainingIntradayMins(refTimeMs);
+  const todayIso = nowBase.etDate;
+  const refIso = refBase.etDate;
   const spotDelta = Number.isFinite(referenceSpot) && referenceSpot > 0 ? Math.abs(liveSpot - referenceSpot) : 0;
   const timeDeltaMs = Math.abs(nowMs - refTimeMs);
   const shouldShiftQuotes =
@@ -392,24 +433,30 @@ export function reanchorDelayedContractsToSpot(params: {
     timeDeltaMs >= 15_000 ||
     (Number.isFinite(referenceSpot) && referenceSpot > 0 && spotDelta > Math.max(0.01, referenceSpot * 0.0001));
 
+  const expMetaCache = new Map<string, { dteNow: number; tNow: number; tRef: number }>();
+  const resolveExpMeta = (exp: string) => {
+    const hit = expMetaCache.get(exp);
+    if (hit) return hit;
+    const isIso = typeof exp === "string" && /^\d{4}-\d{2}-\d{2}$/.test(exp);
+    const dteNow = isIso ? diffIsoDays(exp, todayIso) : 0;
+    const dteRef = isIso ? Math.max(0, diffIsoDays(exp, refIso)) : Math.max(0, dteNow);
+    const meta = {
+      dteNow,
+      tNow: remainingYearsFromBaseMins(nowBase.remainingIntradayMins, Math.max(0, dteNow)),
+      tRef: remainingYearsFromBaseMins(refBase.remainingIntradayMins, Math.max(0, dteRef)),
+    };
+    expMetaCache.set(exp, meta);
+    return meta;
+  };
+
   return contracts.map((c) => {
     if (!c || !Number.isFinite(c.strike) || c.strike <= 0) return { ...c };
     if (c.quoteSource === "TRADIER_LIVE") {
       return { ...c, quoteSource: "TRADIER_LIVE" };
     }
     const isCall = c.optionType === "C";
-    const dteNow =
-      typeof c.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(c.expiration)
-        ? diffIsoDays(c.expiration, todayIso)
-        : 0;
+    const { dteNow, tNow, tRef } = resolveExpMeta(c.expiration);
     if (dteNow < 0) return { ...c, quoteSource: c.quoteSource ?? "DELAYED_CBOE" };
-    const dteRef =
-      typeof c.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(c.expiration)
-        ? Math.max(0, diffIsoDays(c.expiration, refIso))
-        : Math.max(0, dteNow);
-
-    const tNow = computeRemainingYearsToExpiration(nowMs, Math.max(0, dteNow));
-    const tRef = computeRemainingYearsToExpiration(refTimeMs, Math.max(0, dteRef));
     const rawBid = typeof c.bid === "number" && Number.isFinite(c.bid) && c.bid > 0 ? c.bid : 0;
     const rawAsk = typeof c.ask === "number" && Number.isFinite(c.ask) && c.ask > 0 ? c.ask : 0;
     const rawMid = getContractMidPrice(c);
@@ -421,8 +468,10 @@ export function reanchorDelayedContractsToSpot(params: {
           : c.iv
         : 0;
     const quoteSource: OptionContractQuoteSource = c.quoteSource ?? "DELAYED_CBOE";
-    // Far-dated LEAPS (> 45 DTE) are never selected by the 0-3 DTE sniper router; skip 28-step bisection
-    if (dteNow > 45) {
+    // Far-dated LEAPS (> 45 DTE) or deep far-wing strikes (> 18% from spot) skip 28-step bisection
+    const isFarWing =
+      referenceSpot > 0 && Math.abs(c.strike - referenceSpot) > referenceSpot * 0.18;
+    if (dteNow > 45 || isFarWing) {
       const leapsIv = rawIv >= 0.04 && rawIv <= 1.8 ? rawIv : fallbackIv;
       return {
         ...c,
@@ -837,30 +886,14 @@ export async function fetchLiveCboeOptions(
     return fallbackFromCached();
   }
 
-  const linkedTimeout = createLinkedTimeoutSignal(signal, 6000);
+  const linkedTimeout = createLinkedTimeoutSignal(signal, 7500);
   try {
-    const res = await fetch(`https://cdn-api.cboe.com/api/global/delayed_quotes/options/${cboeSymbol}.json`, {
-      headers: {
-        Accept: "application/json, text/plain, */*",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        Referer: "https://www.cboe.com/",
-        Origin: "https://www.cboe.com",
-      },
-      cache: "no-store",
+    const cboeResult = await fetchCboeDelayedChain(cboeSymbol, {
       signal: linkedTimeout.signal,
+      allowStaleFallback: true,
     });
-
-    if (!res.ok) {
-      setBoundedMapEntry(cboeFailureCooldownUntil, cboeSymbol, Date.now() + CBOE_FAILURE_BACKOFF_MS);
-      return fallbackFromCached();
-    }
-    const json = await res.json();
-    const data = json?.data;
-    if (!data) {
-      setBoundedMapEntry(cboeFailureCooldownUntil, cboeSymbol, Date.now() + CBOE_FAILURE_BACKOFF_MS);
-      return fallbackFromCached();
-    }
+    const data = cboeResult.data;
+    const fetchedAtMs = cboeResult.fetchedAtMs;
 
     const marketOpenNow = isMarketOpen().open;
     const cboeClose = Number(data.close ?? data.current_price ?? 0);
@@ -929,7 +962,6 @@ export async function fetchLiveCboeOptions(
       });
     }
 
-    const fetchedAtMs = Date.now();
     const rawEntry: CachedRawChainEntry = {
       rawContracts,
       referenceSpot: cboeSpot,
@@ -950,7 +982,7 @@ export async function fetchLiveCboeOptions(
 
     cboeFailureCooldownUntil.delete(cboeSymbol);
     return effectiveSpot > 0
-      ? resolveContractsFromRawCacheEntry(rawEntry, effectiveSpot, fetchedAtMs)
+      ? resolveContractsFromRawCacheEntry(rawEntry, effectiveSpot, Date.now())
       : rawContracts.map((c) => ({ ...c }));
   } catch {
     setBoundedMapEntry(cboeFailureCooldownUntil, cboeSymbol, Date.now() + CBOE_FAILURE_BACKOFF_MS);

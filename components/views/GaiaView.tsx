@@ -13,7 +13,13 @@ import {
 import {
   GaiaCallPutBiasHud,
 } from "@/components/gaia/GaiaCallPutBiasHud";
-import { toEpochSec } from "@/lib/gaiaSessionGuards";
+import {
+  etMinutesOfDay,
+  getSessionBoundsEt,
+  getTodayEt,
+  toEpochSec,
+} from "@/lib/gaiaSessionGuards";
+import { isMarketOpen } from "@/lib/marketDataService";
 import type { SessionPlaybookPolicy } from "@/lib/persistenceStore";
 import type {
   GaiaExpirationInfo,
@@ -235,19 +241,32 @@ function evaluateBucketExposureM(
   return netGexM + netVexM;
 }
 
+const GAIA_CLIENT_HM_24_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+const GAIA_CLIENT_TIME_12_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+});
+
+function formatClientEtTimeLabel(tsSec: number): string {
+  return GAIA_CLIENT_TIME_12_FMT.format(new Date(tsSec * 1000));
+}
+
 function getCandleEtMinutes(c: { timestamp?: number; timeLabel?: string }): number | null {
   if (typeof c.timestamp === "number" && c.timestamp > 0) {
     const epochMs = c.timestamp > 1e11 ? c.timestamp : c.timestamp * 1000;
     try {
-      const parts = new Intl.DateTimeFormat("en-US", {
-        timeZone: "America/New_York",
-        hour: "2-digit",
-        minute: "2-digit",
-        hourCycle: "h23",
-      }).formatToParts(new Date(epochMs));
+      const parts = GAIA_CLIENT_HM_24_FMT.formatToParts(new Date(epochMs));
       const h = Number(parts.find((p) => p.type === "hour")?.value ?? NaN);
       const m = Number(parts.find((p) => p.type === "minute")?.value ?? NaN);
-      if (Number.isFinite(h) && Number.isFinite(m)) return h * 60 + m;
+      if (Number.isFinite(h) && Number.isFinite(m)) return (h % 24) * 60 + m;
     } catch {}
   }
   if (c.timeLabel) {
@@ -707,6 +726,10 @@ export function GaiaView() {
     setPrzmHudSignals([]);
     setServerTrades({ activePositions: {}, closedPositions: [], alerts: [], loaded: false });
     setHistoricalSupervisorPolicy(null);
+    isReplayingRef.current = false;
+    setIsReplaying(false);
+    isReplayFrozenRef.current = false;
+    setIsReplayFrozen(false);
   }, [loadedTicker]);
 
   const [livePayload, setLivePayload] = useState<GaiaLivePayload | null>(
@@ -730,10 +753,21 @@ export function GaiaView() {
   const [isReplaying, setIsReplaying] = useState<boolean>(false);
   const [isReplayFrozen, setIsReplayFrozen] = useState<boolean>(false);
   const [replaySpeed, setReplaySpeed] = useState<1 | 2 | 4>(1);
-  const isHistoricalOrReplay = isReplaying || isReplayFrozen || Boolean(selectedSessionIso);
+  const [barClockTick, setBarClockTick] = useState<number>(0);
+
+  const todayEtIso = getTodayEt();
+  const isHistoricalSession =
+    Boolean(selectedSessionIso) &&
+    selectedSessionIso !== todayEtIso &&
+    selectedSessionIso !== livePayload?.sessions?.[0]?.isoDate;
+  const effectiveRthOpen =
+    typeof liveTickMarketOpen === "boolean"
+      ? liveTickMarketOpen
+      : (livePayload?.marketOpen ?? isMarketOpen().open);
+  const isHistoricalOrReplay = isReplaying || isReplayFrozen || isHistoricalSession;
   const replayFrozenTradesRef = useRef<ServerTradesState | null>(null);
   const effectiveServerTrades: ServerTradesState = useMemo(() => {
-    if (selectedSessionIso) {
+    if (isHistoricalSession) {
       return {
         activePositions: serverTrades.activePositions || {},
         closedPositions: serverTrades.closedPositions || [],
@@ -755,7 +789,7 @@ export function GaiaView() {
     }
     replayFrozenTradesRef.current = null;
     return liveSnapshot;
-  }, [selectedSessionIso, isReplaying, isReplayFrozen, serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts, storeServerTradesLoaded]);
+  }, [isHistoricalSession, isReplaying, isReplayFrozen, serverTrades, storeActivePositions, storeClosedTrades, storeTradeAlerts, storeServerTradesLoaded]);
   const storeHeatmapKingNode = useDashboardStore((s) => s.kingNode);
   const storeHeatmapTicker = useDashboardStore((s) => s.activeTicker);
   const isReplayingRef = useRef<boolean>(false);
@@ -830,6 +864,7 @@ export function GaiaView() {
   const gaiaAbortRef = useRef<AbortController | null>(null);
   const gaiaReqSeqRef = useRef<number>(0);
   const gaiaInFlightRef = useRef<boolean>(false);
+  const gaiaInFlightSinceRef = useRef<number>(0);
   const hoverRafRef = useRef<number | null>(null);
   const pendingHoverRef = useRef<{
     cursor: { x: number; y: number } | null;
@@ -846,15 +881,40 @@ export function GaiaView() {
     };
   }, []);
 
+  // Normalize selectedSessionIso: if it equals today's ET date (or latest live session), treat as live ("")
+  useEffect(() => {
+    if (!selectedSessionIso) return;
+    const latestIso = livePayload?.sessions?.[0]?.isoDate;
+    if (selectedSessionIso === getTodayEt() || (latestIso && selectedSessionIso === latestIso)) {
+      setSelectedSessionIso("");
+    }
+  }, [selectedSessionIso, livePayload?.sessions]);
+
+  // 1-second active bar countdown clock during live RTH so right-axis price pill stays continuously live
+  useEffect(() => {
+    if (isHistoricalOrReplay || !effectiveRthOpen) return;
+    const id = setInterval(() => {
+      setBarClockTick((n) => (n + 1) % 3600);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isHistoricalOrReplay, effectiveRthOpen]);
+
   const fetchLiveGaia = useCallback(
     async (tickerSymbol: string, sessionIso?: string, sHour: number = startHour, silent: boolean = false) => {
-      if (silent && gaiaInFlightRef.current) {
+      const nowMs = Date.now();
+      if (
+        silent &&
+        gaiaInFlightRef.current &&
+        nowMs - gaiaInFlightSinceRef.current < 12_000
+      ) {
         return;
       }
       gaiaAbortRef.current?.abort();
       const controller = new AbortController();
+      const fetchTimeout = setTimeout(() => controller.abort(), 12_000);
       gaiaAbortRef.current = controller;
       gaiaInFlightRef.current = true;
+      gaiaInFlightSinceRef.current = nowMs;
       const reqSeq = ++gaiaReqSeqRef.current;
       if (!silent) {
         setIsLoading(true);
@@ -865,7 +925,9 @@ export function GaiaView() {
           ticker: tickerSymbol,
           start: String(sHour),
         });
-        if (sessionIso) qs.set("session", sessionIso);
+        const cleanSession =
+          sessionIso && sessionIso !== getTodayEt() ? sessionIso : "";
+        if (cleanSession) qs.set("session", cleanSession);
         const res = await fetch(`/api/gaia?${qs.toString()}`, {
           cache: "no-store",
           signal: controller.signal,
@@ -878,18 +940,17 @@ export function GaiaView() {
         const payload = data as GaiaLivePayload;
         setLivePayload(payload);
         if (!isReplayingRef.current && !isReplayFrozenRef.current) {
-          {
-          const winStart = startHour === 0 ? 0 : startHour === 7 ? 420 : startHour === 8 ? 480 : 570;
-          const winEnd = startHour === 0 ? 1440 : 1020;
+          const winStart = sHour === 0 ? 0 : sHour === 7 ? 420 : sHour === 8 ? 480 : 570;
+          const winEnd = sHour === 0 ? 1440 : 1020;
           let lastAllowed = payload.candles.length - 1;
           for (let i = payload.candles.length - 1; i >= 0; i--) {
             const m = getCandleEtMinutes(payload.candles[i]);
-            if (m !== null && m >= winStart && m <= winEnd) { lastAllowed = i; break; }
+            if (m !== null && m >= winStart && m <= winEnd) {
+              lastAllowed = i;
+              break;
+            }
           }
           setActiveBarIndex(Math.max(0, lastAllowed));
-        }
-        }
-        if (!isReplayingRef.current && !isReplayFrozenRef.current) {
           setHoverBarIndex(null);
         }
       } catch (err) {
@@ -902,6 +963,7 @@ export function GaiaView() {
           setErrorMsg(msg);
         }
       } finally {
+        clearTimeout(fetchTimeout);
         if (reqSeq === gaiaReqSeqRef.current) {
           gaiaInFlightRef.current = false;
           setIsLoading(false);
@@ -968,42 +1030,68 @@ export function GaiaView() {
         setLoadedTicker(urlTicker);
         setStoreTicker(urlTicker);
         setLivePayload(null);
+        isReplayingRef.current = false;
+        setIsReplaying(false);
+        isReplayFrozenRef.current = false;
+        setIsReplayFrozen(false);
+        setSelectedSessionIso("");
         return;
       }
       syncTickerUrlParam(loadedTicker);
     }
-    fetchLiveGaia(loadedTicker, selectedSessionIso, startHour, false);
-  }, [loadedTicker, selectedSessionIso, startHour, fetchLiveGaia, setStoreTicker, syncTickerUrlParam]);
+    fetchLiveGaia(loadedTicker, isHistoricalSession ? selectedSessionIso : "", startHour, false);
+  }, [loadedTicker, isHistoricalSession, selectedSessionIso, startHour, fetchLiveGaia, setStoreTicker, syncTickerUrlParam]);
 
   useEffect(() => {
-    if (!isReplaying && !isReplayFrozen && !selectedSessionIso) {
-      const pollMs = liveTickMarketOpen === false ? 45_000 : 8_000;
-      const liveInterval = setInterval(() => {
+    if (!isReplaying && !isReplayFrozen && !isHistoricalSession) {
+      const pollMs = effectiveRthOpen === false ? 45_000 : 8_000;
+      const runSilentPoll = () => {
         if (
           !isReplayingRef.current &&
           !isReplayFrozenRef.current &&
           (typeof document === "undefined" || document.visibilityState === "visible")
         ) {
-          fetchLiveGaia(loadedTicker, "", startHour, true);
+          void fetchLiveGaia(loadedTicker, "", startHour, true);
         }
-      }, pollMs);
-      return () => clearInterval(liveInterval);
+      };
+      const liveInterval = setInterval(runSilentPoll, pollMs);
+      const onVisibilityOrFocus = () => {
+        if (typeof document === "undefined" || document.visibilityState === "visible") {
+          runSilentPoll();
+        }
+      };
+      if (typeof document !== "undefined") {
+        document.addEventListener("visibilitychange", onVisibilityOrFocus);
+      }
+      if (typeof window !== "undefined") {
+        window.addEventListener("focus", onVisibilityOrFocus);
+      }
+      return () => {
+        clearInterval(liveInterval);
+        if (typeof document !== "undefined") {
+          document.removeEventListener("visibilitychange", onVisibilityOrFocus);
+        }
+        if (typeof window !== "undefined") {
+          window.removeEventListener("focus", onVisibilityOrFocus);
+        }
+      };
     }
-  }, [loadedTicker, selectedSessionIso, startHour, isReplaying, isReplayFrozen, liveTickMarketOpen, fetchLiveGaia]);
+  }, [loadedTicker, isHistoricalSession, startHour, isReplaying, isReplayFrozen, effectiveRthOpen, fetchLiveGaia]);
 
-  // Instant 800ms tick reactivity for GaiaView livePayload spot & candle tip strictly during active RTH
+  // Instant 800ms tick reactivity for GaiaView livePayload spot, right-axis pill & forming 5m candle strictly during active RTH
   useEffect(() => {
     if (
-      liveTickMarketOpen !== true ||
+      effectiveRthOpen !== true ||
       !liveTickPrice ||
       liveTickPrice <= 0 ||
       isReplaying ||
       isReplayFrozen ||
-      Boolean(selectedSessionIso)
+      isHistoricalSession
     ) {
       return;
     }
     if (storeTicker.toUpperCase() !== loadedTicker.toUpperCase()) return;
+    let nextNewBarIdx: number | null = null;
     setLivePayload((prev) => {
       if (
         !prev ||
@@ -1016,15 +1104,51 @@ export function GaiaView() {
       const candles = prev.candles;
       if (!candles || candles.length === 0) return prev;
       const lastCandle = candles[candles.length - 1];
+      const relDiff = Math.abs(liveTickPrice - lastCandle.close) / Math.max(1, lastCandle.close);
+      if (relDiff > 0.05) return prev;
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const curBucketSec = Math.floor(nowSec / 300) * 300;
+      const lastTsSec = lastCandle.timestamp > 0 ? toEpochSec(lastCandle.timestamp) : 0;
+      const lastBucketSec = lastTsSec > 0 ? Math.floor(lastTsSec / 300) * 300 : 0;
+      const etMins = etMinutesOfDay(nowSec);
+      const bounds = getSessionBoundsEt(getTodayEt());
+
+      if (
+        lastBucketSec > 0 &&
+        curBucketSec > lastBucketSec &&
+        curBucketSec - lastBucketSec <= 900 &&
+        etMins >= bounds.rthOpenMins &&
+        etMins < bounds.rthCloseMins
+      ) {
+        const liveP = Number(liveTickPrice.toFixed(2));
+        const rolledBar: GaiaIntradayCandle = {
+          ...lastCandle,
+          index: candles.length,
+          timestamp: curBucketSec,
+          timeLabel: formatClientEtTimeLabel(curBucketSec),
+          open: liveP,
+          high: liveP,
+          low: liveP,
+          close: liveP,
+        };
+        const updatedCandles = [...candles, rolledBar];
+        nextNewBarIdx = updatedCandles.length - 1;
+        return {
+          ...prev,
+          spotPrice: liveP,
+          candles: updatedCandles,
+        };
+      }
+
       if (
         Math.abs(liveTickPrice - lastCandle.close) < 1e-6 &&
         lastCandle.high >= liveTickPrice &&
-        lastCandle.low <= liveTickPrice
+        lastCandle.low <= liveTickPrice &&
+        Math.abs((prev.spotPrice ?? 0) - liveTickPrice) < 1e-6
       ) {
         return prev;
       }
-      const relDiff = Math.abs(liveTickPrice - lastCandle.close) / Math.max(1, lastCandle.close);
-      if (relDiff > 0.05) return prev;
 
       const updatedCandles = [...candles];
       const last = { ...updatedCandles[updatedCandles.length - 1] };
@@ -1039,7 +1163,10 @@ export function GaiaView() {
         candles: updatedCandles,
       };
     });
-  }, [liveTickPrice, liveTickCount, isReplaying, isReplayFrozen, selectedSessionIso, storeTicker, loadedTicker]);
+    if (nextNewBarIdx !== null && !isReplayingRef.current && !isReplayFrozenRef.current) {
+      setActiveBarIndex(nextNewBarIdx);
+    }
+  }, [liveTickPrice, liveTickCount, effectiveRthOpen, isReplaying, isReplayFrozen, isHistoricalSession, storeTicker, loadedTicker]);
 
   // Observe chart container width for responsive high-DPI canvas rendering
   useEffect(() => {
@@ -1120,7 +1247,7 @@ export function GaiaView() {
 
   // Historical Session Trade Signals Hook (live session uses GlobalMarketDataSync store state)
   useEffect(() => {
-    if (!selectedSessionIso) {
+    if (!isHistoricalSession) {
       setServerTrades({ activePositions: {}, closedPositions: [], alerts: [], loaded: false });
       setHistoricalSupervisorPolicy(null);
       return;
@@ -1158,7 +1285,7 @@ export function GaiaView() {
       isMounted = false;
       controller.abort();
     };
-  }, [loadedTicker, chartSessionDate, selectedSessionIso, isReplaying, isReplayFrozen]);
+  }, [loadedTicker, chartSessionDate, isHistoricalSession, isReplaying, isReplayFrozen]);
 
   const flowVwapPoints = useMemo<FlowGammaVwapSnapshot[]>(() => {
     if (!dataset?.candles || dataset.candles.length === 0) return [];
@@ -1210,7 +1337,7 @@ export function GaiaView() {
     const spot = visibleCandles[visibleCandles.length - 1]?.close ?? dataset.priorClose;
 
     const lastCol = dataset.columnsByBar[Math.max(0, maxIdx)];
-    const allowLiveStoreOverlay = !isReplayActive && !selectedSessionIso;
+    const allowLiveStoreOverlay = !isReplayActive && !isHistoricalSession;
     const isLiveSynced = allowLiveStoreOverlay && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
     const allExpKingStrike =
       isLiveSynced && storeHeatmapKingNode?.allExpKing
@@ -1299,7 +1426,7 @@ export function GaiaView() {
     const yAxisTicks = computeNicePriceTicks(yMin, yMax, 6);
 
     return { yMin, yMax, yAxisTicks };
-  }, [dataset, scopePreset, expFilter, gammaLevels, yScale, yPanOffset, isReplaying, isReplayFrozen, activeBarIndex, selectedSessionIso, storeHeatmapTicker, loadedTicker, storeHeatmapKingNode]);
+  }, [dataset, scopePreset, expFilter, gammaLevels, yScale, yPanOffset, isReplaying, isReplayFrozen, activeBarIndex, isHistoricalSession, storeHeatmapTicker, loadedTicker, storeHeatmapKingNode]);
 
   const handleLoadTicker = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -1311,6 +1438,7 @@ export function GaiaView() {
     setIsReplaying(false);
     isReplayFrozenRef.current = false;
     setIsReplayFrozen(false);
+    setHoverBarIndex(null);
     setSelectedSessionIso("");
     resetViewportTo24H();
     syncTickerUrlParam(cleaned);
@@ -1325,11 +1453,16 @@ export function GaiaView() {
   const handleSessionChange = (newSessionIso: string) => {
     const latestSessionIso = sessionOptions[0]?.isoDate;
     const normalizedIso =
-      latestSessionIso && newSessionIso === latestSessionIso ? "" : newSessionIso;
+      !newSessionIso ||
+      newSessionIso === getTodayEt() ||
+      (latestSessionIso && newSessionIso === latestSessionIso)
+        ? ""
+        : newSessionIso;
     isReplayingRef.current = false;
     setIsReplaying(false);
     isReplayFrozenRef.current = false;
     setIsReplayFrozen(false);
+    setHoverBarIndex(null);
     resetViewportTo24H();
     if (normalizedIso === selectedSessionIso) {
       fetchLiveGaia(loadedTicker, normalizedIso);
@@ -1685,7 +1818,7 @@ export function GaiaView() {
       const barLabel = dataset?.candles[safeActiveIdx]?.timeLabel;
       return barLabel ? barLabel.replace(/\s*ET$/i, "") : "REPLAY";
     }
-    if (liveTickMarketOpen === false) {
+    if (effectiveRthOpen === false) {
       return "RTH CLOSED";
     }
     const now = new Date();
@@ -1704,7 +1837,7 @@ export function GaiaView() {
   const liveBarIdx = dataset && dataset.candles.length > 0 ? dataset.candles.length - 1 : 0;
   const structuralBarIdx = (isReplaying || isReplayFrozen) ? Math.min(safeActiveIdx, liveBarIdx) : liveBarIdx;
   const structuralBookCol = dataset?.columnsByBar[structuralBarIdx] ?? activeBookCol;
-  const isLiveHeatmapSynced = !(isReplaying || isReplayFrozen || Boolean(selectedSessionIso)) && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
+  const isLiveHeatmapSynced = !(isReplaying || isReplayFrozen || isHistoricalSession) && storeHeatmapTicker === loadedTicker && Boolean(storeHeatmapKingNode);
   const liveAllExpKingStrike =
     isLiveHeatmapSynced && storeHeatmapKingNode && storeHeatmapKingNode.allExpKing > 0
       ? storeHeatmapKingNode.allExpKing
@@ -2959,6 +3092,8 @@ export function GaiaView() {
     gammaLevels?.zeroGamma,
     livePayload,
     isHistoricalOrReplay,
+    barClockTick,
+    effectiveRthOpen,
   ]);
 
   const isSma34Bullish = activeCandle
@@ -3863,7 +3998,7 @@ export function GaiaView() {
         liveSpot={activeCandle ? activeCandle.close : null}
         serverTrades={effectiveServerTrades}
         supervisorPolicy={
-          selectedSessionIso
+          isHistoricalSession
             ? historicalSupervisorPolicy
             : loadedTicker.toUpperCase() === storeTicker.toUpperCase()
               ? storeSupervisorPolicy

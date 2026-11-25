@@ -18,6 +18,7 @@ import {
   resolveContractsFromRawCacheEntry,
 } from "@/lib/tradeSignalEngine";
 import { fetchLiveTickQuote } from "@/lib/liveTick";
+import { fetchCboeDelayedChain } from "@/lib/cboeClient";
 import { isMarketOpen } from "@/lib/marketDataService";
 import {
   ensureLiveBotRunning,
@@ -237,60 +238,24 @@ async function fetchTradierOptions(
 }
 
 async function fetchCboeOptions(
-  ticker: TickerSymbol
+  ticker: TickerSymbol,
+  forceRefresh = false
 ): Promise<OptionsAnalyticsPayload | null> {
-  const cboeSymbol =
-    ticker === "SPX" || ticker === "SPXW"
-      ? "_SPX"
-      : ticker === "NDX" || ticker === "NDXP"
-        ? "_NDX"
-        : ticker;
-  const url = `https://cdn-api.cboe.com/api/global/delayed_quotes/options/${cboeSymbol}.json`;
-
-  const backoffDelays = [1000, 2000, 4000]; // 1s, 2s, 4s exponential backoff
-  const maxAttempts = 3;
-
-  const fetchWithTimeout = async (attempt = 1): Promise<Response | null> => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-      Accept: "application/json, text/plain, */*",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      Referer: "https://www.cboe.com/",
-      Origin: "https://www.cboe.com",
-    },
-        cache: "no-store",
-      });
-    } catch {
-      if (attempt <= maxAttempts) {
-        const delay = backoffDelays[attempt - 1] ?? 4000;
-        await new Promise((r) => setTimeout(r, delay));
-        return fetchWithTimeout(attempt + 1);
-      }
-      return null;
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    if (res.ok) return res;
-    if (attempt <= maxAttempts) {
-      const delay = backoffDelays[attempt - 1] ?? 4000;
-      await new Promise((r) => setTimeout(r, delay));
-      return fetchWithTimeout(attempt + 1);
-    }
+  let cboeResult;
+  try {
+    cboeResult = await fetchCboeDelayedChain(ticker, {
+      forceRefresh,
+      allowStaleFallback: false,
+    });
+  } catch (err) {
+    console.warn(
+      `[/api/options] CBOE fetch failed for ${ticker}:`,
+      err instanceof Error ? err.message : String(err)
+    );
     return null;
-  };
+  }
 
-  const response = await fetchWithTimeout();
-  if (!response) return null;
-
-  const json = await response.json();
-  const data = json?.data;
+  const data = cboeResult.data;
   if (!data || !Array.isArray(data.options)) return null;
 
   const marketOpenNow = isMarketOpen().open;
@@ -344,7 +309,7 @@ async function fetchCboeOptions(
 
   if (contracts.length === 0) return null;
 
-  const fetchedAtMs = Date.now();
+  const fetchedAtMs = cboeResult.fetchedAtMs;
   const rawCacheEntry = {
     rawContracts: contracts,
     referenceSpot: cboeSpotPrice,
@@ -355,7 +320,7 @@ async function fetchCboeOptions(
   const anchoredContracts = resolveContractsFromRawCacheEntry(
     rawCacheEntry,
     spotPrice,
-    fetchedAtMs,
+    Date.now(),
     impliedVolatility
   );
   const extendedQuote = await fetchExtendedQuote(ticker, spotPrice);
@@ -587,7 +552,9 @@ export async function GET(request: NextRequest) {
         connectionStatus: cached.payload.connectionStatus ?? "LIVE",
         cacheAgeSec,
       });
-      return NextResponse.json(slimOptionsPayloadForWire(enriched));
+      return NextResponse.json(slimOptionsPayloadForWire(enriched), {
+        headers: { "Cache-Control": "no-store, max-age=0" },
+      });
     }
   }
 
@@ -608,7 +575,9 @@ export async function GET(request: NextRequest) {
           payload: taggedTradier,
         });
         const enriched = await attachIntraday(taggedTradier);
-        return NextResponse.json(slimOptionsPayloadForWire(enriched));
+        return NextResponse.json(slimOptionsPayloadForWire(enriched), {
+          headers: { "Cache-Control": "no-store, max-age=0" },
+        });
       }
     } catch {
       // Fall through to Tier 2 (CBOE Market Data)
@@ -617,7 +586,7 @@ export async function GET(request: NextRequest) {
 
   // Tier 2: CBOE Live Market Data Feed
   try {
-    const cboePayload = await fetchCboeOptions(ticker);
+    const cboePayload = await fetchCboeOptions(ticker, forceRefresh);
     if (cboePayload) {
       const taggedCboe: OptionsAnalyticsPayload = {
         ...cboePayload,
@@ -630,7 +599,9 @@ export async function GET(request: NextRequest) {
         payload: taggedCboe,
       });
       const enriched = await attachIntraday(taggedCboe);
-      return NextResponse.json(slimOptionsPayloadForWire(enriched));
+      return NextResponse.json(slimOptionsPayloadForWire(enriched), {
+        headers: { "Cache-Control": "no-store, max-age=0" },
+      });
     }
   } catch {
     // Live feed error - fall through to Tier 2b/3

@@ -28,18 +28,21 @@ interface MarketStatusInfo {
   countdown: string;
 }
 
+const ET_HEADER_PARTS_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  weekday: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+  hourCycle: "h23",
+});
+
 function getEtParts(d: Date) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    weekday: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).formatToParts(d);
+  const parts = ET_HEADER_PARTS_FMT.formatToParts(d);
   const map: Record<string, string> = {};
   parts.forEach((p) => {
     map[p.type] = p.value;
@@ -187,11 +190,27 @@ function HeaderTickBadge() {
       }
     };
 
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible" && !isCancelled) {
+        if (timerId) {
+          clearTimeout(timerId);
+          timerId = null;
+        }
+        void pollTick();
+      }
+    };
+
     pollTick();
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
     return () => {
       isCancelled = true;
       activeController?.abort();
       if (timerId) clearTimeout(timerId);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
     };
   }, [activeTicker, setLiveTick]);
 
@@ -202,11 +221,21 @@ function HeaderTickBadge() {
     return () => clearTimeout(t);
   }, [liveTickPrice, liveTickCount]);
 
+  const [mountedOpenFallback, setMountedOpenFallback] = useState<boolean | null>(null);
+  useEffect(() => {
+    const syncRth = () => setMountedOpenFallback(computeMarketStatus().state === "open");
+    syncRth();
+    const rthTimer = setInterval(syncRth, 5000);
+    return () => clearInterval(rthTimer);
+  }, []);
+
   const isStale = isStaleSnapshot || connectionStatus === "SYNCING" || connectionStatus === "RECONNECTING";
-  const isRthLive = liveTickMarketOpen === true && !isStale;
+  const effectiveMarketOpen =
+    typeof liveTickMarketOpen === "boolean" ? liveTickMarketOpen : mountedOpenFallback;
+  const isRthLive = effectiveMarketOpen === true && !isStale;
   const hasLagWarn = cboeSpotLagDollars !== null && Math.abs(cboeSpotLagDollars) >= 0.35;
   const displayPrice =
-    liveTickMarketOpen === false && spotPrice > 0
+    effectiveMarketOpen === false && spotPrice > 0
       ? spotPrice
       : liveTickPrice ?? spotPrice;
 
@@ -278,16 +307,24 @@ function HeaderTickBadge() {
 }
 
 function MarketStatusPill() {
-  const [mounted, setMounted] = useState(false);
-  const [mktStatus, setMktStatus] = useState<MarketStatusInfo>(() => computeMarketStatus());
+  const [mktStatus, setMktStatus] = useState<MarketStatusInfo | null>(null);
 
   useEffect(() => {
-    setMounted(true);
-    setMktStatus(computeMarketStatus());
-    const id = setInterval(() => {
-      setMktStatus(computeMarketStatus());
-    }, 1000);
-    return () => clearInterval(id);
+    const refreshStatus = () => setMktStatus(computeMarketStatus());
+    refreshStatus();
+    const id = setInterval(refreshStatus, 1000);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        refreshStatus();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", refreshStatus);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", refreshStatus);
+    };
   }, []);
 
   return (
@@ -296,21 +333,20 @@ function MarketStatusPill() {
       className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#111520] border border-[#1e2638] text-xs font-mono tabular-nums text-slate-400"
     >
       <span
-        suppressHydrationWarning
         className={cn(
           "w-2 h-2 rounded-full shrink-0",
-          mktStatus.state === "open"
+          mktStatus?.state === "open"
             ? "bg-[#22c55e] shadow-[0_0_8px_#22c55e]"
-            : mktStatus.state === "pre" || mktStatus.state === "after"
+            : mktStatus?.state === "pre" || mktStatus?.state === "after"
               ? "bg-[#eab308] shadow-[0_0_6px_#eab308]"
               : "bg-[#64748b]"
         )}
       />
-      <b suppressHydrationWarning className="text-slate-200 font-semibold">
-        {mktStatus.label}
+      <b className="text-slate-200 font-semibold">
+        {mktStatus ? mktStatus.label : "Checking..."}
       </b>
-      <span suppressHydrationWarning className="tabular-nums">
-        {mounted ? `· ${mktStatus.countdown}` : ""}
+      <span className="tabular-nums">
+        {mktStatus ? `· ${mktStatus.countdown}` : ""}
       </span>
     </div>
   );

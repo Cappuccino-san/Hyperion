@@ -8,8 +8,10 @@ import {
   parseOccSymbol,
   resolveEffectiveOpenInterest,
 } from "@/lib/optionsExposure";
-import { fetchLiveTickQuote } from "@/lib/liveTick";
+import { fetchLiveTickQuote, LiveTickResponse } from "@/lib/liveTick";
+import { fetchCboeDelayedChain } from "@/lib/cboeClient";
 import { isMarketOpen } from "@/lib/marketDataService";
+import { getSessionBoundsEt, getTodayEt } from "@/lib/gaiaSessionGuards";
 import { reanchorDelayedContractsToSpot } from "@/lib/execution/optionPricing";
 import {
   detectGlobalPivotSignals,
@@ -110,6 +112,9 @@ export interface GaiaLivePayload {
   pivotSignals5m: GaiaPivotSignal[];
   mtfByBar: GaiaMtfRow[];
   optionBuckets: GaiaStrikeExpBucket[];
+  isStale?: boolean;
+  marketOpen?: boolean;
+  lastUpdated?: string;
 }
 
 interface RawYahooBar {
@@ -160,19 +165,54 @@ function mapCboeSymbol(ticker: string): string {
   return ticker;
 }
 
+const GAIA_ET_DATE_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+const GAIA_ET_TIME_12_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+});
+
+const GAIA_ET_HM_24_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+  hourCycle: "h23",
+});
+
 function formatEtDate(tsSeconds: number): string {
-  return new Date(tsSeconds * 1000).toLocaleDateString("en-CA", {
-    timeZone: "America/New_York",
-  });
+  const parts = GAIA_ET_DATE_FMT.formatToParts(new Date(tsSeconds * 1000));
+  let y = "";
+  let m = "";
+  let d = "";
+  for (const p of parts) {
+    if (p.type === "year") y = p.value;
+    else if (p.type === "month") m = p.value;
+    else if (p.type === "day") d = p.value;
+  }
+  return `${y}-${m}-${d}`;
 }
 
 function formatEtTime(tsSeconds: number): string {
-  return new Date(tsSeconds * 1000).toLocaleTimeString("en-US", {
-    timeZone: "America/New_York",
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
-  });
+  return GAIA_ET_TIME_12_FMT.format(new Date(tsSeconds * 1000));
+}
+
+function getEtHourMinute24(tsSeconds: number): { hNum: number; mNum: number } {
+  const parts = GAIA_ET_HM_24_FMT.formatToParts(new Date(tsSeconds * 1000));
+  let h = 0;
+  let m = 0;
+  for (const p of parts) {
+    if (p.type === "hour") h = Number(p.value) % 24;
+    else if (p.type === "minute") m = Number(p.value);
+  }
+  return { hNum: h, mNum: m };
 }
 
 function formatBookLabel(isoDate: string): string {
@@ -185,6 +225,14 @@ function formatBookLabel(isoDate: string): string {
   return `book ${monthDay}, 4:00 PM ET`;
 }
 
+const YAHOO_GAIA_HEADERS: Record<string, string> = {
+  Accept: "application/json",
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+};
+
+const mtfSeriesCache = new BoundedMap<string, { tsMs: number; bars: RawYahooBar[] }>(128);
+
 async function fetchYahooSeries(
   yahooSymbol: string,
   interval: string,
@@ -193,24 +241,48 @@ async function fetchYahooSeries(
   startHour: number = 0,
   signal?: AbortSignal
 ): Promise<RawYahooBar[]> {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
-    yahooSymbol
-  )}?interval=${interval}&range=${range}&includePrePost=${includePrePost}`;
+  let json: any = null;
+  let lastStatus = 0;
+  let lastErrMsg = "";
 
-  const res = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "Mozilla/5.0 (compatible; HyperionAnalytics/1.0)",
-    },
-    cache: "no-store",
-    signal,
-  });
+  for (const host of ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]) {
+    if (signal?.aborted) break;
+    const url = `https://${host}/v8/finance/chart/${encodeURIComponent(
+      yahooSymbol
+    )}?interval=${interval}&range=${range}&includePrePost=${includePrePost}`;
 
-  if (!res.ok) {
-    throw new Error(`Yahoo Finance ${interval} HTTP ${res.status}`);
+    try {
+      const res = await fetch(url, {
+        headers: YAHOO_GAIA_HEADERS,
+        cache: "no-store",
+        signal,
+      });
+
+      if (!res.ok) {
+        lastStatus = res.status;
+        console.warn(`[/api/gaia] Yahoo ${host} ${yahooSymbol} ${interval} HTTP ${res.status}`);
+        continue;
+      }
+
+      json = await res.json();
+      if (json?.chart?.result?.[0]) {
+        break;
+      }
+    } catch (err) {
+      lastErrMsg = err instanceof Error ? err.message : String(err);
+      if (signal?.aborted) throw err;
+      console.warn(`[/api/gaia] Yahoo ${host} ${yahooSymbol} ${interval} fetch error: ${lastErrMsg}`);
+    }
   }
 
-  const json = await res.json();
+  if (!json?.chart?.result?.[0]) {
+    throw new Error(
+      lastStatus > 0
+        ? `Yahoo Finance ${interval} HTTP ${lastStatus}`
+        : `Yahoo Finance ${interval} unavailable (${lastErrMsg || "empty response"})`
+    );
+  }
+
   const result = json?.chart?.result?.[0];
   const timestamps: number[] = result?.timestamp ?? [];
   const quote = result?.indicators?.quote?.[0] ?? {};
@@ -221,10 +293,24 @@ async function fetchYahooSeries(
 
   const bars: RawYahooBar[] = [];
   for (let i = 0; i < timestamps.length; i++) {
-    const c = closes[i];
-    const o = opens[i];
-    const h = highs[i];
-    const l = lows[i];
+    let c = closes[i];
+    let o = opens[i];
+    let h = highs[i];
+    let l = lows[i];
+    // Preserve active forming 5m bar if Yahoo quotes regularMarketPrice while trailing slot is still null
+    if (
+      interval === "5m" &&
+      i === timestamps.length - 1 &&
+      (c === null || c === undefined) &&
+      typeof result?.meta?.regularMarketPrice === "number" &&
+      result.meta.regularMarketPrice > 0
+    ) {
+      const rmp = Number(result.meta.regularMarketPrice);
+      c = rmp;
+      o = o ?? rmp;
+      h = h != null ? Math.max(h, rmp) : rmp;
+      l = l != null ? Math.min(l, rmp) : rmp;
+    }
     if (
       c === null ||
       c === undefined ||
@@ -238,16 +324,8 @@ async function fetchYahooSeries(
       continue;
     }
     const ts = timestamps[i];
-    const etTime = formatEtTime(ts);
     if (interval === "5m") {
-      const d = new Date(ts * 1000);
-      const etTime24 = d.toLocaleTimeString("en-US", {
-        timeZone: "America/New_York",
-        hour12: false,
-        hourCycle: "h23",
-      });
-      const [hNumRaw, mNum] = etTime24.split(":").map(Number);
-      const hNum = hNumRaw % 24;
+      const { hNum, mNum } = getEtHourMinute24(ts);
       if (startHour === 0) {
         // 24-hour ET window (00:00 – 23:59 ET): keep all extended-hours + RTH 5m bars
       } else if (startHour === 9) {
@@ -271,7 +349,7 @@ async function fetchYahooSeries(
     bars.push({
       ts,
       etDate: formatEtDate(ts),
-      etTime,
+      etTime: formatEtTime(ts),
       open: Number(o),
       high: Number(h),
       low: Number(l),
@@ -280,6 +358,44 @@ async function fetchYahooSeries(
   }
 
   return bars;
+}
+
+async function fetchCachedMtfSeries(
+  yahooSymbol: string,
+  interval: string,
+  range: string,
+  ttlMs: number,
+  required: boolean,
+  signal?: AbortSignal
+): Promise<RawYahooBar[]> {
+  const key = `${yahooSymbol}:${interval}:${range}`;
+  const cached = mtfSeriesCache.get(key);
+  if (cached && Date.now() - cached.tsMs < ttlMs) {
+    return cached.bars;
+  }
+  try {
+    const bars = await fetchYahooSeries(yahooSymbol, interval, range, false, 0, signal);
+    if (bars.length > 0) {
+      mtfSeriesCache.set(key, { tsMs: Date.now(), bars });
+      return bars;
+    }
+    if (cached) return cached.bars;
+    return [];
+  } catch (err) {
+    if (cached) {
+      console.warn(
+        `[/api/gaia] Using cached ${interval} bars for ${yahooSymbol} after transient error:`,
+        err instanceof Error ? err.message : String(err)
+      );
+      return cached.bars;
+    }
+    if (required) throw err;
+    console.warn(
+      `[/api/gaia] Non-fatal ${interval} MTF fetch error for ${yahooSymbol}:`,
+      err instanceof Error ? err.message : String(err)
+    );
+    return [];
+  }
 }
 
 function pairHourlyInto2Hr(bars60m: RawYahooBar[]): RawYahooBar[] {
@@ -305,7 +421,8 @@ async function fetchLiveOptionsBuckets(
   referenceSpot: number,
   priorClose: number,
   latestSessionDate: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  preFetchedTick?: LiveTickResponse | null
 ): Promise<{
   dataSource: "TRADIER_LIVE" | "CBOE_MARKET_DATA";
   spotPrice: number;
@@ -316,31 +433,13 @@ async function fetchLiveOptionsBuckets(
   has0DteActive: boolean;
   expirations: GaiaExpirationInfo[];
   buckets: GaiaStrikeExpBucket[];
+  isStaleFallback: boolean;
 }> {
-  const cboeSymbol = mapCboeSymbol(ticker);
-  const url = `https://cdn-api.cboe.com/api/global/delayed_quotes/options/${cboeSymbol}.json`;
-
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json, text/plain, */*",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      Referer: "https://www.cboe.com/",
-      Origin: "https://www.cboe.com",
-    },
-    cache: "no-store",
+  const cboeResult = await fetchCboeDelayedChain(ticker, {
     signal,
+    allowStaleFallback: true,
   });
-
-  if (!response.ok) {
-    throw new Error(`Live CBOE options feed HTTP ${response.status}`);
-  }
-
-  const json = await response.json();
-  const data = json?.data;
-  if (!data || !Array.isArray(data.options) || data.options.length === 0) {
-    throw new Error("Live CBOE options feed returned empty option chain");
-  }
+  const data = cboeResult.data;
 
   const marketOpenNow = isMarketOpen().open;
   // Match /api/options identically: outside RTH, anchor frozen 4:00 PM option chain to official RTH close (data.close)
@@ -355,7 +454,10 @@ async function fetchLiveOptionsBuckets(
     try {
       const sym = ticker.trim().toUpperCase();
       const mapped = sym === "SPXW" ? "SPX" : sym === "NDXP" ? "NDX" : sym;
-      const tick = await fetchLiveTickQuote(mapped).catch(() => null);
+      const tick =
+        preFetchedTick !== undefined
+          ? preFetchedTick
+          : await fetchLiveTickQuote(mapped).catch(() => null);
       if (tick && tick.spot > 0 && Number.isFinite(tick.spot)) {
         liveSpot = Number(tick.spot.toFixed(2));
       }
@@ -657,12 +759,16 @@ async function fetchLiveOptionsBuckets(
     has0DteActive: hasZeroDte,
     expirations,
     buckets,
+    isStaleFallback: cboeResult.isStaleFallback,
   };
 }
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
-  const requestedSession = (searchParams.get("session") ?? "").trim();
+  const rawRequestedSession = (searchParams.get("session") ?? "").trim();
+  const todayEt = getTodayEt();
+  const requestedSession =
+    rawRequestedSession === todayEt ? "" : rawRequestedSession;
   const rawStart = (searchParams.get("start") ?? searchParams.get("startHour") ?? "0").trim().toLowerCase();
   const startHour =
     rawStart === "9:30" || rawStart === "9.5" || rawStart === "9"
@@ -679,7 +785,9 @@ export async function GET(request: NextRequest) {
 
   const cached = gaiaShortCache.get(cacheKey);
   if (cached && Date.now() - cached.tsMs < GAIA_SHORT_CACHE_MS) {
-    return NextResponse.json(cached.payload);
+    return NextResponse.json(cached.payload, {
+      headers: { "Cache-Control": "no-store, max-age=0" },
+    });
   }
 
   let pending = gaiaInFlight.get(cacheKey);
@@ -689,15 +797,21 @@ export async function GET(request: NextRequest) {
     let createdPromise: Promise<GaiaCoalescedResult> | undefined;
     createdPromise = (async (): Promise<GaiaCoalescedResult> => {
       try {
-        // Fetch live multi-timeframe candle series from Yahoo Finance in parallel
-        // 5m series includes pre-market starting from 7:00 AM ET (or 8:00 AM / 9:30 AM if requested)
-        const [bars5mRaw, bars30mRaw, bars60mRaw, bars1dRaw, bars1wkRaw] =
+        const marketOpenNow = isMarketOpen().open;
+        const tickSym =
+          ticker === "SPXW" ? "SPX" : ticker === "NDXP" ? "NDX" : ticker;
+
+        // Fetch live 5m series + cached higher-timeframe MTF series + live RTH tick in parallel
+        const [bars5mRaw, bars30mRaw, bars60mRaw, bars1dRaw, bars1wkRaw, liveTick] =
           await Promise.all([
             fetchYahooSeries(yahooSymbol, "5m", "1mo", true, startHour, controller.signal),
-            fetchYahooSeries(yahooSymbol, "30m", "1mo", false, 0, controller.signal),
-            fetchYahooSeries(yahooSymbol, "60m", "3mo", false, 0, controller.signal),
-            fetchYahooSeries(yahooSymbol, "1d", "6mo", false, 0, controller.signal),
-            fetchYahooSeries(yahooSymbol, "1wk", "2y", false, 0, controller.signal),
+            fetchCachedMtfSeries(yahooSymbol, "30m", "1mo", 45_000, false, controller.signal),
+            fetchCachedMtfSeries(yahooSymbol, "60m", "3mo", 60_000, false, controller.signal),
+            fetchCachedMtfSeries(yahooSymbol, "1d", "6mo", 120_000, true, controller.signal),
+            fetchCachedMtfSeries(yahooSymbol, "1wk", "2y", 300_000, false, controller.signal),
+            marketOpenNow && !requestedSession
+              ? fetchLiveTickQuote(tickSym).catch(() => null)
+              : Promise.resolve(null),
           ]);
 
         if (bars5mRaw.length === 0 || bars1dRaw.length === 0) {
@@ -712,6 +826,12 @@ export async function GET(request: NextRequest) {
       .reverse()
       .slice(0, 10);
 
+    // Ensure today's active RTH session is represented even right at the 09:30 AM ET bell
+    if (marketOpenNow && !sessionDatesDesc.includes(todayEt)) {
+      sessionDatesDesc.unshift(todayEt);
+      if (sessionDatesDesc.length > 10) sessionDatesDesc.length = 10;
+    }
+
     const sessions: GaiaSessionOption[] = sessionDatesDesc.map((iso) => ({
       isoDate: iso,
       bookLabel: formatBookLabel(iso),
@@ -725,7 +845,7 @@ export async function GET(request: NextRequest) {
     const activeSessionObj =
       sessions.find((s) => s.isoDate === activeSessionDate) ?? sessions[0];
 
-    // Backfill missing 5m extended-hours buckets (00:00–24:00 ET) from recorded intraday history
+    // Backfill missing 5m extended-hours / RTH buckets from recorded intraday history
     const extPoints = getMergedIntradayHistory(ticker, activeSessionDate);
     let bars5mWithExt = bars5mRaw;
     if (extPoints.length > 0) {
@@ -763,6 +883,59 @@ export async function GET(request: NextRequest) {
           close: Number(ohlc.close.toFixed(2)),
         }));
         bars5mWithExt = [...bars5mRaw, ...backfilledBars].sort((a, b) => a.ts - b.ts);
+      }
+    }
+
+    // Append or update the active forming 5m bar through the current ET minute strictly during RTH
+    if (
+      marketOpenNow &&
+      activeSessionDate === todayEt &&
+      liveTick &&
+      liveTick.spot > 0 &&
+      Number.isFinite(liveTick.spot)
+    ) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const nowMinsEt = getEtMinutesFromTs(nowSec);
+      const bounds = getSessionBoundsEt(todayEt);
+      const minAllowed = startHour === 9 ? bounds.rthOpenMins : startHour >= 7 ? startHour * 60 : 0;
+      const maxAllowed = startHour === 0 ? 1440 : bounds.rthCloseMins;
+      if (nowMinsEt >= minAllowed && nowMinsEt < maxAllowed) {
+        const curBucketTs = Math.floor(nowSec / 300) * 300;
+        const liveP = Number(liveTick.spot.toFixed(2));
+        const cloned = [...bars5mWithExt];
+        let matchedIdx = -1;
+        for (let i = cloned.length - 1; i >= 0; i--) {
+          if (cloned[i].etDate !== activeSessionDate) break;
+          if (Math.floor(cloned[i].ts / 300) * 300 === curBucketTs) {
+            matchedIdx = i;
+            break;
+          }
+        }
+        if (matchedIdx >= 0) {
+          const cur = cloned[matchedIdx];
+          cloned[matchedIdx] = {
+            ...cur,
+            high: Number(Math.max(cur.high, liveP).toFixed(2)),
+            low: Number(Math.min(cur.low, liveP).toFixed(2)),
+            close: liveP,
+          };
+          bars5mWithExt = cloned;
+        } else {
+          const lastToday = [...cloned].reverse().find((b) => b.etDate === activeSessionDate);
+          if (!lastToday || curBucketTs > lastToday.ts) {
+            cloned.push({
+              ts: curBucketTs,
+              etDate: todayEt,
+              etTime: formatEtTime(curBucketTs),
+              open: liveP,
+              high: liveP,
+              low: liveP,
+              close: liveP,
+            });
+            cloned.sort((a, b) => a.ts - b.ts);
+            bars5mWithExt = cloned;
+          }
+        }
       }
     }
 
@@ -937,15 +1110,41 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    // Fetch live options chain book from CBOE
+    // Fetch live options chain book from CBOE (falling back to cached book if CBOE transiently hiccups so candles never freeze)
     const lastSessionClose = candles[candles.length - 1].close;
-    const liveBook = await fetchLiveOptionsBuckets(
-      ticker,
-      lastSessionClose,
-      priorClose,
-      sessionDatesDesc[0],
-      controller.signal
-    );
+    let liveBook: Awaited<ReturnType<typeof fetchLiveOptionsBuckets>>;
+    try {
+      liveBook = await fetchLiveOptionsBuckets(
+        ticker,
+        lastSessionClose,
+        priorClose,
+        sessionDatesDesc[0],
+        controller.signal,
+        liveTick
+      );
+    } catch (cboeErr) {
+      const prevGaia = gaiaShortCache.get(cacheKey)?.payload;
+      if (prevGaia && prevGaia.optionBuckets.length > 0) {
+        console.warn(
+          `[/api/gaia] Keeping fresh candles for ${ticker} with cached option book after transient CBOE error:`,
+          cboeErr instanceof Error ? cboeErr.message : String(cboeErr)
+        );
+        liveBook = {
+          dataSource: prevGaia.dataSource,
+          spotPrice: liveTick?.spot && liveTick.spot > 0 ? Number(liveTick.spot.toFixed(2)) : lastSessionClose,
+          impliedVolatility: prevGaia.impliedVolatility,
+          sigma1Move: prevGaia.sigma1Move,
+          sigma2Move: prevGaia.sigma2Move,
+          strikeStep: prevGaia.strikeStep,
+          has0DteActive: prevGaia.has0DteActive,
+          expirations: prevGaia.expirations,
+          buckets: prevGaia.optionBuckets,
+          isStaleFallback: true,
+        };
+      } else {
+        throw cboeErr;
+      }
+    }
 
     const payload: GaiaLivePayload = {
       ticker,
@@ -965,6 +1164,9 @@ export async function GET(request: NextRequest) {
       pivotSignals5m,
       mtfByBar,
       optionBuckets: liveBook.buckets,
+      isStale: Boolean(liveBook.isStaleFallback),
+      marketOpen: marketOpenNow,
+      lastUpdated: new Date().toISOString(),
     };
 
       return { ok: true, payload };
@@ -984,32 +1186,43 @@ export async function GET(request: NextRequest) {
     if (!result.ok) {
       const staleFallback = gaiaShortCache.get(cacheKey);
       if (staleFallback) {
-        return NextResponse.json(staleFallback.payload, {
+        return NextResponse.json(
+          { ...staleFallback.payload, isStale: true, marketOpen: isMarketOpen().open },
+          {
+            headers: {
+              "X-Hyperion-Data-Status": "STALE_SYNCING",
+              "Cache-Control": "no-store, max-age=0",
+            },
+          }
+        );
+      }
+      return NextResponse.json(
+        { error: result.error },
+        { status: result.status, headers: { "Cache-Control": "no-store, max-age=0" } }
+      );
+    }
+    gaiaShortCache.set(cacheKey, { tsMs: Date.now(), payload: result.payload });
+    return NextResponse.json(result.payload, {
+      headers: { "Cache-Control": "no-store, max-age=0" },
+    });
+  } catch (err) {
+    const staleFallback = gaiaShortCache.get(cacheKey);
+    if (staleFallback) {
+      return NextResponse.json(
+        { ...staleFallback.payload, isStale: true, marketOpen: isMarketOpen().open },
+        {
           headers: {
             "X-Hyperion-Data-Status": "STALE_SYNCING",
             "Cache-Control": "no-store, max-age=0",
           },
-        });
-      }
-      return NextResponse.json({ error: result.error }, { status: result.status });
-    }
-    gaiaShortCache.set(cacheKey, { tsMs: Date.now(), payload: result.payload });
-    return NextResponse.json(result.payload);
-  } catch (err) {
-    const staleFallback = gaiaShortCache.get(cacheKey);
-    if (staleFallback) {
-      return NextResponse.json(staleFallback.payload, {
-        headers: {
-          "X-Hyperion-Data-Status": "STALE_SYNCING",
-          "Cache-Control": "no-store, max-age=0",
-        },
-      });
+        }
+      );
     }
     const message =
       err instanceof Error ? err.message : "Live market feed error";
     return NextResponse.json(
       { error: `Live Gaia feed unavailable for ${ticker}: ${message}` },
-      { status: 502 }
+      { status: 502, headers: { "Cache-Control": "no-store, max-age=0" } }
     );
   } finally {
     if (gaiaInFlight.get(cacheKey) === pending) {

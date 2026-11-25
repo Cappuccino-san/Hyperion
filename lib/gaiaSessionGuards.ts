@@ -154,8 +154,34 @@ export interface SessionBoundsEt {
   rthCloseMins: number;
 }
 
+const ET_DATE_WEEKDAY_FMT = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  weekday: "short",
+});
+
+export function getEtDateAndWeekday(now: Date = new Date()): {
+  etDate: string;
+  weekday: string;
+} {
+  const parts = ET_DATE_WEEKDAY_FMT.formatToParts(now);
+  let y = "1970";
+  let m = "01";
+  let d = "01";
+  let wd = "Mon";
+  for (const p of parts) {
+    if (p.type === "year") y = p.value;
+    else if (p.type === "month") m = p.value;
+    else if (p.type === "day") d = p.value;
+    else if (p.type === "weekday") wd = p.value;
+  }
+  return { etDate: `${y}-${m}-${d}`, weekday: wd };
+}
+
 export function getTodayEt(now: Date = new Date()): string {
-  return now.toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+  return getEtDateAndWeekday(now).etDate;
 }
 
 /**

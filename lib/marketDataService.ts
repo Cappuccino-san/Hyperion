@@ -12,7 +12,7 @@
 
 import {
   getSessionBoundsEt,
-  getTodayEt,
+  getEtDateAndWeekday,
   etMinutesOfDay,
 } from "@/lib/gaiaSessionGuards";
 
@@ -64,13 +64,11 @@ export function isMarketOpen(nowEt?: Date): { open: boolean; reason?: string } {
   let weekdayStr = "";
   let dateIso = "";
   try {
-    weekdayStr = new Intl.DateTimeFormat("en-US", {
-      timeZone: "America/New_York",
-      weekday: "short",
-    }).format(d);
-    dateIso = getTodayEt(d);
+    const resolved = getEtDateAndWeekday(d);
+    weekdayStr = resolved.weekday;
+    dateIso = resolved.etDate;
   } catch {
-    const wd = d.getDay();
+    const wd = d.getUTCDay();
     weekdayStr = wd === 0 ? "Sun" : wd === 6 ? "Sat" : "Mon";
     dateIso = "";
   }
