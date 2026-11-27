@@ -46,6 +46,10 @@ export interface ProfitRatchetInput {
   onFavorableSideOfVwap?: boolean;
   /** True to evaluate ratchet floor strictly on confirmed 5m bar close rather than intra-bar wicks/ticks */
   evaluateOnCloseOnly?: boolean;
+  /** Peak favorable spot MFE % recorded strictly prior to bar t (< t) */
+  prevPeakSpotMfePct?: number;
+  /** Running peak favorable spot MFE % through bar t */
+  peakSpotMfePct?: number;
 }
 
 export interface ProfitRatchetEvaluation {
@@ -71,9 +75,14 @@ export function resolveRatchetFloorForPeak(params: {
   chi: number;
   netFluxJ: number;
   isAlignedTrendRegime?: boolean;
+  peakSpotMfePct?: number;
 }): { tier: ProfitRatchetTier; floorPct: number | null } {
-  const { peakOptionPnlPct, isCall, chi, netFluxJ, isAlignedTrendRegime } = params;
+  const { peakOptionPnlPct, isCall, chi, netFluxJ, isAlignedTrendRegime, peakSpotMfePct } = params;
   const peak = Number.isFinite(peakOptionPnlPct) ? peakOptionPnlPct : 0;
+  const hasRealSpotMfeFor60 =
+    typeof peakSpotMfePct !== "number" ||
+    !Number.isFinite(peakSpotMfePct) ||
+    peakSpotMfePct >= 0.25;
 
   const isExtremeRunner =
     (isCall ? chi >= 0.88 && netFluxJ > 0 : chi <= 0.12 && netFluxJ < 0);
@@ -83,7 +92,7 @@ export function resolveRatchetFloorForPeak(params: {
       const floorPct = Number(Math.max(55, peak - 40).toFixed(2));
       return { tier: "RUNNER_TRAIL_100", floorPct };
     }
-    if (peak >= 65) {
+    if (peak >= 65 && hasRealSpotMfeFor60) {
       return { tier: "PROFIT_LOCK_60", floorPct: 15 };
     }
     return { tier: "NONE", floorPct: null };
@@ -124,6 +133,8 @@ export function evaluateOptionProfitRatchet(
     heldMinutes,
     onFavorableSideOfVwap,
     evaluateOnCloseOnly,
+    prevPeakSpotMfePct,
+    peakSpotMfePct,
   } = input;
 
   // Step 1: Resolve standing ratchet floor armed strictly BEFORE bar t (bars < t)
@@ -133,14 +144,18 @@ export function evaluateOptionProfitRatchet(
     chi,
     netFluxJ,
     isAlignedTrendRegime,
+    peakSpotMfePct: prevPeakSpotMfePct ?? peakSpotMfePct,
   });
 
   // Step 2: Pessimistic intrabar check — test adverse extreme against standing floor FIRST
   const openingShieldActive =
-    standing.tier === "BREAKEVEN_30" &&
+    (standing.tier === "BREAKEVEN_30" ||
+      (standing.tier === "PROFIT_LOCK_60" &&
+        (Boolean(isAlignedTrendRegime) || closeOptionPnlPct <= 0))) &&
     typeof heldMinutes === "number" &&
     heldMinutes < 15 &&
-    onFavorableSideOfVwap === true;
+    onFavorableSideOfVwap === true &&
+    !fluxFlippedAgainst;
   const evalPnlPct = evaluateOnCloseOnly ? closeOptionPnlPct : adverseOptionPnlPct;
 
   if (!openingShieldActive && standing.floorPct !== null && evalPnlPct <= standing.floorPct) {
@@ -181,6 +196,7 @@ export function evaluateOptionProfitRatchet(
     chi,
     netFluxJ,
     isAlignedTrendRegime,
+    peakSpotMfePct,
   });
 
   // Step 4: Flux-Flip MFE Harvest on confirmed closed bar (once peak >= +50% and netFluxJ flips)

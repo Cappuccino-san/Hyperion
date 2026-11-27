@@ -11,7 +11,7 @@ import {
   scoreSetupExpectancy,
 } from "@/lib/alphaScorer";
 import { getSessionBoundsEt, getTodayEt } from "@/lib/gaiaSessionGuards";
-import { readAlphaPriorsSync } from "@/lib/persistenceStore";
+import { readAlphaPriorsSync, readIntradayStoreSync } from "@/lib/persistenceStore";
 import {
   type ContractType,
   type DailyTradeStore,
@@ -22,7 +22,9 @@ import {
   isSupportedTradeTicker,
 } from "@/lib/execution/types";
 import {
+  MIN_REALISTIC_OPTION_IV,
   clampToCandleRange,
+  computeRemainingYearsForExpirationIso,
   computeRemainingYearsToExpiration,
   fetchLive5mCandleAndDivergence,
   fetchLiveCboeOptions,
@@ -32,6 +34,7 @@ import {
   getContractMidPrice,
   getNowEtTime,
   repriceOptionBS,
+  repriceOptionBSExact,
   solveImpliedVol,
 } from "@/lib/execution/optionPricing";
 import {
@@ -268,14 +271,48 @@ async function backfillIntradaySessionSignals(
       if (spyChain.length > 0) baseContracts = spyChain;
     }
 
+    const nowEtCheck = getNowEtTime(new Date());
+    const isPostCloseBackfill = nowEtCheck.totalMinutes >= sessionBounds.rthCloseMins;
+    const intraTicker = isPostCloseBackfill
+      ? readIntradayStoreSync(latestSessionDate)?.tickers?.[normalizedTicker]
+      : undefined;
+    const rawIntraPts = intraTicker?.rthHistory?.length
+      ? intraTicker.rthHistory
+      : intraTicker?.history ?? [];
+    const validRthWallSnaps = isPostCloseBackfill
+      ? rawIntraPts.filter((p) => {
+          if (!p || !(p.ts > 0) || !(p.spot > 0)) return false;
+          const ptEt = getNowEtTime(new Date(p.ts * 1000));
+          const cw = p.callWall ?? p.cw ?? 0;
+          const pw = p.putWall ?? p.pw ?? 0;
+          return (
+            ptEt.totalMinutes >= sessionBounds.rthOpenMins &&
+            ptEt.totalMinutes < sessionBounds.rthCloseMins &&
+            cw > pw &&
+            pw > 0 &&
+            (cw - pw) / p.spot <= 0.03
+          );
+        })
+      : [];
+    const anchorRthSnap = validRthWallSnaps[0];
+    const resolvedBackfillCw = anchorRthSnap
+      ? (anchorRthSnap.callWall ?? anchorRthSnap.cw ?? params.callWall)
+      : params.callWall;
+    const resolvedBackfillPw = anchorRthSnap
+      ? (anchorRthSnap.putWall ?? anchorRthSnap.pw ?? params.putWall)
+      : params.putWall;
+    const resolvedBackfillZg = anchorRthSnap
+      ? (anchorRthSnap.zeroGamma ?? anchorRthSnap.zg ?? params.zeroGamma)
+      : params.zeroGamma;
+
     const backfillStructuralNodes: StructuralFlowNodes | undefined =
-      (params.putWall && params.putWall > 0) ||
-      (params.callWall && params.callWall > 0) ||
-      (params.zeroGamma && params.zeroGamma > 0)
+      (resolvedBackfillPw && resolvedBackfillPw > 0) ||
+      (resolvedBackfillCw && resolvedBackfillCw > 0) ||
+      (resolvedBackfillZg && resolvedBackfillZg > 0)
         ? {
-            floorNode: params.putWall && params.putWall > 0 ? params.putWall : undefined,
-            ceilingNode: params.callWall && params.callWall > 0 ? params.callWall : undefined,
-            zeroGamma: params.zeroGamma && params.zeroGamma > 0 ? params.zeroGamma : undefined,
+            floorNode: resolvedBackfillPw && resolvedBackfillPw > 0 ? resolvedBackfillPw : undefined,
+            ceilingNode: resolvedBackfillCw && resolvedBackfillCw > 0 ? resolvedBackfillCw : undefined,
+            zeroGamma: resolvedBackfillZg && resolvedBackfillZg > 0 ? resolvedBackfillZg : undefined,
             netGex: typeof params.netGex === "number" ? params.netGex : undefined,
           }
         : undefined;
@@ -312,17 +349,38 @@ async function backfillIntradaySessionSignals(
       runningSessionHigh = Math.max(runningSessionHigh, bar.high);
       runningSliceLow = Math.min(runningSliceLow, bar.low);
 
-      const effectiveDailyLow =
-        params.dailyExpectedMove?.low &&
-        Math.abs(runningOpeningLow - params.dailyExpectedMove.low) / Math.max(1, runningOpeningLow) <= 0.008
+      let causalRthSnap = anchorRthSnap;
+      if (validRthWallSnaps.length > 0) {
+        for (const pt of validRthWallSnaps) {
+          if (pt.ts <= bar.ts) causalRthSnap = pt;
+          else break;
+        }
+      }
+      const barCw = causalRthSnap
+        ? (causalRthSnap.callWall ?? causalRthSnap.cw ?? resolvedBackfillCw)
+        : resolvedBackfillCw;
+      const barPw = causalRthSnap
+        ? (causalRthSnap.putWall ?? causalRthSnap.pw ?? resolvedBackfillPw)
+        : resolvedBackfillPw;
+      const barZg = causalRthSnap
+        ? (causalRthSnap.zeroGamma ?? causalRthSnap.zg ?? resolvedBackfillZg)
+        : resolvedBackfillZg;
+      const barKing = causalRthSnap?.king;
+
+      const effectiveDailyLow = anchorRthSnap
+        ? runningOpeningLow
+        : params.dailyExpectedMove?.low &&
+            Math.abs(runningOpeningLow - params.dailyExpectedMove.low) / Math.max(1, runningOpeningLow) <= 0.008
           ? Math.max(runningOpeningLow, params.dailyExpectedMove.low)
           : runningOpeningLow;
-      const effectiveDailyHigh = Math.max(
-        runningSessionHigh,
-        params.filteredKing ?? 0,
-        params.dailyExpectedMove?.high ?? 0,
-        Number((runningOpeningLow * 1.0065).toFixed(2))
-      );
+      const effectiveDailyHigh = anchorRthSnap
+        ? Math.max(runningSessionHigh, Number((runningOpeningLow * 1.0065).toFixed(2)))
+        : Math.max(
+            runningSessionHigh,
+            params.filteredKing ?? 0,
+            params.dailyExpectedMove?.high ?? 0,
+            Number((runningOpeningLow * 1.0065).toFixed(2))
+          );
       const barDate = new Date(bar.ts * 1000);
 
       const latestStore = loadTradeStore();
@@ -380,8 +438,11 @@ async function backfillIntradaySessionSignals(
           typeof c.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(c.expiration)
             ? c.expiration
             : latestSessionDate;
+        const isIsoExp = typeof c.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(c.expiration);
         const dte = Math.max(0, formatExpirationHuman(expStr, latestSessionDate).dte);
-        const tRemaining = computeRemainingYearsToExpiration(barDate.getTime(), dte);
+        const tRemaining = isIsoExp
+          ? computeRemainingYearsForExpirationIso(barDate.getTime(), expStr)
+          : computeRemainingYearsToExpiration(barDate.getTime(), dte);
         const rawChainIv =
           typeof c.iv === "number" && Number.isFinite(c.iv) && c.iv > 0
             ? c.iv > 4
@@ -396,16 +457,19 @@ async function backfillIntradaySessionSignals(
           isCallOpt === (openPos.contractType === "CALL")
         ) {
           const entryAskRef = openPos.optionAsk || openPos.btoOptionMid || 0.45;
+          const entryMidRef = openPos.btoOptionMid || entryAskRef;
           const tEntry =
             typeof openPos.entryTYears === "number" && openPos.entryTYears > 0
               ? openPos.entryTYears
-              : computeRemainingYearsToExpiration((openPos.openedTs || bar.ts) * 1000, dte);
+              : isIsoExp
+                ? computeRemainingYearsForExpirationIso((openPos.openedTs || bar.ts) * 1000, expStr)
+                : computeRemainingYearsToExpiration((openPos.openedTs || bar.ts) * 1000, dte);
           const anchorIv =
-            typeof openPos.entryIv === "number" && openPos.entryIv >= 0.04
+            typeof openPos.entryIv === "number" && openPos.entryIv >= MIN_REALISTIC_OPTION_IV
               ? openPos.entryIv
-              : rawChainIv >= 0.04 && rawChainIv <= 2.5
+              : rawChainIv >= MIN_REALISTIC_OPTION_IV && rawChainIv <= 2.5
                 ? rawChainIv
-                : solveImpliedVol(entryAskRef, openPos.btoSpotPrice, openPos.strike, tEntry, isCallOpt);
+                : solveImpliedVol(entryMidRef, openPos.btoSpotPrice, openPos.strike, tEntry, isCallOpt);
           const bsEntryCheck = repriceOptionBS(
             openPos.btoSpotPrice,
             openPos.strike,
@@ -413,14 +477,35 @@ async function backfillIntradaySessionSignals(
             anchorIv,
             isCallOpt
           );
-          const effectiveIv =
-            Math.abs(bsEntryCheck - entryAskRef) > entryAskRef * 0.15
-              ? solveImpliedVol(entryAskRef, openPos.btoSpotPrice, openPos.strike, tEntry, isCallOpt)
+          const rawEffectiveIv =
+            Math.abs(bsEntryCheck - entryMidRef) > entryMidRef * 0.15
+              ? solveImpliedVol(entryMidRef, openPos.btoSpotPrice, openPos.strike, tEntry, isCallOpt)
               : anchorIv;
-          const curEstMid = repriceOptionBS(refSpotForChain, openPos.strike, tRemaining, effectiveIv, isCallOpt);
+          const effectiveIv = Math.max(MIN_REALISTIC_OPTION_IV, rawEffectiveIv);
+          const bsEntryAtEffIv = repriceOptionBSExact(
+            openPos.btoSpotPrice,
+            openPos.strike,
+            tEntry,
+            effectiveIv,
+            isCallOpt
+          );
+          const bsAtBar = repriceOptionBSExact(
+            refSpotForChain,
+            openPos.strike,
+            tRemaining,
+            effectiveIv,
+            isCallOpt
+          );
+          const rawEstMid =
+            bsEntryAtEffIv > entryMidRef * 1.05
+              ? entryMidRef * (bsAtBar / Math.max(0.01, bsEntryAtEffIv))
+              : entryMidRef + (bsAtBar - bsEntryAtEffIv);
+          const curEstMid = Number(Math.max(0.01, rawEstMid).toFixed(2));
           const halfSpread =
-            c.bid && c.ask && c.ask > c.bid
-              ? Math.max(0.01, Number(((c.ask - c.bid) / 2).toFixed(2)))
+            typeof openPos.optionAsk === "number" &&
+            typeof openPos.optionBid === "number" &&
+            openPos.optionAsk >= openPos.optionBid
+              ? Math.max(0.01, Number(((openPos.optionAsk - openPos.optionBid) / 2).toFixed(2)))
               : 0.01;
           bid = Math.max(0.01, Number((curEstMid - halfSpread).toFixed(2)));
           ask = Number(Math.max(bid + 0.01, curEstMid + halfSpread).toFixed(2));
@@ -467,6 +552,21 @@ async function backfillIntradaySessionSignals(
 
       await evaluateTradeSignals({
         ...params,
+        ...(causalRthSnap
+          ? {
+              callWall: barCw,
+              putWall: barPw,
+              zeroGamma: barZg,
+              zeroDteCallWall: barCw,
+              zeroDtePutWall: barPw,
+              zeroDteZeroGamma: barZg,
+              filteredKing:
+                barKing && Math.abs(barKing - evalSpot) / Math.max(1, evalSpot) <= 0.015
+                  ? barKing
+                  : undefined,
+              allExpKing: barKing || params.allExpKing,
+            }
+          : {}),
         ticker: normalizedTicker,
         spotPrice: evalSpot,
         prevSpotPrice: prevBar.close,
@@ -492,6 +592,7 @@ async function backfillIntradaySessionSignals(
         dataSource: "BACKFILL",
         contractsAlreadyAnchored: true,
         nowEt: barDate,
+        webhookUrl: undefined,
         isHistoricalBackfill: true,
       });
     }
@@ -543,13 +644,22 @@ export async function evaluateTradeSignals(
   const preFetchBounds = getSessionBoundsEt(preFetchSessionDate);
   const preFetchEt = getNowEtTime(preFetchDate);
   const hasStoredPos = Boolean(store.activePositions[normalizedTicker] || store.activePositions[positionKey]);
-  if (preFetchEt.totalMinutes >= preFetchBounds.rthCloseMins && !hasStoredPos) {
+  const needsSameDayBackfill =
+    !params.nowEt &&
+    preFetchBounds.isTradingDay &&
+    !store.backfilledTickers?.[normalizedTicker] &&
+    !store.alerts.some((a) => a.ticker === normalizedTicker || a.ticker === positionKey) &&
+    !store.closedPositions.some((p) => p.ticker === normalizedTicker || p.ticker === positionKey);
+  if (preFetchEt.totalMinutes >= preFetchBounds.rthCloseMins && !hasStoredPos && !needsSameDayBackfill) {
     return {
       ticker: normalizedTicker,
       activePosition: null,
       emittedAlerts: [],
       allAlerts: store.alerts,
     };
+  }
+  if (preFetchEt.totalMinutes >= preFetchBounds.rthCloseMins && needsSameDayBackfill) {
+    params = { ...params, webhookUrl: undefined, isHistoricalBackfill: true };
   }
 
   let spotPrice = Number(params.spotPrice.toFixed(2));
@@ -715,7 +825,7 @@ export async function evaluateTradeSignals(
   const isEarlyShakeout =
     closedForTickerEarly.length === 1 &&
     typeof phase1Closed?.pnlOptionPct === "number" &&
-    phase1Closed.pnlOptionPct >= 0 &&
+    phase1Closed.pnlOptionPct >= -5 &&
     phase1Closed.pnlOptionPct < 25 &&
     /RATCHET|BREAKEVEN/i.test(phase1Closed.exitReason || "");
   const isEarlyWinCont =
@@ -857,7 +967,7 @@ export async function evaluateTradeSignals(
   const isLeg1RatchetShakeout =
     sameTickerClosed.length === 1 &&
     typeof lastClosed?.pnlOptionPct === "number" &&
-    lastClosed.pnlOptionPct >= 0 &&
+    lastClosed.pnlOptionPct >= -5 &&
     lastClosed.pnlOptionPct < 25 &&
     /RATCHET|BREAKEVEN/i.test(lastClosed.exitReason || "");
   const isShakeoutRecoveryWindow =

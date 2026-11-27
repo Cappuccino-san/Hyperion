@@ -1193,7 +1193,7 @@ export function evaluateBtoCandidateSetup(input: {
       etTotalMinutes >= 585 &&
       spotPrice > effectiveFlowVwap &&
       spotPrice > effectiveSma34 &&
-      impChi >= 0.72 &&
+      (impChi >= 0.72 || (Math.max(currentChi, impChi) >= 0.65 && impChi >= 0.65)) &&
       impPe >= 1.8 &&
       currentNetFlux > 0 &&
       deltaFlux6 >= 0 &&
@@ -1682,7 +1682,6 @@ export function evaluateBtoCandidateSetup(input: {
     candidateBto &&
     sameTickerClosedCount >= 1 &&
     lastClosed &&
-    !(isShakeoutRecoveryWindow && candidateBto.contractType === lastClosed.contractType) &&
     !(isWinningTrendContinuation && candidateBto.contractType === lastClosed.contractType)
   ) {
     const effectiveDeltaChi6 =

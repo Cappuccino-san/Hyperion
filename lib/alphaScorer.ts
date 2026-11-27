@@ -195,7 +195,7 @@ export function evaluateLeg2StructuralGate(
         ? leg1Trade.pnlOptionPct
         : 0;
   const isRatchetShakeout =
-    leg1PnlPre >= 0 &&
+    leg1PnlPre >= -5 &&
     leg1PnlPre < 25 &&
     /RATCHET|BREAKEVEN/i.test(leg1Trade.exitReason || "");
 
@@ -206,19 +206,32 @@ export function evaluateLeg2StructuralGate(
     const isCallDir = direction === "CALL";
     const hasVwap = typeof flowVwap === "number" && flowVwap > 0;
     const hasSma = typeof sma34 === "number" && sma34 > 0;
+    const effChi =
+      typeof ceilingShareChi === "number" && Number.isFinite(ceilingShareChi)
+        ? ceilingShareChi
+        : impulseChi;
+    const strongAdvectionOverridesZg = isCallDir
+      ? effChi >= 0.65 &&
+        impulseChi >= 0.65 &&
+        impulsePeclet >= 1.8 &&
+        (netFluxJ === undefined || netFluxJ > 0)
+      : effChi <= 0.35 &&
+        impulseChi <= 0.35 &&
+        impulsePeclet <= -1.8 &&
+        (netFluxJ === undefined || netFluxJ < 0);
     const continuationConfirmed = isCallDir
       ? hasVwap &&
         spotPrice > flowVwap &&
         hasSma &&
         spotPrice > sma34 &&
-        (zeroGamma <= 0 || spotPrice > zeroGamma) &&
+        (zeroGamma <= 0 || spotPrice > zeroGamma || strongAdvectionOverridesZg) &&
         impulseChi >= 0.55 &&
         impulsePeclet >= 1.0
       : hasVwap &&
         spotPrice < flowVwap &&
         hasSma &&
         spotPrice < sma34 &&
-        (zeroGamma <= 0 || spotPrice < zeroGamma) &&
+        (zeroGamma <= 0 || spotPrice < zeroGamma || strongAdvectionOverridesZg) &&
         impulseChi <= 0.45 &&
         impulsePeclet <= -1.0;
 
@@ -261,7 +274,7 @@ export function evaluateLeg2StructuralGate(
       : typeof leg1Trade.pnlOptionPct === "number" && Number.isFinite(leg1Trade.pnlOptionPct)
         ? leg1Trade.pnlOptionPct
         : 0;
-  const leg1ClosedAsLoss = leg1Pnl < 0;
+  const leg1ClosedAsLoss = leg1Pnl < 0 && !isRatchetShakeout;
 
   if (leg1ClosedAsLoss) {
     const minCrossDist = Math.max(0.15, spotPrice * 0.0002);

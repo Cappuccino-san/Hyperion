@@ -27,6 +27,9 @@ import {
 
 export { getTodayEt };
 
+export const MIN_SOLVED_OPTION_IV = 0.05;
+export const MIN_REALISTIC_OPTION_IV = 0.065;
+
 /**
  * Inverts Black-Scholes to solve for exact contract Implied Volatility from market mid price.
  */
@@ -44,9 +47,9 @@ export function solveImpliedVol(
   const discountedForwardIntrinsic = isCall
     ? Math.max(0, spot * Math.exp(-q * effectiveT) - strike * Math.exp(-r * effectiveT))
     : Math.max(0, strike * Math.exp(-r * effectiveT) - spot * Math.exp(-q * effectiveT));
-  if (midPrice <= discountedForwardIntrinsic + 1e-4) return 0.04;
+  if (midPrice <= discountedForwardIntrinsic + 1e-4) return MIN_REALISTIC_OPTION_IV;
 
-  let low = 0.02;
+  let low = MIN_SOLVED_OPTION_IV;
   let high = 4.0;
   let iv = 0.25;
 
@@ -252,6 +255,52 @@ export function computeRemainingYearsToExpiration(
 }
 
 /**
+ * Counts actual NYSE trading sessions in (startIso, expIso] so Friday -> Monday = 1 session (not 3).
+ * Returns -1 when expIso < startIso, 0 when expIso === startIso or inputs are invalid.
+ */
+export function countTradingSessionsBetween(startIso: string, expIso: string): number {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startIso) || !/^\d{4}-\d{2}-\d{2}$/.test(expIso)) {
+    return 0;
+  }
+  if (expIso < startIso) return -1;
+  if (expIso === startIso) return 0;
+  const diffDays = diffIsoDays(expIso, startIso);
+  if (diffDays <= 0) return 0;
+  if (diffDays > 60) {
+    return Math.max(1, Math.round((diffDays * 252) / 365));
+  }
+  const [sy, sm, sd] = startIso.split("-").map(Number);
+  const cursor = new Date(Date.UTC(sy, sm - 1, sd, 12, 0, 0));
+  let sessions = 0;
+  const maxSteps = Math.min(400, diffDays);
+  for (let i = 0; i < maxSteps; i++) {
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+    const curIso = cursor.toISOString().slice(0, 10);
+    if (getSessionBoundsEt(curIso).isTradingDay) {
+      sessions++;
+    }
+    if (curIso >= expIso) break;
+  }
+  return sessions;
+}
+
+/**
+ * Computes exact remaining time to expiration in years for an ISO expiration date (YYYY-MM-DD),
+ * counting actual NYSE trading sessions rather than raw calendar weekend days.
+ */
+export function computeRemainingYearsForExpirationIso(
+  timestampMs: number,
+  expIso: string
+): number {
+  const { etDate, remainingIntradayMins } = computeBaseRemainingIntradayMins(timestampMs);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(expIso)) {
+    return remainingYearsFromBaseMins(remainingIntradayMins, 0);
+  }
+  const sessions = countTradingSessionsBetween(etDate, expIso);
+  return remainingYearsFromBaseMins(remainingIntradayMins, Math.max(0, sessions));
+}
+
+/**
  * Dynamically estimates ATM Implied Volatility from intraday realized bar returns
  * scaled by the Variance Risk Premium (VRP).
  */
@@ -439,11 +488,14 @@ export function reanchorDelayedContractsToSpot(params: {
     if (hit) return hit;
     const isIso = typeof exp === "string" && /^\d{4}-\d{2}-\d{2}$/.test(exp);
     const dteNow = isIso ? diffIsoDays(exp, todayIso) : 0;
-    const dteRef = isIso ? Math.max(0, diffIsoDays(exp, refIso)) : Math.max(0, dteNow);
+    const sessionsNow = isIso && dteNow > 0 ? countTradingSessionsBetween(todayIso, exp) : 0;
+    const sessionsRef = isIso
+      ? Math.max(0, countTradingSessionsBetween(refIso, exp))
+      : Math.max(0, sessionsNow);
     const meta = {
       dteNow,
-      tNow: remainingYearsFromBaseMins(nowBase.remainingIntradayMins, Math.max(0, dteNow)),
-      tRef: remainingYearsFromBaseMins(refBase.remainingIntradayMins, Math.max(0, dteRef)),
+      tNow: remainingYearsFromBaseMins(nowBase.remainingIntradayMins, Math.max(0, sessionsNow)),
+      tRef: remainingYearsFromBaseMins(refBase.remainingIntradayMins, Math.max(0, sessionsRef)),
     };
     expMetaCache.set(exp, meta);
     return meta;
@@ -472,7 +524,7 @@ export function reanchorDelayedContractsToSpot(params: {
     const isFarWing =
       referenceSpot > 0 && Math.abs(c.strike - referenceSpot) > referenceSpot * 0.18;
     if (dteNow > 45 || isFarWing) {
-      const leapsIv = rawIv >= 0.04 && rawIv <= 1.8 ? rawIv : fallbackIv;
+      const leapsIv = rawIv >= MIN_REALISTIC_OPTION_IV && rawIv <= 1.8 ? rawIv : fallbackIv;
       return {
         ...c,
         iv: Number(leapsIv.toFixed(4)),
@@ -483,10 +535,10 @@ export function reanchorDelayedContractsToSpot(params: {
     const anchorIv =
       rawMid > 0 && referenceSpot > 0
         ? solveImpliedVol(rawMid, referenceSpot, c.strike, tRef, isCall)
-        : rawIv >= 0.04 && rawIv <= 1.8
+        : rawIv >= MIN_REALISTIC_OPTION_IV && rawIv <= 1.8
           ? rawIv
           : fallbackIv;
-    const contractIv = Math.max(0.04, Math.min(3.5, anchorIv));
+    const contractIv = Math.max(MIN_REALISTIC_OPTION_IV, Math.min(3.5, anchorIv));
 
     const liveGreeks = computeBlackScholesGreeks(liveSpot, c.strike, tNow, contractIv);
     const liveDelta = isCall ? liveGreeks.deltaCall : liveGreeks.deltaPut;

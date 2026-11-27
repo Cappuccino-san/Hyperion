@@ -16,6 +16,8 @@ import { DEFAULT_HARD_OPTION_STOP_LOSS_PCT } from "@/lib/bracketOrderEngine";
 import { MAX_OPTION_DELTA, resolveMinOptionDelta } from "@/lib/positionSizer";
 import type { ContractType, SelectedOptionContract } from "@/lib/execution/types";
 import {
+  MIN_REALISTIC_OPTION_IV,
+  computeRemainingYearsForExpirationIso,
   computeRemainingYearsToExpiration,
   fetchLiveCboeOptions,
   formatEtIsoDate,
@@ -410,7 +412,10 @@ export async function selectSmallAccountContract(params: {
       }
       const totalOutlay = singleContractCents / 100;
 
-      const tYears = computeRemainingYearsToExpiration((nowEt ?? new Date()).getTime(), Math.max(0, dte));
+      const nowEpochMs = (nowEt ?? new Date()).getTime();
+      const tYears = /^\d{4}-\d{2}-\d{2}$/.test(c.expiration)
+        ? computeRemainingYearsForExpirationIso(nowEpochMs, c.expiration)
+        : computeRemainingYearsToExpiration(nowEpochMs, Math.max(0, dte));
       const rawChainIv =
         typeof c.iv === "number" && Number.isFinite(c.iv) && c.iv > 0
           ? c.iv > 4
@@ -421,21 +426,31 @@ export async function selectSmallAccountContract(params: {
       const impliedMidIv = solveImpliedVol(midForIv, effectiveSpot, c.strike, tYears, isCall);
       const impliedAskIv = solveImpliedVol(entryAsk, effectiveSpot, c.strike, tYears, isCall);
       const hasLiveChainIv =
-        c.quoteSource !== "DELAYED_CBOE" && rawChainIv >= 0.04 && rawChainIv <= 2.50;
-      const solvedIv = hasLiveChainIv ? Number(rawChainIv.toFixed(4)) : Number(impliedMidIv.toFixed(4));
+        c.quoteSource !== "DELAYED_CBOE" &&
+        rawChainIv >= MIN_REALISTIC_OPTION_IV &&
+        rawChainIv <= 2.50;
+      const solvedIv = Number(
+        Math.max(MIN_REALISTIC_OPTION_IV, hasLiveChainIv ? rawChainIv : impliedMidIv).toFixed(4)
+      );
       const bsEntryCheck = hasLiveChainIv
         ? repriceOptionBS(effectiveSpot, c.strike, tYears, solvedIv, isCall)
         : entryAsk;
-      const repriceIv =
+      const rawRepriceIv =
         hasLiveChainIv && Math.abs(bsEntryCheck - entryAsk) > Math.max(0.02, entryAsk * 0.10)
           ? impliedAskIv
           : hasLiveChainIv
             ? solvedIv
             : impliedAskIv;
+      const repriceIv = Math.max(MIN_REALISTIC_OPTION_IV, rawRepriceIv);
 
-      const bsTp1Mid = repriceOptionBS(effectiveTarget1, c.strike, tYears * 0.96, repriceIv, isCall);
-      const bsTp2Mid = repriceOptionBS(effectiveTarget2, c.strike, tYears * 0.92, repriceIv, isCall);
-      const bsStopMid = repriceOptionBS(effectiveStopLoss, c.strike, tYears * 0.96, repriceIv, isCall);
+      const bsEntryAnchor = repriceOptionBSExact(effectiveSpot, c.strike, tYears, repriceIv, isCall);
+      const ivFloorOffset = Math.abs(bsEntryAnchor - entryAsk) > 0.02 ? entryAsk - bsEntryAnchor : 0;
+      const bsTp1Raw = repriceOptionBSExact(effectiveTarget1, c.strike, tYears * 0.96, repriceIv, isCall);
+      const bsTp2Raw = repriceOptionBSExact(effectiveTarget2, c.strike, tYears * 0.92, repriceIv, isCall);
+      const bsStopRaw = repriceOptionBSExact(effectiveStopLoss, c.strike, tYears * 0.96, repriceIv, isCall);
+      const bsTp1Mid = Number(Math.max(0.01, bsTp1Raw + ivFloorOffset).toFixed(2));
+      const bsTp2Mid = Number(Math.max(0.01, bsTp2Raw + ivFloorOffset).toFixed(2));
+      const bsStopMid = Number(Math.max(0.01, bsStopRaw + ivFloorOffset).toFixed(2));
 
       const estTp1Mid = Number(Math.max(entryAsk + 0.05, bsTp1Mid).toFixed(2));
       const estTp2Mid = Number(Math.max(estTp1Mid + 0.05, bsTp2Mid).toFixed(2));

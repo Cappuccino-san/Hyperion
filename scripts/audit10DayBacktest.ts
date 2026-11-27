@@ -712,6 +712,7 @@ async function run10DaySniperAudit() {
         iv: number;
         dteDays: number;
         peakOptionPnlPct: number;
+        peakSpotMfePct: number;
         seenSmaSide?: boolean;
         ratchetedBe?: boolean;
         optBeArmed?: boolean;
@@ -866,7 +867,23 @@ async function run10DaySniperAudit() {
           // Strict pessimistic intrabar ordering: evaluate existing standing stops & profit ratchet
           // armed strictly BEFORE bar t (`prevPeakOptionPnlPct`) against bar t's adverse extreme FIRST.
           const prevPeakOptionPnlPct = activePosition.peakOptionPnlPct;
+          const prevPeakSpotMfePct = activePosition.peakSpotMfePct;
+          const barFavSpot = isCall ? bar.high : bar.low;
+          const barFavSpotMfePct =
+            activePosition.entrySpot > 0
+              ? ((isCall
+                  ? barFavSpot - activePosition.entrySpot
+                  : activePosition.entrySpot - barFavSpot) /
+                  activePosition.entrySpot) *
+                100
+              : 0;
+          const runningPeakSpotMfePct = Number(
+            Math.max(prevPeakSpotMfePct, barFavSpotMfePct).toFixed(4)
+          );
           const exitChi = exitFlow?.ceilingShareChi ?? 0.5;
+          const exitImpChiBt = exitFlow?.impulseChi ?? exitChi;
+          const exitPeBt = exitFlow?.pecletNumber ?? 0;
+          const exitImpPeBt = exitFlow?.impulsePeclet ?? exitPeBt;
           const exitFlux = exitFlow?.netFluxJ ?? 0;
           const fluxFlippedAgainst = isCall ? exitFlux < 0 : exitFlux > 0;
           const optStopEval = evaluateOptionRiskStop({
@@ -891,12 +908,20 @@ async function run10DaySniperAudit() {
             : causalPutWall > 0 && bar.close > causalPutWall
               ? bar.close - causalPutWall
               : 0;
+          const hasStrongBullAdvBt =
+            Math.max(exitChi, exitImpChiBt) >= 0.65 &&
+            exitFlux > 0 &&
+            Math.max(exitPeBt, exitImpPeBt) >= 1.5;
+          const hasStrongBearAdvBt =
+            Math.min(exitChi, exitImpChiBt) <= 0.35 &&
+            exitFlux < 0 &&
+            Math.min(exitPeBt, exitImpPeBt) <= -1.5;
           const isAlignedTrendRegime = isCall
-            ? (causalZeroGamma > 0 && bar.close > causalZeroGamma) &&
+            ? ((causalZeroGamma > 0 && bar.close > causalZeroGamma) || hasStrongBullAdvBt) &&
               onFavorableSideOfVwap &&
               (exitChi > 0.55 || exitFlux > 0) &&
               (causalCallWall <= 0 || btWallDist >= 3.0)
-            : (causalZeroGamma > 0 && bar.close < causalZeroGamma) &&
+            : ((causalZeroGamma > 0 && bar.close < causalZeroGamma) || hasStrongBearAdvBt) &&
               onFavorableSideOfVwap &&
               (exitChi < 0.45 || exitFlux < 0) &&
               (causalPutWall <= 0 || btWallDist >= 3.0);
@@ -915,8 +940,11 @@ async function run10DaySniperAudit() {
             heldMinutes,
             onFavorableSideOfVwap,
             evaluateOnCloseOnly: true,
+            prevPeakSpotMfePct,
+            peakSpotMfePct: runningPeakSpotMfePct,
           });
           activePosition.peakOptionPnlPct = ratchetEval.nextPeakOptionPnlPct;
+          activePosition.peakSpotMfePct = runningPeakSpotMfePct;
           if (!activePosition.optBeArmed && activePosition.peakOptionPnlPct >= 30) {
             activePosition.optBeArmed = true;
           }
@@ -1211,7 +1239,7 @@ async function run10DaySniperAudit() {
           tradeCountToday === 1 &&
           contCooldownMet &&
           typeof lastClosedTrade?.pnlOptionPct === "number" &&
-          lastClosedTrade.pnlOptionPct >= 0 &&
+          lastClosedTrade.pnlOptionPct >= -5 &&
           lastClosedTrade.pnlOptionPct < 25 &&
           /RATCHET|BREAKEVEN/i.test(lastClosedTrade.exitReason || "") &&
           bar.totalMinutes <= Math.min(840, sessionBounds.entryCutoffMins);
@@ -1689,6 +1717,7 @@ async function run10DaySniperAudit() {
               iv: candAtmIv,
               dteDays,
               peakOptionPnlPct: 0,
+              peakSpotMfePct: 0,
               seenSmaSide: isCall ? bar.close >= bar.sma34 : bar.close <= bar.sma34,
               ratchetedBe: false,
               openedTimeEt: bar.timeEt,

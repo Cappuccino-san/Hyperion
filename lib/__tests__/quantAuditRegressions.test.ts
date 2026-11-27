@@ -15,6 +15,15 @@ import {
 import { cloneDefaultAlphaPriors, readAlphaPriorsSync } from "../persistenceStore";
 import { computeNeutralEmpiricalBayesCalibration } from "../execution/signalScoring";
 import {
+  MIN_REALISTIC_OPTION_IV,
+  computeRemainingYearsForExpirationIso,
+  countTradingSessionsBetween,
+} from "../execution/optionPricing";
+import { selectSmallAccountContract } from "../execution/contractRouter";
+import { evaluateActivePositionStepA } from "../execution/bracketStateMachine";
+import { evaluateBtoCandidateSetup } from "../execution/signalScoring";
+import type { DailyTradeStore, OptionTradePosition } from "../execution/types";
+import {
   evaluateOptionProfitRatchet,
   resolveRatchetFloorForPeak,
 } from "../execution/profitRatchet";
@@ -800,4 +809,401 @@ test("Shakeout Recovery: < +25% ratchet exit unlocks same-direction continuation
     impulsePeclet: -2.4,
   });
   assert.equal(confirmed.allowed, true, "Confirmed Flow VWAP + SMA34 breakdown after < +25% ratchet shakeout must unlock continuation PUT");
+});
+
+// ============================================================================
+// 7. 2026-11-27 SPY 728C WINNING-DIRECTION RATCHET & SHAKEOUT RECOVERY REGRESSION
+// ============================================================================
+
+test("2026-11-27 SPY 728C: Friday->Monday weekend expiration counts 1 trading session and floors entryIv >= 6.5%", async () => {
+  assert.equal(
+    countTradingSessionsBetween("2026-11-27", "2026-11-30"),
+    1,
+    "Friday 2026-11-27 to Monday 2026-11-30 across weekend is 1 trading session, not 3"
+  );
+
+  // 2026-11-27 10:35 AM ET (Black Friday early close 13:00 ET -> 145 mins rem + 1 overnight/session = 625 mins)
+  const entryTsMs = Date.parse("2026-11-27T15:35:00Z");
+  const tYears = computeRemainingYearsForExpirationIso(entryTsMs, "2026-11-30");
+  assert.ok(
+    tYears > 0.0055 && tYears < 0.007,
+    `Expected trading-session tYears (~0.00636) without weekend inflation, got ${tYears}`
+  );
+
+  const selected = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "CALL",
+    spotPrice: 725.26,
+    target1Spot: 727.5,
+    target2Spot: 729.5,
+    stopLossSpot: 723.16,
+    nowEt: new Date(entryTsMs),
+    zeroDteCallWall: 730,
+    zeroDtePutWall: 725,
+    dataSource: "TRADIER_LIVE",
+    contracts: [
+      {
+        symbol: "SPY261130C00728000",
+        strike: 728,
+        expiration: "2026-11-30",
+        optionType: "C",
+        bid: 0.4,
+        ask: 0.41,
+        last: 0.41,
+        volume: 4200,
+        openInterest: 5500,
+        iv: 0.0332,
+        delta: 0.31,
+        gamma: 0.08,
+        vega: 0.04,
+        percentChange: 0,
+        quoteSource: "TRADIER_LIVE",
+      },
+    ],
+  });
+
+  assert.ok(selected, "Valid 1-session Monday contract must be selected");
+  assert.ok(
+    (selected.entryIv ?? 0) >= MIN_REALISTIC_OPTION_IV,
+    `entryIv must be floored >= ${MIN_REALISTIC_OPTION_IV} instead of distorted 0.0332, got ${selected.entryIv}`
+  );
+});
+
+test("2026-11-27 SPY 728C: Opening/Structure shield keeps winning-direction CALL OPEN at 10:45 AM (-2.44% scratch after +60.98% convexity spike)", () => {
+  const openedTs = Math.floor(Date.parse("2026-11-27T15:35:00Z") / 1000); // 10:35 AM ET
+  const evalTs = openedTs + 600; // 10:45 AM ET (heldMinutes = 10)
+
+  const ratchetOnly = evaluateOptionProfitRatchet({
+    isCall: true,
+    prevPeakOptionPnlPct: 60.98,
+    adverseOptionPnlPct: -2.44,
+    closeOptionPnlPct: -2.44,
+    favorableOptionPnlPct: 12.2,
+    openOptionPnlPct: 5.0,
+    chi: 0.7096,
+    netFluxJ: 1.4,
+    hasPostEntryBarElapsed: true,
+    fluxFlippedAgainst: false,
+    isAlignedTrendRegime: true,
+    heldMinutes: 10,
+    onFavorableSideOfVwap: true,
+    evaluateOnCloseOnly: true,
+    prevPeakSpotMfePct: 0.1875,
+    peakSpotMfePct: 0.1875,
+  });
+  assert.equal(
+    ratchetOnly.triggered,
+    false,
+    "Sub-0.25% spot MFE convexity spike + <15m aligned trend above Flow VWAP must NOT lock out a -2.44% scratch"
+  );
+
+  const activePos: OptionTradePosition = {
+    id: "SPY-CALL-1795793700",
+    ticker: "SPY",
+    contractType: "CALL",
+    contractLabel: "SPY 261130 728C",
+    strike: 728,
+    expiration: "2026-11-30",
+    setupName: "Gaia Advection Breakout (χ=71%, Pe=+2.83)",
+    status: "OPEN",
+    btoSpotPrice: 725.26,
+    btoOptionMid: 0.41,
+    btoOptionAsk: 0.41,
+    optionBid: 0.4,
+    optionAsk: 0.41,
+    contractsQty: 1,
+    remainingQty: 1,
+    totalOutlay: 41,
+    target1Spot: 727.5,
+    target2Spot: 729.5,
+    stopLossSpot: 723.16,
+    initialRisk: 2.1,
+    flowVwap: 723.92,
+    ceilingShareChi: 0.7096,
+    pecletNumber: 2.834,
+    callWall: 730,
+    putWall: 725,
+    zeroGamma: 730.1,
+    peakOptionPnlPct: 60.98,
+    peakFavorableSpotMfePct: 0.1875,
+    openedAt: "10:35 AM",
+    openedTs,
+    lastCandleTs: openedTs + 300,
+  };
+  const store: DailyTradeStore = {
+    date: "2026-11-27",
+    activePositions: { SPY: activePos },
+    closedPositions: [],
+    alerts: [],
+    prevSpotPrices: { SPY: 725.59 },
+  };
+  const emittedAlerts: DailyTradeStore["alerts"] = [];
+
+  const updated = evaluateActivePositionStepA({
+    activePos,
+    normalizedTicker: "SPY",
+    positionKey: "SPY",
+    isSpxw: false,
+    spotPrice: 725.2,
+    putWall: 725,
+    callWall: 730,
+    zeroGamma: 730.1,
+    latest5mCandle: {
+      open: 725.55,
+      high: 725.7,
+      low: 725.05,
+      close: 725.2,
+      sma34: 724.3,
+      timestamp: evalTs,
+      flowSnapshot: {
+        timestamp: evalTs,
+        spot: 725.2,
+        flowVwap: 723.92,
+        ceilingShareChi: 0.7096,
+        impulseChi: 0.71,
+        pecletNumber: 2.834,
+        impulsePeclet: 2.834,
+        netFluxJ: 1.4,
+        deltaChi6Bar: 0.04,
+        deltaImpulseChi6Bar: 0.05,
+        deltaNetFlux6Bar: 0.25,
+        upper1s: 726.8,
+        lower1s: 721.8,
+        upper2s: 728.5,
+        lower2s: 720.0,
+        upper1Sigma: 726.8,
+        lower1Sigma: 721.8,
+        upper2Sigma: 728.5,
+        lower2Sigma: 720.0,
+        sigma: 1.8,
+        variance: 3.24,
+        cumGammaWeight: 100,
+        totalWeight: 100,
+        signedGammaAcceleration: 0,
+        count: 15,
+        atr5m: 1.2,
+        bandSignal: null,
+      },
+    },
+    divergence5m: "NO",
+    contracts: [
+      {
+        symbol: "SPY261130C00728000",
+        strike: 728,
+        expiration: "2026-11-30",
+        optionType: "C",
+        bid: 0.4,
+        ask: 0.41,
+        last: 0.4,
+        volume: 4200,
+        openInterest: 5500,
+        iv: 0.14,
+        delta: 0.3,
+        gamma: 0.08,
+        vega: 0.04,
+        percentChange: 0,
+        quoteSource: "DELAYED_CBOE",
+      },
+    ],
+    dataSource: "CBOE_MARKET_DATA",
+    nowTs: evalTs,
+    timeStr: "10:45 AM",
+    etHours: 10,
+    etMinutes: 45,
+    etTotalMinutes: 645,
+    sessionDate: "2026-11-27",
+    store,
+    emittedAlerts,
+  });
+
+  assert.ok(updated, "SPY 728C must stay OPEN through 10:45 AM scratch pullback above Flow VWAP");
+  assert.equal(updated.status, "OPEN");
+  assert.equal(store.closedPositions.length, 0);
+});
+
+test("2026-11-27 SPY 728C: -2.44% ratchet scratch unlocks same-direction CALL continuation after >= 15m even with overhead zeroGamma", () => {
+  const closedTs = Math.floor(Date.parse("2026-11-27T15:45:00Z") / 1000); // 10:45 AM ET
+  const leg1Scratch: OptionTradePosition = {
+    id: "SPY-CALL-1795793700",
+    ticker: "SPY",
+    contractType: "CALL",
+    contractLabel: "SPY 261130 728C",
+    strike: 728,
+    expiration: "2026-11-30",
+    setupName: "Gaia Advection Breakout",
+    status: "CLOSED",
+    btoSpotPrice: 725.26,
+    btoOptionMid: 0.41,
+    btoOptionAsk: 0.41,
+    contractsQty: 1,
+    remainingQty: 0,
+    totalOutlay: 41,
+    target1Spot: 727.5,
+    target2Spot: 729.5,
+    stopLossSpot: 723.16,
+    openedAt: "10:35 AM",
+    openedTs: closedTs - 600,
+    closedAt: "10:45 AM",
+    closedTs,
+    closedSpotPrice: 725.2,
+    pnlOptionPct: -2.44,
+    exitReason: "OPTION PROFIT RATCHET (+60% -> +25% PROFIT LOCK)",
+  };
+
+  // < 15m cooldown must block
+  const tooSoonGate = evaluateLeg2StructuralGate({
+    direction: "CALL",
+    etMins: 655, // 10:55 AM ET (+10m)
+    nowTsSec: closedTs + 600,
+    spotPrice: 726.1,
+    prevSpotPrice: 725.6,
+    zeroGamma: 730.1,
+    flowVwap: 725.5,
+    sma34: 724.8,
+    leg1Trade: leg1Scratch,
+    testedPutWallOrMinus1Sigma: false,
+    testedCallWallOrPlus1Sigma: false,
+    has5mBullDiv: false,
+    has5mBearDiv: false,
+    impulseChi: 0.68,
+    deltaChi6Bar: 0.05,
+    impulsePeclet: 2.2,
+    ceilingShareChi: 0.7,
+    netFluxJ: 1.2,
+  });
+  assert.equal(tooSoonGate.allowed, false, "Cooldown < 15m must block CALL shakeout recovery");
+
+  // >= 15m cooldown with opposing flux must block
+  const negativeFluxGate = evaluateLeg2StructuralGate({
+    direction: "CALL",
+    etMins: 665, // 11:05 AM ET (+20m)
+    nowTsSec: closedTs + 1200,
+    spotPrice: 726.1,
+    prevSpotPrice: 725.6,
+    zeroGamma: 730.1,
+    flowVwap: 725.5,
+    sma34: 724.8,
+    leg1Trade: leg1Scratch,
+    testedPutWallOrMinus1Sigma: false,
+    testedCallWallOrPlus1Sigma: false,
+    has5mBullDiv: false,
+    has5mBearDiv: false,
+    impulseChi: 0.42,
+    deltaChi6Bar: -0.05,
+    impulsePeclet: -0.6,
+    ceilingShareChi: 0.42,
+    netFluxJ: -0.9,
+  });
+  assert.equal(negativeFluxGate.allowed, false, "Bearish/negative flux must block CALL shakeout recovery");
+
+  // >= 15m cooldown + strong bullish advection (below overhead zeroGamma 730.1) must unlock
+  const reEntryTs = closedTs + 1200; // 11:05 AM ET (etTotalMinutes = 665 <= 690 Black Friday cutoff)
+  const confirmedGate = evaluateLeg2StructuralGate({
+    direction: "CALL",
+    etMins: 665,
+    nowTsSec: reEntryTs,
+    spotPrice: 726.1,
+    prevSpotPrice: 725.6,
+    zeroGamma: 730.1,
+    flowVwap: 725.5,
+    sma34: 724.8,
+    leg1Trade: leg1Scratch,
+    testedPutWallOrMinus1Sigma: false,
+    testedCallWallOrPlus1Sigma: false,
+    has5mBullDiv: false,
+    has5mBearDiv: false,
+    impulseChi: 0.68,
+    deltaChi6Bar: 0.05,
+    impulsePeclet: 2.2,
+    ceilingShareChi: 0.7,
+    netFluxJ: 1.2,
+  });
+  assert.equal(
+    confirmedGate.allowed,
+    true,
+    "Strong bullish advection after >= 15m must unlock CALL continuation after -2.44% ratchet scratch even below zeroGamma"
+  );
+
+  // Also verify signalScoring evaluateBtoCandidateSetup wires live currentChi & currentNetFlux cleanly
+  const store: DailyTradeStore = {
+    date: "2026-11-27",
+    activePositions: {},
+    closedPositions: [leg1Scratch],
+    alerts: [],
+    prevSpotPrices: { SPY: 725.6 },
+  };
+  const candle = {
+    open: 725.6,
+    high: 726.25,
+    low: 725.45,
+    close: 726.1,
+    sma34: 724.8,
+    timestamp: reEntryTs,
+    flowSnapshot: {
+      timestamp: reEntryTs,
+      spot: 726.1,
+      flowVwap: 725.5,
+      ceilingShareChi: 0.7,
+      impulseChi: 0.68,
+      pecletNumber: 2.1,
+      impulsePeclet: 2.2,
+      netFluxJ: 1.2,
+      deltaChi6Bar: 0.05,
+      deltaImpulseChi6Bar: 0.06,
+      deltaNetFlux6Bar: 0.2,
+      upper1s: 727.5,
+      lower1s: 723.5,
+      upper2s: 729.5,
+      lower2s: 721.5,
+      upper1Sigma: 727.5,
+      lower1Sigma: 723.5,
+      upper2Sigma: 729.5,
+      lower2Sigma: 721.5,
+      sigma: 1.8,
+      variance: 3.24,
+      cumGammaWeight: 100,
+      totalWeight: 100,
+      signedGammaAcceleration: 0,
+      count: 18,
+      atr5m: 1.6,
+      bandSignal: null,
+    },
+  };
+  const setupRes = evaluateBtoCandidateSetup({
+    normalizedTicker: "SPY",
+    spotPrice: 726.1,
+    prevSpotPrice: 725.6,
+    params: {
+      ticker: "SPY",
+      spotPrice: 726.1,
+      prevSpotPrice: 725.6,
+      callWall: 730,
+      putWall: 725,
+      zeroGamma: 730.1,
+      zeroDteCallWall: 730,
+      zeroDtePutWall: 725,
+      priorClose: 723.5,
+      premarketFlowVwap: 724.0,
+      divergence5m: "NO",
+      divergence30m: "BULL",
+      latest5mCandle: candle,
+    },
+    store,
+    latest5mCandle: candle,
+    divergence5m: "NO",
+    divergence30m: "BULL",
+    etTotalMinutes: 665,
+    nowTs: reEntryTs,
+    sessionDate: "2026-11-27",
+    isPhase2ReclaimWindow: true,
+    isShakeoutRecoveryWindow: true,
+    lastClosed: leg1Scratch,
+    sameTickerClosedCount: 1,
+  });
+
+  assert.equal(
+    setupRes.candidateBto?.contractType,
+    "CALL",
+    "evaluateBtoCandidateSetup must emit continuation CALL through evaluateLeg2StructuralGate after -2.44% scratch"
+  );
 });

@@ -32,6 +32,7 @@ import {
   registerActiveTrackedTicker,
   getEtClockNow,
   getLiveBotStatus,
+  isAllowedAutonomousTicker,
   isExecutionHalted,
   setExecutionHalted,
 } from "@/lib/liveBotDaemon";
@@ -517,6 +518,26 @@ export async function GET(req: NextRequest) {
       const evalTimeout = setTimeout(() => evalController.abort(), 12_000);
       try {
         await evaluateAllActivePositions({ signal: evalController.signal });
+        if (ticker && isAllowedAutonomousTicker(policyTicker)) {
+          const curStore = loadTradeStore();
+          const hasTickerHistory =
+            Boolean(curStore.backfilledTickers?.[policyTicker]) ||
+            Boolean(curStore.activePositions[policyTicker]) ||
+            curStore.closedPositions.some((p) => p.ticker === policyTicker) ||
+            curStore.alerts.some((a) => a.ticker === policyTicker);
+          if (!hasTickerHistory) {
+            await evaluateTradeSignals({
+              ticker: policyTicker,
+              spotPrice: 0,
+              callWall: 0,
+              putWall: 0,
+              zeroGamma: 0,
+              webhookUrl: undefined,
+              isHistoricalBackfill: true,
+              signal: evalController.signal,
+            });
+          }
+        }
       } finally {
         const clock = getEtClockNow();
         const bounds = getSessionBoundsEt(clock.etDate);

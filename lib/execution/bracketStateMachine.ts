@@ -16,8 +16,10 @@ import type {
   TradeLifecycleAlert,
 } from "@/lib/execution/types";
 import {
+  MIN_REALISTIC_OPTION_IV,
   clampOptionPriceToGreekEnvelope,
   clampToCandleRange,
+  computeRemainingYearsForExpirationIso,
   computeRemainingYearsToExpiration,
   formatTimeEt,
   getContractMidPrice,
@@ -109,11 +111,16 @@ export function evaluateActivePositionStepA(input: {
   let liveAsk: number | undefined = activePos.optionAsk;
 
   const dte = computeDteDays(activePos.expiration, sessionDate);
-  const tRemaining = computeRemainingYearsToExpiration(nowTs * 1000, dte);
+  const hasIsoExp = /^\d{4}-\d{2}-\d{2}$/.test(activePos.expiration);
+  const tRemaining = hasIsoExp
+    ? computeRemainingYearsForExpirationIso(nowTs * 1000, activePos.expiration)
+    : computeRemainingYearsToExpiration(nowTs * 1000, dte);
   const tEntry =
     typeof activePos.entryTYears === "number" && activePos.entryTYears > 0
       ? activePos.entryTYears
-      : computeRemainingYearsToExpiration((activePos.openedTs || nowTs) * 1000, dte);
+      : hasIsoExp
+        ? computeRemainingYearsForExpirationIso((activePos.openedTs || nowTs) * 1000, activePos.expiration)
+        : computeRemainingYearsToExpiration((activePos.openedTs || nowTs) * 1000, dte);
   const entryFillPrice = activePos.btoOptionAsk ?? activePos.optionAsk ?? activePos.btoOptionMid;
 
   let matchedContract = false;
@@ -144,12 +151,15 @@ export function evaluateActivePositionStepA(input: {
         : entryFillPrice > 0
           ? entryFillPrice
           : 0.45;
-    const baseEntryIv = solveImpliedVol(
-      entryMidRef,
-      activePos.btoSpotPrice,
-      activePos.strike,
-      tEntry,
-      isCall
+    const baseEntryIv = Math.max(
+      MIN_REALISTIC_OPTION_IV,
+      solveImpliedVol(
+        entryMidRef,
+        activePos.btoSpotPrice,
+        activePos.strike,
+        tEntry,
+        isCall
+      )
     );
     const evalSpotForBs = posCandle ? clampToCandleRange(posSpotPrice, posCandle) : posSpotPrice;
     // Conservative equity-index call skew compression on spot rallies (prevents constant-vol BS overstatement on OTM calls)
@@ -157,14 +167,30 @@ export function evaluateActivePositionStepA(input: {
       isCall && activePos.btoSpotPrice > 0
         ? Math.max(0, (evalSpotForBs - activePos.btoSpotPrice) / activePos.btoSpotPrice)
         : 0;
-    const effectiveIv = baseEntryIv * Math.max(0.88, 1 - callRallyPct * 18);
-    const bsMidAtEval = repriceOptionBSExact(
+    const effectiveIv = Math.max(
+      MIN_REALISTIC_OPTION_IV,
+      baseEntryIv * Math.max(0.88, 1 - callRallyPct * 18)
+    );
+    const bsEntryAtBaseIv = repriceOptionBSExact(
+      activePos.btoSpotPrice,
+      activePos.strike,
+      tEntry,
+      baseEntryIv,
+      isCall
+    );
+    const bsMidRaw = repriceOptionBSExact(
       evalSpotForBs,
       activePos.strike,
       tRemaining,
       effectiveIv,
       isCall
     );
+    const bsMidAtEval =
+      bsEntryAtBaseIv > entryMidRef * 1.05
+        ? Math.max(0.01, entryMidRef * (bsMidRaw / Math.max(0.01, bsEntryAtBaseIv)))
+        : Math.abs(bsEntryAtBaseIv - entryMidRef) > 0.02
+          ? Math.max(0.01, entryMidRef + (bsMidRaw - bsEntryAtBaseIv))
+          : bsMidRaw;
     const entryHalfSpread =
       typeof activePos.optionAsk === "number" &&
       typeof activePos.optionBid === "number" &&
@@ -343,6 +369,7 @@ export function evaluateActivePositionStepA(input: {
   const exitChi = typeof flowSnapExit?.ceilingShareChi === "number" ? flowSnapExit.ceilingShareChi : 0.5;
   const exitImpChi = typeof flowSnapExit?.impulseChi === "number" ? flowSnapExit.impulseChi : exitChi;
   const exitPe = typeof flowSnapExit?.pecletNumber === "number" ? flowSnapExit.pecletNumber : 0;
+  const exitImpPe = typeof flowSnapExit?.impulsePeclet === "number" ? flowSnapExit.impulsePeclet : exitPe;
   const exitFlux = typeof flowSnapExit?.netFluxJ === "number" ? flowSnapExit.netFluxJ : 0;
   const isRunnerSetup =
     activePos.setupName.includes("Bearish Zero-Gamma Flush") ||
@@ -371,8 +398,9 @@ export function evaluateActivePositionStepA(input: {
           activePos.btoSpotPrice) *
         100
       : 0;
+  const prevPeakSpotMfePct = activePos.peakFavorableSpotMfePct;
   activePos.peakFavorableSpotMfePct = Number(
-    Math.max(activePos.peakFavorableSpotMfePct ?? 0, barFavSpotMfePct).toFixed(4)
+    Math.max(prevPeakSpotMfePct ?? 0, barFavSpotMfePct).toFixed(4)
   );
 
   const hasNetFlux =
@@ -470,12 +498,20 @@ export function evaluateActivePositionStepA(input: {
     : posPutWall > 0 && closeRefSpot > posPutWall
       ? closeRefSpot - posPutWall
       : 0;
+  const hasStrongBullAdvection =
+    Math.max(exitChi, exitImpChi) >= 0.65 &&
+    exitFlux > 0 &&
+    Math.max(exitPe, exitImpPe) >= 1.5;
+  const hasStrongBearAdvection =
+    Math.min(exitChi, exitImpChi) <= 0.35 &&
+    exitFlux < 0 &&
+    Math.min(exitPe, exitImpPe) <= -1.5;
   const isAlignedTrendRegime = isCall
-    ? (posZeroGamma > 0 && closeRefSpot > posZeroGamma) &&
+    ? ((posZeroGamma > 0 && closeRefSpot > posZeroGamma) || hasStrongBullAdvection) &&
       onFavorableSideOfVwap &&
       (exitChi > 0.55 || exitFlux > 0) &&
       (posCallWall <= 0 || remainingWallDist >= 3.0)
-    : (posZeroGamma > 0 && closeRefSpot < posZeroGamma) &&
+    : ((posZeroGamma > 0 && closeRefSpot < posZeroGamma) || hasStrongBearAdvection) &&
       onFavorableSideOfVwap &&
       (exitChi < 0.45 || exitFlux < 0) &&
       (posPutWall <= 0 || remainingWallDist >= 3.0);
@@ -566,6 +602,8 @@ export function evaluateActivePositionStepA(input: {
     heldMinutes: rawHeldMin,
     onFavorableSideOfVwap,
     evaluateOnCloseOnly: true,
+    prevPeakSpotMfePct,
+    peakSpotMfePct: activePos.peakFavorableSpotMfePct ?? 0,
   });
   if (
     !posCandle ||
