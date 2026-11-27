@@ -1459,6 +1459,7 @@ export interface TacticalStructuralLevels {
   callWall: number;
   putWall: number;
   zeroGamma: number;
+  zeroDteZeroGamma: number;
   tacticalKing: number;
   bookCenter: number;
   dailyExpectedMove: { low: number; high: number } | null;
@@ -1539,6 +1540,10 @@ export function deriveTacticalStructuralLevels(
   }
 
   const zeroGamma =
+    gammaLevels.zeroGamma > 0
+      ? gammaLevels.zeroGamma
+      : zeroDteLevels?.zeroGamma ?? 0;
+  const zeroDteZeroGamma =
     zeroDteLevels?.hasZeroGammaFlip && zeroDteLevels.zeroGamma > 0
       ? zeroDteLevels.zeroGamma
       : gammaLevels.zeroGamma;
@@ -1566,6 +1571,7 @@ export function deriveTacticalStructuralLevels(
     callWall,
     putWall,
     zeroGamma,
+    zeroDteZeroGamma,
     tacticalKing,
     bookCenter,
     dailyExpectedMove: payload.expectedMoves?.daily

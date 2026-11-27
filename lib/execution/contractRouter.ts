@@ -1,6 +1,13 @@
 import type { NormalizedOptionContract } from "@/lib/optionsExposure";
 import type { MarketRegimeId } from "@/lib/persistenceStore";
-import { getSessionBoundsEt, getTodayEt } from "@/lib/gaiaSessionGuards";
+import {
+  AFTERNOON_DTE_SHIFT_REM_MINS,
+  OTM_0DTE_BAN_REM_MINS,
+  STRICT_OTM_0DTE_BAN_REM_MINS,
+  getRemainingRthMinutes,
+  getSessionBoundsEt,
+  getTodayEt,
+} from "@/lib/gaiaSessionGuards";
 import {
   selectOptimalSmallAccountContract,
   type ContractCandidateInput,
@@ -16,6 +23,7 @@ import {
   getNowEtTime,
   reanchorDelayedContractsToSpot,
   repriceOptionBS,
+  repriceOptionBSExact,
   solveImpliedVol,
 } from "@/lib/execution/optionPricing";
 
@@ -91,6 +99,7 @@ export async function selectSmallAccountContract(params: {
   regime?: MarketRegimeId;
   absImpulsePeclet?: number;
   remainingExpectedMove?: number;
+  atr5m?: number;
   dataSource?: string;
   referenceSpotPrice?: number;
   contractsAlreadyAnchored?: boolean;
@@ -110,6 +119,7 @@ export async function selectSmallAccountContract(params: {
     regime,
     absImpulsePeclet,
     remainingExpectedMove,
+    atr5m,
     dataSource,
     referenceSpotPrice,
     contractsAlreadyAnchored,
@@ -174,10 +184,19 @@ export async function selectSmallAccountContract(params: {
 
   if (contracts && contracts.length > 0) {
     const validCandidates: ContractCandidateInput[] = [];
-    const isAfternoon = etTime.hours > 11 || (etTime.hours === 11 && etTime.minutes >= 30);
+    const minsRemaining = getRemainingRthMinutes(etTime.totalMinutes, sessionBounds);
+    const isShortHorizon0Dte =
+      sessionBounds.isEarlyClose || minsRemaining <= OTM_0DTE_BAN_REM_MINS;
+    const isAfternoon =
+      sessionBounds.isEarlyClose || minsRemaining <= AFTERNOON_DTE_SHIFT_REM_MINS;
     const hasFutureExpirations = contracts.some(
       (item) => typeof item.expiration === "string" && /^\d{4}-\d{2}-\d{2}$/.test(item.expiration) && item.expiration > todayEt
     );
+    const effectiveAtr5m =
+      typeof atr5m === "number" && Number.isFinite(atr5m) && atr5m > 0
+        ? (isSpxw ? atr5m / 10 : atr5m)
+        : 0;
+    const spotStopDist = Math.abs(effectiveSpot - effectiveStopLoss);
 
     const minOptionDelta = resolveMinOptionDelta({
       regime,
@@ -251,18 +270,55 @@ export async function selectSmallAccountContract(params: {
       ) {
         continue;
       }
-      if (
-        etTime.totalMinutes >= 750 &&
-        dte === 0 &&
-        (etTime.totalMinutes >= 810
+      if (dte === 0 && isShortHorizon0Dte) {
+        if (sessionBounds.isEarlyClose && hasFutureExpirations) {
+          continue;
+        }
+        const isStrictOtmBan =
+          sessionBounds.isEarlyClose || minsRemaining <= STRICT_OTM_0DTE_BAN_REM_MINS;
+        const isBannedOtm0Dte = isStrictOtmBan
           ? isCall
             ? c.strike > effectiveSpot
             : c.strike < effectiveSpot
           : isCall
             ? c.strike > Math.ceil(effectiveSpot)
-            : c.strike < Math.floor(effectiveSpot))
+            : c.strike < Math.floor(effectiveSpot);
+        if (isBannedOtm0Dte) {
+          continue;
+        }
+      }
+
+      // 0DTE Convexity / Hard-Stop Gap-Through Guard:
+      // Reject 0DTE contracts where a routine 0.5 * ATR5m adverse wiggle (strictly inside stopLossSpot)
+      // already breaches the -45% option hard stop at Bid after 1 bar (5m).
+      if (
+        dte === 0 &&
+        effectiveAtr5m > 0 &&
+        spotStopDist > 0 &&
+        0.5 * effectiveAtr5m < spotStopDist * 0.90
       ) {
-        continue;
+        const candTYears = computeRemainingYearsToExpiration(
+          (nowEt ?? new Date()).getTime(),
+          0
+        );
+        const candAskIv = solveImpliedVol(askPrice, effectiveSpot, c.strike, candTYears, isCall);
+        const adverseSpot = isCall
+          ? effectiveSpot - 0.5 * effectiveAtr5m
+          : effectiveSpot + 0.5 * effectiveAtr5m;
+        const tAdverse = Math.max(1 / 525600, candTYears - 5 / (252 * 390));
+        const bsAdverseMid = repriceOptionBSExact(adverseSpot, c.strike, tAdverse, candAskIv, isCall);
+        const halfSpread = Math.max(0.01, (askPrice - effectiveBid) / 2);
+        const modeledAdverseBid = Math.max(0.01, bsAdverseMid - halfSpread);
+        const rawHardStop = Math.max(
+          0.05,
+          askPrice * (1 - DEFAULT_HARD_OPTION_STOP_LOSS_PCT / 100)
+        );
+        const hardStopBid = Number(
+          (Math.round((rawHardStop + Number.EPSILON) * 100) / 100).toFixed(2)
+        );
+        if (modeledAdverseBid <= hardStopBid) {
+          continue;
+        }
       }
 
       const normZeroDteCw = typeof zeroDteCallWall === "number" && zeroDteCallWall > 0
@@ -298,6 +354,10 @@ export async function selectSmallAccountContract(params: {
       highIvFallbackCandidates.length > 0 &&
       hasPricedOutNearAtm &&
       regime !== "POS_GAMMA_PIN";
+    const effectivePreferredDte =
+      isShortHorizon0Dte && hasFutureExpirations && preferredDte === "0DTE"
+        ? "1-2DTE"
+        : preferredDte;
     const selection = selectOptimalSmallAccountContract({
       candidates: validCandidates.length > 0
         ? validCandidates
@@ -312,7 +372,7 @@ export async function selectSmallAccountContract(params: {
       zeroDteCallWall,
       zeroDtePutWall,
       isAfternoon,
-      preferredDte,
+      preferredDte: effectivePreferredDte,
       regime,
       absImpulsePeclet,
       remainingExpectedMove:

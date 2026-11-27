@@ -238,6 +238,7 @@ export interface Candle5m {
   timestamp?: number;
   prevLow?: number;
   prevHigh?: number;
+  sessionOpen?: number;
   flowSnapshot?: FlowGammaVwapSnapshot | null;
 }
 

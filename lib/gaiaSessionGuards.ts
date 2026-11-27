@@ -13,6 +13,11 @@ export const ENTRY_CUTOFF_MINS = 870; // 14:30 ET (no late-day chasing)
 export const EOD_FORCE_FLAT_MINS = 955; // 15:55 ET (hard MOC flat)
 export const RTH_CLOSE_MINS = 960; // 16:00 ET (after-hours firewall)
 
+// Remaining-RTH-minute thresholds (match 11:30 / 12:30 / 13:30 ET on 960m full days; scale automatically on 780m half-days)
+export const AFTERNOON_DTE_SHIFT_REM_MINS = 270;
+export const OTM_0DTE_BAN_REM_MINS = 210;
+export const STRICT_OTM_0DTE_BAN_REM_MINS = 150;
+
 export const EARLY_CLOSES_2026: Readonly<Record<string, number>> = {
   "2026-11-27": 780, // Day after Thanksgiving: 13:00 ET close
   "2026-12-24": 780, // Christmas Eve: 13:00 ET close
@@ -221,6 +226,13 @@ export function getSessionBoundsEt(etDate?: string): SessionBoundsEt {
     eodFlatMins: EOD_FORCE_FLAT_MINS,
     rthCloseMins: RTH_CLOSE_MINS,
   };
+}
+
+export function getRemainingRthMinutes(
+  etMins: number,
+  sessionBounds: Pick<SessionBoundsEt, "rthCloseMins">
+): number {
+  return Math.max(0, sessionBounds.rthCloseMins - etMins);
 }
 
 export function formatEtMinsAsTimeString(mins: number): string {

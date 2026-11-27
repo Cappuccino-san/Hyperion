@@ -660,10 +660,70 @@ export function evaluateBtoCandidateSetup(input: {
     latest5mCandle && barRange > 0
       ? (latest5mCandle.close - latest5mCandle.low) / barRange
       : 0;
+  const upperWickRatio =
+    latest5mCandle && barRange > 0
+      ? (latest5mCandle.high - Math.max(latest5mCandle.open, latest5mCandle.close)) / barRange
+      : 0;
   const hasBullishWickRejection =
     Boolean(latest5mCandle) &&
     (lowerWickRatio >= 0.40 ||
       (closeInBarRatio >= 0.55 && latest5mCandle!.close >= latest5mCandle!.open));
+  const hasBearishWickRejection =
+    Boolean(latest5mCandle) &&
+    (upperWickRatio >= 0.40 ||
+      (closeInBarRatio <= 0.45 && latest5mCandle!.close <= latest5mCandle!.open));
+
+  const dailyEmHalfWidth =
+    dailyExpectedMove && dailyExpectedMove.high > dailyExpectedMove.low
+      ? (dailyExpectedMove.high - dailyExpectedMove.low) / 2
+      : 0;
+  const sessionOpenRef =
+    typeof latest5mCandle?.sessionOpen === "number" && latest5mCandle.sessionOpen > 0
+      ? latest5mCandle.sessionOpen
+      : 0;
+  const flushFromSessionOpen = sessionOpenRef > spotPrice ? sessionOpenRef - spotPrice : 0;
+  const rallyFromSessionOpen =
+    sessionOpenRef > 0 && spotPrice > sessionOpenRef ? spotPrice - sessionOpenRef : 0;
+  const maxUnreclaimedSessionMove = Math.max(
+    entryAtr5m * 1.60,
+    dailyEmHalfWidth > 0 ? dailyEmHalfWidth * 1.05 : spotPrice * 0.0055
+  );
+  const testedFlowVwapBearPullback = Boolean(
+    latest5mCandle &&
+      flowSnap &&
+      (latest5mCandle.high >= flowSnap.flowVwap - entryAtr5m * 0.25 ||
+        (typeof latest5mCandle.prevHigh === "number" &&
+          latest5mCandle.prevHigh >= flowSnap.flowVwap - entryAtr5m * 0.25))
+  );
+  const testedFlowVwapBullPullback = Boolean(
+    latest5mCandle &&
+      flowSnap &&
+      (latest5mCandle.low <= flowSnap.flowVwap + entryAtr5m * 0.25 ||
+        (typeof latest5mCandle.prevLow === "number" &&
+          latest5mCandle.prevLow <= flowSnap.flowVwap + entryAtr5m * 0.25))
+  );
+  const isAdvectionBreakdownExhausted =
+    isFluxExhausted ||
+    hasBullishWickRejection ||
+    Boolean(
+      flowSnap &&
+        flowSnap.lower1Sigma > 0 &&
+        spotPrice <= flowSnap.lower1Sigma * 1.0008 &&
+        !testedFlowVwapBearPullback
+    ) ||
+    (flushFromSessionOpen > maxUnreclaimedSessionMove && !testedFlowVwapBearPullback);
+  const isAdvectionBreakoutExhausted =
+    fluxZScore > (currentNetFlux <= 0 || currentPe < 0.75 ? 1.0 : 1.25) ||
+    (effectiveFlowVwap > 0 && (spotPrice - effectiveFlowVwap) / spotPrice > 0.0065) ||
+    hasBearishWickRejection ||
+    Boolean(
+      flowSnap &&
+        flowSnap.upper1Sigma > 0 &&
+        spotPrice >= flowSnap.upper1Sigma * 0.9992 &&
+        !testedFlowVwapBullPullback
+    ) ||
+    (rallyFromSessionOpen > maxUnreclaimedSessionMove && !testedFlowVwapBullPullback);
+  const minZeroGammaClearance = Math.max(minOpposingWallClearance, entryAtr5m * 0.75);
 
   // SETUP 1A: Bearish Zero-Gamma Flush [BTO PUT]
   if (
@@ -922,6 +982,8 @@ export function evaluateBtoCandidateSetup(input: {
       currentPe >= 0.85 &&
       currentNetFlux > 0 &&
       hasAdequateCallRoomToWall &&
+      !isAdvectionBreakoutExhausted &&
+      (effectiveZeroGamma <= spotPrice || effectiveZeroGamma - spotPrice >= minZeroGammaClearance) &&
       spotPrice > flowSnap.flowVwap &&
       latest5mCandle.close > latest5mCandle.sma34 &&
       latest5mCandle.close > latest5mCandle.open &&
@@ -931,7 +993,13 @@ export function evaluateBtoCandidateSetup(input: {
       const candleStop = Number(
         Math.min(spotPrice - minRiskFloor, Math.min(flowSnap.flowVwap, latest5mCandle.low) - spotPrice * 0.0005).toFixed(2)
       );
-      const cwCeiling = tacticalCw > spotPrice ? tacticalCw : 0;
+      const zgCeiling = effectiveZeroGamma > spotPrice ? effectiveZeroGamma : 0;
+      const cwCeiling =
+        tacticalCw > spotPrice && zgCeiling > 0
+          ? Math.min(tacticalCw, zgCeiling)
+          : tacticalCw > spotPrice
+            ? tacticalCw
+            : zgCeiling;
       const stopLoss = candleStop;
       const risk = Math.max(minRiskFloor, spotPrice - stopLoss);
       if (cwCeiling === 0 || cwCeiling - spotPrice >= risk * 1.5) {
@@ -957,6 +1025,8 @@ export function evaluateBtoCandidateSetup(input: {
       currentPe <= -0.85 &&
       currentNetFlux < 0 &&
       hasAdequatePutRoomToWall &&
+      !isAdvectionBreakdownExhausted &&
+      (effectiveZeroGamma <= 0 || effectiveZeroGamma >= spotPrice || spotPrice - effectiveZeroGamma >= minZeroGammaClearance) &&
       spotPrice < flowSnap.flowVwap &&
       latest5mCandle.close < latest5mCandle.sma34 &&
       latest5mCandle.close < latest5mCandle.open &&
@@ -966,7 +1036,11 @@ export function evaluateBtoCandidateSetup(input: {
       const candleStop = Number(
         Math.max(spotPrice + minRiskFloor, Math.max(flowSnap.flowVwap, latest5mCandle.high) + spotPrice * 0.0005).toFixed(2)
       );
-      const pwFloor = tacticalPw > 0 && tacticalPw < spotPrice ? tacticalPw : 0;
+      const zgFloor = effectiveZeroGamma > 0 && effectiveZeroGamma < spotPrice ? effectiveZeroGamma : 0;
+      const pwFloor = Math.max(
+        tacticalPw > 0 && tacticalPw < spotPrice ? tacticalPw : 0,
+        zgFloor
+      );
       const stopLoss = candleStop;
       const risk = Math.max(minRiskFloor, stopLoss - spotPrice);
       if (pwFloor === 0 || spotPrice - pwFloor >= risk * 1.5) {

@@ -102,6 +102,34 @@ export {
 export * from "./tradePerformanceEngine";
 
 /**
+ * Enforces the global 1-active-slot and <= $100 portfolio outlay invariants across BOTH
+ * live ticks (`store.activePositions`) and sequential multi-ticker historical backfills
+ * (`store.closedPositions` whose half-open lifecycle `[openedTs, closedTs)` contains `evalTs`).
+ */
+function hasGlobalPortfolioSlotOrBudgetConflict(
+  store: DailyTradeStore,
+  evalTs: number,
+  candidateOutlayDollars = 0
+): boolean {
+  const activeList = Object.values(store.activePositions || {}).filter(Boolean);
+  if (activeList.length > 0) {
+    return true;
+  }
+  for (const closed of store.closedPositions || []) {
+    if (!closed) continue;
+    if (
+      typeof closed.openedTs === "number" &&
+      typeof closed.closedTs === "number" &&
+      closed.openedTs <= evalTs &&
+      evalTs < closed.closedTs
+    ) {
+      return true;
+    }
+  }
+  return candidateOutlayDollars > 100;
+}
+
+/**
  * Backfills today's RTH 5m bars from Yahoo Finance when the server boots mid-session,
  * ensuring exact causal replay without emitting live Discord alerts (`isHistoricalBackfill: true`).
  */
@@ -240,6 +268,18 @@ async function backfillIntradaySessionSignals(
       if (spyChain.length > 0) baseContracts = spyChain;
     }
 
+    const backfillStructuralNodes: StructuralFlowNodes | undefined =
+      (params.putWall && params.putWall > 0) ||
+      (params.callWall && params.callWall > 0) ||
+      (params.zeroGamma && params.zeroGamma > 0)
+        ? {
+            floorNode: params.putWall && params.putWall > 0 ? params.putWall : undefined,
+            ceilingNode: params.callWall && params.callWall > 0 ? params.callWall : undefined,
+            zeroGamma: params.zeroGamma && params.zeroGamma > 0 ? params.zeroGamma : undefined,
+            netGex: typeof params.netGex === "number" ? params.netGex : undefined,
+          }
+        : undefined;
+
     const sessionFlowSeries = computeBarFlowGammaVwapSeries(
       sessionBars.map((b) => ({
         timestamp: b.ts,
@@ -250,7 +290,8 @@ async function backfillIntradaySessionSignals(
         close: b.close,
         volume: 1000,
       })),
-      flowContracts
+      flowContracts,
+      backfillStructuralNodes
     );
 
     const resetBounceStore = loadTradeStore();
@@ -444,6 +485,7 @@ async function backfillIntradaySessionSignals(
           timestamp: bar.ts,
           prevLow: prevBar.low,
           prevHigh: prevBar.high,
+          sessionOpen: sessionBars[0].open,
           flowSnapshot: sessionFlowSeries[idx] ?? null,
         },
         contracts: barContracts,
@@ -539,7 +581,12 @@ export async function evaluateTradeSignals(
   }
 
   const populateMissingWallsFromChain = () => {
-    if (spotPrice > 0 && params.contracts && params.contracts.length > 0 && (!params.callWall || !params.putWall)) {
+    if (
+      spotPrice > 0 &&
+      params.contracts &&
+      params.contracts.length > 0 &&
+      (!params.callWall || !params.putWall || !params.zeroGamma)
+    ) {
       try {
         const analytics = computeOptionsAnalytics({
           ticker: normalizedTicker as any,
@@ -848,7 +895,7 @@ export async function evaluateTradeSignals(
       hadActivePositionAtStart ||
       store.activePositions[positionTickerForCheck] ||
       store.activePositions[normalizedTicker] ||
-      Object.keys(store.activePositions || {}).length > 0
+      hasGlobalPortfolioSlotOrBudgetConflict(store, nowTs)
   );
 
   const isWithinRthEntryWindow =
@@ -983,6 +1030,7 @@ export async function evaluateTradeSignals(
           regime: params.regime ?? regimeClassification.regime,
           absImpulsePeclet: params.absImpulsePeclet ?? absImpulsePeclet,
           remainingExpectedMove,
+          atr5m: setupEval.entryAtr5m,
           dataSource: params.dataSource,
           referenceSpotPrice: params.referenceSpotPrice,
           contractsAlreadyAnchored: params.contractsAlreadyAnchored,
@@ -1195,9 +1243,15 @@ export async function evaluateTradeSignals(
             ...store.bouncedPutWalls,
           };
         }
-        if (Object.keys(latestStoreBeforeCommit.activePositions || {}).length > 0) {
+        if (
+          hasGlobalPortfolioSlotOrBudgetConflict(
+            latestStoreBeforeCommit,
+            nowTs,
+            optimalContract.totalOutlay
+          )
+        ) {
           console.warn(
-            `[evaluateTradeSignals] Aborted ${positionTicker} BTO commit: global slot already occupied (${Object.keys(latestStoreBeforeCommit.activePositions).join(", ")}).`
+            `[evaluateTradeSignals] Aborted ${positionTicker} BTO commit at ts=${nowTs}: global portfolio slot/budget conflict.`
           );
           saveTradeStore(latestStoreBeforeCommit);
           store = latestStoreBeforeCommit;

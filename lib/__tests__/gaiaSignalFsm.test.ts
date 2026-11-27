@@ -541,15 +541,16 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
 
   it("Same-Direction Leg-2 Block & Asymmetric Call Wall Rejection Cooldown (< 1800s blocked, >= 1800s allowed)", () => {
     const fsm = new GaiaSignalFsm();
+    const baseTs = Math.floor(new Date("2026-11-18T09:35:00-05:00").getTime() / 1000);
     const bars: GaiaBarData[] = [
-      { barTimestamp: 1000, open: 757.0, high: 759.0, low: 756.8, close: 758.5, chi: 0.84, bias: 0.42, netFlux: 0.32, peclet: 2.2, flowVwap: 757.2, sma34: 757.0, etMins: 575, isClosed: true },
-      { barTimestamp: 3400, open: 761.8, high: 762.1, low: 759.8, close: 760.0, recentHigh3: 762.1, chi: 0.38, bias: -0.25, netFlux: -0.18, peclet: -1.1, flowVwap: 760.5, sma34: 760.8, etMins: 615, isClosed: true }, // close Leg-1 LONG
+      { barTimestamp: baseTs, open: 757.0, high: 759.0, low: 756.8, close: 758.5, chi: 0.84, bias: 0.42, netFlux: 0.32, peclet: 2.2, flowVwap: 757.2, sma34: 757.0, etMins: 575, isClosed: true },
+      { barTimestamp: baseTs + 2400, open: 761.8, high: 762.1, low: 759.8, close: 760.0, recentHigh3: 762.1, chi: 0.38, bias: -0.25, netFlux: -0.18, peclet: -1.1, flowVwap: 760.5, sma34: 760.8, etMins: 615, isClosed: true }, // close Leg-1 LONG
       // +1795s < 1800s (10:44:55 ET): Call Wall SHORT blocked
-      { barTimestamp: 5195, open: 761.9, high: 762.0, low: 760.2, close: 760.4, recentHigh3: 762.0, chi: 0.40, impulseChi: 0.32, deltaNetFlux6Bar: -0.22, bias: -0.35, netFlux: -0.24, peclet: -0.9, impulsePeclet: -1.6, flowVwap: 760.9, sma34: 761.0, bearDiv5m: true, etMins: 644, isClosed: true },
+      { barTimestamp: baseTs + 4195, open: 761.9, high: 762.0, low: 760.2, close: 760.4, recentHigh3: 762.0, chi: 0.40, impulseChi: 0.32, deltaNetFlux6Bar: -0.22, bias: -0.35, netFlux: -0.24, peclet: -0.9, impulsePeclet: -1.6, flowVwap: 760.9, sma34: 761.0, bearDiv5m: true, etMins: 644, isClosed: true },
       // 11:30 ET (+3600s): same-direction Put Wall LONG attempt strictly blocked (<= 1 per direction)
-      { barTimestamp: 7000, open: 750.3, high: 751.9, low: 750.1, close: 751.7, recentLow4: 750.1, chi: 0.62, impulseChi: 0.72, deltaNetFlux6Bar: 0.24, bias: 0.38, netFlux: 0.28, peclet: 1.1, impulsePeclet: 1.7, flowVwap: 751.2, sma34: 751.4, bullDiv5m: true, etMins: 690, isClosed: true },
+      { barTimestamp: baseTs + 6900, open: 750.3, high: 751.9, low: 750.1, close: 751.7, recentLow4: 750.1, chi: 0.62, impulseChi: 0.72, deltaNetFlux6Bar: 0.24, bias: 0.38, netFlux: 0.28, peclet: 1.1, impulsePeclet: 1.7, flowVwap: 751.2, sma34: 751.4, bullDiv5m: true, etMins: 690, isClosed: true },
       // 11:35 ET (+3900s): opposite-direction Call Wall SHORT admitted
-      { barTimestamp: 7300, open: 761.9, high: 762.0, low: 760.2, close: 760.4, recentHigh3: 762.0, chi: 0.41, impulseChi: 0.32, deltaNetFlux6Bar: -0.22, bias: -0.35, netFlux: -0.24, peclet: -0.9, impulsePeclet: -1.6, flowVwap: 760.9, sma34: 761.0, bearDiv5m: true, etMins: 695, isClosed: true },
+      { barTimestamp: baseTs + 7200, open: 761.9, high: 762.0, low: 760.2, close: 760.4, recentHigh3: 762.0, chi: 0.41, impulseChi: 0.32, deltaNetFlux6Bar: -0.22, bias: -0.35, netFlux: -0.24, peclet: -0.9, impulsePeclet: -1.6, flowVwap: 760.9, sma34: 761.0, bearDiv5m: true, etMins: 695, isClosed: true },
     ];
     const { newlyCommitted } = fsm.commitSeries(bars, {
       macroRegime: "CALL",
@@ -559,7 +560,7 @@ describe("Gaia Signal FSM Non-Repainting Invariants", () => {
     const entries = newlyCommitted.filter((s) => s.toState === "LONG" || s.toState === "SHORT");
     assert.strictEqual(entries.length, 2);
     assert.strictEqual(entries[1].toState, "SHORT");
-    assert.strictEqual(entries[1].barTimestamp, 7300, "Same-direction LONG & <1800s cooldown SHORT must both be blocked");
+    assert.strictEqual(entries[1].barTimestamp, baseTs + 7200, "Same-direction LONG & <1800s cooldown SHORT must both be blocked");
   });
 
   it("Symmetrical Reversal Hold (< 2 bars / 10m) and < $0.75 vs >= $0.75 Adverse Invalidation (LONG & SHORT)", () => {

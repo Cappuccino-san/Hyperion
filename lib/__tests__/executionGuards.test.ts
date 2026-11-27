@@ -5,12 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import { NextRequest } from "next/server";
 import {
+  AFTERNOON_DTE_SHIFT_REM_MINS,
   EARLY_CLOSES_2026,
+  OTM_0DTE_BAN_REM_MINS,
+  STRICT_OTM_0DTE_BAN_REM_MINS,
   capExitTsToEodFlat,
+  getRemainingRthMinutes,
   getSessionBoundsEt,
   isAtOrPastEodFlat,
   isWithinEntryWindow,
 } from "../gaiaSessionGuards";
+import { deriveTacticalStructuralLevels } from "../optionsExposure";
+import { evaluateActivePositionStepA } from "../execution/bracketStateMachine";
 import {
   computeTaylorNetPayoff,
   resolveMinOptionDelta,
@@ -1299,4 +1305,522 @@ test("afternoon 0DTE OTM ban (>= 12:30 ET), +2σ target1Spot cap, BOUNDARY_FLUX_
     typeof closedTrade?.pnlOptionPct === "number" && closedTrade.pnlOptionPct < -10,
     `Expected real 52m afternoon 0DTE BS theta loss (< -10%), got ${closedTrade?.pnlOptionPct}%`
   );
+});
+
+test("2026-11-27 Black Friday Wipeout Regression: early-close 0DTE guard, 0.5*ATR5m convexity filter, global backfill slot lock, exhaustion/zeroGamma gates & ZG/Bid parity", async () => {
+  // 1. Remaining-RTH-Minutes 0DTE Guard on 2026-11-27 (10:00 AM ET -> 180m remaining on 13:00 ET early close)
+  const bfBounds = getSessionBoundsEt("2026-11-27");
+  assert.equal(bfBounds.isEarlyClose, true);
+  assert.equal(getRemainingRthMinutes(600, bfBounds), 180);
+  assert.equal(AFTERNOON_DTE_SHIFT_REM_MINS, 270);
+  assert.equal(OTM_0DTE_BAN_REM_MINS, 210);
+  assert.equal(STRICT_OTM_0DTE_BAN_REM_MINS, 150);
+
+  const bf10amEt = new Date("2026-11-27T10:00:00-05:00");
+  const spy0DtePutOnly = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "PUT",
+    spotPrice: 720.49,
+    target1Spot: 716.71,
+    target2Spot: 716.39,
+    stopLossSpot: 722.98,
+    preferredDte: "0DTE",
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.13,
+    atr5m: 2.6655,
+    nowEt: bf10amEt,
+    contracts: [
+      {
+        symbol: "SPY261127P00719000",
+        strike: 719,
+        expiration: "2026-11-27",
+        optionType: "P",
+        bid: 0.49,
+        ask: 0.53,
+        last: 0.51,
+        volume: 15000,
+        openInterest: 10000,
+        iv: 0.0906,
+        delta: -0.30,
+        gamma: 0.08,
+        vega: 0.04,
+        percentChange: 0,
+      },
+    ],
+  });
+  assert.equal(spy0DtePutOnly, null, "2026-11-27 10:00 AM ET early close must reject OTM 0DTE SPY 719P");
+
+  const qqqRoutedTo1Dte = await selectSmallAccountContract({
+    ticker: "QQQ",
+    contractType: "PUT",
+    spotPrice: 638.0,
+    target1Spot: 631.72,
+    target2Spot: 631.47,
+    stopLossSpot: 642.13,
+    preferredDte: "0DTE",
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 1.62,
+    atr5m: 4.38,
+    nowEt: bf10amEt,
+    contracts: [
+      {
+        symbol: "QQQ261127P00637000",
+        strike: 637,
+        expiration: "2026-11-27",
+        optionType: "P",
+        bid: 0.54,
+        ask: 0.58,
+        last: 0.56,
+        volume: 15000,
+        openInterest: 10000,
+        iv: 0.0913,
+        delta: -0.32,
+        gamma: 0.08,
+        vega: 0.04,
+        percentChange: 0,
+      },
+      {
+        symbol: "QQQ261130P00636000",
+        strike: 636,
+        expiration: "2026-11-30",
+        optionType: "P",
+        bid: 0.80,
+        ask: 0.84,
+        last: 0.82,
+        volume: 9000,
+        openInterest: 8000,
+        iv: 0.14,
+        delta: -0.34,
+        gamma: 0.04,
+        vega: 0.09,
+        percentChange: 0,
+      },
+    ],
+  });
+  assert.equal(qqqRoutedTo1Dte?.expiration, "2026-11-30", "Early-close 10:00 AM must route to multi-DTE when available");
+
+  // 2. 0.5 * ATR5m Convexity / Hard-Stop Gap-Through Guard on full trading day (3.5h left, low IV 0DTE)
+  const fullDayMiddayEt = new Date("2026-11-18T12:15:00-05:00");
+  const hyperConvexRejected = await selectSmallAccountContract({
+    ticker: "SPY",
+    contractType: "PUT",
+    spotPrice: 720.49,
+    target1Spot: 716.0,
+    target2Spot: 714.5,
+    stopLossSpot: 722.98, // stopDist = $2.49; 0.5 * 2.6655 = $1.33 < 0.90 * $2.49
+    preferredDte: "0DTE",
+    regime: "NEG_GAMMA_TREND",
+    absImpulsePeclet: 2.13,
+    atr5m: 2.6655,
+    nowEt: fullDayMiddayEt,
+    contracts: [
+      {
+        symbol: "SPY261118P00719000",
+        strike: 719,
+        expiration: "2026-11-18",
+        optionType: "P",
+        bid: 0.49,
+        ask: 0.53,
+        last: 0.51,
+        volume: 18000,
+        openInterest: 12000,
+        iv: 0.0906,
+        delta: -0.30,
+        gamma: 0.08,
+        vega: 0.04,
+        percentChange: 0,
+      },
+    ],
+  });
+  assert.equal(
+    hyperConvexRejected,
+    null,
+    "0DTE contract whose 0.5 * ATR5m adverse bounce breaches -45% hard stop Bid must be rejected"
+  );
+
+  // 3. Global Single-Slot Lock in Sequential Multi-Ticker Backfill ([openedTs, closedTs))
+  const { evaluateTradeSignals } = await import("../tradeSignalEngine");
+  const bfDate = "2026-11-27";
+  const spyOpenTs = 1795791600; // 10:00 AM ET
+  const spyCloseTs = 1795792200; // 10:10 AM ET
+  const bfRegDate = "2026-11-18"; // full-day session to isolate global slot lock from early-close contract filter
+  const regOpenTs = Math.floor(new Date("2026-11-18T10:00:00-05:00").getTime() / 1000);
+  const regCloseTs = Math.floor(new Date("2026-11-18T10:10:00-05:00").getTime() / 1000);
+  saveTradeStore({
+    date: bfRegDate,
+    activePositions: {},
+    closedPositions: [
+      {
+        id: "SPY-PUT-REG-OPEN",
+        ticker: "SPY",
+        contractType: "PUT",
+        contractLabel: "SPY 720P",
+        strike: 720,
+        expiration: bfRegDate,
+        setupName: "Gaia Advection Breakdown",
+        status: "CLOSED",
+        btoSpotPrice: 721.5,
+        btoOptionMid: 0.55,
+        btoOptionAsk: 0.57,
+        contractsQty: 1,
+        remainingQty: 0,
+        totalOutlay: 57,
+        target1Spot: 718,
+        target2Spot: 716,
+        stopLossSpot: 723.5,
+        openedAt: "10:00 AM",
+        openedTs: regOpenTs,
+        closedAt: "10:10 AM",
+        closedTs: regCloseTs,
+        pnlOptionPct: -20,
+        exitReason: "TEST_CLOSED",
+      },
+    ],
+    alerts: [],
+    prevSpotPrices: { SPY: 721.5, QQQ: 641.0 },
+  });
+
+  const qqqChainReg = [
+    {
+      symbol: "QQQ261118P00639000",
+      strike: 639,
+      expiration: bfRegDate,
+      optionType: "P" as const,
+      bid: 0.64,
+      ask: 0.67,
+      last: 0.65,
+      volume: 14000,
+      openInterest: 9000,
+      iv: 0.20,
+      delta: -0.35,
+      gamma: 0.05,
+      vega: 0.07,
+      percentChange: 0,
+    },
+  ];
+  const makeQqqCandle = (ts: number) => ({
+    open: 641.2,
+    high: 641.5,
+    low: 640.5,
+    close: 640.6,
+    sma34: 641.6,
+    timestamp: ts,
+    prevLow: 640.8,
+    prevHigh: 642.0,
+    sessionOpen: 642.0,
+    flowSnapshot: {
+      timestamp: ts,
+      spot: 640.6,
+      flowVwap: 641.4,
+      ceilingShareChi: 0.36,
+      pecletNumber: -1.65,
+      netFluxJ: -0.18,
+      upper1s: 643.2,
+      lower1s: 639.6,
+      upper2s: 645.0,
+      lower2s: 637.8,
+      upper1Sigma: 643.2,
+      lower1Sigma: 639.6,
+      upper2Sigma: 645.0,
+      lower2Sigma: 637.8,
+      sigma: 1.8,
+      variance: 3.24,
+      atr5m: 1.4,
+      cumGammaWeight: 100,
+      totalWeight: 100,
+      signedGammaAcceleration: 0,
+      count: 10,
+      bandSignal: null,
+    },
+  });
+
+  const qqqBlockedAtOpen = await evaluateTradeSignals({
+    ticker: "QQQ",
+    spotPrice: 640.6,
+    prevSpotPrice: 641.2,
+    callWall: 650,
+    putWall: 632,
+    zeroGamma: 642.5,
+    contracts: qqqChainReg,
+    nowEt: new Date(regOpenTs * 1000),
+    isHistoricalBackfill: true,
+    latest5mCandle: makeQqqCandle(regOpenTs),
+  });
+  assert.equal(qqqBlockedAtOpen.activePosition, null, "QQQ must be blocked at exact SPY openedTs");
+
+  const qqqBlockedMidLife = await evaluateTradeSignals({
+    ticker: "QQQ",
+    spotPrice: 640.6,
+    prevSpotPrice: 641.2,
+    callWall: 650,
+    putWall: 632,
+    zeroGamma: 642.5,
+    contracts: qqqChainReg,
+    nowEt: new Date((regOpenTs + 300) * 1000),
+    isHistoricalBackfill: true,
+    latest5mCandle: makeQqqCandle(regOpenTs + 300),
+  });
+  assert.equal(qqqBlockedMidLife.activePosition, null, "QQQ must be blocked inside SPY [openedTs, closedTs)");
+
+  const qqqAllowedAfterClose = await evaluateTradeSignals({
+    ticker: "QQQ",
+    spotPrice: 640.6,
+    prevSpotPrice: 641.2,
+    callWall: 650,
+    putWall: 632,
+    zeroGamma: 642.5,
+    contracts: qqqChainReg,
+    nowEt: new Date(regCloseTs * 1000),
+    isHistoricalBackfill: true,
+    latest5mCandle: makeQqqCandle(regCloseTs),
+  });
+  assert.equal(
+    qqqAllowedAfterClose.activePosition?.ticker,
+    "QQQ",
+    "QQQ should unlock once evalTs >= SPY closedTs"
+  );
+
+  // 4. Exhausted Opening Flush & zeroGamma Structural Floor Gates in Gaia Advection Breakdown
+  const storeForScoring = loadTradeStore(bfDate);
+  const spyExhaustedSetup = evaluateBtoCandidateSetup({
+    normalizedTicker: "SPY",
+    spotPrice: 720.49,
+    prevSpotPrice: 720.09,
+    params: {
+      ticker: "SPY",
+      spotPrice: 720.49,
+      callWall: 730,
+      putWall: 725,
+      zeroGamma: 729.8,
+      dailyExpectedMove: { low: 715.92, high: 721.64 }, // EM half-width = $2.86
+    },
+    store: storeForScoring,
+    latest5mCandle: {
+      open: 720.72,
+      high: 720.88,
+      low: 719.87,
+      close: 720.49,
+      sma34: 721.9,
+      timestamp: spyOpenTs,
+      prevLow: 720.0,
+      prevHigh: 722.21,
+      sessionOpen: 725.86, // -$5.37 opening flush = 1.88x Daily EM
+      flowSnapshot: {
+        timestamp: spyOpenTs,
+        spot: 720.49,
+        flowVwap: 722.01,
+        ceilingShareChi: 0.33,
+        pecletNumber: -2.13,
+        netFluxJ: -0.25,
+        upper1s: 724.1,
+        lower1s: 719.9,
+        upper2s: 726.2,
+        lower2s: 717.8,
+        upper1Sigma: 724.1,
+        lower1Sigma: 719.9,
+        upper2Sigma: 726.2,
+        lower2Sigma: 717.8,
+        sigma: 2.1,
+        variance: 4.41,
+        atr5m: 2.6655,
+        cumGammaWeight: 100,
+        totalWeight: 100,
+        signedGammaAcceleration: 0,
+        count: 7,
+        bandSignal: null,
+      },
+    },
+    divergence5m: "NO",
+    divergence30m: "NO",
+    etTotalMinutes: 600,
+    nowTs: spyOpenTs,
+    sessionDate: bfDate,
+    isPhase2ReclaimWindow: false,
+    sameTickerClosedCount: 0,
+  });
+  assert.equal(
+    spyExhaustedSetup.candidateBto,
+    null,
+    "Gaia Advection Breakdown must reject exhausted SPY opening flush with hammer wick and >1.05x Daily EM without VWAP pullback"
+  );
+
+  const qqqZeroGammaBlockedSetup = evaluateBtoCandidateSetup({
+    normalizedTicker: "QQQ",
+    spotPrice: 638.0,
+    prevSpotPrice: 637.82,
+    params: {
+      ticker: "QQQ",
+      spotPrice: 638.0,
+      callWall: 650,
+      putWall: 640, // above spot, so tacticalPw doesn't cap
+      zeroGamma: 636.51, // only $1.49 below spot (< minZeroGammaClearance = max($2.25, 0.75 * 4.38))
+    },
+    store: storeForScoring,
+    latest5mCandle: {
+      open: 638.8,
+      high: 639.6,
+      low: 637.9,
+      close: 638.0,
+      sma34: 639.8,
+      timestamp: spyOpenTs,
+      prevLow: 637.67,
+      prevHigh: 640.17,
+      sessionOpen: 640.0,
+      flowSnapshot: {
+        timestamp: spyOpenTs,
+        spot: 638.0,
+        flowVwap: 639.73,
+        ceilingShareChi: 0.37,
+        pecletNumber: -1.62,
+        netFluxJ: -0.22,
+        upper1s: 642.5,
+        lower1s: 636.9,
+        upper2s: 645.3,
+        lower2s: 634.1,
+        upper1Sigma: 642.5,
+        lower1Sigma: 636.9,
+        upper2Sigma: 645.3,
+        lower2Sigma: 634.1,
+        sigma: 2.8,
+        variance: 7.84,
+        atr5m: 4.38,
+        cumGammaWeight: 100,
+        totalWeight: 100,
+        signedGammaAcceleration: 0,
+        count: 7,
+        bandSignal: null,
+      },
+    },
+    divergence5m: "NO",
+    divergence30m: "NO",
+    etTotalMinutes: 600,
+    nowTs: spyOpenTs,
+    sessionDate: bfDate,
+    isPhase2ReclaimWindow: false,
+    sameTickerClosedCount: 0,
+  });
+  assert.equal(
+    qqqZeroGammaBlockedSetup.candidateBto,
+    null,
+    "Gaia Advection Breakdown must reject shorting QQQ $638.00 directly into zeroGamma $636.51 ($1.49 room)"
+  );
+
+  // 5. Backfill vs Live zeroGamma Parity & STC Bid Formatting Audit
+  const tactical = deriveTacticalStructuralLevels({
+    ticker: "SPY",
+    dataSource: "CBOE_MARKET_DATA",
+    lastUpdated: "10:49:00",
+    spotPrice: 725.62,
+    previousClose: 718.78,
+    impliedVolatility: 0.14,
+    strikeStep: 1,
+    expectedMoves: {
+      daily: { exp: "2026-11-27", em: 2.86, pct: 0.4, low: 715.92, high: 721.64 },
+      weekly: null,
+      monthly: null,
+      annual: null,
+    },
+    netMetrics: { netGex: 0.45, netVex: 12, netDex: 15, netCharm: -2 },
+    gammaLevels: { callWall: 730, putWall: 725, zeroGamma: 729.8 },
+    gammaLevelsByFilter: {
+      "0DTE": { callWall: 730, putWall: 725, zeroGamma: 715.71, hasZeroGammaFlip: true },
+    },
+    kingNode: {
+      allExpKing: 700,
+      filteredKing: 700,
+      filteredLabel: "ALL",
+      zeroDteKing: 700,
+      zeroDteDate: "11-27",
+      hasZeroDte: true,
+      weeklyKing: 700,
+      weeklyDate: "11-27",
+      kingValue: 10,
+      secondLargestStrike: 725,
+      secondLargestValue: 8,
+      totalBoardGamma: 50,
+      kingStrength: 20,
+      isContested: false,
+    },
+    kingByFilter: {
+      ALL: { strike: 700, label: "ALL" },
+      "0DTE": { strike: 700, label: "0DTE" },
+      THIS_WEEK: { strike: 700, label: "THIS_WEEK" },
+      OPEX: { strike: 700, label: "OPEX" },
+    },
+    expirations: [],
+    strikes: [],
+  });
+  assert.equal(tactical.zeroGamma, 729.8, "deriveTacticalStructuralLevels must match aggregate Gaia ZERO Γ");
+  assert.equal(tactical.zeroDteZeroGamma, 715.71, "deriveTacticalStructuralLevels must still expose zeroDteZeroGamma");
+
+  const stcStore = loadTradeStore(bfDate);
+  const emittedAlerts: any[] = [];
+  evaluateActivePositionStepA({
+    activePos: {
+      id: "SPY-PUT-FMT-TEST",
+      ticker: "SPY",
+      contractType: "PUT",
+      contractLabel: "SPY 261127 719P",
+      strike: 719,
+      expiration: bfDate,
+      setupName: "Test",
+      status: "OPEN",
+      btoSpotPrice: 720.49,
+      btoOptionMid: 0.51,
+      btoOptionAsk: 0.53,
+      optionBid: 0.49,
+      optionAsk: 0.53,
+      contractsQty: 1,
+      remainingQty: 1,
+      totalOutlay: 53,
+      target1Spot: 716.71,
+      target2Spot: 716.39,
+      stopLossSpot: 722.98,
+      openedAt: "10:00 AM",
+      openedTs: spyOpenTs,
+      entryIv: 0.0906,
+      entryTYears: 0.0018315,
+    },
+    normalizedTicker: "SPY",
+    positionKey: "SPY",
+    isSpxw: false,
+    spotPrice: 722.21,
+    putWall: 725,
+    callWall: 730,
+    zeroGamma: 729.8,
+    latest5mCandle: null,
+    divergence5m: "NO",
+    contracts: [
+      {
+        symbol: "SPY261127P00719000",
+        strike: 719,
+        expiration: bfDate,
+        optionType: "P",
+        bid: 0.14,
+        ask: 0.16,
+        last: 0.15,
+        volume: 1000,
+        openInterest: 1000,
+        iv: 0.0906,
+        delta: -0.08,
+        gamma: 0.05,
+        vega: 0.01,
+        percentChange: -70,
+        quoteSource: "DELAYED_CBOE",
+      },
+    ],
+    dataSource: "CBOE_MARKET_DATA",
+    nowTs: spyCloseTs,
+    timeStr: "10:10 AM",
+    etHours: 10,
+    etMinutes: 10,
+    etTotalMinutes: 610,
+    sessionDate: bfDate,
+    isHistoricalBackfill: true,
+    store: stcStore,
+    emittedAlerts,
+  });
+  assert.equal(emittedAlerts.length, 1);
+  assert.match(emittedAlerts[0].message, /Ask \$0\.53 → Bid \$0\.14/);
+  assert.doesNotMatch(emittedAlerts[0].message, /Biid/i);
 });

@@ -1084,6 +1084,15 @@ export async function fetchLive5mCandleAndDivergence(
         if (closedBars.length >= 2) {
           const latest = closedBars[closedBars.length - 1];
           const prevClosedBar = closedBars[closedBars.length - 2];
+          const latestEtDate = formatEtIsoDate(new Date(latest.timestamp * 1000));
+          const latestBounds = getSessionBoundsEt(latestEtDate);
+          const firstSessionRthBar = closedBars.find((b) => {
+            const dt = new Date(b.timestamp * 1000);
+            return (
+              formatEtIsoDate(dt) === latestEtDate &&
+              getNowEtTime(dt).totalMinutes >= latestBounds.rthOpenMins
+            );
+          });
 
           const startIdx = Math.max(0, closedBars.length - 34);
           let sum = 0;
@@ -1109,6 +1118,10 @@ export async function fetchLive5mCandleAndDivergence(
             timestamp: latest.timestamp,
             prevLow: Number(prevClosedBar.low.toFixed(2)),
             prevHigh: Number(prevClosedBar.high.toFixed(2)),
+            sessionOpen:
+              firstSessionRthBar && firstSessionRthBar.open > 0
+                ? Number(firstSessionRthBar.open.toFixed(2))
+                : undefined,
             flowSnapshot,
           };
 

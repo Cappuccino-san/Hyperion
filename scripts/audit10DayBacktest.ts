@@ -42,7 +42,13 @@ import {
 } from "../lib/bracketOrderEngine";
 import { evaluateOptionProfitRatchet } from "../lib/execution/profitRatchet";
 import { MAX_OPTION_DELTA, resolveMinOptionDelta } from "../lib/positionSizer";
-import { getSessionBoundsEt } from "../lib/gaiaSessionGuards";
+import {
+  AFTERNOON_DTE_SHIFT_REM_MINS,
+  OTM_0DTE_BAN_REM_MINS,
+  STRICT_OTM_0DTE_BAN_REM_MINS,
+  getRemainingRthMinutes,
+  getSessionBoundsEt,
+} from "../lib/gaiaSessionGuards";
 import { computeAdaptiveQuantMetrics } from "../lib/gaiaSignalFsm";
 import {
   evaluateSessionPlaybook,
@@ -159,7 +165,11 @@ function selectRegimeAdaptiveBacktestContract(params: {
       Math.max(spot * 0.0095, target2Dist * 0.85)
     )
   );
-  const dtePool = preferredDte === "1-2DTE" || isAfternoon ? [1, 2, 0] : [0, 1, 2];
+  const sessionBounds = getSessionBoundsEt(sessionDate);
+  const minsRemaining = getRemainingRthMinutes(etMins, sessionBounds);
+  const effectiveAfternoon =
+    isAfternoon || sessionBounds.isEarlyClose || minsRemaining <= AFTERNOON_DTE_SHIFT_REM_MINS;
+  const dtePool = preferredDte === "1-2DTE" || effectiveAfternoon ? [1, 2, 0] : [0, 1, 2];
 
   const primaryCandidates: ContractCandidateInput[] = [];
   const highIvFallbackCandidates: ContractCandidateInput[] = [];
@@ -179,12 +189,14 @@ function selectRegimeAdaptiveBacktestContract(params: {
       const strike = Number((isCall ? baseStrike + step * strikeStep : baseStrike - step * strikeStep).toFixed(2));
       const otmDist = Math.abs(strike - spot);
       if (otmDist > maxFallbackOtmDist) break;
-      // Exact parity with production contractRouter.ts:
-      // 12:30-13:29 ET bans >ceil/<floor OTM 0DTE; >= 13:30 ET (<2.5h to expiry) bans ALL OTM 0DTE.
+      // Exact parity with production contractRouter.ts remaining-RTH-minutes 0DTE guard:
+      if (dteDays === 0 && sessionBounds.isEarlyClose) {
+        continue;
+      }
       if (
-        etMins >= 750 &&
+        minsRemaining <= OTM_0DTE_BAN_REM_MINS &&
         dteDays === 0 &&
-        (etMins >= 810
+        (minsRemaining <= STRICT_OTM_0DTE_BAN_REM_MINS
           ? isCall
             ? strike > spot
             : strike < spot

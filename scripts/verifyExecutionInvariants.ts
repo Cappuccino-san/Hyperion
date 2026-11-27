@@ -54,6 +54,19 @@ import {
   getPersistenceCacheDir,
   resetPersistenceMemCachesForTests,
 } from "../lib/persistenceStore";
+import { getSessionBoundsEt } from "../lib/gaiaSessionGuards";
+
+function resolveRegularFullTradingDate(startIso: string = getTodayEt()): string {
+  const [y, m, d] = startIso.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, (m || 1) - 1, d || 1, 12, 0, 0));
+  for (let i = 0; i < 14; i++) {
+    const iso = dt.toISOString().slice(0, 10);
+    const b = getSessionBoundsEt(iso);
+    if (b.isTradingDay && !b.isEarlyClose) return iso;
+    dt.setUTCDate(dt.getUTCDate() - 1);
+  }
+  return "2026-11-25";
+}
 
 let totalTests = 0;
 let passedTests = 0;
@@ -411,7 +424,7 @@ async function runTestSuite() {
   console.log("\n5. Verifying 0DTE Wall Strike Alignment Invariants for BTO Put Triggers...");
 
   // Mock chain: 0DTE Put Wall at 760, Call Wall at 770, spot at 762 (within min($3.50, 0.45%) OTM + absDelta >= 0.25)
-  const activeExpDate = getTodayEt();
+  const activeExpDate = resolveRegularFullTradingDate();
   const mockPuts: NormalizedOptionContract[] = [
     {
       symbol: "SPY261023P00750000",
@@ -1878,76 +1891,105 @@ async function runTestSuite() {
     "deltaImpulseChi6Bar must turn strictly positive on afternoon V-reclaim"
   );
 
-  // Verify GET /api/signals?ticker=SPY&date=2026-11-13 returns historical session trades read-only on weekends/off-hours
+  // Verify GET /api/signals?ticker=SPY&date=<recent> returns historical session trades read-only on weekends/off-hours
   const fsHist = await import("fs");
   const pathHist = await import("path");
   const histCacheDir = getPersistenceCacheDir();
-  const histFixturePath = pathHist.join(histCacheDir, "active-trades-2026-11-13.json");
-  const hadHistFixture = fsHist.existsSync(histFixturePath);
-  if (!hadHistFixture) {
-    fsHist.mkdirSync(histCacheDir, { recursive: true });
-    const fixtureStore: DailyTradeStore = {
-      date: "2026-11-13",
-      version: 1,
-      updatedAtMs: 1794585000000,
-      activePositions: {},
-      closedPositions: [
-        {
-          id: "SPY-PUT-1794581245",
-          ticker: "SPY",
-          contractType: "PUT",
-          contractLabel: "SPY 261113 750P (0 DTE · $0.68)",
-          strike: 750,
-          expiration: "2026-11-13",
-          setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
-          status: "CLOSED",
-          btoSpotPrice: 751.2,
-          btoOptionMid: 0.68,
-          optionBid: 0.66,
-          optionAsk: 0.68,
-          contractsQty: 1,
-          remainingQty: 0,
-          totalOutlay: 68,
-          target1Spot: 749.2,
-          target2Spot: 748.0,
-          stopLossSpot: 752.4,
-          openedAt: "9:47 AM",
-          openedTs: 1794581245,
-          closedAt: "10:18 AM",
-          closedTs: 1794583080,
-          closedSpotPrice: 749.1,
-          closedOptionMid: 1.42,
-          pnlOptionPct: 108.8,
-          pnlSpotPct: 0.28,
-          exitReason: "TARGET 1 PROFIT SECURED",
-        },
-      ],
-      alerts: [],
-      prevSpotPrices: { SPY: 751.2 },
-    };
-    fsHist.writeFileSync(histFixturePath, JSON.stringify(fixtureStore, null, 2), "utf-8");
+  const todayIsoForHist = getTodayEt();
+  let histTestDate = "";
+  for (let off = 1; off <= 12; off++) {
+    const cand = new Date(Date.now() - off * 86_400_000).toLocaleDateString("en-CA", {
+      timeZone: "America/New_York",
+    });
+    if (
+      cand !== todayIsoForHist &&
+      !fsHist.existsSync(pathHist.join(histCacheDir, `active-trades-${cand}.json`))
+    ) {
+      histTestDate = cand;
+      break;
+    }
   }
+  if (!histTestDate) {
+    histTestDate = new Date(Date.now() - 2 * 86_400_000).toLocaleDateString("en-CA", {
+      timeZone: "America/New_York",
+    });
+  }
+  const histFixturePath = pathHist.join(histCacheDir, `active-trades-${histTestDate}.json`);
+  const hadHistFixture = fsHist.existsSync(histFixturePath);
+  const prevHistRaw = hadHistFixture ? fsHist.readFileSync(histFixturePath, "utf-8") : null;
+  fsHist.mkdirSync(histCacheDir, { recursive: true });
+  const fixtureStore: DailyTradeStore = {
+    date: histTestDate,
+    version: 1,
+    updatedAtMs: Date.now() - 86_400_000,
+    activePositions: {},
+    closedPositions: [
+      {
+        id: "SPY-PUT-1794581245",
+        ticker: "SPY",
+        contractType: "PUT",
+        contractLabel: `SPY ${histTestDate.replace(/-/g, "").slice(2)} 750P (0 DTE · $0.68)`,
+        strike: 750,
+        expiration: histTestDate,
+        setupName: "Bearish Zero-Gamma Flush [BTO PUT]",
+        status: "CLOSED",
+        btoSpotPrice: 751.2,
+        btoOptionMid: 0.68,
+        optionBid: 0.66,
+        optionAsk: 0.68,
+        contractsQty: 1,
+        remainingQty: 0,
+        totalOutlay: 68,
+        target1Spot: 749.2,
+        target2Spot: 748.0,
+        stopLossSpot: 752.4,
+        openedAt: "9:47 AM",
+        openedTs: 1794581245,
+        closedAt: "10:18 AM",
+        closedTs: 1794583080,
+        closedSpotPrice: 749.1,
+        closedOptionMid: 1.42,
+        pnlOptionPct: 108.8,
+        pnlSpotPct: 0.28,
+        exitReason: "TARGET 1 PROFIT SECURED",
+      },
+    ],
+    alerts: [],
+    prevSpotPrices: { SPY: 751.2 },
+  };
+  fsHist.writeFileSync(histFixturePath, JSON.stringify(fixtureStore, null, 2), "utf-8");
+  resetPersistenceMemCachesForTests();
   try {
-    const histSignalsReq = new NextRequest("http://localhost:3000/api/signals?ticker=SPY&date=2026-11-13");
+    const histSignalsReq = new NextRequest(
+      `http://localhost:3000/api/signals?ticker=SPY&date=${histTestDate}`
+    );
     const histSignalsRes = await getSignalsRoute(histSignalsReq);
     const histSignalsBody = await histSignalsRes.json();
     assert(
       histSignalsRes.status === 200,
-      `GET /api/signals?ticker=SPY&date=2026-11-13 returns HTTP 200 (got ${histSignalsRes.status})`
+      `GET /api/signals?ticker=SPY&date=${histTestDate} returns HTTP 200 (got ${histSignalsRes.status})`
     );
     assert(
-      histSignalsBody.sessionDate === "2026-11-13",
-      `GET /api/signals?date=2026-11-13 returns sessionDate === "2026-11-13" (got ${histSignalsBody.sessionDate})`
+      histSignalsBody.sessionDate === histTestDate,
+      `GET /api/signals?date=${histTestDate} returns sessionDate === "${histTestDate}" (got ${histSignalsBody.sessionDate})`
     );
     assert(
       Array.isArray(histSignalsBody.closedPositions) &&
         histSignalsBody.closedPositions.some((p: { id?: string }) => p.id === "SPY-PUT-1794581245"),
-      "GET /api/signals?ticker=SPY&date=2026-11-13 returns 2026-11-13 closed trade SPY-PUT-1794581245"
+      `GET /api/signals?ticker=SPY&date=${histTestDate} returns ${histTestDate} closed trade SPY-PUT-1794581245`
     );
   } finally {
-    if (!hadHistFixture && fsHist.existsSync(histFixturePath)) {
+    if (hadHistFixture && prevHistRaw !== null) {
+      try {
+        fsHist.writeFileSync(histFixturePath, prevHistRaw, "utf-8");
+        resetPersistenceMemCachesForTests();
+      } catch {
+        // Ignore restore failures
+      }
+    } else if (!hadHistFixture && fsHist.existsSync(histFixturePath)) {
       try {
         fsHist.unlinkSync(histFixturePath);
+        resetPersistenceMemCachesForTests();
       } catch {
         // Ignore cleanup failures
       }
@@ -2090,9 +2132,9 @@ async function runTestSuite() {
   // TEST SECTION 13: MULTI-TICKER DYNAMIC ATR/% GATES IN evaluateTradeSignals
   // ===========================================================================
   console.log("\n13. Verifying Dynamic ATR/% Gates Trigger Valid IWM ($220) & NVDA ($140 @ 48% IV) Setups...");
-  const storeBackupMT = loadTradeStore();
+  const mtDate = resolveRegularFullTradingDate();
+  const storeBackupMT = loadTradeStore(mtDate);
   try {
-    const mtDate = getTodayEt();
     const makeEtDateMt = (hh: number, mm: number): Date => {
       const utcGuess = Date.UTC(Number(mtDate.slice(0, 4)), Number(mtDate.slice(5, 7)) - 1, Number(mtDate.slice(8, 10)), hh + 5, mm, 0);
       const etHh = Number(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", hourCycle: "h23" }).format(new Date(utcGuess)));
@@ -2163,7 +2205,7 @@ async function runTestSuite() {
       contracts: [{ symbol: "NVDA_140_5C", strike: 140.5, expiration: mtExpLive, optionType: "C", bid: 0.62, ask: 0.65, last: 0.63, volume: 18500, openInterest: 14200, iv: 0.48, delta: 0.33, gamma: 0.13, vega: 0.04, percentChange: 0 }],
       latest5mCandle: { open: 139.90, high: 139.95, low: 139.05, close: 139.50, sma34: 139.85, timestamp: nvdaExitTs, flowSnapshot: { ...makeMtFlow(139.50, 139.85, 0.45, 0.35, 0.32, -1.2, -0.15, -0.15), atr5m: 0.90 } },
     });
-    assert(nvdaWickHold.activePosition !== null && loadTradeStore().closedPositions.length === 0, "13B.3a: 0.55x ATR5m (-$0.50) close / intra-bar wick inside 1.0x ATR ($0.90) STRUCT_CLOSE stop must NOT prematurely stop out");
+    assert(nvdaWickHold.activePosition !== null && loadTradeStore(mtDate).closedPositions.length === 0, "13B.3a: 0.55x ATR5m (-$0.50) close / intra-bar wick inside 1.0x ATR ($0.90) STRUCT_CLOSE stop must NOT prematurely stop out");
 
     const nvdaCloseBreakExit = await evaluateTradeSignals({
       ticker: "NVDA", spotPrice: 139.02, prevSpotPrice: 139.50, callWall: 141.5, putWall: 138.5, zeroGamma: 140.5,
@@ -2171,7 +2213,7 @@ async function runTestSuite() {
       contracts: [{ symbol: "NVDA_140_5C", strike: 140.5, expiration: mtExpLive, optionType: "C", bid: 0.46, ask: 0.49, last: 0.47, volume: 18500, openInterest: 14200, iv: 0.48, delta: 0.25, gamma: 0.10, vega: 0.04, percentChange: 0 }],
       latest5mCandle: { open: 139.50, high: 139.55, low: 139.00, close: 139.02, sma34: 139.75, timestamp: nvdaExitTs + 300, flowSnapshot: { ...makeMtFlow(139.02, 139.75, 0.45, 0.30, 0.28, -1.5, -0.20, -0.18), atr5m: 0.90 } },
     });
-    assert(nvdaCloseBreakExit.activePosition === null && loadTradeStore().closedPositions.length === 1, "13B.3b: Confirmed 5m close <= stopLossSpot (139.02 <= 139.10) triggers clean STRUCT_CLOSE exit");
+    assert(nvdaCloseBreakExit.activePosition === null && loadTradeStore(mtDate).closedPositions.length === 1, "13B.3b: Confirmed 5m close <= stopLossSpot (139.02 <= 139.10) triggers clean STRUCT_CLOSE exit");
 
     // =========================================================================
     // TEST SECTION 14: GLOBAL SINGLE-SLOT LOCK ACROSS TICKERS (SPY ACTIVE -> NVDA BLOCKED)
@@ -2192,7 +2234,7 @@ async function runTestSuite() {
       contracts: nvdaChainLive,
       latest5mCandle: { open: 139.65, high: 140.05, low: 139.18, prevLow: 139.18, close: 140.0, sma34: 139.80, timestamp: mtEvalTs, flowSnapshot: { ...makeMtFlow(140.0, 139.80, 0.45, 0.64, 0.70, 1.4, 0.18, 0.18), atr5m: 0.40 } },
     });
-    const storeAfter14A = loadTradeStore();
+    const storeAfter14A = loadTradeStore(mtDate);
     assert(nvdaLockedEval.activePosition === null && nvdaLockedEval.emittedAlerts.length === 0, "14A.1: evaluateTradeSignals strictly blocks NVDA while SPY has an active position");
     assert(Object.keys(storeAfter14A.activePositions).length === 1 && storeAfter14A.activePositions["SPY"]?.id === spyOpenPos.id && !storeAfter14A.activePositions["NVDA"], "14A.2: Global activePositions remains strictly { SPY }");
 
@@ -2211,7 +2253,7 @@ async function runTestSuite() {
       }),
     });
     const postLockedRes = await postSignalsRoute(postLockedReq);
-    const storeAfter14B = loadTradeStore();
+    const storeAfter14B = loadTradeStore(mtDate);
     assert(syncLockedRes.dispatchedCount === 0 && postLockedRes.status === 200, "14B.1: syncGaiaTickerSignalsToDiscord & POST /api/signals block NVDA dispatch while SPY is active");
     assert(Object.keys(storeAfter14B.activePositions).length === 1 && storeAfter14B.activePositions["SPY"]?.id === spyOpenPos.id, "14B.2: NVDA sync (even STAND_ASIDE) never mutates or purges active SPY slot");
 
@@ -2233,7 +2275,7 @@ async function runTestSuite() {
       contracts: [{ symbol: "IWM_220_5C", strike: 220.5, expiration: mtExpLive, optionType: "C", bid: 0.65, ask: 0.68, last: 0.67, volume: 12000, openInterest: 9000, iv: 0.24, delta: 0.38, gamma: 0.10, vega: 0.04, percentChange: 0 }],
       latest5mCandle: { open: 219.65, high: 220.08, low: 219.12, prevLow: 219.12, close: 220.0, sma34: 219.80, timestamp: mtEvalTs, flowSnapshot: { ...makeMtFlow(220.0, 219.75, 0.55, 0.62, 0.68, 1.3, 0.16, 0.16), atr5m: 0.45 } },
     });
-    assert(nvdaAfterSpyClose.activePosition?.ticker === "NVDA" && iwmBlockedByNvda.activePosition === null && Object.keys(loadTradeStore().activePositions).length === 1, "14C: Closing SPY unlocks NVDA; active NVDA blocks IWM");
+    assert(nvdaAfterSpyClose.activePosition?.ticker === "NVDA" && iwmBlockedByNvda.activePosition === null && Object.keys(loadTradeStore(mtDate).activePositions).length === 1, "14C: Closing SPY unlocks NVDA; active NVDA blocks IWM");
 
     // 14D: 200-step Multi-Ticker Monte Carlo (SPY/QQQ/IWM/NVDA global single-slot + <= $100 outlay)
     const rng14D = createPrng(2026111401);
@@ -2255,7 +2297,7 @@ async function runTestSuite() {
         contracts: [{ symbol: `${cfg.ticker}_${cfg.strike}C`, strike: cfg.strike, expiration: mtExpLive, optionType: "C", bid: Number((cfg.ask - 0.03).toFixed(2)), ask: cfg.ask, last: cfg.ask, volume: 12000, openInterest: 9000, iv: cfg.iv, delta: 0.38, gamma: 0.10, vega: 0.04, percentChange: 0 }],
         latest5mCandle: { open: cfg.spot - cfg.sigma * 0.4, high: cfg.spot + cfg.sigma * 0.1, low: cfg.pw, prevLow: cfg.pw, close: cfg.spot, sma34: cfg.spot - cfg.sigma * 0.2, timestamp: mtEvalTs, flowSnapshot: makeMtFlow(cfg.spot, cfg.spot - cfg.sigma * 0.3, cfg.sigma, 0.64, 0.70, 1.4, 0.18, 0.18) },
       });
-      const st = loadTradeStore();
+      const st = loadTradeStore(mtDate);
       const actKeys = Object.keys(st.activePositions || {});
       if (actKeys.length > 1) mtSlotViolations++;
       for (const p of Object.values(st.activePositions || {})) {
